@@ -12,11 +12,11 @@ import Transactions from './components/Transactions';
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <PortfolioProvider>
-        <div className="min-h-screen bg-gray-50">
+        <div style={{ minHeight: '100vh', backgroundColor: '#f8f9fa' }}>
           <Navbar />
-          <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          <main className="container py-4">
             <Routes>
               <Route path="/" element={<Dashboard />} />
               <Route path="/investments" element={<Investments />} />

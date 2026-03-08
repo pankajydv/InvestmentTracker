@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Card, Row, Col, Button, Form, Alert } from 'react-bootstrap';
 import { createInvestment, addTransaction, searchMutualFunds, searchStock } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileUp } from 'lucide-react';
@@ -39,7 +40,6 @@ export default function AddInvestment() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
 
-  // Auto-calculate amount
   const updateTxn = (field, value) => {
     const updated = { ...txn, [field]: value };
     if ((field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
@@ -48,7 +48,6 @@ export default function AddInvestment() {
     setTxn(updated);
   };
 
-  // Search mutual funds
   const handleMfSearch = async () => {
     if (mfSearch.length < 2) return;
     setSearching(true);
@@ -62,14 +61,12 @@ export default function AddInvestment() {
     }
   };
 
-  // Select a mutual fund from search
   const selectMf = (mf) => {
     setForm({ ...form, name: mf.schemeName, amfi_code: mf.schemeCode });
     setMfResults([]);
     setMfSearch(mf.schemeName);
   };
 
-  // Validate stock ticker
   const handleStockSearch = async () => {
     if (!form.ticker_symbol) return;
     setSearching(true);
@@ -86,7 +83,6 @@ export default function AddInvestment() {
     }
   };
 
-  // Submit form
   const handleSubmit = async () => {
     setError('');
     setSubmitting(true);
@@ -97,7 +93,6 @@ export default function AddInvestment() {
         return;
       }
 
-      // Create investment
       const inv = await createInvestment({
         name: form.name,
         asset_type: assetType,
@@ -111,7 +106,6 @@ export default function AddInvestment() {
         portfolio_id: portfolioId || null,
       });
 
-      // Add initial transaction if amount provided
       if (txn.amount && parseFloat(txn.amount) > 0) {
         const isPPF = assetType === 'PPF' || assetType === 'PF';
         await addTransaction({
@@ -138,313 +132,307 @@ export default function AddInvestment() {
   const isStock = assetType === 'INDIAN_STOCK' || assetType === 'FOREIGN_STOCK';
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="mx-auto d-flex flex-column gap-4" style={{ maxWidth: 680 }}>
       <div>
-        <button onClick={() => navigate(-1)} className="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1 mb-2">
+        <button onClick={() => navigate(-1)} className="btn btn-link btn-sm text-muted text-decoration-none d-flex align-items-center gap-1 mb-2 p-0">
           <ArrowLeft className="h-4 w-4" /> Back
         </button>
-        <h1 className="text-2xl font-bold text-gray-900">Add Investment</h1>
+        <h1 className="h4 fw-bold">Add Investment</h1>
       </div>
 
       {/* CAS Import Banner */}
       <Link
         to="/investments/import-cas"
-        className="block bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl border border-blue-200 p-4 hover:border-blue-400 transition-colors"
+        className="text-decoration-none d-block rounded border p-3"
+        style={{ background: 'linear-gradient(to right, #eff6ff, #eef2ff)', borderColor: '#bfdbfe' }}
       >
-        <div className="flex items-center gap-3">
-          <FileUp className="h-8 w-8 text-blue-600" />
+        <div className="d-flex align-items-center gap-3">
+          <FileUp size={32} className="text-primary" />
           <div>
-            <div className="font-semibold text-gray-900">Import from CAS PDF</div>
-            <div className="text-sm text-gray-500">Upload CDSL Consolidated Account Statement to bulk-import all your holdings</div>
+            <div className="fw-semibold text-dark">Import from CAS PDF</div>
+            <div className="small text-muted">Upload CDSL Consolidated Account Statement to bulk-import all your holdings</div>
           </div>
         </div>
       </Link>
 
-      {error && (
-        <div className="bg-red-50 text-red-700 p-3 rounded-lg text-sm">{error}</div>
-      )}
+      {error && <Alert variant="danger" className="small py-2">{error}</Alert>}
 
       {/* Step 1: Choose Asset Type */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">1. Choose Asset Type</h2>
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-          {ASSET_TYPES.map((type) => (
-            <button
-              key={type}
-              onClick={() => {
-                setAssetType(type);
-                setForm({ ...form, name: '', ticker_symbol: '', amfi_code: '', currency: type === 'FOREIGN_STOCK' ? 'USD' : 'INR' });
-                setStockInfo(null);
-                setMfResults([]);
-                setMfSearch('');
-              }}
-              className={`p-3 rounded-lg text-sm font-medium border-2 transition-colors ${
-                assetType === type
-                  ? 'border-blue-500 bg-blue-50 text-blue-700'
-                  : 'border-gray-200 text-gray-600 hover:border-gray-300'
-              }`}
-            >
-              {ASSET_TYPE_LABELS[type]}
-            </button>
-          ))}
-        </div>
+      <Card className="shadow-sm">
+        <Card.Body>
+          <h2 className="h6 fw-semibold mb-3">1. Choose Asset Type</h2>
+          <Row className="g-2" xs={2} sm={5}>
+            {ASSET_TYPES.map((type) => (
+              <Col key={type}>
+                <button
+                  onClick={() => {
+                    setAssetType(type);
+                    setForm({ ...form, name: '', ticker_symbol: '', amfi_code: '', currency: type === 'FOREIGN_STOCK' ? 'USD' : 'INR' });
+                    setStockInfo(null);
+                    setMfResults([]);
+                    setMfSearch('');
+                  }}
+                  className={`btn w-100 btn-sm border-2 ${
+                    assetType === type
+                      ? 'btn-outline-primary border-primary bg-primary bg-opacity-10'
+                      : 'btn-outline-secondary'
+                  }`}
+                >
+                  {ASSET_TYPE_LABELS[type]}
+                </button>
+              </Col>
+            ))}
+          </Row>
 
-        {/* Portfolio (Family Member) selector */}
-        {portfolios.length > 0 && (
-          <div className="mt-4 pt-4 border-t border-gray-100">
-            <label className="block text-sm font-medium text-gray-700 mb-2">Assign to Portfolio</label>
-            <select
-              value={portfolioId || ''}
-              onChange={(e) => setPortfolioId(e.target.value ? Number(e.target.value) : '')}
-              className="border border-gray-300 rounded-lg px-3 py-2 text-sm w-full sm:w-auto focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-            >
-              <option value="">Unassigned</option>
-              {portfolios.map((p) => (
-                <option key={p.id} value={p.id}>{p.name}</option>
-              ))}
-            </select>
-          </div>
-        )}
-      </div>
+          {portfolios.length > 0 && (
+            <div className="mt-3 pt-3 border-top">
+              <Form.Label className="small">Assign to Portfolio</Form.Label>
+              <Form.Select
+                size="sm"
+                value={portfolioId || ''}
+                onChange={(e) => setPortfolioId(e.target.value ? Number(e.target.value) : '')}
+                style={{ width: 'auto' }}
+              >
+                <option value="">Unassigned</option>
+                {portfolios.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name}</option>
+                ))}
+              </Form.Select>
+            </div>
+          )}
+        </Card.Body>
+      </Card>
 
       {/* Step 2: Investment Details */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">2. Investment Details</h2>
+      <Card className="shadow-sm">
+        <Card.Body>
+          <h2 className="h6 fw-semibold mb-3">2. Investment Details</h2>
 
-        {/* Mutual Fund Search */}
-        {isMF && (
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Search Mutual Fund</label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={mfSearch}
-                onChange={(e) => setMfSearch(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleMfSearch()}
-                className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                placeholder="Search by fund name (e.g., HDFC Flexi Cap)"
-              />
-              <button
-                onClick={handleMfSearch}
-                disabled={searching}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm disabled:opacity-50"
-              >
-                <Search className="h-4 w-4" />
-              </button>
-            </div>
-            {mfResults.length > 0 && (
-              <div className="mt-2 border border-gray-200 rounded-lg max-h-60 overflow-y-auto">
-                {mfResults.map((mf) => (
-                  <button
-                    key={mf.schemeCode}
-                    onClick={() => selectMf(mf)}
-                    className="w-full text-left px-4 py-2.5 hover:bg-blue-50 text-sm border-b border-gray-100 last:border-0"
-                  >
-                    <div className="font-medium text-gray-900">{mf.schemeName}</div>
-                    <div className="text-xs text-gray-500">Code: {mf.schemeCode}</div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Stock Ticker Search */}
-        {isStock && (
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              {assetType === 'INDIAN_STOCK' ? 'NSE Symbol' : 'Ticker Symbol'}
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={form.ticker_symbol}
-                onChange={(e) => setForm({ ...form, ticker_symbol: e.target.value.toUpperCase() })}
-                onKeyDown={(e) => e.key === 'Enter' && handleStockSearch()}
-                className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                placeholder={assetType === 'INDIAN_STOCK' ? 'e.g., RELIANCE, TCS, INFY' : 'e.g., AAPL, MSFT, GOOGL'}
-              />
-              <button
-                onClick={handleStockSearch}
-                disabled={searching}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm disabled:opacity-50"
-              >
-                <Search className="h-4 w-4" />
-              </button>
-            </div>
-            {stockInfo && (
-              <div className="mt-2 p-3 bg-green-50 rounded-lg flex items-center gap-2">
-                <CheckCircle className="h-4 w-4 text-green-600" />
-                <span className="text-sm text-green-700">
-                  Found: <strong>{stockInfo.name}</strong> — ₹{stockInfo.price?.toFixed(2)} ({stockInfo.currency})
-                </span>
-              </div>
-            )}
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Name</label>
-            <input
-              type="text"
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-              placeholder="Investment name"
-              required
-            />
-          </div>
-
+          {/* Mutual Fund Search */}
           {isMF && (
-            <>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">AMFI Code</label>
-                <input
+            <div className="mb-3">
+              <Form.Label className="small">Search Mutual Fund</Form.Label>
+              <div className="d-flex gap-2">
+                <Form.Control
+                  size="sm"
                   type="text"
-                  value={form.amfi_code}
-                  onChange={(e) => setForm({ ...form, amfi_code: e.target.value })}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                  placeholder="e.g., 118989"
+                  value={mfSearch}
+                  onChange={(e) => setMfSearch(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleMfSearch()}
+                  placeholder="Search by fund name (e.g., HDFC Flexi Cap)"
                 />
+                <Button size="sm" variant="primary" onClick={handleMfSearch} disabled={searching}>
+                  <Search size={16} />
+                </Button>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Folio Number</label>
-                <input
-                  type="text"
-                  value={form.folio_number}
-                  onChange={(e) => setForm({ ...form, folio_number: e.target.value })}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                  placeholder="Optional"
-                />
-              </div>
-            </>
+              {mfResults.length > 0 && (
+                <div className="mt-2 border rounded" style={{ maxHeight: 240, overflowY: 'auto' }}>
+                  {mfResults.map((mf) => (
+                    <button
+                      key={mf.schemeCode}
+                      onClick={() => selectMf(mf)}
+                      className="w-100 text-start px-3 py-2 small border-bottom bg-transparent border-0"
+                      style={{ cursor: 'pointer' }}
+                      onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#eff6ff'}
+                      onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+                    >
+                      <div className="fw-medium">{mf.schemeName}</div>
+                      <div className="text-muted" style={{ fontSize: '0.75rem' }}>Code: {mf.schemeCode}</div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
 
-          {isPPF && (
-            <>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Account Number</label>
-                <input
+          {/* Stock Ticker Search */}
+          {isStock && (
+            <div className="mb-3">
+              <Form.Label className="small">
+                {assetType === 'INDIAN_STOCK' ? 'NSE Symbol' : 'Ticker Symbol'}
+              </Form.Label>
+              <div className="d-flex gap-2">
+                <Form.Control
+                  size="sm"
                   type="text"
-                  value={form.account_number}
-                  onChange={(e) => setForm({ ...form, account_number: e.target.value })}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                  placeholder="Account number"
+                  value={form.ticker_symbol}
+                  onChange={(e) => setForm({ ...form, ticker_symbol: e.target.value.toUpperCase() })}
+                  onKeyDown={(e) => e.key === 'Enter' && handleStockSearch()}
+                  placeholder={assetType === 'INDIAN_STOCK' ? 'e.g., RELIANCE, TCS, INFY' : 'e.g., AAPL, MSFT, GOOGL'}
                 />
+                <Button size="sm" variant="primary" onClick={handleStockSearch} disabled={searching}>
+                  <Search size={16} />
+                </Button>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Interest Rate (% p.a.)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={form.interest_rate}
-                  onChange={(e) => setForm({ ...form, interest_rate: e.target.value })}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                  placeholder={assetType === 'PPF' ? '7.1' : '8.25'}
-                />
-              </div>
-            </>
+              {stockInfo && (
+                <div className="mt-2 p-2 bg-success bg-opacity-10 rounded d-flex align-items-center gap-2">
+                  <CheckCircle size={16} className="text-success" />
+                  <span className="small text-success">
+                    Found: <strong>{stockInfo.name}</strong> — ₹{stockInfo.price?.toFixed(2)} ({stockInfo.currency})
+                  </span>
+                </div>
+              )}
+            </div>
           )}
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
-            <input
-              type="text"
-              value={form.notes}
-              onChange={(e) => setForm({ ...form, notes: e.target.value })}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-              placeholder="Optional notes"
-            />
-          </div>
-        </div>
-      </div>
+          <Row className="g-3">
+            <Col md={6}>
+              <Form.Label className="small">Name</Form.Label>
+              <Form.Control
+                size="sm"
+                type="text"
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+                placeholder="Investment name"
+                required
+              />
+            </Col>
+
+            {isMF && (
+              <>
+                <Col md={6}>
+                  <Form.Label className="small">AMFI Code</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="text"
+                    value={form.amfi_code}
+                    onChange={(e) => setForm({ ...form, amfi_code: e.target.value })}
+                    placeholder="e.g., 118989"
+                  />
+                </Col>
+                <Col md={6}>
+                  <Form.Label className="small">Folio Number</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="text"
+                    value={form.folio_number}
+                    onChange={(e) => setForm({ ...form, folio_number: e.target.value })}
+                    placeholder="Optional"
+                  />
+                </Col>
+              </>
+            )}
+
+            {isPPF && (
+              <>
+                <Col md={6}>
+                  <Form.Label className="small">Account Number</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="text"
+                    value={form.account_number}
+                    onChange={(e) => setForm({ ...form, account_number: e.target.value })}
+                    placeholder="Account number"
+                  />
+                </Col>
+                <Col md={6}>
+                  <Form.Label className="small">Interest Rate (% p.a.)</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    step="0.01"
+                    value={form.interest_rate}
+                    onChange={(e) => setForm({ ...form, interest_rate: e.target.value })}
+                    placeholder={assetType === 'PPF' ? '7.1' : '8.25'}
+                  />
+                </Col>
+              </>
+            )}
+
+            <Col md={6}>
+              <Form.Label className="small">Notes</Form.Label>
+              <Form.Control
+                size="sm"
+                type="text"
+                value={form.notes}
+                onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                placeholder="Optional notes"
+              />
+            </Col>
+          </Row>
+        </Card.Body>
+      </Card>
 
       {/* Step 3: Initial Transaction */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">
-          3. Initial Transaction <span className="text-sm font-normal text-gray-400">(optional)</span>
-        </h2>
+      <Card className="shadow-sm">
+        <Card.Body>
+          <h2 className="h6 fw-semibold mb-3">
+            3. Initial Transaction <span className="fw-normal text-muted small">(optional)</span>
+          </h2>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
-            <input
-              type="date"
-              value={txn.transaction_date}
-              onChange={(e) => updateTxn('transaction_date', e.target.value)}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-            />
-          </div>
+          <Row className="g-3">
+            <Col md={6}>
+              <Form.Label className="small">Date</Form.Label>
+              <Form.Control
+                size="sm"
+                type="date"
+                value={txn.transaction_date}
+                onChange={(e) => updateTxn('transaction_date', e.target.value)}
+              />
+            </Col>
 
-          {!isPPF && (
-            <>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Units / Shares</label>
-                <input
-                  type="number"
-                  step="0.001"
-                  value={txn.units}
-                  onChange={(e) => updateTxn('units', e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                  placeholder="Number of units"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Price per Unit (₹)</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  value={txn.price_per_unit}
-                  onChange={(e) => updateTxn('price_per_unit', e.target.value)}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                  placeholder="Cost per unit"
-                />
-              </div>
-            </>
-          )}
+            {!isPPF && (
+              <>
+                <Col md={6}>
+                  <Form.Label className="small">Units / Shares</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    step="0.001"
+                    value={txn.units}
+                    onChange={(e) => updateTxn('units', e.target.value)}
+                    placeholder="Number of units"
+                  />
+                </Col>
+                <Col md={6}>
+                  <Form.Label className="small">Price per Unit (₹)</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    step="0.01"
+                    value={txn.price_per_unit}
+                    onChange={(e) => updateTxn('price_per_unit', e.target.value)}
+                    placeholder="Cost per unit"
+                  />
+                </Col>
+              </>
+            )}
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Total Amount (₹)</label>
-            <input
-              type="number"
-              step="0.01"
-              value={txn.amount}
-              onChange={(e) => updateTxn('amount', e.target.value)}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-              placeholder="Total invested amount"
-            />
-          </div>
+            <Col md={6}>
+              <Form.Label className="small">Total Amount (₹)</Form.Label>
+              <Form.Control
+                size="sm"
+                type="number"
+                step="0.01"
+                value={txn.amount}
+                onChange={(e) => updateTxn('amount', e.target.value)}
+                placeholder="Total invested amount"
+              />
+            </Col>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Fees (₹)</label>
-            <input
-              type="number"
-              step="0.01"
-              value={txn.fees}
-              onChange={(e) => updateTxn('fees', e.target.value)}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-              placeholder="0"
-            />
-          </div>
-        </div>
-      </div>
+            <Col md={6}>
+              <Form.Label className="small">Fees (₹)</Form.Label>
+              <Form.Control
+                size="sm"
+                type="number"
+                step="0.01"
+                value={txn.fees}
+                onChange={(e) => updateTxn('fees', e.target.value)}
+                placeholder="0"
+              />
+            </Col>
+          </Row>
+        </Card.Body>
+      </Card>
 
       {/* Submit */}
-      <div className="flex justify-end gap-3">
-        <button
-          onClick={() => navigate(-1)}
-          className="px-6 py-3 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium"
-        >
+      <div className="d-flex justify-content-end gap-2">
+        <Button variant="outline-secondary" onClick={() => navigate(-1)}>
           Cancel
-        </button>
-        <button
-          onClick={handleSubmit}
-          disabled={submitting}
-          className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium disabled:opacity-50"
-        >
+        </Button>
+        <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
           {submitting ? 'Adding...' : 'Add Investment'}
-        </button>
+        </Button>
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { Form, Button } from 'react-bootstrap';
 import { usePortfolio } from '../context/PortfolioContext';
-import { ChevronDown, Users, User, Plus, Palette } from 'lucide-react';
+import { ChevronDown, Users, Plus } from 'lucide-react';
 
 export default function PortfolioSelector() {
   const { portfolios, selectedId, selectedPortfolio, selectPortfolio, refreshPortfolios } = usePortfolio();
@@ -11,7 +12,6 @@ export default function PortfolioSelector() {
   const [newColor, setNewColor] = useState('#f59e0b');
   const ref = useRef(null);
 
-  // Close dropdown on outside click
   useEffect(() => {
     const handler = (e) => {
       if (ref.current && !ref.current.contains(e.target)) {
@@ -46,125 +46,139 @@ export default function PortfolioSelector() {
   const COLORS = ['#f59e0b', '#3b82f6', '#10b981', '#ef4444', '#8b5cf6', '#ec4899'];
 
   return (
-    <div className="relative" ref={ref}>
+    <div className="position-relative" ref={ref}>
       <button
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-2 px-3 py-2 rounded-lg border border-gray-200 hover:border-gray-300 bg-white transition-colors text-sm"
+        className="d-flex align-items-center gap-2 px-3 py-2 rounded border bg-white small"
       >
         {selectedPortfolio ? (
-          <span
-            className="w-3 h-3 rounded-full flex-shrink-0"
-            style={{ backgroundColor: selectedPortfolio.color }}
-          />
+          <span className="portfolio-dot flex-shrink-0" style={{ backgroundColor: selectedPortfolio.color }} />
         ) : (
-          <Users className="h-4 w-4 text-gray-500" />
+          <Users size={16} className="text-muted" />
         )}
-        <span className="font-medium text-gray-800 max-w-[140px] truncate">{label}</span>
+        <span className="fw-medium text-truncate" style={{ maxWidth: 140 }}>{label}</span>
         {portfolios.length > 0 && (
-          <span className="text-xs text-gray-400">
+          <span className="text-muted" style={{ fontSize: '0.75rem' }}>
             {selectedCount} of {portfolios.length}
           </span>
         )}
-        <ChevronDown className={`h-4 w-4 text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+        <ChevronDown
+          size={16}
+          className="text-muted"
+          style={{ transition: 'transform 0.2s', transform: open ? 'rotate(180deg)' : 'none' }}
+        />
       </button>
 
       {open && (
-        <div className="absolute top-full left-0 mt-1 w-72 bg-white rounded-xl shadow-lg border border-gray-200 z-50 overflow-hidden">
-          {/* All Portfolios option */}
+        <div
+          className="position-absolute top-100 start-0 mt-1 bg-white rounded shadow-lg border overflow-hidden"
+          style={{ width: 288, zIndex: 1050 }}
+        >
+          {/* All Portfolios */}
           <button
             onClick={() => { selectPortfolio(null); setOpen(false); }}
-            className={`w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-50 transition-colors ${
-              selectedId === null ? 'bg-blue-50 border-l-4 border-blue-600' : 'border-l-4 border-transparent'
-            }`}
+            className="w-100 d-flex align-items-center gap-3 px-3 py-3 border-0 bg-transparent text-start"
+            style={{
+              borderLeft: selectedId === null ? '4px solid #0d6efd' : '4px solid transparent',
+              backgroundColor: selectedId === null ? '#e8f0fe' : undefined,
+            }}
+            onMouseEnter={(e) => { if (selectedId !== null) e.currentTarget.style.backgroundColor = '#f8f9fa'; }}
+            onMouseLeave={(e) => { if (selectedId !== null) e.currentTarget.style.backgroundColor = 'transparent'; }}
           >
-            <Users className="h-5 w-5 text-gray-500" />
-            <div className="text-left">
-              <div className="font-medium text-gray-900">All Portfolios</div>
-              <div className="text-xs text-gray-500">{portfolios.length} member{portfolios.length !== 1 ? 's' : ''}</div>
+            <Users size={20} className="text-muted" />
+            <div>
+              <div className="fw-medium">All Portfolios</div>
+              <div className="text-muted" style={{ fontSize: '0.75rem' }}>{portfolios.length} member{portfolios.length !== 1 ? 's' : ''}</div>
             </div>
           </button>
 
-          <div className="border-t border-gray-100" />
+          <hr className="my-0" />
 
           {/* Individual portfolios */}
           {portfolios.map((p) => (
             <button
               key={p.id}
               onClick={() => { selectPortfolio(p.id); setOpen(false); }}
-              className={`w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-50 transition-colors ${
-                selectedId === p.id ? 'bg-blue-50 border-l-4 border-blue-600' : 'border-l-4 border-transparent'
-              }`}
+              className="w-100 d-flex align-items-center gap-3 px-3 py-3 border-0 bg-transparent text-start"
+              style={{
+                borderLeft: selectedId === p.id ? '4px solid #0d6efd' : '4px solid transparent',
+                backgroundColor: selectedId === p.id ? '#e8f0fe' : undefined,
+              }}
+              onMouseEnter={(e) => { if (selectedId !== p.id) e.currentTarget.style.backgroundColor = '#f8f9fa'; }}
+              onMouseLeave={(e) => { if (selectedId !== p.id) e.currentTarget.style.backgroundColor = selectedId === p.id ? '#e8f0fe' : 'transparent'; }}
             >
               <span
-                className="w-4 h-4 rounded-full flex-shrink-0"
-                style={{ backgroundColor: p.color }}
+                className="portfolio-dot flex-shrink-0"
+                style={{ backgroundColor: p.color, width: 16, height: 16 }}
               />
-              <div className="text-left flex-1 min-w-0">
-                <div className="font-medium text-gray-900 truncate">{p.name}</div>
-                <div className="text-xs text-gray-500">
+              <div className="flex-grow-1" style={{ minWidth: 0 }}>
+                <div className="fw-medium text-truncate">{p.name}</div>
+                <div className="text-muted" style={{ fontSize: '0.75rem' }}>
                   {p.investment_count || 0} investment{(p.investment_count || 0) !== 1 ? 's' : ''}
                 </div>
               </div>
             </button>
           ))}
 
-          <div className="border-t border-gray-100" />
+          <hr className="my-0" />
 
           {/* Add new portfolio */}
           {!showAdd ? (
             <button
               onClick={() => setShowAdd(true)}
-              className="w-full flex items-center gap-3 px-4 py-3 text-blue-600 hover:bg-blue-50 transition-colors"
+              className="w-100 d-flex align-items-center gap-3 px-3 py-3 border-0 bg-transparent text-primary small fw-medium"
+              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#e8f0fe'}
+              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
             >
-              <Plus className="h-4 w-4" />
-              <span className="text-sm font-medium">Add Family Member</span>
+              <Plus size={16} />
+              Add Family Member
             </button>
           ) : (
-            <div className="p-3 space-y-2">
-              <input
+            <div className="p-3 d-flex flex-column gap-2">
+              <Form.Control
+                size="sm"
                 type="text"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 placeholder="Name (e.g. Rahul Yadav)"
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                 autoFocus
                 onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
               />
-              <input
+              <Form.Control
+                size="sm"
                 type="text"
                 value={newPan}
                 onChange={(e) => setNewPan(e.target.value.toUpperCase())}
                 placeholder="PAN Number (e.g. ABCDE1234F)"
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono"
+                className="font-monospace"
                 maxLength={10}
                 onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
               />
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-gray-500">Color:</span>
+              <div className="d-flex align-items-center gap-2">
+                <span className="text-muted" style={{ fontSize: '0.75rem' }}>Color:</span>
                 {COLORS.map((c) => (
                   <button
                     key={c}
                     onClick={() => setNewColor(c)}
-                    className={`w-6 h-6 rounded-full border-2 transition-transform ${
-                      newColor === c ? 'border-gray-800 scale-110' : 'border-transparent'
-                    }`}
-                    style={{ backgroundColor: c }}
+                    className="rounded-circle border-0 p-0"
+                    style={{
+                      width: 24,
+                      height: 24,
+                      backgroundColor: c,
+                      border: newColor === c ? '2px solid #333' : '2px solid transparent',
+                      transform: newColor === c ? 'scale(1.15)' : 'scale(1)',
+                      transition: 'transform 0.15s',
+                    }}
                   />
                 ))}
               </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={handleAdd}
-                  className="flex-1 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"
-                >
+              <div className="d-flex gap-2">
+                <Button variant="primary" size="sm" className="flex-grow-1" onClick={handleAdd}>
                   Add
-                </button>
-                <button
-                  onClick={() => { setShowAdd(false); setNewName(''); }}
-                  className="px-3 py-1.5 bg-gray-100 text-gray-600 rounded-lg text-sm hover:bg-gray-200"
-                >
+                </Button>
+                <Button variant="light" size="sm" onClick={() => { setShowAdd(false); setNewName(''); }}>
                   Cancel
-                </button>
+                </Button>
               </div>
             </div>
           )}

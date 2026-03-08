@@ -1,9 +1,6 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
 body {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: #f8f9fa;
 }
 
 /* Custom scrollbar */
@@ -16,8 +13,8 @@ body {
 .rupee::before { content: '₹'; }
 
 /* Profit/Loss colors */
-.text-profit { color: #16a34a; }
-.text-loss { color: #dc2626; }
+.text-profit { color: #16a34a !important; }
+.text-loss { color: #dc2626 !important; }
 
 /* Mobile-first responsive table */
 @media (max-width: 768px) {
@@ -27,3 +24,61 @@ body {
     -webkit-overflow-scrolling: touch;
   }
 }
+
+/* Custom card styling to match original look */
+.card {
+  border-radius: 0.75rem;
+}
+
+/* Type badge colors */
+.badge-buy { background-color: #dcfce7 !important; color: #15803d !important; }
+.badge-sell { background-color: #fee2e2 !important; color: #b91c1c !important; }
+.badge-dividend { background-color: #dbeafe !important; color: #1d4ed8 !important; }
+.badge-bonus { background-color: #d1fae5 !important; color: #047857 !important; }
+.badge-ipo { background-color: #dcfce7 !important; color: #15803d !important; }
+.badge-deposit { background-color: #dcfce7 !important; color: #15803d !important; }
+.badge-withdrawal { background-color: #fee2e2 !important; color: #b91c1c !important; }
+.badge-split { background-color: #dbeafe !important; color: #1d4ed8 !important; }
+.badge-interest { background-color: #dbeafe !important; color: #1d4ed8 !important; }
+.badge-merger { background-color: #f3e8ff !important; color: #7c3aed !important; }
+
+/* Portfolio color dot */
+.portfolio-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+/* File upload dropzone */
+.dropzone {
+  border: 2px dashed #dee2e6;
+  border-radius: 0.75rem;
+  padding: 2rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+.dropzone:hover {
+  border-color: #0d6efd;
+  background-color: rgba(13, 110, 253, 0.03);
+}
+
+/* Truncate text */
+.text-truncate-custom {
+  max-width: 150px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Active nav link */
+.nav-link.active-nav {
+  color: #0d6efd !important;
+  font-weight: 500;
+}
+
+/* Spinner rotation for refresh icon */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner-rotate { animation: spin 1s linear infinite; }

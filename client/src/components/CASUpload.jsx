@@ -1,5 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Card, Button, Form, Alert, Table, Spinner } from 'react-bootstrap';
 import { usePortfolio } from '../context/PortfolioContext';
 import { uploadCASPreview, importCASHoldings, triggerPriceUpdate } from '../services/api';
 import { ArrowLeft, Upload, FileText, CheckCircle, AlertCircle, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
@@ -18,12 +19,10 @@ export default function CASUpload() {
   const [error, setError] = useState('');
   const [preview, setPreview] = useState(null);
 
-  // Selection state
   const [selectedStocks, setSelectedStocks] = useState(new Set());
   const [selectedMFs, setSelectedMFs] = useState(new Set());
   const [selectedBonds, setSelectedBonds] = useState(new Set());
 
-  // Collapse state
   const [showStocks, setShowStocks] = useState(true);
   const [showMFs, setShowMFs] = useState(true);
   const [showBonds, setShowBonds] = useState(true);
@@ -39,8 +38,6 @@ export default function CASUpload() {
     try {
       const result = await uploadCASPreview(file, portfolioId);
       setPreview(result);
-
-      // Auto-select all new holdings
       setSelectedStocks(new Set(result.stocks.filter(h => h.isNew).map((_, i) => i)));
       setSelectedMFs(new Set(result.mutualFunds.filter(h => h.isNew).map((_, i) => i)));
       setSelectedBonds(new Set(result.bonds.filter(h => h.isNew).map((_, i) => i)));
@@ -54,26 +51,15 @@ export default function CASUpload() {
   const handleImport = async () => {
     setError('');
     const holdings = [];
-
-    // Collect selected stocks
-    selectedStocks.forEach(idx => {
-      if (preview.stocks[idx]) holdings.push(preview.stocks[idx]);
-    });
-    // Collect selected MFs
-    selectedMFs.forEach(idx => {
-      if (preview.mutualFunds[idx]) holdings.push(preview.mutualFunds[idx]);
-    });
-    // Collect selected bonds
-    selectedBonds.forEach(idx => {
-      if (preview.bonds[idx]) holdings.push(preview.bonds[idx]);
-    });
+    selectedStocks.forEach(idx => { if (preview.stocks[idx]) holdings.push(preview.stocks[idx]); });
+    selectedMFs.forEach(idx => { if (preview.mutualFunds[idx]) holdings.push(preview.mutualFunds[idx]); });
+    selectedBonds.forEach(idx => { if (preview.bonds[idx]) holdings.push(preview.bonds[idx]); });
 
     if (holdings.length === 0) return setError('No holdings selected for import');
 
     setImporting(true);
     try {
       const result = await importCASHoldings(portfolioId, holdings);
-      // Trigger price update for newly imported investments
       try { await triggerPriceUpdate(); } catch (e) { /* non-critical */ }
       await refreshPortfolios();
       navigate('/investments', {
@@ -104,131 +90,140 @@ export default function CASUpload() {
   const totalSelected = selectedStocks.size + selectedMFs.size + selectedBonds.size;
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
+    <div className="mx-auto d-flex flex-column gap-4" style={{ maxWidth: 900 }}>
       {/* Header */}
       <div>
-        <button onClick={() => navigate(-1)} className="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1 mb-2">
-          <ArrowLeft className="h-4 w-4" /> Back
+        <button onClick={() => navigate(-1)} className="btn btn-link btn-sm text-muted text-decoration-none d-flex align-items-center gap-1 mb-2 p-0">
+          <ArrowLeft size={16} /> Back
         </button>
-        <h1 className="text-2xl font-bold text-gray-900">Import from CAS PDF</h1>
-        <p className="text-sm text-gray-500 mt-1">
+        <h1 className="h4 fw-bold">Import from CAS PDF</h1>
+        <p className="small text-muted mt-1">
           Upload your CDSL Consolidated Account Statement to bulk-import investments
         </p>
       </div>
 
       {error && (
-        <div className="bg-red-50 text-red-700 p-3 rounded-lg text-sm flex items-center gap-2">
-          <AlertCircle className="h-4 w-4 flex-shrink-0" />
+        <Alert variant="danger" className="small py-2 d-flex align-items-center gap-2">
+          <AlertCircle size={16} className="flex-shrink-0" />
           {error}
-        </div>
+        </Alert>
       )}
 
       {/* Step 1: Upload */}
       {!preview && (
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 space-y-4">
-          <h2 className="text-lg font-semibold text-gray-900">1. Select Portfolio & PDF</h2>
+        <Card className="shadow-sm">
+          <Card.Body className="d-flex flex-column gap-3">
+            <h2 className="h6 fw-semibold">1. Select Portfolio & PDF</h2>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Family Member (Portfolio)</label>
-            <select
-              value={portfolioId}
-              onChange={(e) => setPortfolioId(e.target.value)}
-              className="border border-gray-300 rounded-lg px-3 py-2 text-sm w-full sm:w-72 focus:ring-2 focus:ring-blue-500"
-            >
-              <option value="">Select a portfolio...</option>
-              {portfolios.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name} {p.pan_number ? `(PAN: ${p.pan_number})` : '(no PAN set)'}
-                </option>
-              ))}
-            </select>
-            {selectedPortfolio && !selectedPortfolio.pan_number && (
-              <p className="text-xs text-amber-600 mt-1">
-                ⚠ This portfolio has no PAN number. The CAS PDF is password-protected with the PAN.
-                Please edit the portfolio to add the PAN number first.
-              </p>
-            )}
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">CAS PDF File</label>
-            <div
-              onClick={() => fileRef.current?.click()}
-              className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50/50 transition-colors"
-            >
-              <input
-                ref={fileRef}
-                type="file"
-                accept="application/pdf"
-                className="hidden"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
-              />
-              {file ? (
-                <div className="flex items-center justify-center gap-3">
-                  <FileText className="h-8 w-8 text-blue-600" />
-                  <div className="text-left">
-                    <div className="font-medium text-gray-900">{file.name}</div>
-                    <div className="text-xs text-gray-500">{(file.size / 1024).toFixed(1)} KB</div>
-                  </div>
-                </div>
-              ) : (
-                <div>
-                  <Upload className="h-8 w-8 text-gray-400 mx-auto mb-2" />
-                  <div className="text-sm text-gray-500">Click to select CAS PDF</div>
-                  <div className="text-xs text-gray-400 mt-1">CDSL Consolidated Account Statement (max 20MB)</div>
-                </div>
+            <div>
+              <Form.Label className="small">Family Member (Portfolio)</Form.Label>
+              <Form.Select
+                size="sm"
+                value={portfolioId}
+                onChange={(e) => setPortfolioId(e.target.value)}
+                style={{ maxWidth: 360 }}
+              >
+                <option value="">Select a portfolio...</option>
+                {portfolios.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} {p.pan_number ? `(PAN: ${p.pan_number})` : '(no PAN set)'}
+                  </option>
+                ))}
+              </Form.Select>
+              {selectedPortfolio && !selectedPortfolio.pan_number && (
+                <p className="text-warning small mt-1">
+                  ⚠ This portfolio has no PAN number. The CAS PDF is password-protected with the PAN.
+                  Please edit the portfolio to add the PAN number first.
+                </p>
               )}
             </div>
-          </div>
 
-          <button
-            onClick={handleUpload}
-            disabled={uploading || !portfolioId || !file}
-            className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium disabled:opacity-50 flex items-center gap-2"
-          >
-            {uploading ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Parsing PDF...
-              </>
-            ) : (
-              <>
-                <Upload className="h-4 w-4" />
-                Upload & Parse
-              </>
-            )}
-          </button>
-        </div>
+            <div>
+              <Form.Label className="small">CAS PDF File</Form.Label>
+              <div
+                onClick={() => fileRef.current?.click()}
+                className="dropzone border rounded p-4 text-center"
+                style={{ cursor: 'pointer' }}
+              >
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="application/pdf"
+                  className="d-none"
+                  onChange={(e) => setFile(e.target.files?.[0] || null)}
+                />
+                {file ? (
+                  <div className="d-flex align-items-center justify-content-center gap-3">
+                    <FileText size={32} className="text-primary" />
+                    <div className="text-start">
+                      <div className="fw-medium">{file.name}</div>
+                      <div className="text-muted" style={{ fontSize: '0.75rem' }}>{(file.size / 1024).toFixed(1)} KB</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <Upload size={32} className="text-muted mx-auto mb-2" />
+                    <div className="small text-muted">Click to select CAS PDF</div>
+                    <div className="text-muted mt-1" style={{ fontSize: '0.75rem' }}>CDSL Consolidated Account Statement (max 20MB)</div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <Button
+                variant="primary"
+                onClick={handleUpload}
+                disabled={uploading || !portfolioId || !file}
+                className="d-flex align-items-center gap-2"
+              >
+                {uploading ? (
+                  <>
+                    <Loader2 size={16} className="spinner-rotate" />
+                    Parsing PDF...
+                  </>
+                ) : (
+                  <>
+                    <Upload size={16} />
+                    Upload & Parse
+                  </>
+                )}
+              </Button>
+            </div>
+          </Card.Body>
+        </Card>
       )}
 
       {/* Step 2: Preview & Select */}
       {preview && (
         <>
           {/* Summary Card */}
-          <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-xl border border-blue-100 p-6">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-lg font-semibold text-gray-900">CAS Summary</h2>
-              <span className="text-sm text-gray-500">{preview.investorName}</span>
-            </div>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-center">
-              <div>
-                <div className="text-2xl font-bold text-gray-900">{formatCurrency(preview.portfolioValue)}</div>
-                <div className="text-xs text-gray-500">Total Value</div>
+          <Card className="border-primary border-opacity-25" style={{ background: 'linear-gradient(to right, #eff6ff, #eef2ff)' }}>
+            <Card.Body>
+              <div className="d-flex align-items-center justify-content-between mb-3">
+                <h2 className="h6 fw-semibold mb-0">CAS Summary</h2>
+                <span className="small text-muted">{preview.investorName}</span>
               </div>
-              <div>
-                <div className="text-2xl font-bold text-blue-600">{preview.summary.totalStocks}</div>
-                <div className="text-xs text-gray-500">Stocks</div>
+              <div className="row g-3 text-center">
+                <div className="col-6 col-sm-3">
+                  <div className="fs-5 fw-bold">{formatCurrency(preview.portfolioValue)}</div>
+                  <div className="text-muted" style={{ fontSize: '0.75rem' }}>Total Value</div>
+                </div>
+                <div className="col-6 col-sm-3">
+                  <div className="fs-5 fw-bold text-primary">{preview.summary.totalStocks}</div>
+                  <div className="text-muted" style={{ fontSize: '0.75rem' }}>Stocks</div>
+                </div>
+                <div className="col-6 col-sm-3">
+                  <div className="fs-5 fw-bold text-success">{preview.summary.totalMFs}</div>
+                  <div className="text-muted" style={{ fontSize: '0.75rem' }}>Mutual Funds</div>
+                </div>
+                <div className="col-6 col-sm-3">
+                  <div className="fs-5 fw-bold text-warning">{preview.summary.totalBonds}</div>
+                  <div className="text-muted" style={{ fontSize: '0.75rem' }}>Bonds</div>
+                </div>
               </div>
-              <div>
-                <div className="text-2xl font-bold text-green-600">{preview.summary.totalMFs}</div>
-                <div className="text-xs text-gray-500">Mutual Funds</div>
-              </div>
-              <div>
-                <div className="text-2xl font-bold text-amber-600">{preview.summary.totalBonds}</div>
-                <div className="text-xs text-gray-500">Bonds</div>
-              </div>
-            </div>
-          </div>
+            </Card.Body>
+          </Card>
 
           {/* Stocks */}
           {preview.stocks.length > 0 && (
@@ -242,8 +237,8 @@ export default function CASUpload() {
               toggle={() => setShowStocks(!showStocks)}
               columns={['Name', 'ISIN', 'Units', 'Price', 'Value']}
               renderRow={(h) => [
-                <span className="font-medium">{h.name}</span>,
-                <span className="font-mono text-xs">{h.isin}</span>,
+                <span className="fw-medium">{h.name}</span>,
+                <span className="font-monospace" style={{ fontSize: '0.75rem' }}>{h.isin}</span>,
                 h.units?.toLocaleString('en-IN'),
                 formatCurrency(h.price),
                 formatCurrency(h.value),
@@ -264,12 +259,15 @@ export default function CASUpload() {
               columns={['Name', 'Source', 'Units', 'NAV/Price', 'Value']}
               renderRow={(h) => [
                 <div>
-                  <span className="font-medium">{h.name}</span>
-                  {h.folio && <span className="text-xs text-gray-400 ml-1">({h.folio})</span>}
+                  <span className="fw-medium">{h.name}</span>
+                  {h.folio && <span className="text-muted ms-1" style={{ fontSize: '0.75rem' }}>({h.folio})</span>}
                 </div>,
-                <span className={`text-xs px-2 py-0.5 rounded-full ${
-                  h.source === 'demat' ? 'bg-purple-100 text-purple-700' : 'bg-teal-100 text-teal-700'
-                }`}>
+                <span className={`badge ${h.source === 'demat' ? 'bg-purple-100 text-purple-700' : 'bg-teal-100 text-teal-700'}`}
+                  style={{
+                    fontSize: '0.7rem',
+                    backgroundColor: h.source === 'demat' ? '#f3e8ff' : '#ccfbf1',
+                    color: h.source === 'demat' ? '#7c3aed' : '#0f766e',
+                  }}>
                   {h.source === 'demat' ? 'Demat' : 'RTA'}
                 </span>,
                 h.units?.toLocaleString('en-IN', { maximumFractionDigits: 3 }),
@@ -291,8 +289,8 @@ export default function CASUpload() {
               toggle={() => setShowBonds(!showBonds)}
               columns={['Name', 'ISIN', 'Quantity', 'Market Value', 'Total']}
               renderRow={(h) => [
-                <span className="font-medium">{h.name}</span>,
-                <span className="font-mono text-xs">{h.isin}</span>,
+                <span className="fw-medium">{h.name}</span>,
+                <span className="font-monospace" style={{ fontSize: '0.75rem' }}>{h.isin}</span>,
                 h.quantity,
                 formatCurrency(h.marketValue),
                 formatCurrency(h.value),
@@ -301,34 +299,37 @@ export default function CASUpload() {
           )}
 
           {/* Import Bar */}
-          <div className="sticky bottom-0 bg-white border-t border-gray-200 rounded-xl shadow-lg p-4 flex items-center justify-between">
-            <div className="text-sm text-gray-600">
+          <div className="sticky-bottom bg-white border-top rounded shadow-lg p-3 d-flex align-items-center justify-content-between">
+            <div className="small text-muted">
               <strong>{totalSelected}</strong> of {(preview.stocks.length + preview.mutualFunds.length + preview.bonds.length)} holdings selected
             </div>
-            <div className="flex gap-3">
-              <button
+            <div className="d-flex gap-2">
+              <Button
+                variant="outline-secondary"
+                size="sm"
                 onClick={() => { setPreview(null); setFile(null); }}
-                className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm"
               >
                 Back
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="success"
+                size="sm"
                 onClick={handleImport}
                 disabled={importing || totalSelected === 0}
-                className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium text-sm disabled:opacity-50 flex items-center gap-2"
+                className="d-flex align-items-center gap-2"
               >
                 {importing ? (
                   <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <Loader2 size={16} className="spinner-rotate" />
                     Importing...
                   </>
                 ) : (
                   <>
-                    <CheckCircle className="h-4 w-4" />
+                    <CheckCircle size={16} />
                     Import {totalSelected} Holdings
                   </>
                 )}
-              </button>
+              </Button>
             </div>
           </div>
         </>
@@ -344,47 +345,49 @@ function HoldingSection({ title, emoji, items, selected, setSelected, open, togg
   const existingCount = items.length - newCount;
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+    <Card className="shadow-sm overflow-hidden">
       <button
         onClick={toggle}
-        className="w-full flex items-center justify-between px-6 py-4 hover:bg-gray-50 transition-colors"
+        className="d-flex align-items-center justify-content-between w-100 px-3 py-3 bg-transparent border-0"
+        style={{ cursor: 'pointer' }}
+        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f8f9fa'}
+        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
       >
-        <div className="flex items-center gap-3">
-          <span className="text-lg">{emoji}</span>
-          <span className="font-semibold text-gray-900">{title}</span>
-          <span className="text-sm text-gray-500">({items.length})</span>
+        <div className="d-flex align-items-center gap-2">
+          <span style={{ fontSize: '1.1rem' }}>{emoji}</span>
+          <span className="fw-semibold">{title}</span>
+          <span className="small text-muted">({items.length})</span>
           {existingCount > 0 && (
-            <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">
+            <span className="badge" style={{ fontSize: '0.7rem', backgroundColor: '#fef3c7', color: '#92400e' }}>
               {existingCount} already tracked
             </span>
           )}
         </div>
-        {open ? <ChevronUp className="h-4 w-4 text-gray-400" /> : <ChevronDown className="h-4 w-4 text-gray-400" />}
+        {open ? <ChevronUp size={16} className="text-muted" /> : <ChevronDown size={16} className="text-muted" />}
       </button>
 
       {open && (
-        <div className="border-t border-gray-100">
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="bg-gray-50">
-                  <th className="px-4 py-2 text-left w-10">
-                    <input
+        <div className="border-top">
+          <div className="table-responsive">
+            <Table size="sm" className="mb-0 small">
+              <thead className="table-light">
+                <tr>
+                  <th className="px-3 py-2" style={{ width: 40 }}>
+                    <Form.Check
                       type="checkbox"
                       checked={allSelected}
                       onChange={() => {
                         if (allSelected) setSelected(new Set());
                         else setSelected(new Set(items.map((_, i) => i)));
                       }}
-                      className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                     />
                   </th>
                   {columns.map((col, i) => (
-                    <th key={i} className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+                    <th key={i} className="px-3 py-2 text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>
                       {col}
                     </th>
                   ))}
-                  <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                  <th className="px-3 py-2 text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>Status</th>
                 </tr>
               </thead>
               <tbody>
@@ -393,12 +396,11 @@ function HoldingSection({ title, emoji, items, selected, setSelected, open, togg
                   return (
                     <tr
                       key={idx}
-                      className={`border-t border-gray-50 ${selected.has(idx) ? 'bg-blue-50/50' : 'hover:bg-gray-50'} ${
-                        !h.isNew ? 'opacity-75' : ''
-                      }`}
+                      className={selected.has(idx) ? 'table-primary' : ''}
+                      style={{ opacity: !h.isNew ? 0.75 : 1 }}
                     >
-                      <td className="px-4 py-2">
-                        <input
+                      <td className="px-3 py-2">
+                        <Form.Check
                           type="checkbox"
                           checked={selected.has(idx)}
                           onChange={() => {
@@ -407,17 +409,16 @@ function HoldingSection({ title, emoji, items, selected, setSelected, open, togg
                             else next.add(idx);
                             setSelected(next);
                           }}
-                          className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
                         />
                       </td>
                       {cells.map((cell, i) => (
-                        <td key={i} className="px-4 py-2 text-gray-700">{cell}</td>
+                        <td key={i} className="px-3 py-2">{cell}</td>
                       ))}
-                      <td className="px-4 py-2">
+                      <td className="px-3 py-2">
                         {h.isNew ? (
-                          <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">New</span>
+                          <span className="badge" style={{ fontSize: '0.7rem', backgroundColor: '#dcfce7', color: '#15803d' }}>New</span>
                         ) : (
-                          <span className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full" title={`Matches: ${h.existingName}`}>
+                          <span className="badge bg-light text-muted" style={{ fontSize: '0.7rem' }} title={`Matches: ${h.existingName}`}>
                             Tracked
                           </span>
                         )}
@@ -426,10 +427,10 @@ function HoldingSection({ title, emoji, items, selected, setSelected, open, togg
                   );
                 })}
               </tbody>
-            </table>
+            </Table>
           </div>
         </div>
       )}
-    </div>
+    </Card>
   );
 }
