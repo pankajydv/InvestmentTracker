@@ -1,0 +1,26 @@
+{
+  "name": "investment-tracker",
+  "version": "1.0.0",
+  "description": "Personal investment tracking app for Indian Stocks, Mutual Funds, Foreign Stocks, PPF, PF",
+  "private": true,
+  "scripts": {
+    "server": "node server/index.js",
+    "client": "cd client && npm run dev",
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "setup": "node server/db/setup.js",
+    "install-all": "npm install && cd client && npm install",
+    "build": "cd client && npm run build",
+    "start": "NODE_ENV=production node server/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "concurrently": "^9.1.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "multer": "^2.1.0",
+    "node-cron": "^3.0.3",
+    "pdf-parse": "^2.4.5",
+    "xlsx": "^0.18.5",
+    "yahoo-finance2": "^2.13.2"
+  }
+}

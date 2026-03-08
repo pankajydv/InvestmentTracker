@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Database
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build output
+dist/
+client/dist/
+
+# Environment
+.env
+.env.*
+
+# Editor
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Scripts text dumps
+scripts/*.txt
