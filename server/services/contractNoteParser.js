@@ -1,12 +1,13 @@
 /**
  * Contract Note Parser Service
  *
- * Parses contract note files (HTM inside ZIP) from various brokers.
- * Supports: Sharekhan (HTM format with old/new layouts).
+ * Parses contract note files from various brokers.
+ * Supports: Sharekhan (HTM inside ZIP), NSE (PDF).
  * Returns: { broker, clientCode, panNumber, tradeDate, trades[], charges }
  */
 
 const AdmZip = require('adm-zip');
+const { PDFParse } = require('pdf-parse');
 
 /**
  * Convert HTML to cell-delimited rows.
@@ -334,16 +335,89 @@ function parseSharekhanHTM(text, fileName) {
 }
 
 /**
- * Parse contract notes from a buffer (supports ZIP containing HTM files, or single HTM).
+ * Parse an NSE contract note PDF.
+ * NSE PDFs are password-protected with the client's PAN.
+ * Format: Sr.No | TM Name | Client Code | Buy/Sell | Security Name | Symbol | Series | Trade No | Trade Time | Quantity | Price | Traded Value
+ */
+async function parseNSEPDF(buffer, fileName, password) {
+  const parser = new PDFParse({ data: buffer, password, verbosity: 0 });
+  const result = await parser.getText();
+  const text = result.text;
+
+  // Extract trade date from filename: 20150812.pdf
+  let tradeDate = null;
+  const dateMatch = fileName.match(/(\d{8})\.pdf$/i);
+  if (dateMatch) {
+    const d = dateMatch[1];
+    tradeDate = `${d.substring(0, 4)}-${d.substring(4, 6)}-${d.substring(6, 8)}`;
+  }
+  if (!tradeDate) return null;
+
+  // Detect broker from TM Name field
+  let broker = 'NSE';
+  if (/SHAREKHAN/i.test(text)) broker = 'Sharekhan';
+  else if (/ZERODHA/i.test(text)) broker = 'Zerodha';
+  else if (/GROWW/i.test(text)) broker = 'Groww';
+  else if (/ICICI/i.test(text)) broker = 'ICICI Direct';
+  else if (/HDFC SECURITIES/i.test(text)) broker = 'HDFC Securities';
+  else if (/ANGEL/i.test(text)) broker = 'Angel One';
+  else if (/KOTAK/i.test(text)) broker = 'Kotak Securities';
+
+  // Extract client code
+  let clientCode = null;
+  const ccMatch = text.match(/(?:SHAREKHAN|ZERODHA|GROWW|ICICI|HDFC|ANGEL|KOTAK)[^\d]*(\d{5,10})/i);
+  if (ccMatch) clientCode = ccMatch[1];
+
+  // Parse trade rows
+  // Each trade line: <Sr.No> <TM Name> <ClientCode> <B|S> <Security Name> <Symbol> <Series> <TradeNo> <TradeTime> <Quantity> <Price> <TradedValue>
+  const trades = [];
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
+  for (const line of lines) {
+    // Match line starting with a number (Sr.No), containing B or S (buy/sell), EQ series, and ending with price/value numbers
+    const m = line.match(/^(\d+)\s+(.+?)\s+(\d{5,10})\s+(B|S)\s+(.+?)\s+(\w+)\s+(EQ|BE|BL|BZ)\s+(\d+)\s+(\d{2}:\d{2}:\d{2}\s*(?:AM|PM))\s+(\d+)\s+([\d.]+)\s+([\d.]+)/);
+    if (!m) continue;
+
+    const type = m[4] === 'B' ? 'BUY' : 'SELL';
+    const security = m[5].trim();
+    const quantity = parseInt(m[10]);
+    const rate = parseFloat(m[11]);
+    const total = parseFloat(m[12]);
+    if (!clientCode) clientCode = m[3];
+
+    if (security && rate > 0 && quantity > 0) {
+      trades.push({ tradeDate, security, isin: null, type, quantity, rate, total, brokerage: 0 });
+    }
+  }
+
+  return {
+    broker,
+    clientCode,
+    panNumber: password ? password.toUpperCase() : null,
+    tradeDate,
+    trades,
+    charges: { total: 0, brokerage: 0, stt: 0, serviceTax: 0, stampDuty: 0, turnoverCharges: 0, educationCess: 0 },
+  };
+}
+
+/**
+ * Parse contract notes from a buffer (supports ZIP containing HTM files, single HTM, or PDF).
  * @param {Buffer} buffer - File content
  * @param {string} fileName - Original filename
- * @returns {Array} Array of parsed note objects { broker, clientCode, panNumber, tradeDate, trades[], charges }
+ * @param {string} [password] - Optional password for encrypted PDFs (e.g. PAN)
+ * @returns {Array|Promise<Array>} Array of parsed note objects { broker, clientCode, panNumber, tradeDate, trades[], charges }
  */
-function parseContractNotes(buffer, fileName) {
+async function parseContractNotes(buffer, fileName, password) {
   const isZip = /\.zip$/i.test(fileName);
+  const isPDF = /\.pdf$/i.test(fileName);
   const results = [];
 
-  if (isZip) {
+  if (isPDF) {
+    const parsed = await parseNSEPDF(buffer, fileName, password);
+    if (parsed && parsed.trades.length > 0) {
+      results.push(parsed);
+    }
+  } else if (isZip) {
     const zip = new AdmZip(buffer);
     const entries = zip.getEntries();
     for (const entry of entries) {

@@ -23,10 +23,10 @@ module.exports = function (db) {
       const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolioId);
       if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
 
-      // Parse all uploaded files
+      // Parse all uploaded files (pass PAN as password for encrypted PDFs)
       const allParsed = [];
       for (const file of req.files) {
-        const notes = parseContractNotes(file.buffer, file.originalname);
+        const notes = await parseContractNotes(file.buffer, file.originalname, portfolio.pan_number);
         allParsed.push(...notes);
       }
 

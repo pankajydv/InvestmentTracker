@@ -295,7 +295,7 @@ export default function AddInvestment() {
                 <h2 className="h6 fw-semibold mb-0">Upload Contract Notes from Broker</h2>
               </div>
               <p className="small text-muted mb-3">
-                Upload contract note ZIP or HTM files. Broker is auto-detected from the file.
+                Upload contract note ZIP, HTM, or PDF files. Broker is auto-detected from the file.
               </p>
 
               {!contractPreview && !contractResult && (
@@ -305,7 +305,7 @@ export default function AddInvestment() {
                     ref={contractFileRef}
                     size="sm"
                     type="file"
-                    accept=".zip,.htm,.html"
+                    accept=".zip,.htm,.html,.pdf"
                     multiple
                     onChange={(e) => setContractFiles(Array.from(e.target.files))}
                   />
