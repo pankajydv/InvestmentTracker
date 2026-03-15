@@ -188,8 +188,9 @@ module.exports = function (db) {
 
             if (existingTxn) {
               // Check if anything changed
-              if (Math.abs(existingTxn.amount - amount) > 0.01 || Math.abs(existingTxn.fees - fees) > 0.01) {
-                updateTransaction.run(amount, fees, notes, existingTxn.id);
+              const newFees = fees > 0 ? fees : existingTxn.fees;
+              if (Math.abs(existingTxn.amount - amount) > 0.01 || Math.abs(existingTxn.fees - newFees) > 0.01) {
+                updateTransaction.run(amount, newFees, notes, existingTxn.id);
                 transactionsUpdated++;
               } else {
                 transactionsSkipped++;

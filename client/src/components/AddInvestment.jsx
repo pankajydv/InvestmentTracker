@@ -1,11 +1,10 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner } from 'react-bootstrap';
 import { createInvestment, addTransaction, searchMutualFunds, searchStock, previewContractNotes, importContractNotes, uploadPnLStatement } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
-import { ArrowLeft, Search, CheckCircle, FileUp, FileText, Upload, Receipt } from 'lucide-react';
+import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
-import { Link } from 'react-router-dom';
 
 const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'PPF', 'PF'];
 const STOCK_TXN_TYPES = ['BUY', 'SELL'];
@@ -16,6 +15,7 @@ export default function AddInvestment() {
   const [step, setStep] = useState(1);
   const [assetType, setAssetType] = useState('MUTUAL_FUND');
   const [portfolioId, setPortfolioId] = useState(selectedId || '');
+
   const [form, setForm] = useState({
     name: '',
     ticker_symbol: '',
@@ -55,6 +55,13 @@ export default function AddInvestment() {
   const [pnlBroker, setPnlBroker] = useState('');
   const [pnlUploading, setPnlUploading] = useState(false);
   const [pnlResult, setPnlResult] = useState(null);
+
+  // Sync local portfolioId when navbar portfolio changes
+  useEffect(() => {
+    setPortfolioId(selectedId || '');
+    setError('');
+    setContractPreview(null);
+  }, [selectedId]);
 
   const updateTxn = (field, value) => {
     const updated = { ...txn, [field]: value };
@@ -242,21 +249,6 @@ export default function AddInvestment() {
         <h1 className="h4 fw-bold">Add Investment</h1>
       </div>
 
-      {/* CAS Import Banner */}
-      <Link
-        to="/investments/import-cas"
-        className="text-decoration-none d-block rounded border p-3"
-        style={{ background: 'linear-gradient(to right, #eff6ff, #eef2ff)', borderColor: '#bfdbfe' }}
-      >
-        <div className="d-flex align-items-center gap-3">
-          <FileUp size={32} className="text-primary" />
-          <div>
-            <div className="fw-semibold text-dark">Import from CAS PDF</div>
-            <div className="small text-muted">Upload CDSL Consolidated Account Statement to bulk-import all your holdings</div>
-          </div>
-        </div>
-      </Link>
-
       {error && <Alert variant="danger" className="small py-2">{error}</Alert>}
 
       {/* Step 1: Choose Asset Type */}
@@ -289,23 +281,6 @@ export default function AddInvestment() {
               </Col>
             ))}
           </Row>
-
-          {portfolios.length > 0 && (
-            <div className="mt-3 pt-3 border-top">
-              <Form.Label className="small">Assign to Portfolio</Form.Label>
-              <Form.Select
-                size="sm"
-                value={portfolioId || ''}
-                onChange={(e) => setPortfolioId(e.target.value ? Number(e.target.value) : '')}
-                style={{ width: 'auto' }}
-              >
-                <option value="">Unassigned</option>
-                {portfolios.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </Form.Select>
-            </div>
-          )}
         </Card.Body>
       </Card>
 
@@ -370,7 +345,7 @@ export default function AddInvestment() {
                           <th style={{ width: 60 }}>Type</th>
                           <th style={{ width: 70 }}>Shares</th>
                           <th style={{ width: 90 }}>Price</th>
-                          <th style={{ width: 90 }}>Brokerage</th>
+                          <th style={{ width: 90 }}>Charges</th>
                           <th style={{ width: 100 }}>Total</th>
                           <th style={{ width: 30 }}></th>
                         </tr>
@@ -427,11 +402,15 @@ export default function AddInvestment() {
                   {/* Summary row */}
                   <div className="d-flex justify-content-between mt-2 small text-muted">
                     <span>
-                      {contractPreview.trades.filter(t => t.type === 'BUY').length} buys,{' '}
-                      {contractPreview.trades.filter(t => t.type === 'SELL').length} sells
-                    </span>
-                    <span>
-                      Total: ₹{contractPreview.trades.reduce((s, t) => s + (t.total || 0), 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                      {(() => {
+                        const buys = contractPreview.trades.filter(t => t.type === 'BUY');
+                        const sells = contractPreview.trades.filter(t => t.type === 'SELL');
+                        const fmt = v => '₹' + v.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+                        const parts = [];
+                        if (buys.length) parts.push(`${buys.length} buy${buys.length > 1 ? 's' : ''} @ ${fmt(buys.reduce((s, t) => s + (t.total || 0), 0))}`);
+                        if (sells.length) parts.push(`${sells.length} sell${sells.length > 1 ? 's' : ''} @ ${fmt(sells.reduce((s, t) => s + (t.total || 0), 0))}`);
+                        return parts.join(', ');
+                      })()}
                     </span>
                   </div>
                   <div className="d-flex gap-2 mt-3">
@@ -634,7 +613,7 @@ export default function AddInvestment() {
 
                 {/* Fees */}
                 <Col md={6}>
-                  <Form.Label className="small">Brokerage / Fees (₹)</Form.Label>
+                  <Form.Label className="small">Charges (₹)</Form.Label>
                   <Form.Control
                     size="sm"
                     type="number"
@@ -868,7 +847,7 @@ export default function AddInvestment() {
                 </Col>
 
                 <Col md={6}>
-                  <Form.Label className="small">Fees (₹)</Form.Label>
+                  <Form.Label className="small">Charges (₹)</Form.Label>
                   <Form.Control
                     size="sm"
                     type="number"

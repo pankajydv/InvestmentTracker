@@ -242,6 +242,7 @@ export default function Transactions() {
                   <th className="px-3 py-2 text-end">Units</th>
                   <th className="px-3 py-2 text-end">Price/Unit</th>
                   <th className="px-3 py-2 text-end">Amount</th>
+                  <th className="px-3 py-2 text-end">Charges</th>
                   <th className="px-3 py-2">Broker</th>
                   <th className="px-3 py-2">Notes</th>
                 </tr>
@@ -271,8 +272,9 @@ export default function Transactions() {
                     <td className="px-3 py-2 text-end">{txn.units ? formatNumber(txn.units, 3) : '-'}</td>
                     <td className="px-3 py-2 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>
                     <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
+                    <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
                     <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>
-                    <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }}>{txn.notes || '-'}</td>
+                    <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                   </tr>
                 ))}
               </tbody>

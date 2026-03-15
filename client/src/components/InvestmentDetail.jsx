@@ -194,7 +194,7 @@ export default function InvestmentDetail() {
                   <Form.Control size="sm" type="number" step="0.01" value={txnForm.amount} onChange={(e) => updateTxnField('amount', e.target.value)} placeholder="Total amount" required />
                 </Col>
                 <Col md={4}>
-                  <Form.Label className="small">Fees (₹)</Form.Label>
+                  <Form.Label className="small">Charges (₹)</Form.Label>
                   <Form.Control size="sm" type="number" step="0.01" value={txnForm.fees} onChange={(e) => updateTxnField('fees', e.target.value)} />
                 </Col>
                 <Col md={4}>
@@ -229,7 +229,7 @@ export default function InvestmentDetail() {
                   <th className="px-3 text-end">Units</th>
                   <th className="px-3 text-end">Price/Unit</th>
                   <th className="px-3 text-end">Amount</th>
-                  <th className="px-3 text-end">Fees</th>
+                  <th className="px-3 text-end">Charges</th>
                   <th className="px-3">Notes</th>
                   <th className="px-3"></th>
                 </tr>
