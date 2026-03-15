@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Card, Row, Col, Button, Form, Alert, Spinner } from 'react-bootstrap';
+import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse } from 'react-bootstrap';
 import { createInvestment, addTransaction, searchMutualFunds, searchStock, previewContractNotes, importContractNotes, uploadPnLStatement, addAmcCharge } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, Wallet } from 'lucide-react';
@@ -60,6 +60,10 @@ export default function AddInvestment() {
   const [amcForm, setAmcForm] = useState({ date: new Date().toISOString().split('T')[0], amount: '', broker: 'Sharekhan', notes: '' });
   const [amcSubmitting, setAmcSubmitting] = useState(false);
   const [amcResult, setAmcResult] = useState(null);
+
+  // Accordion state for Indian Stocks sections (null = all collapsed)
+  const [expandedSection, setExpandedSection] = useState(null);
+  const toggleSection = (key) => setExpandedSection(prev => prev === key ? null : key);
 
   // Sync local portfolioId when navbar portfolio changes
   useEffect(() => {
@@ -305,16 +309,26 @@ export default function AddInvestment() {
         </Card.Body>
       </Card>
 
-      {/* Indian Stocks: 3 sections */}
+      {/* Indian Stocks: collapsible sections */}
       {isIndianStock && (
         <>
           {/* Upload Contract Notes */}
           <Card className="shadow-sm">
-            <Card.Body>
-              <div className="d-flex align-items-center gap-2 mb-2">
-                <Receipt size={20} className="text-primary" />
-                <h2 className="h6 fw-semibold mb-0">Upload Contract Notes from Broker</h2>
-              </div>
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('contract')}
+            >
+              <Receipt size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Upload Contract Notes from Broker</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'contract' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'contract'}>
+              <div>
+                <Card.Body className="pt-2">
               <p className="small text-muted mb-3">
                 Upload contract note ZIP, HTM, or PDF files. Broker is auto-detected from the file.
               </p>
@@ -463,15 +477,27 @@ export default function AddInvestment() {
                 </Alert>
               )}
             </Card.Body>
+              </div>
+            </Collapse>
           </Card>
 
           {/* Add P&L Statement */}
           <Card className="shadow-sm">
-            <Card.Body>
-              <div className="d-flex align-items-center gap-2 mb-2">
-                <FileText size={20} className="text-primary" />
-                <h2 className="h6 fw-semibold mb-0">Add P&L Statement</h2>
-              </div>
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('pnl')}
+            >
+              <FileText size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Add P&L Statement</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'pnl' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'pnl'}>
+              <div>
+                <Card.Body className="pt-2">
               <p className="small text-muted mb-3">
                 Upload your profit & loss or trade history report (Excel/CSV) from your broker.
               </p>
@@ -518,14 +544,28 @@ export default function AddInvestment() {
                 </Alert>
               )}
             </Card.Body>
+              </div>
+            </Collapse>
           </Card>
 
           {/* Add Stocks Manually */}
           <Card className="shadow-sm">
-            <Card.Body>
-              <h2 className="h6 fw-semibold mb-1">Add Stocks Manually</h2>
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('manual')}
+            >
+              <Search size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Add Stocks Manually</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'manual' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'manual'}>
+              <div>
+                <Card.Body className="pt-2">
               <p className="small text-muted mb-3">Search for a stock and enter the transaction details.</p>
-              <hr className="mt-0" />
 
               {/* Transaction Type */}
               <div className="mb-3">
@@ -655,15 +695,27 @@ export default function AddInvestment() {
                 </Button>
               </div>
             </Card.Body>
+              </div>
+            </Collapse>
           </Card>
 
           {/* AMC / Maintenance Charges */}
           <Card className="shadow-sm">
-            <Card.Body>
-              <div className="d-flex align-items-center gap-2 mb-2">
-                <Wallet size={20} className="text-warning" />
-                <h2 className="h6 fw-semibold mb-0">AMC / Maintenance Charges</h2>
-              </div>
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('amc')}
+            >
+              <Wallet size={20} className="text-warning" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">AMC / Maintenance Charges</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'amc' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'amc'}>
+              <div>
+                <Card.Body className="pt-2">
               <p className="small text-muted mb-3">
                 Record demat account AMC / maintenance charges.
               </p>
@@ -729,6 +781,8 @@ export default function AddInvestment() {
                 </Alert>
               )}
             </Card.Body>
+              </div>
+            </Collapse>
           </Card>
         </>
       )}
