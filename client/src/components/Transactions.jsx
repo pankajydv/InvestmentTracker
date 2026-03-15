@@ -6,7 +6,7 @@ import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters
 import { usePortfolio } from '../context/PortfolioContext';
 
 const TRANSACTION_TYPES = [
-  'BUY', 'SELL', 'DIVIDEND', 'BONUS', 'IPO',
+  'BUY', 'SELL', 'DIVIDEND', 'BONUS', 'IPO', 'AMC',
 ];
 
 const TYPE_BADGE = {
@@ -24,6 +24,7 @@ const TYPE_BADGE = {
   SELL: 'badge-sell',
   WITHDRAWAL: 'badge-withdrawal',
   TRANSFER_OUT: 'badge-sell',
+  AMC: 'badge-withdrawal',
 };
 
 export default function Transactions() {
@@ -207,8 +208,23 @@ export default function Transactions() {
           </button>
         )}
 
-        <span className="ms-auto small text-muted">
+        <span className="ms-auto d-flex align-items-center gap-2 small text-muted">
           {transactions.length} transaction{transactions.length !== 1 ? 's' : ''}
+          <button
+            onClick={loadTransactions}
+            disabled={loading}
+            className="btn btn-outline-secondary btn-sm d-inline-flex align-items-center justify-content-center p-0"
+            style={{ width: 28, height: 28 }}
+            title="Refresh transactions"
+          >
+            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+              className={loading ? 'spin' : ''}
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                d="M4 4v5h5M20 20v-5h-5M4.93 9a8 8 0 0113.14-2.07L20 9M19.07 15a8 8 0 01-13.14 2.07L4 15"
+              />
+            </svg>
+          </button>
         </span>
       </div>
 

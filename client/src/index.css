@@ -81,4 +81,4 @@ body {
 
 /* Spinner rotation for refresh icon */
 @keyframes spin { to { transform: rotate(360deg); } }
-.spinner-rotate { animation: spin 1s linear infinite; }
+.spinner-rotate, .spin { animation: spin 1s linear infinite; }

@@ -328,5 +328,48 @@ module.exports = function (db) {
     }
   });
 
+  /**
+   * POST /api/stocks/amc-charge
+   * Record an AMC / maintenance charge or refund against the portfolio.
+   * Auto-creates a "Demat Account Charges" investment if it doesn't exist.
+   * Body: { portfolio_id, date, amount, broker, notes }
+   */
+  router.post('/amc-charge', express.json(), (req, res) => {
+    try {
+      const { portfolio_id, date, amount, broker, notes } = req.body;
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
+      if (!date) return res.status(400).json({ error: 'date is required' });
+      if (!amount || amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
+
+      const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolio_id);
+      if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
+
+      // Find or create the "Demat Account Charges" investment for this portfolio
+      const investmentName = 'Demat Account Charges';
+      let investment = db.prepare(
+        'SELECT * FROM investments WHERE name = ? AND asset_type = ? AND portfolio_id = ?'
+      ).get(investmentName, 'INDIAN_STOCK', portfolio_id);
+
+      if (!investment) {
+        const result = db.prepare(
+          'INSERT INTO investments (name, asset_type, portfolio_id, broker, notes) VALUES (?, ?, ?, ?, ?)'
+        ).run(investmentName, 'INDIAN_STOCK', portfolio_id, broker || null, 'Demat/trading account charges');
+        investment = { id: result.lastInsertRowid };
+      }
+
+      // Store as AMC type: units=0, price=0, amount=0, fees=charge amount (negative for charge, positive for refund)
+      const fees = parseFloat(amount);
+
+      db.prepare(
+        'INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(investment.id, 'AMC', date, 0, 0, 0, fees, notes || 'AMC/Maintenance charge');
+
+      res.json({ success: true, investment_id: investment.id });
+    } catch (e) {
+      console.error('AMC charge error:', e);
+      res.status(500).json({ error: 'Failed to record charge: ' + e.message });
+    }
+  });
+
   return router;
 };

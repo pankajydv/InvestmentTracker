@@ -134,3 +134,7 @@ export const uploadPnLStatement = async (file, broker, portfolioId) => {
   }
   return res.json();
 };
+
+// AMC / Maintenance Charges
+export const addAmcCharge = (data) =>
+  fetchJSON('/stocks/amc-charge', { method: 'POST', body: JSON.stringify(data) });
