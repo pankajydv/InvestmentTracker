@@ -1,13 +1,16 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import { Card, Table, Spinner, Form } from 'react-bootstrap';
-import { getTransactions, getBrokers, getInvestmentNames } from '../services/api';
+import { Card, Table, Spinner, Form, Modal, Button } from 'react-bootstrap';
+import { getTransactions, getBrokers, getInvestmentNames, updateTransaction, deleteTransaction } from '../services/api';
 import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const TRANSACTION_TYPES = [
   'BUY', 'SELL', 'DIVIDEND', 'BONUS', 'IPO', 'AMC',
 ];
+
+// User-action types that can be edited/deleted (not corporate actions)
+const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT'];
 
 const TYPE_BADGE = {
   BUY: 'badge-buy',
@@ -38,6 +41,70 @@ export default function Transactions() {
   const [filterInvestment, setFilterInvestment] = useState('');
   const [typeDropdownOpen, setTypeDropdownOpen] = useState(false);
   const typeDropdownRef = useRef(null);
+
+  // Edit/Delete state
+  const [editTxn, setEditTxn] = useState(null);
+  const [editForm, setEditForm] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [deleteText, setDeleteText] = useState('');
+
+  // Compute which fields changed in edit form
+  const getChanges = () => {
+    if (!editTxn) return [];
+    const changes = [];
+    if (editForm.transaction_date !== editTxn.transaction_date) changes.push('Date');
+    if (String(editForm.units || '') !== String(editTxn.units || '')) changes.push('Units');
+    if (String(editForm.price_per_unit || '') !== String(editTxn.price_per_unit || '')) changes.push('Price/Unit');
+    if (String(editForm.amount || '') !== String(editTxn.amount || '')) changes.push('Amount');
+    if (String(editForm.fees || '') !== String(editTxn.fees || '')) changes.push('Charges');
+    if ((editForm.notes || '') !== (editTxn.notes || '')) changes.push('Notes');
+    return changes;
+  };
+  const editChanges = getChanges();
+  const hasChanges = editChanges.length > 0;
+
+  const handleEdit = (txn) => {
+    setEditTxn(txn);
+    setEditForm({
+      transaction_date: txn.transaction_date,
+      units: txn.units || '',
+      price_per_unit: txn.price_per_unit || '',
+      amount: txn.amount || '',
+      fees: txn.fees || '',
+      notes: txn.notes || '',
+    });
+  };
+
+  const handleEditSave = async () => {
+    try {
+      setSaving(true);
+      await updateTransaction(editTxn.id, {
+        transaction_date: editForm.transaction_date,
+        units: editForm.units ? Number(editForm.units) : null,
+        price_per_unit: editForm.price_per_unit ? Number(editForm.price_per_unit) : null,
+        amount: Number(editForm.amount),
+        fees: editForm.fees ? Number(editForm.fees) : 0,
+        notes: editForm.notes || null,
+      });
+      setEditTxn(null);
+      loadTransactions();
+    } catch (e) {
+      alert('Failed to update: ' + e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDelete = async (id) => {
+    try {
+      await deleteTransaction(id);
+      setDeleteConfirm(null);
+      loadTransactions();
+    } catch (e) {
+      alert('Failed to delete: ' + e.message);
+    }
+  };
 
   useEffect(() => {
     getBrokers().then(setBrokers).catch(() => {});
@@ -261,6 +328,7 @@ export default function Transactions() {
                   <th className="px-3 py-2 text-end">Charges</th>
                   <th className="px-3 py-2">Broker</th>
                   <th className="px-3 py-2">Notes</th>
+                  <th className="px-3 py-2 text-center" style={{ width: 80 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -291,6 +359,30 @@ export default function Transactions() {
                     <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
                     <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>
                     <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }} title={txn.notes || ''}>{txn.notes || '-'}</td>
+                    <td className="px-3 py-2 text-center">
+                      {EDITABLE_TYPES.includes(txn.transaction_type) && (
+                        <div className="d-flex justify-content-center gap-1 row-actions">
+                          <button
+                            className="btn btn-link btn-sm p-0 text-primary"
+                            title="Edit"
+                            onClick={() => handleEdit(txn)}
+                          >
+                            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                            </svg>
+                          </button>
+                          <button
+                            className="btn btn-link btn-sm p-0 text-danger"
+                            title="Delete"
+                            onClick={() => { setDeleteConfirm(txn); setDeleteText(''); }}
+                          >
+                            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
+                          </button>
+                        </div>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -298,6 +390,123 @@ export default function Transactions() {
           </div>
         )}
       </Card>
+
+      {/* Edit Modal */}
+      <Modal show={!!editTxn} onHide={() => setEditTxn(null)} centered>
+        <Modal.Header closeButton>
+          <Modal.Title className="h6">
+            Edit {editTxn?.transaction_type?.replace(/_/g, ' ')} — {editTxn?.investment_name}
+          </Modal.Title>
+        </Modal.Header>
+        <Modal.Body>
+          {editTxn && (
+            <div className="d-flex flex-column gap-3">
+              <Form.Group>
+                <Form.Label className="small fw-semibold">Date</Form.Label>
+                <Form.Control
+                  type="date"
+                  size="sm"
+                  value={editForm.transaction_date || ''}
+                  onChange={(e) => setEditForm({ ...editForm, transaction_date: e.target.value })}
+                />
+              </Form.Group>
+              {editTxn.transaction_type !== 'AMC' && (
+                <>
+                  <Form.Group>
+                    <Form.Label className="small fw-semibold">Units</Form.Label>
+                    <Form.Control
+                      type="number"
+                      size="sm"
+                      step="any"
+                      value={editForm.units}
+                      onChange={(e) => setEditForm({ ...editForm, units: e.target.value })}
+                    />
+                  </Form.Group>
+                  <Form.Group>
+                    <Form.Label className="small fw-semibold">Price/Unit</Form.Label>
+                    <Form.Control
+                      type="number"
+                      size="sm"
+                      step="any"
+                      value={editForm.price_per_unit}
+                      onChange={(e) => setEditForm({ ...editForm, price_per_unit: e.target.value })}
+                    />
+                  </Form.Group>
+                </>
+              )}
+              <Form.Group>
+                <Form.Label className="small fw-semibold">Amount</Form.Label>
+                <Form.Control
+                  type="number"
+                  size="sm"
+                  step="any"
+                  value={editForm.amount}
+                  onChange={(e) => setEditForm({ ...editForm, amount: e.target.value })}
+                />
+              </Form.Group>
+              <Form.Group>
+                <Form.Label className="small fw-semibold">Charges</Form.Label>
+                <Form.Control
+                  type="number"
+                  size="sm"
+                  step="any"
+                  value={editForm.fees}
+                  onChange={(e) => setEditForm({ ...editForm, fees: e.target.value })}
+                />
+              </Form.Group>
+              <Form.Group>
+                <Form.Label className="small fw-semibold">Notes</Form.Label>
+                <Form.Control
+                  as="textarea"
+                  size="sm"
+                  rows={2}
+                  value={editForm.notes}
+                  onChange={(e) => setEditForm({ ...editForm, notes: e.target.value })}
+                />
+              </Form.Group>
+            </div>
+          )}
+        </Modal.Body>
+        {hasChanges && (
+          <div className="px-3 pb-2">
+            <div className="small text-muted bg-light rounded p-2">
+              <strong>Changes:</strong> {editChanges.join(', ')}
+            </div>
+          </div>
+        )}
+        <Modal.Footer>
+          <Button variant="secondary" size="sm" onClick={() => setEditTxn(null)}>Cancel</Button>
+          <Button variant="primary" size="sm" onClick={handleEditSave} disabled={saving || !hasChanges}>
+            {saving ? 'Saving...' : hasChanges ? 'Save Changes' : 'No Changes'}
+          </Button>
+        </Modal.Footer>
+      </Modal>
+
+      {/* Delete Confirmation Modal */}
+      <Modal show={!!deleteConfirm} onHide={() => setDeleteConfirm(null)} centered size="sm">
+        <Modal.Header closeButton>
+          <Modal.Title className="h6">Delete Transaction</Modal.Title>
+        </Modal.Header>
+        <Modal.Body className="small">
+          Are you sure you want to delete this <strong>{deleteConfirm?.transaction_type}</strong> transaction
+          for <strong>{deleteConfirm?.investment_name}</strong> on <strong>{formatDate(deleteConfirm?.transaction_date)}</strong>
+          {deleteConfirm?.amount ? <> for <strong>₹{formatNumber(deleteConfirm.amount, 2)}</strong></> : null}?
+          <div className="mt-3">
+            <Form.Label className="small fw-semibold">Type <span className="text-danger">DELETE</span> to confirm</Form.Label>
+            <Form.Control
+              size="sm"
+              value={deleteText}
+              onChange={(e) => setDeleteText(e.target.value)}
+              placeholder="Type DELETE"
+              autoFocus
+            />
+          </div>
+        </Modal.Body>
+        <Modal.Footer>
+          <Button variant="secondary" size="sm" onClick={() => setDeleteConfirm(null)}>Cancel</Button>
+          <Button variant="danger" size="sm" onClick={() => handleDelete(deleteConfirm.id)} disabled={deleteText !== 'DELETE'}>Delete</Button>
+        </Modal.Footer>
+      </Modal>
     </div>
   );
 }

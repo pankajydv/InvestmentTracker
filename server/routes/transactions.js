@@ -92,6 +92,30 @@ module.exports = function (db) {
     res.json(txns);
   });
 
+  // ─── Update transaction ───────────────────────────────────────────────
+  router.put('/:id', (req, res) => {
+    const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Transaction not found' });
+
+    const { transaction_date, units, price_per_unit, amount, fees, notes } = req.body;
+    db.prepare(`
+      UPDATE transactions
+      SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?
+      WHERE id = ?
+    `).run(
+      transaction_date || existing.transaction_date,
+      units ?? existing.units,
+      price_per_unit ?? existing.price_per_unit,
+      amount ?? existing.amount,
+      fees ?? existing.fees,
+      notes !== undefined ? notes : existing.notes,
+      req.params.id
+    );
+
+    const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
+    res.json(txn);
+  });
+
   // ─── Delete transaction ───────────────────────────────────────────────
   router.delete('/:id', (req, res) => {
     db.prepare('DELETE FROM transactions WHERE id = ?').run(req.params.id);

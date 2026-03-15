@@ -71,6 +71,8 @@ export const getInvestmentNames = (params = {}) => {
 };
 export const addTransaction = (data) =>
   fetchJSON('/transactions', { method: 'POST', body: JSON.stringify(data) });
+export const updateTransaction = (id, data) =>
+  fetchJSON(`/transactions/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteTransaction = (id) =>
   fetchJSON(`/transactions/${id}`, { method: 'DELETE' });
 

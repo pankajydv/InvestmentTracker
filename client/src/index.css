@@ -25,6 +25,15 @@ body {
   }
 }
 
+/* Row actions: hidden by default, visible on hover */
+.row-actions {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+tr:hover .row-actions {
+  opacity: 1;
+}
+
 /* Custom card styling to match original look */
 .card {
   border-radius: 0.75rem;
