@@ -48,12 +48,12 @@ async function updateAllPrices(db) {
 
   const getInvestedAmount = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO')
+    FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'AMC')
   `);
 
   const getSaleProceeds = db.prepare(`
     SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND transaction_type IN ('SELL', 'WITHDRAWAL')
+    FROM transactions WHERE investment_id = ? AND transaction_type IN ('SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST')
   `);
 
   const getTotalUnits = db.prepare(`
