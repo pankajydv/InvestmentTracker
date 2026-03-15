@@ -140,3 +140,9 @@ export const uploadPnLStatement = async (file, broker, portfolioId) => {
 // AMC / Maintenance Charges
 export const addAmcCharge = (data) =>
   fetchJSON('/stocks/amc-charge', { method: 'POST', body: JSON.stringify(data) });
+
+// Corporate Actions
+export const previewCorporateActions = (portfolioId, year) =>
+  fetchJSON(`/stocks/corporate-actions/preview?portfolio_id=${portfolioId}&year=${year}`);
+export const importCorporateActions = ({ transactions, corrections, deletions }) =>
+  fetchJSON('/stocks/corporate-actions/import', { method: 'POST', body: JSON.stringify({ transactions, corrections, deletions }) });

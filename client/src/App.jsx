@@ -9,6 +9,7 @@ import AddInvestment from './components/AddInvestment';
 import CASUpload from './components/CASUpload';
 import Performance from './components/Performance';
 import Transactions from './components/Transactions';
+import CorporateActions from './components/CorporateActions';
 
 export default function App() {
   return (
@@ -25,6 +26,7 @@ export default function App() {
               <Route path="/investments/:id" element={<InvestmentDetail />} />
               <Route path="/performance" element={<Performance />} />
               <Route path="/transactions" element={<Transactions />} />
+              <Route path="/corporate-actions" element={<CorporateActions />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </main>

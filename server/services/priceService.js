@@ -311,12 +311,74 @@ async function lookupTickerByISIN(isin) {
   });
 }
 
+/**
+ * Fetch corporate actions (dividends & splits) for a stock in a given year.
+ * Uses Yahoo Finance v8 chart API with events parameter.
+ * @param {string} symbol - Yahoo Finance symbol (e.g., 'RELIANCE.NS')
+ * @param {number} year - Calendar year to fetch actions for
+ * @returns {Promise<{dividends: Array, splits: Array}>}
+ */
+function fetchCorporateActions(symbol, year) {
+  const period1 = Math.floor(new Date(`${year}-01-01`).getTime() / 1000);
+  const period2 = Math.floor(new Date(`${year}-12-31T23:59:59`).getTime() / 1000);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d&events=div%2Csplit`;
+
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const result = json.chart?.result?.[0];
+          if (!result) {
+            resolve({ dividends: [], splits: [] });
+            return;
+          }
+
+          const events = result.events || {};
+          const dividends = [];
+          const splits = [];
+
+          if (events.dividends) {
+            for (const [ts, div] of Object.entries(events.dividends)) {
+              dividends.push({
+                date: new Date(parseInt(ts) * 1000).toISOString().split('T')[0],
+                amount: div.amount,
+              });
+            }
+          }
+
+          if (events.splits) {
+            for (const [ts, split] of Object.entries(events.splits)) {
+              splits.push({
+                date: new Date(parseInt(ts) * 1000).toISOString().split('T')[0],
+                numerator: split.numerator,
+                denominator: split.denominator,
+              });
+            }
+          }
+
+          dividends.sort((a, b) => a.date.localeCompare(b.date));
+          splits.sort((a, b) => a.date.localeCompare(b.date));
+
+          resolve({ dividends, splits });
+        } catch (e) {
+          reject(new Error(`Failed to parse corporate actions for ${symbol}: ${e.message}`));
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
 module.exports = {
   fetchMutualFundNAV,
   searchMutualFunds,
   fetchMutualFundHistory,
   fetchStockPrice,
   fetchStockHistory,
+  fetchCorporateActions,
   fetchUSDToINR,
   calculatePPFValue,
   toNSETicker,

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Card, Table, Spinner, Form, Modal, Button } from 'react-bootstrap';
 import { getTransactions, getBrokers, getInvestmentNames, updateTransaction, deleteTransaction } from '../services/api';
 import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters';
@@ -31,6 +31,7 @@ const TYPE_BADGE = {
 };
 
 export default function Transactions() {
+  const navigate = useNavigate();
   const { selectedId } = usePortfolio();
   const [transactions, setTransactions] = useState([]);
   const [brokers, setBrokers] = useState([]);
@@ -155,7 +156,12 @@ export default function Transactions() {
 
   return (
     <div className="d-flex flex-column gap-3">
-      <h1 className="h4 fw-bold">Transactions</h1>
+      <div className="d-flex align-items-center justify-content-between">
+        <h1 className="h4 fw-bold mb-0">Transactions</h1>
+        <button onClick={() => navigate('/corporate-actions')} className="btn btn-outline-primary btn-sm">
+          Sync Corporate Actions
+        </button>
+      </div>
 
       {/* Filter bar */}
       <div className="d-flex flex-wrap align-items-center gap-3">
