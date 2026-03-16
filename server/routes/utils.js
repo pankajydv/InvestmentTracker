@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { searchMutualFunds, fetchStockPrice, toNSETicker } = require('../services/priceService');
+const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = require('../services/priceService');
 const { updateAllPrices } = require('../services/updater');
 
 module.exports = function (db) {
@@ -10,6 +10,18 @@ module.exports = function (db) {
       const { q } = req.query;
       if (!q || q.length < 2) return res.json([]);
       const results = await searchMutualFunds(q);
+      res.json(results);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Search stocks by name ────────────────────────────────────────────
+  router.get('/search-stock-name', async (req, res) => {
+    try {
+      const { q, market } = req.query;
+      if (!q || q.length < 2) return res.json([]);
+      const results = await searchStocks(q, market);
       res.json(results);
     } catch (e) {
       res.status(500).json({ error: e.message });

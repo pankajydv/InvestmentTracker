@@ -1,13 +1,12 @@
 /**
  * Contract Note Parser Service
  *
- * Parses contract note files from various brokers.
- * Supports: Sharekhan (HTM inside ZIP), NSE (PDF).
+ * Parses contract note files (HTM inside ZIP) from various brokers.
+ * Supports: Sharekhan (HTM format with old/new layouts).
  * Returns: { broker, clientCode, panNumber, tradeDate, trades[], charges }
  */
 
 const AdmZip = require('adm-zip');
-const { PDFParse } = require('pdf-parse');
 
 /**
  * Convert HTML to cell-delimited rows.
@@ -51,37 +50,14 @@ function detectBroker(text) {
 
 /**
  * Extract PAN from HTML content.
- * Prioritizes client PAN over broker/company PAN.
  */
 function extractPAN(text) {
-  // Strip HTML tags for cleaner matching
-  const clean = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
-
-  // Priority 1: Explicit client PAN patterns
-  // "PAN of Client XXXXX9999X" or "Client PAN No.: XXXXX9999X" or "Client PAN XXXXX9999X"
-  const clientPan = clean.match(/(?:PAN\s+of\s+Client|Client\s+PAN\s*(?:No\.?)?)\s*:?\s*([A-Z]{5}\d{4}[A-Z])/i);
-  if (clientPan) return clientPan[1].toUpperCase();
-
-  // Priority 2: All PAN-labelled matches, filtering out broker/company PANs
-  const allMatches = [...clean.matchAll(/(?:PAN\s*(?:No\.?|Number)?\s*:?\s*)([A-Z]{5}\d{4}[A-Z])/gi)];
-  if (allMatches.length === 1) return allMatches[0][1].toUpperCase();
-
-  if (allMatches.length > 1) {
-    for (const m of allMatches) {
-      const start = Math.max(0, m.index - 150);
-      const context = clean.substring(start, m.index + m[0].length + 50).toUpperCase();
-      // Skip if context mentions broker/company identifiers (DP ID, STC NO, For Sharekhan, etc.)
-      if (/DP\s*ID|STC\s*NO|SHAREKHAN\s+LIMITED|FOR\s+SHAREKHAN|ZERODHA|ICICI\s+SECURITIES|GROWW/i.test(context)) continue;
-      return m[1].toUpperCase();
-    }
-    // If all were near company names, return first anyway
-    return allMatches[0][1].toUpperCase();
-  }
-
-  // Priority 3: Fallback - any PAN-format string near "PAN" keyword
-  const fallback = clean.match(/PAN[\s\S]{0,50}?([A-Z]{5}\d{4}[A-Z])/i);
-  if (fallback) return fallback[1].toUpperCase();
-
+  // PAN pattern: 5 letters, 4 digits, 1 letter
+  const panMatch = text.match(/(?:PAN[^:]*?:\s*|PAN\s+No\.?\s*:?\s*)([A-Z]{5}\d{4}[A-Z])/i);
+  if (panMatch) return panMatch[1].toUpperCase();
+  // Fallback: look for standalone PAN-format strings near "PAN"
+  const context = text.match(/PAN[\s\S]{0,50}?([A-Z]{5}\d{4}[A-Z])/i);
+  if (context) return context[1].toUpperCase();
   return null;
 }
 
@@ -166,35 +142,12 @@ function parseSharekhanHTM(text, fileName) {
       }
 
       // Determine buy/sell qty and rate based on column count
-      // Three known Sharekhan formats:
-      // OLD (2010-2014): BuyQty | SellQty | Rate | Total(qty*rate) | Brokerage | ServiceTax | STT | Amount
-      // MID (2015-2016): BuyQty | SellQty | Rate | BrkgPerUnit | NetRate | 0 | NetTotal | 0
-      // NEW (2019+):     BuyQty | SellQty | ForeignRate(0) | Rate | BrkgPerUnit | NetRate | 0 | NetTotal | 0
       let buyQty = 0, sellQty = 0, rate = 0, total = 0, brokerage = 0, stt = 0;
 
       if (numCols.length >= 8) {
-        const qty = numCols[0] || numCols[1];
-
-        if (numCols[2] === 0 && numCols.length >= 9) {
-          // NEW (2019+): extra foreign currency column shifts everything right
-          buyQty = numCols[0]; sellQty = numCols[1];
-          rate = numCols[3];
-          const brokeragePerUnit = numCols[4];
-          const q = buyQty || sellQty;
-          total = q * rate;
-          brokerage = parseFloat((brokeragePerUnit * q).toFixed(2));
-        } else if (qty > 0 && numCols[2] > 0 && Math.abs(numCols[3] - qty * numCols[2]) < qty * numCols[2] * 0.05) {
-          // OLD (2010-2014): col[3] ≈ qty * rate
-          buyQty = numCols[0]; sellQty = numCols[1]; rate = numCols[2]; total = numCols[3];
-          brokerage = numCols[4]; stt = numCols[6];
-        } else {
-          // MID (2015+): col[3] = brokerage per unit, col[4] = net rate per unit
-          buyQty = numCols[0]; sellQty = numCols[1]; rate = numCols[2];
-          const brokeragePerUnit = numCols[3];
-          const q = buyQty || sellQty;
-          total = q * rate;
-          brokerage = parseFloat((brokeragePerUnit * q).toFixed(2));
-        }
+        // Full format: BuyQty | SellQty | Rate | Total | Brokerage | ServiceTax | STT | Amount
+        buyQty = numCols[0]; sellQty = numCols[1]; rate = numCols[2]; total = numCols[3];
+        brokerage = numCols[4]; stt = numCols[6];
       } else if (numCols.length >= 5) {
         // Compact: Qty | 0 | Rate | Total | Brokerage ...
         const q1 = numCols[0], q2 = numCols[1];
@@ -208,7 +161,7 @@ function parseSharekhanHTM(text, fileName) {
         buyQty = qty;
       }
 
-      // Fallback for shifted formats where rate ended up as 0
+      // Handle 2019+ shifted format
       if (rate === 0 && numCols.length >= 4) {
         const tryRate = numCols[3];
         if (tryRate > 0) {
@@ -335,89 +288,16 @@ function parseSharekhanHTM(text, fileName) {
 }
 
 /**
- * Parse an NSE contract note PDF.
- * NSE PDFs are password-protected with the client's PAN.
- * Format: Sr.No | TM Name | Client Code | Buy/Sell | Security Name | Symbol | Series | Trade No | Trade Time | Quantity | Price | Traded Value
- */
-async function parseNSEPDF(buffer, fileName, password) {
-  const parser = new PDFParse({ data: buffer, password, verbosity: 0 });
-  const result = await parser.getText();
-  const text = result.text;
-
-  // Extract trade date from filename: 20150812.pdf
-  let tradeDate = null;
-  const dateMatch = fileName.match(/(\d{8})\.pdf$/i);
-  if (dateMatch) {
-    const d = dateMatch[1];
-    tradeDate = `${d.substring(0, 4)}-${d.substring(4, 6)}-${d.substring(6, 8)}`;
-  }
-  if (!tradeDate) return null;
-
-  // Detect broker from TM Name field
-  let broker = 'NSE';
-  if (/SHAREKHAN/i.test(text)) broker = 'Sharekhan';
-  else if (/ZERODHA/i.test(text)) broker = 'Zerodha';
-  else if (/GROWW/i.test(text)) broker = 'Groww';
-  else if (/ICICI/i.test(text)) broker = 'ICICI Direct';
-  else if (/HDFC SECURITIES/i.test(text)) broker = 'HDFC Securities';
-  else if (/ANGEL/i.test(text)) broker = 'Angel One';
-  else if (/KOTAK/i.test(text)) broker = 'Kotak Securities';
-
-  // Extract client code
-  let clientCode = null;
-  const ccMatch = text.match(/(?:SHAREKHAN|ZERODHA|GROWW|ICICI|HDFC|ANGEL|KOTAK)[^\d]*(\d{5,10})/i);
-  if (ccMatch) clientCode = ccMatch[1];
-
-  // Parse trade rows
-  // Each trade line: <Sr.No> <TM Name> <ClientCode> <B|S> <Security Name> <Symbol> <Series> <TradeNo> <TradeTime> <Quantity> <Price> <TradedValue>
-  const trades = [];
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-
-  for (const line of lines) {
-    // Match line starting with a number (Sr.No), containing B or S (buy/sell), EQ series, and ending with price/value numbers
-    const m = line.match(/^(\d+)\s+(.+?)\s+(\d{5,10})\s+(B|S)\s+(.+?)\s+(\w+)\s+(EQ|BE|BL|BZ)\s+(\d+)\s+(\d{2}:\d{2}:\d{2}\s*(?:AM|PM))\s+(\d+)\s+([\d.]+)\s+([\d.]+)/);
-    if (!m) continue;
-
-    const type = m[4] === 'B' ? 'BUY' : 'SELL';
-    const security = m[5].trim();
-    const quantity = parseInt(m[10]);
-    const rate = parseFloat(m[11]);
-    const total = parseFloat(m[12]);
-    if (!clientCode) clientCode = m[3];
-
-    if (security && rate > 0 && quantity > 0) {
-      trades.push({ tradeDate, security, isin: null, type, quantity, rate, total, brokerage: 0 });
-    }
-  }
-
-  return {
-    broker,
-    clientCode,
-    panNumber: password ? password.toUpperCase() : null,
-    tradeDate,
-    trades,
-    charges: { total: 0, brokerage: 0, stt: 0, serviceTax: 0, stampDuty: 0, turnoverCharges: 0, educationCess: 0 },
-  };
-}
-
-/**
- * Parse contract notes from a buffer (supports ZIP containing HTM files, single HTM, or PDF).
+ * Parse contract notes from a buffer (supports ZIP containing HTM files, or single HTM).
  * @param {Buffer} buffer - File content
  * @param {string} fileName - Original filename
- * @param {string} [password] - Optional password for encrypted PDFs (e.g. PAN)
- * @returns {Array|Promise<Array>} Array of parsed note objects { broker, clientCode, panNumber, tradeDate, trades[], charges }
+ * @returns {Array} Array of parsed note objects { broker, clientCode, panNumber, tradeDate, trades[], charges }
  */
-async function parseContractNotes(buffer, fileName, password) {
+function parseContractNotes(buffer, fileName) {
   const isZip = /\.zip$/i.test(fileName);
-  const isPDF = /\.pdf$/i.test(fileName);
   const results = [];
 
-  if (isPDF) {
-    const parsed = await parseNSEPDF(buffer, fileName, password);
-    if (parsed && parsed.trades.length > 0) {
-      results.push(parsed);
-    }
-  } else if (isZip) {
+  if (isZip) {
     const zip = new AdmZip(buffer);
     const entries = zip.getEntries();
     for (const entry of entries) {

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse } from 'react-bootstrap';
-import { createInvestment, addTransaction, searchMutualFunds, searchStock, previewContractNotes, importContractNotes, uploadPnLStatement, addAmcCharge } from '../services/api';
+import { createInvestment, addTransaction, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, addAmcCharge } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, Wallet } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -38,6 +38,8 @@ export default function AddInvestment() {
   const [mfSearch, setMfSearch] = useState('');
   const [searching, setSearching] = useState(false);
   const [stockInfo, setStockInfo] = useState(null);
+  const [stockResults, setStockResults] = useState([]);
+  const [stockQuery, setStockQuery] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
 
@@ -100,16 +102,36 @@ export default function AddInvestment() {
   };
 
   const handleStockSearch = async () => {
-    if (!form.ticker_symbol) return;
+    if (!stockQuery || stockQuery.length < 2) return;
     setSearching(true);
+    setStockInfo(null);
+    setStockResults([]);
+    setError('');
     try {
       const market = assetType === 'INDIAN_STOCK' ? 'NSE' : '';
-      const data = await searchStock(form.ticker_symbol, market);
-      setStockInfo(data);
-      setForm({ ...form, name: data.name, currency: data.currency === 'USD' ? 'USD' : 'INR' });
+      const results = await searchStockByName(stockQuery, market);
+      if (results.length === 0) {
+        setError(`No stocks found for: ${stockQuery}`);
+      } else {
+        setStockResults(results);
+      }
     } catch (e) {
-      setStockInfo(null);
-      setError(`Could not find stock: ${form.ticker_symbol}`);
+      setError(`Search failed: ${e.message}`);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const selectStock = async (result) => {
+    setStockResults([]);
+    setSearching(true);
+    try {
+      const data = await searchStock(result.symbol, '');
+      setStockInfo(data);
+      setForm({ ...form, name: data.name, ticker_symbol: result.symbol, currency: data.currency === 'USD' ? 'USD' : 'INR' });
+      setStockQuery(result.name);
+    } catch (e) {
+      setError(`Could not fetch price for ${result.symbol}`);
     } finally {
       setSearching(false);
     }
@@ -288,6 +310,8 @@ export default function AddInvestment() {
                     setAssetType(type);
                     setForm({ ...form, name: '', ticker_symbol: '', amfi_code: '', currency: type === 'FOREIGN_STOCK' ? 'USD' : 'INR' });
                     setStockInfo(null);
+                    setStockResults([]);
+                    setStockQuery('');
                     setMfResults([]);
                     setMfSearch('');
                     setContractResult(null);
@@ -594,20 +618,40 @@ export default function AddInvestment() {
                     <Form.Control
                       size="sm"
                       type="text"
-                      value={form.ticker_symbol}
-                      onChange={(e) => setForm({ ...form, ticker_symbol: e.target.value.toUpperCase() })}
+                      value={stockQuery}
+                      onChange={(e) => { setStockQuery(e.target.value); setStockInfo(null); setStockResults([]); }}
                       onKeyDown={(e) => e.key === 'Enter' && handleStockSearch()}
-                      placeholder="e.g., RELIANCE, TCS, INFY"
+                      placeholder="e.g., ICICI, Nifty ETF, Reliance"
                     />
                     <Button size="sm" variant="primary" onClick={handleStockSearch} disabled={searching}>
-                      <Search size={16} />
+                      {searching ? <Spinner size="sm" animation="border" /> : <Search size={16} />}
                     </Button>
                   </div>
+                  {stockResults.length > 0 && (
+                    <div className="border rounded mt-1 bg-white shadow-sm" style={{ maxHeight: 200, overflowY: 'auto' }}>
+                      {stockResults.map((r, i) => (
+                        <div
+                          key={i}
+                          className="px-3 py-2 border-bottom small d-flex justify-content-between align-items-center"
+                          style={{ cursor: 'pointer' }}
+                          onClick={() => selectStock(r)}
+                          onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f0f0f0'}
+                          onMouseLeave={(e) => e.currentTarget.style.backgroundColor = ''}
+                        >
+                          <div>
+                            <strong>{r.symbol}</strong>
+                            <span className="text-muted ms-2">{r.name}</span>
+                          </div>
+                          <span className="badge bg-secondary">{r.type}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {stockInfo && (
                     <div className="mt-2 p-2 bg-success bg-opacity-10 rounded d-flex align-items-center gap-2">
                       <CheckCircle size={14} className="text-success" />
                       <span className="small text-success">
-                        <strong>{stockInfo.name}</strong> — ₹{stockInfo.price?.toFixed(2)}
+                        <strong>{stockInfo.name}</strong> ({form.ticker_symbol}) — ₹{stockInfo.price?.toFixed(2)}
                       </span>
                     </div>
                   )}
@@ -835,25 +879,45 @@ export default function AddInvestment() {
               {/* Foreign Stock Ticker Search */}
               {isForeignStock && (
                 <div className="mb-3">
-                  <Form.Label className="small">Ticker Symbol</Form.Label>
+                  <Form.Label className="small">Stock / ETF Name</Form.Label>
                   <div className="d-flex gap-2">
                     <Form.Control
                       size="sm"
                       type="text"
-                      value={form.ticker_symbol}
-                      onChange={(e) => setForm({ ...form, ticker_symbol: e.target.value.toUpperCase() })}
+                      value={stockQuery}
+                      onChange={(e) => { setStockQuery(e.target.value); setStockInfo(null); setStockResults([]); }}
                       onKeyDown={(e) => e.key === 'Enter' && handleStockSearch()}
-                      placeholder="e.g., AAPL, MSFT, GOOGL"
+                      placeholder="e.g., AAPL, Tesla, S&P 500 ETF"
                     />
                     <Button size="sm" variant="primary" onClick={handleStockSearch} disabled={searching}>
-                      <Search size={16} />
+                      {searching ? <Spinner size="sm" animation="border" /> : <Search size={16} />}
                     </Button>
                   </div>
+                  {stockResults.length > 0 && (
+                    <div className="border rounded mt-1 bg-white shadow-sm" style={{ maxHeight: 200, overflowY: 'auto' }}>
+                      {stockResults.map((r, i) => (
+                        <div
+                          key={i}
+                          className="px-3 py-2 border-bottom small d-flex justify-content-between align-items-center"
+                          style={{ cursor: 'pointer' }}
+                          onClick={() => selectStock(r)}
+                          onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f0f0f0'}
+                          onMouseLeave={(e) => e.currentTarget.style.backgroundColor = ''}
+                        >
+                          <div>
+                            <strong>{r.symbol}</strong>
+                            <span className="text-muted ms-2">{r.name}</span>
+                          </div>
+                          <span className="badge bg-secondary">{r.type}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {stockInfo && (
                     <div className="mt-2 p-2 bg-success bg-opacity-10 rounded d-flex align-items-center gap-2">
                       <CheckCircle size={16} className="text-success" />
                       <span className="small text-success">
-                        Found: <strong>{stockInfo.name}</strong> — ${stockInfo.price?.toFixed(2)} ({stockInfo.currency})
+                        Found: <strong>{stockInfo.name}</strong> ({form.ticker_symbol}) — ${stockInfo.price?.toFixed(2)} ({stockInfo.currency})
                       </span>
                     </div>
                   )}

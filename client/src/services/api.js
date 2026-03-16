@@ -78,6 +78,8 @@ export const deleteTransaction = (id) =>
 
 // Utils
 export const searchMutualFunds = (q) => fetchJSON(`/utils/search-mf?q=${encodeURIComponent(q)}`);
+export const searchStockByName = (q, market) =>
+  fetchJSON(`/utils/search-stock-name?q=${encodeURIComponent(q)}&market=${market || ''}`);
 export const searchStock = (symbol, market) =>
   fetchJSON(`/utils/search-stock?symbol=${encodeURIComponent(symbol)}&market=${market || ''}`);
 export const triggerPriceUpdate = () =>

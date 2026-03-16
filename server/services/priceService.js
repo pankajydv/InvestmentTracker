@@ -275,6 +275,43 @@ function toNSETicker(symbol) {
 }
 
 /**
+ * Search stocks/ETFs by name or ticker using Yahoo Finance search API.
+ * @param {string} query - Search term (e.g., 'ICICI', 'Nifty ETF')
+ * @param {string} [market] - Optional: 'NSE' to filter Indian stocks only
+ * @returns {Promise<Array<{symbol: string, name: string, exchange: string, type: string}>>}
+ */
+function searchStocks(query, market) {
+  return new Promise((resolve) => {
+    const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(query)}&quotesCount=20&newsCount=0`;
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const results = (json.quotes || [])
+            .filter(q => ['EQUITY', 'ETF'].includes(q.quoteType))
+            .filter(q => !market || market !== 'NSE' || q.symbol?.endsWith('.NS') || q.symbol?.endsWith('.BO'))
+            // Filter out junk symbols (0P... are MF codes, not stocks/ETFs)
+            .filter(q => !/^0P/.test(q.symbol))
+            .map(q => ({
+              symbol: q.symbol,
+              name: q.longname || q.shortname || q.symbol,
+              exchange: q.exchDisp || q.exchange || '',
+              type: q.quoteType,
+            }));
+          resolve(results);
+        } catch (e) {
+          console.warn(`Stock search failed for "${query}":`, e.message);
+          resolve([]);
+        }
+      });
+      res.on('error', () => resolve([]));
+    }).on('error', () => resolve([]));
+  });
+}
+
+/**
  * Look up NSE/BSE ticker symbol from an ISIN using Yahoo Finance search API.
  * @param {string} isin - ISIN code (e.g., 'INE296A01032')
  * @returns {Promise<string|null>} Full Yahoo Finance symbol (e.g., 'BAJFINANCE.NS', 'NSDL.BO') or null
@@ -383,4 +420,5 @@ module.exports = {
   calculatePPFValue,
   toNSETicker,
   lookupTickerByISIN,
+  searchStocks,
 };
