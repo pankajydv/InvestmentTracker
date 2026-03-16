@@ -28,7 +28,7 @@ module.exports = function (db) {
         COALESCE((
           SELECT SUM(CASE
             WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(units, 0)
-            WHEN transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(units, 0)
+            WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(units, 0)
             ELSE 0 END)
           FROM transactions WHERE investment_id = investments.id
         ), 0) > 0
@@ -58,9 +58,9 @@ module.exports = function (db) {
     // Get total units and invested amount
     const totals = db.prepare(`
       SELECT
-        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'RIGHTS') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
+        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'RIGHTS') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
         COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO') THEN amount + COALESCE(fees, 0) ELSE 0 END), 0) as total_invested,
-        COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'WITHDRAWAL') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
+        COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
       FROM transactions WHERE investment_id = ?
     `).get(inv.id);
 
@@ -84,6 +84,7 @@ module.exports = function (db) {
     const {
       name, asset_type, ticker_symbol, amfi_code, folio_number,
       account_number, interest_rate, currency, notes, portfolio_id,
+      broker, face_value, coupon_frequency, maturity_date,
     } = req.body;
 
     if (!name || !asset_type) {
@@ -91,11 +92,13 @@ module.exports = function (db) {
     }
 
     const result = db.prepare(`
-      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, notes, portfolio_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, broker, face_value, coupon_frequency, maturity_date, notes, portfolio_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(name, asset_type, ticker_symbol || null, amfi_code || null,
       folio_number || null, account_number || null, interest_rate || null,
-      currency || 'INR', notes || null, portfolio_id || null);
+      currency || 'INR', broker || null, face_value || null,
+      coupon_frequency || null, maturity_date || null,
+      notes || null, portfolio_id || null);
 
     const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json(inv);
@@ -106,8 +109,8 @@ module.exports = function (db) {
     const {
       name, ticker_symbol, amfi_code, folio_number,
       account_number, interest_rate, currency, notes, is_active, portfolio_id,
+      broker, face_value, coupon_frequency, maturity_date,
     } = req.body;
-
     db.prepare(`
       UPDATE investments SET
         name = COALESCE(?, name),
@@ -117,13 +120,18 @@ module.exports = function (db) {
         account_number = COALESCE(?, account_number),
         interest_rate = COALESCE(?, interest_rate),
         currency = COALESCE(?, currency),
+        broker = COALESCE(?, broker),
+        face_value = COALESCE(?, face_value),
+        coupon_frequency = COALESCE(?, coupon_frequency),
+        maturity_date = COALESCE(?, maturity_date),
         notes = COALESCE(?, notes),
         is_active = COALESCE(?, is_active),
         portfolio_id = COALESCE(?, portfolio_id),
         updated_at = datetime('now')
       WHERE id = ?
     `).run(name, ticker_symbol, amfi_code, folio_number,
-      account_number, interest_rate, currency, notes, is_active, portfolio_id, req.params.id);
+      account_number, interest_rate, currency, broker, face_value,
+      coupon_frequency, maturity_date, notes, is_active, portfolio_id, req.params.id);
 
     const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(req.params.id);
     res.json(inv);

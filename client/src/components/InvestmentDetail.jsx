@@ -88,8 +88,11 @@ export default function InvestmentDetail() {
   if (!data) return <div className="text-danger">Investment not found</div>;
 
   const isPPF = data.asset_type === 'PPF' || data.asset_type === 'PF';
+  const isBond = data.asset_type === 'BOND';
   const txnTypes = isPPF
     ? ['DEPOSIT', 'WITHDRAWAL', 'INTEREST']
+    : isBond
+    ? ['BUY', 'SELL', 'REDEMPTION', 'INTEREST']
     : ['BUY', 'SELL', 'DIVIDEND'];
 
   return (

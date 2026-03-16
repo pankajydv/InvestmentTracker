@@ -30,11 +30,11 @@ function initializeDb(db) {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
-    -- Asset types: INDIAN_STOCK, MUTUAL_FUND, FOREIGN_STOCK, PPF, PF
+    -- Asset types: INDIAN_STOCK, MUTUAL_FUND, FOREIGN_STOCK, PPF, PF, BOND
     CREATE TABLE IF NOT EXISTS investments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
-      asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF')),
+      asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND')),
       portfolio_id INTEGER,          -- Owner (family member) portfolio
       ticker_symbol TEXT,          -- NSE symbol for Indian stocks, Yahoo ticker for foreign stocks
       amfi_code TEXT,              -- AMFI scheme code for mutual funds
@@ -43,6 +43,9 @@ function initializeDb(db) {
       interest_rate REAL,          -- For PPF/PF (annual %)
       currency TEXT DEFAULT 'INR', -- INR or USD
       broker TEXT,                 -- Broker/platform name (e.g., Sharekhan, Zerodha)
+      face_value REAL,              -- Face/par value per unit (for bonds)
+      coupon_frequency TEXT,        -- MONTHLY, QUARTERLY, SEMI_ANNUAL, ANNUAL (for bonds)
+      maturity_date TEXT,           -- Maturity date (for bonds)
       notes TEXT,
       is_active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')),
@@ -53,7 +56,7 @@ function initializeDb(db) {
     CREATE TABLE IF NOT EXISTS transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       investment_id INTEGER NOT NULL,
-      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'AMC')),
+      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'REDEMPTION', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'AMC')),
       transaction_date TEXT NOT NULL,
       units REAL,                  -- Number of units/shares bought or sold
       price_per_unit REAL,         -- Price at which transaction happened

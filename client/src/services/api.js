@@ -64,7 +64,15 @@ export const getTransactions = (params = {}) => {
   const qs = new URLSearchParams(params);
   return fetchJSON(`/transactions?${qs}`);
 };
-export const getBrokers = () => fetchJSON('/transactions/brokers');
+export const getBrokers = (params = {}) => {
+  const qs = new URLSearchParams(params).toString();
+  return fetchJSON(`/transactions/brokers${qs ? '?' + qs : ''}`);
+};
+export const getAssetTypes = () => fetchJSON('/transactions/asset-types');
+export const getTransactionTypes = (params = {}) => {
+  const qs = new URLSearchParams(params).toString();
+  return fetchJSON(`/transactions/transaction-types${qs ? '?' + qs : ''}`);
+};
 export const getInvestmentNames = (params = {}) => {
   const query = new URLSearchParams(params).toString();
   return fetchJSON(`/transactions/investment-names${query ? '?' + query : ''}`);

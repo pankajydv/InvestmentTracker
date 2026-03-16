@@ -35,23 +35,60 @@ module.exports = function (db) {
   });
 
   // ─── Get all transactions ─────────────────────────────────────────────
+  // ─── Get distinct asset types that have transactions ──────────────────
+  router.get('/asset-types', (req, res) => {
+    const types = db.prepare(
+      `SELECT DISTINCT i.asset_type FROM investments i
+       INNER JOIN transactions t ON t.investment_id = i.id
+       ORDER BY i.asset_type`
+    ).all().map(r => r.asset_type);
+    res.json(types);
+  });
+
+  // ─── Get distinct transaction types (optionally filtered by asset type) ───
+  router.get('/transaction-types', (req, res) => {
+    const { asset_type } = req.query;
+    let sql = `SELECT DISTINCT t.transaction_type FROM transactions t
+       JOIN investments i ON t.investment_id = i.id`;
+    const params = [];
+    if (asset_type) {
+      sql += ` WHERE i.asset_type = ?`;
+      params.push(asset_type);
+    }
+    sql += ` ORDER BY t.transaction_type`;
+    const types = db.prepare(sql).all(...params).map(r => r.transaction_type);
+    res.json(types);
+  });
+
   // ─── Get distinct brokers ─────────────────────────────────────────────
   router.get('/brokers', (req, res) => {
-    const brokers = db.prepare(
-      "SELECT DISTINCT broker FROM investments WHERE broker IS NOT NULL AND broker != '' ORDER BY broker"
-    ).all().map(r => r.broker);
+    const { asset_type } = req.query;
+    let sql = `SELECT DISTINCT i.broker FROM investments i
+       INNER JOIN transactions t ON t.investment_id = i.id
+       WHERE i.broker IS NOT NULL AND i.broker != ''`;
+    const params = [];
+    if (asset_type) {
+      sql += ` AND i.asset_type = ?`;
+      params.push(asset_type);
+    }
+    sql += ` ORDER BY i.broker`;
+    const brokers = db.prepare(sql).all(...params).map(r => r.broker);
     res.json(brokers);
   });
 
   // ─── Get investment names that have transactions ──────────────────────
   router.get('/investment-names', (req, res) => {
-    const { portfolio_id } = req.query;
+    const { portfolio_id, asset_type } = req.query;
     let sql = `SELECT DISTINCT i.name FROM investments i
-       INNER JOIN transactions t ON t.investment_id = i.id`;
+       INNER JOIN transactions t ON t.investment_id = i.id WHERE 1=1`;
     const params = [];
     if (portfolio_id) {
-      sql += ` WHERE i.portfolio_id = ?`;
+      sql += ` AND i.portfolio_id = ?`;
       params.push(portfolio_id);
+    }
+    if (asset_type) {
+      sql += ` AND i.asset_type = ?`;
+      params.push(asset_type);
     }
     sql += ` ORDER BY i.name`;
     const names = db.prepare(sql).all(...params).map(r => r.name);
@@ -86,6 +123,7 @@ module.exports = function (db) {
     if (broker) { query += ' AND i.broker = ?'; params.push(broker); }
     if (investment_id) { query += ' AND t.investment_id = ?'; params.push(investment_id); }
     if (investment_name) { query += ' AND i.name = ?'; params.push(investment_name); }
+    if (req.query.asset_type) { query += ' AND i.asset_type = ?'; params.push(req.query.asset_type); }
 
     query += ' ORDER BY t.transaction_date DESC LIMIT 500';
     const txns = db.prepare(query).all(...params);

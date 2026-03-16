@@ -70,10 +70,11 @@ export function profitBg(value) {
  */
 export const ASSET_TYPE_LABELS = {
   MUTUAL_FUND: 'Mutual Funds',
-  INDIAN_STOCK: 'Indian Stocks',
+  INDIAN_STOCK: 'Stocks',
   FOREIGN_STOCK: 'Foreign Stocks',
   PPF: 'PPF',
   PF: 'PF',
+  BOND: 'Bonds',
 };
 
 /**
@@ -85,6 +86,7 @@ export const ASSET_TYPE_COLORS = {
   FOREIGN_STOCK: '#8b5cf6',
   PPF: '#f59e0b',
   PF: '#ef4444',
+  BOND: '#f97316',
 };
 
 /**

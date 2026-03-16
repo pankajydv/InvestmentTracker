@@ -6,7 +6,7 @@ import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, Wallet } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'PPF', 'PF'];
+const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'PPF', 'PF', 'BOND'];
 const STOCK_TXN_TYPES = ['BUY', 'SELL'];
 
 export default function AddInvestment() {
@@ -259,6 +259,70 @@ export default function AddInvestment() {
   const isIndianStock = assetType === 'INDIAN_STOCK';
   const isForeignStock = assetType === 'FOREIGN_STOCK';
   const isStock = isIndianStock || isForeignStock;
+  const isBond = assetType === 'BOND';
+
+  // Bond-specific form state
+  const [bondForm, setBondForm] = useState({
+    name: '',
+    face_value: '1000',
+    coupon_rate: '',
+    coupon_frequency: 'ANNUAL',
+    maturity_date: '',
+    broker: 'Paytm Money',
+    notes: '',
+  });
+  const [bondTxn, setBondTxn] = useState({
+    transaction_type: 'BUY',
+    transaction_date: new Date().toISOString().split('T')[0],
+    units: '',
+    price_per_unit: '',
+    fees: '0',
+    notes: '',
+  });
+  const bondAmount = bondTxn.units && bondTxn.price_per_unit
+    ? (parseFloat(bondTxn.units) * parseFloat(bondTxn.price_per_unit)).toFixed(2)
+    : '';
+
+  const handleBondSubmit = async () => {
+    setError('');
+    setSubmitting(true);
+    try {
+      if (!bondForm.name) { setError('Name is required'); setSubmitting(false); return; }
+      if (!bondForm.coupon_rate) { setError('Coupon rate is required'); setSubmitting(false); return; }
+      if (!bondForm.maturity_date) { setError('Maturity date is required'); setSubmitting(false); return; }
+      if (!bondTxn.units || !bondTxn.price_per_unit) { setError('Units and price are required'); setSubmitting(false); return; }
+
+      const inv = await createInvestment({
+        name: bondForm.name,
+        asset_type: 'BOND',
+        interest_rate: parseFloat(bondForm.coupon_rate),
+        face_value: parseFloat(bondForm.face_value) || 1000,
+        coupon_frequency: bondForm.coupon_frequency,
+        maturity_date: bondForm.maturity_date,
+        broker: bondForm.broker || null,
+        currency: 'INR',
+        notes: bondForm.notes || null,
+        portfolio_id: portfolioId || null,
+      });
+
+      await addTransaction({
+        investment_id: inv.id,
+        transaction_type: bondTxn.transaction_type,
+        transaction_date: bondTxn.transaction_date,
+        units: parseFloat(bondTxn.units),
+        price_per_unit: parseFloat(bondTxn.price_per_unit),
+        amount: parseFloat(bondAmount),
+        fees: parseFloat(bondTxn.fees) || 0,
+        notes: bondTxn.notes || null,
+      });
+
+      navigate(`/investments/${inv.id}`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const handleAmcSubmit = async () => {
     setError('');
@@ -831,8 +895,196 @@ export default function AddInvestment() {
         </>
       )}
 
-      {/* Non-Indian-Stock: original flow */}
-      {!isIndianStock && (
+      {/* Bond form */}
+      {isBond && (
+        <>
+          <Card className="shadow-sm">
+            <Card.Body>
+              <h2 className="h6 fw-semibold mb-3">2. Bond Details</h2>
+              <Row className="g-3">
+                <Col md={8}>
+                  <Form.Label className="small">Name</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="text"
+                    value={bondForm.name}
+                    onChange={(e) => setBondForm({ ...bondForm, name: e.target.value })}
+                    placeholder="e.g., Shriram Finance NCD 9.05%"
+                    required
+                  />
+                </Col>
+                <Col md={4}>
+                  <Form.Label className="small">Broker</Form.Label>
+                  <Form.Select
+                    size="sm"
+                    value={bondForm.broker}
+                    onChange={(e) => setBondForm({ ...bondForm, broker: e.target.value })}
+                  >
+                    {[
+                      { value: 'Paytm Money', label: 'Paytm Money' },
+                      ...brokerOptions,
+                    ].map(b => (
+                      <option key={b.value} value={b.value}>{b.label}</option>
+                    ))}
+                  </Form.Select>
+                </Col>
+                <Col md={3}>
+                  <Form.Label className="small">Face Value (₹)</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    step="0.01"
+                    value={bondForm.face_value}
+                    onChange={(e) => setBondForm({ ...bondForm, face_value: e.target.value })}
+                    placeholder="1000"
+                  />
+                </Col>
+                <Col md={3}>
+                  <Form.Label className="small">Coupon Rate (% p.a.)</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    step="0.01"
+                    value={bondForm.coupon_rate}
+                    onChange={(e) => setBondForm({ ...bondForm, coupon_rate: e.target.value })}
+                    placeholder="e.g., 9.05"
+                    required
+                  />
+                </Col>
+                <Col md={3}>
+                  <Form.Label className="small">Coupon Frequency</Form.Label>
+                  <Form.Select
+                    size="sm"
+                    value={bondForm.coupon_frequency}
+                    onChange={(e) => setBondForm({ ...bondForm, coupon_frequency: e.target.value })}
+                  >
+                    <option value="MONTHLY">Monthly</option>
+                    <option value="QUARTERLY">Quarterly</option>
+                    <option value="SEMI_ANNUAL">Semi-Annual</option>
+                    <option value="ANNUAL">Annual</option>
+                  </Form.Select>
+                </Col>
+                <Col md={3}>
+                  <Form.Label className="small">Maturity Date</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="date"
+                    value={bondForm.maturity_date}
+                    onChange={(e) => setBondForm({ ...bondForm, maturity_date: e.target.value })}
+                    required
+                  />
+                </Col>
+                <Col md={12}>
+                  <Form.Label className="small">Notes</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="text"
+                    value={bondForm.notes}
+                    onChange={(e) => setBondForm({ ...bondForm, notes: e.target.value })}
+                    placeholder="Optional notes (e.g., ISIN, series)"
+                  />
+                </Col>
+              </Row>
+            </Card.Body>
+          </Card>
+
+          <Card className="shadow-sm">
+            <Card.Body>
+              <h2 className="h6 fw-semibold mb-3">3. Purchase / Sale / Redemption</h2>
+              <div className="mb-3">
+                <div className="d-flex flex-wrap gap-2">
+                  {['BUY', 'SELL', 'REDEMPTION'].map((t) => (
+                    <Form.Check
+                      key={t}
+                      inline
+                      type="radio"
+                      name="bondTxnType"
+                      id={`bond-txn-${t}`}
+                      label={{ BUY: 'Buy', SELL: 'Sell', REDEMPTION: 'Redemption' }[t]}
+                      checked={bondTxn.transaction_type === t}
+                      onChange={() => setBondTxn({ ...bondTxn, transaction_type: t })}
+                    />
+                  ))}
+                </div>
+              </div>
+              <Row className="g-3">
+                <Col md={4}>
+                  <Form.Label className="small">Date</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="date"
+                    value={bondTxn.transaction_date}
+                    onChange={(e) => setBondTxn({ ...bondTxn, transaction_date: e.target.value })}
+                  />
+                </Col>
+                <Col md={4}>
+                  <Form.Label className="small">No. of Bonds</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    step="1"
+                    value={bondTxn.units}
+                    onChange={(e) => setBondTxn({ ...bondTxn, units: e.target.value })}
+                    placeholder="e.g., 5"
+                  />
+                </Col>
+                <Col md={4}>
+                  <Form.Label className="small">Price per Bond (₹)</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    step="0.01"
+                    value={bondTxn.price_per_unit}
+                    onChange={(e) => setBondTxn({ ...bondTxn, price_per_unit: e.target.value })}
+                    placeholder="e.g., 1000"
+                  />
+                </Col>
+                <Col md={4}>
+                  <Form.Label className="small">Total Amount (₹)</Form.Label>
+                  <div className="form-control form-control-sm bg-light" style={{ minHeight: '31px' }}>
+                    {bondAmount
+                      ? '₹' + parseFloat(bondAmount).toLocaleString('en-IN', { maximumFractionDigits: 2 })
+                      : <span className="text-muted">Auto-calculated</span>}
+                  </div>
+                </Col>
+                <Col md={4}>
+                  <Form.Label className="small">Charges (₹)</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    step="0.01"
+                    value={bondTxn.fees}
+                    onChange={(e) => setBondTxn({ ...bondTxn, fees: e.target.value })}
+                    placeholder="0"
+                  />
+                </Col>
+                <Col md={4}>
+                  <Form.Label className="small">Notes</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="text"
+                    value={bondTxn.notes}
+                    onChange={(e) => setBondTxn({ ...bondTxn, notes: e.target.value })}
+                    placeholder="Optional"
+                  />
+                </Col>
+              </Row>
+            </Card.Body>
+          </Card>
+
+          <div className="d-flex justify-content-end gap-2">
+            <Button variant="outline-secondary" onClick={() => navigate(-1)}>
+              Cancel
+            </Button>
+            <Button variant="primary" onClick={handleBondSubmit} disabled={submitting}>
+              {submitting ? 'Adding...' : 'Add Bond'}
+            </Button>
+          </div>
+        </>
+      )}
+
+      {/* Non-Indian-Stock / Non-Bond: original flow */}
+      {!isIndianStock && !isBond && (
         <>
           {/* Step 2: Investment Details */}
           <Card className="shadow-sm">

@@ -25,7 +25,7 @@ module.exports = function (db) {
 
     // Build hide-sold filter
     const soldFilter = hide_sold === 'true'
-      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(units,0) WHEN transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(units,0) ELSE 0 END) FROM transactions WHERE investment_id = i.id),0) > 0)`
+      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(units,0) WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(units,0) ELSE 0 END) FROM transactions WHERE investment_id = i.id),0) > 0)`
       : '';
 
     // Get individual investment summaries

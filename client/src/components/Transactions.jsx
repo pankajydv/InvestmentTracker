@@ -1,16 +1,16 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Card, Table, Spinner, Form, Modal, Button } from 'react-bootstrap';
-import { getTransactions, getBrokers, getInvestmentNames, updateTransaction, deleteTransaction } from '../services/api';
+import { getTransactions, getBrokers, getAssetTypes, getTransactionTypes, getInvestmentNames, updateTransaction, deleteTransaction } from '../services/api';
 import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const TRANSACTION_TYPES = [
-  'BUY', 'SELL', 'DIVIDEND', 'BONUS', 'IPO', 'AMC',
+const TRANSACTION_TYPES_DEFAULT = [
+  'BUY', 'SELL', 'REDEMPTION', 'DIVIDEND', 'INTEREST', 'BONUS', 'IPO', 'AMC',
 ];
 
 // User-action types that can be edited/deleted (not corporate actions)
-const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'REDEMPTION', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT'];
 
 const TYPE_BADGE = {
   BUY: 'badge-buy',
@@ -25,6 +25,7 @@ const TYPE_BADGE = {
   MERGER: 'badge-merger',
   CONSOLIDATION: 'badge-merger',
   SELL: 'badge-sell',
+  REDEMPTION: 'badge-sell',
   WITHDRAWAL: 'badge-withdrawal',
   TRANSFER_OUT: 'badge-sell',
   AMC: 'badge-withdrawal',
@@ -35,9 +36,12 @@ export default function Transactions() {
   const { selectedId } = usePortfolio();
   const [transactions, setTransactions] = useState([]);
   const [brokers, setBrokers] = useState([]);
+  const [assetTypes, setAssetTypes] = useState([]);
+  const [transactionTypes, setTransactionTypes] = useState(TRANSACTION_TYPES_DEFAULT);
   const [investmentNames, setInvestmentNames] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filterType, setFilterType] = useState([]);
+  const [filterAssetType, setFilterAssetType] = useState('');
   const [filterBroker, setFilterBroker] = useState('');
   const [filterInvestment, setFilterInvestment] = useState('');
   const [typeDropdownOpen, setTypeDropdownOpen] = useState(false);
@@ -108,8 +112,27 @@ export default function Transactions() {
   };
 
   useEffect(() => {
-    getBrokers().then(setBrokers).catch(() => {});
+    getAssetTypes().then(setAssetTypes).catch(() => {});
   }, []);
+
+  // Load brokers based on selected asset type
+  useEffect(() => {
+    const params = filterAssetType ? { asset_type: filterAssetType } : {};
+    getBrokers(params).then(b => {
+      setBrokers(b);
+      setFilterBroker(prev => b.includes(prev) ? prev : '');
+    }).catch(() => {});
+  }, [filterAssetType]);
+
+  // Load transaction types based on selected asset type
+  useEffect(() => {
+    const params = filterAssetType ? { asset_type: filterAssetType } : {};
+    getTransactionTypes(params).then(types => {
+      setTransactionTypes(types.length ? types : TRANSACTION_TYPES_DEFAULT);
+      // Clear any selected types that aren't available in the new list
+      setFilterType(prev => prev.filter(t => types.includes(t)));
+    }).catch(() => {});
+  }, [filterAssetType]);
 
   // Close type dropdown on outside click
   useEffect(() => {
@@ -123,14 +146,18 @@ export default function Transactions() {
   }, []);
 
   useEffect(() => {
-    const params = selectedId ? { portfolio_id: selectedId } : {};
-    getInvestmentNames(params).then(setInvestmentNames).catch(() => {});
-    setFilterInvestment('');
-  }, [selectedId]);
+    const params = {};
+    if (selectedId) params.portfolio_id = selectedId;
+    if (filterAssetType) params.asset_type = filterAssetType;
+    getInvestmentNames(params).then(names => {
+      setInvestmentNames(names);
+      setFilterInvestment(prev => names.includes(prev) ? prev : '');
+    }).catch(() => {});
+  }, [selectedId, filterAssetType]);
 
   useEffect(() => {
     loadTransactions();
-  }, [selectedId, filterType, filterBroker, filterInvestment]);
+  }, [selectedId, filterType, filterAssetType, filterBroker, filterInvestment]);
 
   const loadTransactions = async () => {
     try {
@@ -138,6 +165,7 @@ export default function Transactions() {
       const params = {};
       if (selectedId) params.portfolio_id = selectedId;
       if (filterType.length) params.type = filterType.join(',');
+      if (filterAssetType) params.asset_type = filterAssetType;
       if (filterBroker) params.broker = filterBroker;
       if (filterInvestment) params.investment_name = filterInvestment;
       const result = await getTransactions(params);
@@ -165,6 +193,23 @@ export default function Transactions() {
 
       {/* Filter bar */}
       <div className="d-flex flex-wrap align-items-center gap-3">
+        {assetTypes.length > 1 && (
+          <div className="d-flex align-items-center gap-2">
+            <label className="small fw-semibold text-muted text-uppercase">Asset Type</label>
+            <Form.Select
+              size="sm"
+              value={filterAssetType}
+              onChange={(e) => setFilterAssetType(e.target.value)}
+              style={{ width: 'auto' }}
+            >
+              <option value="">All Asset Types</option>
+              {assetTypes.map((t) => (
+                <option key={t} value={t}>{ASSET_TYPE_LABELS[t] || t}</option>
+              ))}
+            </Form.Select>
+          </div>
+        )}
+
         <div className="d-flex align-items-center gap-2 position-relative" ref={typeDropdownRef}>
           <label className="small fw-semibold text-muted text-uppercase">Type</label>
           <button
@@ -194,7 +239,7 @@ export default function Transactions() {
           </button>
           {typeDropdownOpen && (
             <div className="position-absolute top-100 start-0 mt-1 bg-white border rounded shadow-lg py-1" style={{ zIndex: 20, minWidth: 160 }}>
-              {TRANSACTION_TYPES.map(t => {
+              {transactionTypes.map(t => {
                 const selected = filterType.includes(t);
                 return (
                   <button
@@ -272,9 +317,9 @@ export default function Transactions() {
           </div>
         )}
 
-        {(filterType.length > 0 || filterBroker || filterInvestment) && (
+        {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment) && (
           <button
-            onClick={() => { setFilterType([]); setFilterBroker(''); setFilterInvestment(''); }}
+            onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); }}
             className="btn btn-link btn-sm text-muted text-decoration-underline p-0"
           >
             Clear filters
@@ -309,8 +354,8 @@ export default function Transactions() {
         ) : transactions.length === 0 ? (
           <div className="p-5 text-center text-muted">
             <p>No transactions found.</p>
-            {(filterType.length > 0 || filterBroker || filterInvestment) ? (
-              <button onClick={() => { setFilterType([]); setFilterBroker(''); setFilterInvestment(''); }}
+            {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment) ? (
+              <button onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); }}
                 className="btn btn-link text-primary mt-2">
                 Clear filters
               </button>

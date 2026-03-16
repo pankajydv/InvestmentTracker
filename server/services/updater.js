@@ -53,14 +53,14 @@ async function updateAllPrices(db) {
 
   const getSaleProceeds = db.prepare(`
     SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND transaction_type IN ('SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST')
+    FROM transactions WHERE investment_id = ? AND transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST')
   `);
 
   const getTotalUnits = db.prepare(`
     SELECT COALESCE(
       SUM(CASE
         WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'RIGHTS') THEN COALESCE(units, 0)
-        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0)
         ELSE 0
       END), 0
     ) as total
