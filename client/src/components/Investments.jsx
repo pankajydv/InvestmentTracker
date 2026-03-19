@@ -6,7 +6,7 @@ import { formatINR, ASSET_TYPE_LABELS } from '../utils/formatters';
 import { PlusCircle, Filter, EyeOff, Eye } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const ASSET_TYPES = ['', 'MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'PPF', 'PF'];
+const ASSET_TYPES = ['', 'MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND'];
 
 export default function Investments() {
   const { selectedId } = usePortfolio();

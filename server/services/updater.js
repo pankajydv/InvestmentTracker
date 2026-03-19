@@ -123,6 +123,12 @@ async function updateAllPrices(db) {
           break;
         }
 
+        case 'BOND': {
+          pricePerUnit = inv.face_value || 1000;
+          currentValue = totalUnits * pricePerUnit;
+          break;
+        }
+
         case 'PPF':
         case 'PF': {
           const rateRow = db.prepare(
