@@ -26,7 +26,7 @@ module.exports = function (db) {
       // Parse all uploaded files
       const allParsed = [];
       for (const file of req.files) {
-        const notes = parseContractNotes(file.buffer, file.originalname);
+        const notes = await parseContractNotes(file.buffer, file.originalname, portfolio.pan_number);
         allParsed.push(...notes);
       }
 
