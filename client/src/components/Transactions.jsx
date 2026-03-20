@@ -6,11 +6,11 @@ import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters
 import { usePortfolio } from '../context/PortfolioContext';
 
 const TRANSACTION_TYPES_DEFAULT = [
-  'BUY', 'SELL', 'REDEMPTION', 'DIVIDEND', 'INTEREST', 'BONUS', 'IPO', 'AMC',
+  'BUY', 'SELL', 'REDEMPTION', 'DIVIDEND', 'INTEREST', 'BONUS', 'IPO', 'AMC', 'TRANSFER',
 ];
 
 // User-action types that can be edited/deleted (not corporate actions)
-const EDITABLE_TYPES = ['BUY', 'SELL', 'REDEMPTION', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'REDEMPTION', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER'];
 
 const TYPE_BADGE = {
   BUY: 'badge-buy',
@@ -28,6 +28,7 @@ const TYPE_BADGE = {
   REDEMPTION: 'badge-sell',
   WITHDRAWAL: 'badge-withdrawal',
   TRANSFER_OUT: 'badge-sell',
+  TRANSFER: 'badge-merger',
   AMC: 'badge-withdrawal',
 };
 
