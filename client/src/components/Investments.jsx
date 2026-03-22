@@ -94,12 +94,12 @@ export default function Investments() {
                 <Card.Body>
                   <div className="d-flex justify-content-between align-items-start mb-2">
                     <div>
-                      <h6 className="fw-semibold mb-1">{inv.name}</h6>
+                      <h6 className="fw-semibold mb-1">{inv.display_name || inv.name}</h6>
                       <span className="badge bg-primary bg-opacity-10 text-primary">{ASSET_TYPE_LABELS[inv.asset_type]}</span>
                     </div>
                   </div>
                   <div className="small text-muted">
-                    {inv.ticker_symbol && <div>Ticker: <span className="text-body">{inv.ticker_symbol}</span></div>}
+                    {inv.ticker_symbol && <div>Symbol: <span className="text-body">{inv.ticker_symbol.replace(/\.(NS|BO)$/, '')}</span></div>}
                     {inv.amfi_code && <div>AMFI: <span className="text-body">{inv.amfi_code}</span></div>}
                     {inv.folio_number && <div>Folio: <span className="text-body">{inv.folio_number}</span></div>}
                     <div>Currency: <span className="text-body">{inv.currency}</span></div>

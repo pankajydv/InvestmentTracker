@@ -96,9 +96,20 @@ module.exports = function (db) {
         }
       }
 
+      const findByIsin = db.prepare(
+        'SELECT id, name FROM investments WHERE portfolio_id = ? AND isin_code = ? AND is_active = 1'
+      );
+      const findByTickerBase = db.prepare(
+        `SELECT id, name FROM investments WHERE portfolio_id = ? AND is_active = 1
+         AND REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? LIMIT 1`
+      );
+      const findByFolio = db.prepare(
+        'SELECT id, name FROM investments WHERE portfolio_id = ? AND folio_number = ? AND is_active = 1'
+      );
+
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, currency, portfolio_id, notes)
-        VALUES (?, ?, ?, ?, ?, 'INR', ?, ?)
+        INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, isin_code, currency, portfolio_id, notes)
+        VALUES (?, ?, ?, ?, ?, ?, 'INR', ?, ?)
       `);
 
       const insertTransaction = db.prepare(`
@@ -117,9 +128,35 @@ module.exports = function (db) {
           const folio = h.folio || null;
           const notes = `Imported from CAS PDF. ISIN: ${h.isin}`;
 
-          const inv = insertInvestment.run(
-            h.name, assetType, tickerSymbol, amfiCode, folio, portfolio_id, notes
-          );
+          // Check for existing investment by ISIN, ticker, or folio
+          let existingId = null;
+          if (h.isin) {
+            const byIsin = findByIsin.get(portfolio_id, h.isin);
+            if (byIsin) existingId = byIsin.id;
+          }
+          if (!existingId && tickerSymbol) {
+            const baseTicker = tickerSymbol.replace(/\.(NS|BO)$/, '');
+            const byTicker = findByTickerBase.get(portfolio_id, baseTicker);
+            if (byTicker) existingId = byTicker.id;
+          }
+          if (!existingId && folio) {
+            const byFolio = findByFolio.get(portfolio_id, folio);
+            if (byFolio) existingId = byFolio.id;
+          }
+
+          let investmentId;
+          if (existingId) {
+            investmentId = existingId;
+            // Backfill isin_code if missing
+            if (h.isin) {
+              db.prepare('UPDATE investments SET isin_code = COALESCE(isin_code, ?) WHERE id = ?').run(h.isin, investmentId);
+            }
+          } else {
+            const inv = insertInvestment.run(
+              h.name, assetType, tickerSymbol, amfiCode, folio, h.isin || null, portfolio_id, notes
+            );
+            investmentId = inv.lastInsertRowid;
+          }
 
           // Create initial BUY transaction
           const units = h.units || 0;
@@ -127,11 +164,11 @@ module.exports = function (db) {
           const amount = h.invested || h.value || (units * pricePerUnit);
 
           if (units > 0 && amount > 0) {
-            insertTransaction.run(inv.lastInsertRowid, today, units, pricePerUnit, amount);
+            insertTransaction.run(investmentId, today, units, pricePerUnit, amount);
           }
 
           results.push({
-            id: inv.lastInsertRowid,
+            id: investmentId,
             name: h.name,
             type: assetType,
             units,

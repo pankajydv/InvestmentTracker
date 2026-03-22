@@ -110,9 +110,16 @@ module.exports = function (db) {
       const findInvestment = db.prepare(
         'SELECT id, name, ticker_symbol FROM investments WHERE portfolio_id = ? AND asset_type = ? AND (ticker_symbol = ? OR name = ?)'
       );
+      const findByIsin = db.prepare(
+        'SELECT id, name, ticker_symbol FROM investments WHERE portfolio_id = ? AND isin_code = ? AND is_active = 1'
+      );
+      const findByTickerBase = db.prepare(
+        `SELECT id, name, ticker_symbol FROM investments WHERE portfolio_id = ? AND asset_type = 'INDIAN_STOCK' AND is_active = 1
+         AND REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? LIMIT 1`
+      );
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, portfolio_id, ticker_symbol, currency, notes, is_active)
-        VALUES (?, 'INDIAN_STOCK', ?, ?, 'INR', ?, 1)
+        INSERT INTO investments (name, asset_type, portfolio_id, ticker_symbol, isin_code, currency, notes, is_active)
+        VALUES (?, 'INDIAN_STOCK', ?, ?, ?, 'INR', ?, 1)
       `);
       // Idempotent: find existing transaction by key fields
       const findTransaction = db.prepare(`
@@ -167,9 +174,13 @@ module.exports = function (db) {
           let investmentId;
           if (existing) {
             investmentId = existing.id;
+            // Backfill isin_code if we have it and the existing record doesn't
+            if (stock.isin) {
+              db.prepare('UPDATE investments SET isin_code = COALESCE(isin_code, ?) WHERE id = ?').run(stock.isin, investmentId);
+            }
           } else {
             const result = insertInvestment.run(
-              displayName, portfolioId, tickerSymbol,
+              displayName, portfolioId, tickerSymbol, stock.isin || null,
               `Imported from ${broker || 'broker'} contract note`
             );
             investmentId = result.lastInsertRowid;
@@ -253,9 +264,15 @@ module.exports = function (db) {
       }
 
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, portfolio_id, ticker_symbol, currency, notes, is_active)
-        VALUES (?, 'INDIAN_STOCK', ?, ?, 'INR', ?, 1)
+        INSERT INTO investments (name, asset_type, portfolio_id, ticker_symbol, currency, notes, is_active, isin_code)
+        VALUES (?, 'INDIAN_STOCK', ?, ?, 'INR', ?, 1, ?)
       `);
+      const findByIsin = db.prepare(
+        'SELECT id FROM investments WHERE portfolio_id = ? AND isin_code = ? AND is_active = 1'
+      );
+      const findByTickerBase = db.prepare(
+        "SELECT id FROM investments WHERE portfolio_id = ? AND REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? AND is_active = 1"
+      );
       const findInvestment = db.prepare(
         'SELECT id FROM investments WHERE portfolio_id = ? AND asset_type = ? AND (ticker_symbol = ? OR name = ?)'
       );
@@ -281,8 +298,16 @@ module.exports = function (db) {
           const tickerSymbol = ticker || null;
           const displayName = stock.security;
 
+          // Match existing investment: ISIN first, then ticker base, then legacy match
           let existing = null;
-          if (tickerSymbol) {
+          if (stock.isin) {
+            existing = findByIsin.get(portfolioId, stock.isin);
+          }
+          if (!existing && tickerSymbol) {
+            const base = tickerSymbol.replace(/\.(NS|BO)$/, '');
+            existing = findByTickerBase.get(portfolioId, base);
+          }
+          if (!existing && tickerSymbol) {
             existing = findInvestment.get(portfolioId, 'INDIAN_STOCK', tickerSymbol, displayName);
           }
           if (!existing) {
@@ -292,10 +317,15 @@ module.exports = function (db) {
           let investmentId;
           if (existing) {
             investmentId = existing.id;
+            // Backfill isin_code if we have ISIN but existing record doesn't
+            if (stock.isin) {
+              db.prepare('UPDATE investments SET isin_code = ? WHERE id = ? AND isin_code IS NULL').run(stock.isin, investmentId);
+            }
           } else {
             const result = insertInvestment.run(
               displayName, portfolioId, tickerSymbol,
-              `Imported from ${broker} P&L statement`
+              `Imported from ${broker} P&L statement`,
+              stock.isin || null
             );
             investmentId = result.lastInsertRowid;
             investmentsCreated++;

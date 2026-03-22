@@ -35,7 +35,7 @@ module.exports = function (db) {
       )`;
     }
 
-    query += ' ORDER BY asset_type, name';
+    query += ' ORDER BY asset_type, COALESCE(display_name, name)';
     const investments = db.prepare(query).all(...params);
     res.json(investments);
   });
@@ -110,27 +110,28 @@ module.exports = function (db) {
       name, ticker_symbol, amfi_code, folio_number,
       account_number, interest_rate, currency, notes, is_active, portfolio_id,
       face_value, coupon_frequency, maturity_date,
+      display_name, isin_code,
     } = req.body;
-    db.prepare(`
-      UPDATE investments SET
-        name = COALESCE(?, name),
-        ticker_symbol = COALESCE(?, ticker_symbol),
-        amfi_code = COALESCE(?, amfi_code),
-        folio_number = COALESCE(?, folio_number),
-        account_number = COALESCE(?, account_number),
-        interest_rate = COALESCE(?, interest_rate),
-        currency = COALESCE(?, currency),
-        face_value = COALESCE(?, face_value),
-        coupon_frequency = COALESCE(?, coupon_frequency),
-        maturity_date = COALESCE(?, maturity_date),
-        notes = COALESCE(?, notes),
-        is_active = COALESCE(?, is_active),
-        portfolio_id = COALESCE(?, portfolio_id),
-        updated_at = datetime('now')
-      WHERE id = ?
-    `).run(name, ticker_symbol, amfi_code, folio_number,
-      account_number, interest_rate, currency, face_value,
-      coupon_frequency, maturity_date, notes, is_active, portfolio_id, req.params.id);
+
+    // Build dynamic SET clauses — COALESCE for legacy fields, direct set for new fields
+    const sets = [];
+    const params = [];
+
+    // Legacy fields: only update if provided (COALESCE pattern)
+    const coalesceFields = { name, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes, is_active, portfolio_id };
+    for (const [col, val] of Object.entries(coalesceFields)) {
+      sets.push(`${col} = COALESCE(?, ${col})`);
+      params.push(val !== undefined ? val : null);
+    }
+
+    // New fields: only update if explicitly present in body
+    if (display_name !== undefined) { sets.push('display_name = ?'); params.push(display_name || null); }
+    if (isin_code !== undefined) { sets.push('isin_code = ?'); params.push(isin_code || null); }
+
+    sets.push("updated_at = datetime('now')");
+    params.push(req.params.id);
+
+    db.prepare(`UPDATE investments SET ${sets.join(', ')} WHERE id = ?`).run(...params);
 
     const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(req.params.id);
     res.json(inv);

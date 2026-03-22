@@ -79,7 +79,7 @@ module.exports = function (db) {
   // ─── Get investment names that have transactions ──────────────────────
   router.get('/investment-names', (req, res) => {
     const { portfolio_id, asset_type } = req.query;
-    let sql = `SELECT DISTINCT i.name FROM investments i
+    let sql = `SELECT DISTINCT COALESCE(i.display_name, i.name) as name FROM investments i
        INNER JOIN transactions t ON t.investment_id = i.id WHERE 1=1`;
     const params = [];
     if (portfolio_id) {
@@ -90,7 +90,7 @@ module.exports = function (db) {
       sql += ` AND i.asset_type = ?`;
       params.push(asset_type);
     }
-    sql += ` ORDER BY i.name`;
+    sql += ` ORDER BY name`;
     const names = db.prepare(sql).all(...params).map(r => r.name);
     res.json(names);
   });
@@ -98,7 +98,7 @@ module.exports = function (db) {
   router.get('/', (req, res) => {
     const { from, to, type, portfolio_id, broker, investment_id, investment_name } = req.query;
     let query = `
-      SELECT t.*, i.name as investment_name, i.asset_type, i.portfolio_id,
+      SELECT t.*, COALESCE(i.display_name, i.name) as investment_name, i.asset_type, i.portfolio_id,
         t.broker as broker, p.name as portfolio_name
       FROM transactions t
       JOIN investments i ON t.investment_id = i.id
@@ -122,7 +122,7 @@ module.exports = function (db) {
     }
     if (broker) { query += ' AND t.broker = ?'; params.push(broker); }
     if (investment_id) { query += ' AND t.investment_id = ?'; params.push(investment_id); }
-    if (investment_name) { query += ' AND i.name = ?'; params.push(investment_name); }
+    if (investment_name) { query += ' AND COALESCE(i.display_name, i.name) = ?'; params.push(investment_name); }
     if (req.query.asset_type) { query += ' AND i.asset_type = ?'; params.push(req.query.asset_type); }
 
     query += ' ORDER BY t.transaction_date DESC LIMIT 500';

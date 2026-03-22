@@ -46,6 +46,8 @@ function initializeDb(db) {
       coupon_frequency TEXT,        -- MONTHLY, QUARTERLY, SEMI_ANNUAL, ANNUAL (for bonds)
       maturity_date TEXT,           -- Maturity date (for bonds)
       notes TEXT,
+      display_name TEXT,              -- User-friendly display name (overrides 'name' in UI)
+      isin_code TEXT,                -- ISIN for universal identification
       is_active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))

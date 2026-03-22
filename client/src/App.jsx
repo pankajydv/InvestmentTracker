@@ -10,6 +10,7 @@ import CASUpload from './components/CASUpload';
 import Performance from './components/Performance';
 import Transactions from './components/Transactions';
 import CorporateActions from './components/CorporateActions';
+import InvestmentSettings from './components/InvestmentSettings';
 
 export default function App() {
   return (
@@ -24,6 +25,7 @@ export default function App() {
               <Route path="/investments/add" element={<AddInvestment />} />
               <Route path="/investments/import-cas" element={<CASUpload />} />
               <Route path="/investments/:id" element={<InvestmentDetail />} />
+              <Route path="/investments/:id/settings" element={<InvestmentSettings />} />
               <Route path="/performance" element={<Performance />} />
               <Route path="/transactions" element={<Transactions />} />
               <Route path="/corporate-actions" element={<CorporateActions />} />

@@ -3,7 +3,7 @@ import { useParams, Link, useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge } from 'react-bootstrap';
 import { getInvestment, deleteInvestment, addTransaction, deleteTransaction } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS } from '../utils/formatters';
-import { ArrowLeft, Trash2, Plus, X } from 'lucide-react';
+import { ArrowLeft, Trash2, Plus, X, Settings } from 'lucide-react';
 
 export default function InvestmentDetail() {
   const { id } = useParams();
@@ -103,7 +103,7 @@ export default function InvestmentDetail() {
           <Link to="/investments" className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">
             <ArrowLeft size={16} /> Back to Investments
           </Link>
-          <h1 className="h4 fw-bold mb-1">{data.name}</h1>
+          <h1 className="h4 fw-bold mb-1">{data.display_name || data.name}</h1>
           <div className="d-flex align-items-center gap-2">
             <Badge bg="primary" className="bg-opacity-10 text-primary">{ASSET_TYPE_LABELS[data.asset_type]}</Badge>
             {data.portfolio_name && (
@@ -118,6 +118,9 @@ export default function InvestmentDetail() {
           <Button variant="primary" size="sm" onClick={() => setShowAddTxn(true)} className="d-flex align-items-center gap-1">
             <Plus size={16} /> Add Transaction
           </Button>
+          <Link to={`/investments/${id}/settings`} className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
+            <Settings size={16} /> Settings
+          </Link>
           <Button variant="outline-danger" size="sm" onClick={handleDelete} className="d-flex align-items-center gap-1">
             <Trash2 size={16} /> Delete
           </Button>
@@ -150,6 +153,7 @@ export default function InvestmentDetail() {
           <h2 className="h6 fw-semibold mb-3">Details</h2>
           <Row className="g-3 small">
             {data.ticker_symbol && <Col xs={6} md={3}><Detail label="Ticker" value={data.ticker_symbol} /></Col>}
+            {data.isin_code && <Col xs={6} md={3}><Detail label="ISIN" value={data.isin_code} /></Col>}
             {data.amfi_code && <Col xs={6} md={3}><Detail label="AMFI Code" value={data.amfi_code} /></Col>}
             {data.folio_number && <Col xs={6} md={3}><Detail label="Folio No." value={data.folio_number} /></Col>}
             {!isPPF && <Col xs={6} md={3}><Detail label="Total Units" value={formatNumber(data.totalUnits, 3)} /></Col>}

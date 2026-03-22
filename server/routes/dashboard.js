@@ -31,7 +31,8 @@ module.exports = function (db) {
     // Get individual investment summaries
     const investments = db.prepare(`
       SELECT
-        i.id, i.name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency, i.portfolio_id,
+        i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency, i.portfolio_id,
+        i.isin_code, i.display_name,
         dv.date, dv.price_per_unit, dv.total_units, dv.current_value,
         dv.invested_amount, dv.profit_loss, dv.profit_loss_pct,
         dv.day_change, dv.day_change_pct,
@@ -137,7 +138,7 @@ module.exports = function (db) {
       : [startDate, endDate];
 
     const investmentData = db.prepare(`
-      SELECT dv.*, i.name, i.asset_type
+      SELECT dv.*, COALESCE(i.display_name, i.name) as name, i.asset_type
       FROM daily_values dv
       JOIN investments i ON dv.investment_id = i.id
       WHERE dv.date BETWEEN ? AND ? AND i.is_active = 1${investmentFilter}
