@@ -16,7 +16,7 @@ const rows = db.prepare(`
     t.price_per_unit as Rate,
     t.amount as Amount,
     t.fees as Fees,
-    COALESCE(t.broker, i.broker) as Broker,
+    t.broker as Broker,
     i.face_value as Face_Value,
     i.coupon_frequency as Coupon_Freq,
     i.maturity_date as Maturity_Date,

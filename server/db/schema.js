@@ -42,7 +42,6 @@ function initializeDb(db) {
       account_number TEXT,         -- For PPF/PF accounts
       interest_rate REAL,          -- For PPF/PF (annual %)
       currency TEXT DEFAULT 'INR', -- INR or USD
-      broker TEXT,                 -- Broker/platform name (e.g., Sharekhan, Zerodha)
       face_value REAL,              -- Face/par value per unit (for bonds)
       coupon_frequency TEXT,        -- MONTHLY, QUARTERLY, SEMI_ANNUAL, ANNUAL (for bonds)
       maturity_date TEXT,           -- Maturity date (for bonds)
@@ -62,6 +61,7 @@ function initializeDb(db) {
       price_per_unit REAL,         -- Price at which transaction happened
       amount REAL NOT NULL,        -- Total amount of transaction
       fees REAL DEFAULT 0,         -- Brokerage, stamp duty, etc.
+      broker TEXT,                   -- Broker/platform name (e.g., Sharekhan, Groww)
       notes TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE

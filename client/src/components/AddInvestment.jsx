@@ -299,7 +299,6 @@ export default function AddInvestment() {
         face_value: parseFloat(bondForm.face_value) || 1000,
         coupon_frequency: bondForm.coupon_frequency,
         maturity_date: bondForm.maturity_date,
-        broker: bondForm.broker || null,
         currency: 'INR',
         notes: bondForm.notes || null,
         portfolio_id: portfolioId || null,
@@ -313,6 +312,7 @@ export default function AddInvestment() {
         price_per_unit: parseFloat(bondTxn.price_per_unit),
         amount: parseFloat(bondAmount),
         fees: parseFloat(bondTxn.fees) || 0,
+        broker: bondForm.broker || null,
         notes: bondTxn.notes || null,
       });
 

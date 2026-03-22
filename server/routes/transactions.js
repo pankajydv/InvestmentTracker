@@ -6,7 +6,7 @@ module.exports = function (db) {
   router.post('/', (req, res) => {
     const {
       investment_id, transaction_type, transaction_date,
-      units, price_per_unit, amount, fees, notes,
+      units, price_per_unit, amount, fees, notes, broker,
     } = req.body;
 
     if (!investment_id || !transaction_type || !transaction_date || !amount) {
@@ -17,10 +17,10 @@ module.exports = function (db) {
     if (!inv) return res.status(404).json({ error: 'Investment not found' });
 
     const result = db.prepare(`
-      INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(investment_id, transaction_type, transaction_date,
-      units || null, price_per_unit || null, amount, fees || 0, notes || null);
+      units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null);
 
     const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json(txn);
@@ -63,15 +63,15 @@ module.exports = function (db) {
   // ─── Get distinct brokers ─────────────────────────────────────────────
   router.get('/brokers', (req, res) => {
     const { asset_type } = req.query;
-    let sql = `SELECT DISTINCT i.broker FROM investments i
-       INNER JOIN transactions t ON t.investment_id = i.id
-       WHERE i.broker IS NOT NULL AND i.broker != ''`;
+    let sql = `SELECT DISTINCT t.broker FROM transactions t
+       INNER JOIN investments i ON t.investment_id = i.id
+       WHERE t.broker IS NOT NULL AND t.broker != ''`;
     const params = [];
     if (asset_type) {
       sql += ` AND i.asset_type = ?`;
       params.push(asset_type);
     }
-    sql += ` ORDER BY i.broker`;
+    sql += ` ORDER BY t.broker`;
     const brokers = db.prepare(sql).all(...params).map(r => r.broker);
     res.json(brokers);
   });
@@ -99,7 +99,7 @@ module.exports = function (db) {
     const { from, to, type, portfolio_id, broker, investment_id, investment_name } = req.query;
     let query = `
       SELECT t.*, i.name as investment_name, i.asset_type, i.portfolio_id,
-        i.broker as broker, p.name as portfolio_name
+        t.broker as broker, p.name as portfolio_name
       FROM transactions t
       JOIN investments i ON t.investment_id = i.id
       LEFT JOIN portfolios p ON i.portfolio_id = p.id
@@ -120,7 +120,7 @@ module.exports = function (db) {
         params.push(...types);
       }
     }
-    if (broker) { query += ' AND i.broker = ?'; params.push(broker); }
+    if (broker) { query += ' AND t.broker = ?'; params.push(broker); }
     if (investment_id) { query += ' AND t.investment_id = ?'; params.push(investment_id); }
     if (investment_name) { query += ' AND i.name = ?'; params.push(investment_name); }
     if (req.query.asset_type) { query += ' AND i.asset_type = ?'; params.push(req.query.asset_type); }
@@ -135,10 +135,10 @@ module.exports = function (db) {
     const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Transaction not found' });
 
-    const { transaction_date, units, price_per_unit, amount, fees, notes } = req.body;
+    const { transaction_date, units, price_per_unit, amount, fees, notes, broker } = req.body;
     db.prepare(`
       UPDATE transactions
-      SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?
+      SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?, broker = ?
       WHERE id = ?
     `).run(
       transaction_date || existing.transaction_date,
@@ -147,6 +147,7 @@ module.exports = function (db) {
       amount ?? existing.amount,
       fees ?? existing.fees,
       notes !== undefined ? notes : existing.notes,
+      broker !== undefined ? broker : existing.broker,
       req.params.id
     );
 

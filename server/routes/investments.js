@@ -84,7 +84,7 @@ module.exports = function (db) {
     const {
       name, asset_type, ticker_symbol, amfi_code, folio_number,
       account_number, interest_rate, currency, notes, portfolio_id,
-      broker, face_value, coupon_frequency, maturity_date,
+      face_value, coupon_frequency, maturity_date,
     } = req.body;
 
     if (!name || !asset_type) {
@@ -92,11 +92,11 @@ module.exports = function (db) {
     }
 
     const result = db.prepare(`
-      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, broker, face_value, coupon_frequency, maturity_date, notes, portfolio_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes, portfolio_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(name, asset_type, ticker_symbol || null, amfi_code || null,
       folio_number || null, account_number || null, interest_rate || null,
-      currency || 'INR', broker || null, face_value || null,
+      currency || 'INR', face_value || null,
       coupon_frequency || null, maturity_date || null,
       notes || null, portfolio_id || null);
 
@@ -109,7 +109,7 @@ module.exports = function (db) {
     const {
       name, ticker_symbol, amfi_code, folio_number,
       account_number, interest_rate, currency, notes, is_active, portfolio_id,
-      broker, face_value, coupon_frequency, maturity_date,
+      face_value, coupon_frequency, maturity_date,
     } = req.body;
     db.prepare(`
       UPDATE investments SET
@@ -120,7 +120,6 @@ module.exports = function (db) {
         account_number = COALESCE(?, account_number),
         interest_rate = COALESCE(?, interest_rate),
         currency = COALESCE(?, currency),
-        broker = COALESCE(?, broker),
         face_value = COALESCE(?, face_value),
         coupon_frequency = COALESCE(?, coupon_frequency),
         maturity_date = COALESCE(?, maturity_date),
@@ -130,7 +129,7 @@ module.exports = function (db) {
         updated_at = datetime('now')
       WHERE id = ?
     `).run(name, ticker_symbol, amfi_code, folio_number,
-      account_number, interest_rate, currency, broker, face_value,
+      account_number, interest_rate, currency, face_value,
       coupon_frequency, maturity_date, notes, is_active, portfolio_id, req.params.id);
 
     const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(req.params.id);
