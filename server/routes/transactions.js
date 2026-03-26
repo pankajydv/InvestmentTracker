@@ -6,7 +6,7 @@ module.exports = function (db) {
   router.post('/', (req, res) => {
     const {
       investment_id, transaction_type, transaction_date,
-      units, price_per_unit, amount, fees, notes, broker,
+      units, price_per_unit, amount, fees, notes, broker, portfolio_id,
     } = req.body;
 
     if (!investment_id || !transaction_type || !transaction_date || !amount) {
@@ -17,9 +17,9 @@ module.exports = function (db) {
     if (!inv) return res.status(404).json({ error: 'Investment not found' });
 
     const result = db.prepare(`
-      INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(investment_id, transaction_type, transaction_date,
+      INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(investment_id, portfolio_id || null, transaction_type, transaction_date,
       units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null);
 
     const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
@@ -83,7 +83,7 @@ module.exports = function (db) {
        INNER JOIN transactions t ON t.investment_id = i.id WHERE 1=1`;
     const params = [];
     if (portfolio_id) {
-      sql += ` AND i.portfolio_id = ?`;
+      sql += ` AND t.portfolio_id = ?`;
       params.push(portfolio_id);
     }
     if (asset_type) {
@@ -98,16 +98,16 @@ module.exports = function (db) {
   router.get('/', (req, res) => {
     const { from, to, type, portfolio_id, broker, investment_id, investment_name } = req.query;
     let query = `
-      SELECT t.*, COALESCE(i.display_name, i.name) as investment_name, i.asset_type, i.portfolio_id,
+      SELECT t.*, COALESCE(i.display_name, i.name) as investment_name, i.asset_type,
         t.broker as broker, p.name as portfolio_name
       FROM transactions t
       JOIN investments i ON t.investment_id = i.id
-      LEFT JOIN portfolios p ON i.portfolio_id = p.id
+      LEFT JOIN portfolios p ON t.portfolio_id = p.id
       WHERE 1=1
     `;
     const params = [];
 
-    if (portfolio_id) { query += ' AND i.portfolio_id = ?'; params.push(portfolio_id); }
+    if (portfolio_id) { query += ' AND t.portfolio_id = ?'; params.push(portfolio_id); }
     if (from) { query += ' AND t.transaction_date >= ?'; params.push(from); }
     if (to) { query += ' AND t.transaction_date <= ?'; params.push(to); }
     if (type) {

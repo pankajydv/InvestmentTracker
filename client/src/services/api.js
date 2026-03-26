@@ -147,9 +147,21 @@ export const uploadPnLStatement = async (file, broker, portfolioId) => {
   return res.json();
 };
 
-// AMC / Maintenance Charges
+// AMC / Maintenance Charges (now stored as portfolio expenses)
 export const addAmcCharge = (data) =>
-  fetchJSON('/stocks/amc-charge', { method: 'POST', body: JSON.stringify(data) });
+  fetchJSON('/expenses', { method: 'POST', body: JSON.stringify(data) });
+
+// Portfolio Expenses
+export const getExpenses = (params = {}) => {
+  const qs = new URLSearchParams(params);
+  return fetchJSON(`/expenses?${qs}`);
+};
+export const getExpensesSummary = (portfolioId) => {
+  const params = portfolioId ? `?portfolio_id=${portfolioId}` : '';
+  return fetchJSON(`/expenses/summary${params}`);
+};
+export const deleteExpense = (id) =>
+  fetchJSON(`/expenses/${id}`, { method: 'DELETE' });
 
 // Corporate Actions
 export const previewCorporateActions = (portfolioId, year) =>

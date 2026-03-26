@@ -59,7 +59,7 @@ export default function AddInvestment() {
   const [pnlResult, setPnlResult] = useState(null);
 
   // AMC charges state
-  const [amcForm, setAmcForm] = useState({ date: new Date().toISOString().split('T')[0], amount: '', broker: 'Sharekhan', notes: '' });
+  const [amcForm, setAmcForm] = useState({ date: new Date().toISOString().split('T')[0], amount: '', broker: 'Sharekhan', notes: '', expense_type: 'AMC' });
   const [amcSubmitting, setAmcSubmitting] = useState(false);
   const [amcResult, setAmcResult] = useState(null);
 
@@ -230,13 +230,13 @@ export default function AddInvestment() {
         interest_rate: form.interest_rate ? parseFloat(form.interest_rate) : null,
         currency: form.currency,
         notes: form.notes || null,
-        portfolio_id: portfolioId || null,
       });
 
       if (txn.amount && parseFloat(txn.amount) > 0) {
         const isPPF = assetType === 'PPF' || assetType === 'PF';
         await addTransaction({
           investment_id: inv.id,
+          portfolio_id: portfolioId || null,
           transaction_type: isPPF ? 'DEPOSIT' : txn.transaction_type,
           transaction_date: txn.transaction_date,
           units: txn.units ? parseFloat(txn.units) : null,
@@ -301,11 +301,11 @@ export default function AddInvestment() {
         maturity_date: bondForm.maturity_date,
         currency: 'INR',
         notes: bondForm.notes || null,
-        portfolio_id: portfolioId || null,
       });
 
       await addTransaction({
         investment_id: inv.id,
+        portfolio_id: portfolioId || null,
         transaction_type: bondTxn.transaction_type,
         transaction_date: bondTxn.transaction_date,
         units: parseFloat(bondTxn.units),
@@ -330,9 +330,9 @@ export default function AddInvestment() {
     if (!amcForm.amount || parseFloat(amcForm.amount) <= 0) return setError('Please enter a valid amount');
     setAmcSubmitting(true);
     try {
-      await addAmcCharge({ portfolio_id: portfolioId, date: amcForm.date, amount: parseFloat(amcForm.amount), broker: amcForm.broker, notes: amcForm.notes });
+      await addAmcCharge({ portfolio_id: portfolioId, expense_type: amcForm.expense_type, expense_date: amcForm.date, amount: parseFloat(amcForm.amount), broker: amcForm.broker, notes: amcForm.notes });
       setAmcResult(`₹${Math.abs(parseFloat(amcForm.amount)).toLocaleString('en-IN')} recorded.`);
-      setAmcForm({ date: new Date().toISOString().split('T')[0], amount: '', broker: amcForm.broker, notes: '' });
+      setAmcForm({ date: new Date().toISOString().split('T')[0], amount: '', broker: amcForm.broker, notes: '', expense_type: amcForm.expense_type });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -807,7 +807,7 @@ export default function AddInvestment() {
             </Collapse>
           </Card>
 
-          {/* AMC / Maintenance Charges */}
+          {/* Account Expenses / Charges */}
           <Card className="shadow-sm">
             <Card.Header
               className="d-flex align-items-center gap-2 bg-white py-2 px-3"
@@ -815,7 +815,7 @@ export default function AddInvestment() {
               onClick={() => toggleSection('amc')}
             >
               <Wallet size={20} className="text-warning" />
-              <span className="h6 fw-semibold mb-0 flex-grow-1">AMC / Maintenance Charges</span>
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Account Expenses / Charges</span>
               <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
                 style={{ transition: 'transform 0.2s', transform: expandedSection === 'amc' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -825,10 +825,24 @@ export default function AddInvestment() {
               <div>
                 <Card.Body className="pt-2">
               <p className="small text-muted mb-3">
-                Record demat account AMC / maintenance charges.
+                Record demat account AMC, platform fees, CDSL charges, and other account-level expenses.
               </p>
 
               <Row className="g-3 align-items-end">
+                <Col md={3}>
+                  <Form.Label className="small">Type</Form.Label>
+                  <Form.Select
+                    size="sm"
+                    value={amcForm.expense_type}
+                    onChange={(e) => setAmcForm({ ...amcForm, expense_type: e.target.value })}
+                  >
+                    <option value="AMC">AMC</option>
+                    <option value="PLATFORM_FEE">Platform Fee</option>
+                    <option value="CDSL">CDSL Charges</option>
+                    <option value="ACCOUNT_OPENING">Account Opening</option>
+                    <option value="OTHER">Other</option>
+                  </Form.Select>
+                </Col>
                 <Col md={3}>
                   <Form.Label className="small">Broker</Form.Label>
                   <Form.Select
@@ -841,7 +855,7 @@ export default function AddInvestment() {
                     ))}
                   </Form.Select>
                 </Col>
-                <Col md={3}>
+                <Col md={2}>
                   <Form.Label className="small">Date</Form.Label>
                   <Form.Control
                     size="sm"
@@ -850,7 +864,7 @@ export default function AddInvestment() {
                     onChange={(e) => setAmcForm({ ...amcForm, date: e.target.value })}
                   />
                 </Col>
-                <Col md={3}>
+                <Col md={2}>
                   <Form.Label className="small">Amount (₹)</Form.Label>
                   <Form.Control
                     size="sm"
@@ -861,7 +875,7 @@ export default function AddInvestment() {
                     placeholder="e.g., 300"
                   />
                 </Col>
-                <Col md={3}>
+                <Col md={2}>
                   <Form.Label className="small">Notes</Form.Label>
                   <Form.Control
                     size="sm"

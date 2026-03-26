@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert } from 'react-bootstrap';
 import { getDashboardSummary } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, Receipt } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 export default function Dashboard() {
@@ -33,7 +33,8 @@ export default function Dashboard() {
   if (error) return <ErrorMessage message={error} />;
   if (!data) return null;
 
-  const { portfolio, investments, byType, lastUpdate, portfolioCount } = data;
+  const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses } = data;
+  const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
 
   return (
     <div>
@@ -94,6 +95,20 @@ export default function Dashboard() {
               <div className={`small mt-1 ${profitColor(portfolio.total_profit_loss_pct)}`}>
                 {formatPct(portfolio.total_profit_loss_pct)}
               </div>
+              {totalExpenses > 0 && (
+                <div className="mt-2 pt-2 border-top">
+                  <div className="d-flex justify-content-between small text-muted">
+                    <span><Receipt size={12} className="me-1" />Account Charges</span>
+                    <span className="text-danger">-{formatINR(totalExpenses)}</span>
+                  </div>
+                  <div className="d-flex justify-content-between small fw-semibold mt-1">
+                    <span>Net Returns</span>
+                    <span className={profitColor(netProfitLoss)}>
+                      {netProfitLoss >= 0 ? '+' : ''}{formatINR(netProfitLoss)}
+                    </span>
+                  </div>
+                </div>
+              )}
             </Card.Body>
           </Card>
         </Col>
@@ -155,14 +170,6 @@ export default function Dashboard() {
                       </Link>
                       <div className="d-flex align-items-center gap-2 mt-1">
                         {inv.amfi_code && <span className="text-muted" style={{ fontSize: '0.7rem' }}>{inv.amfi_code}</span>}
-                        {!selectedId && inv.portfolio_name && (
-                          <span
-                            className="badge rounded-pill"
-                            style={{ backgroundColor: inv.portfolio_color + '20', color: inv.portfolio_color, fontSize: '0.65rem' }}
-                          >
-                            {inv.portfolio_name}
-                          </span>
-                        )}
                       </div>
                     </td>
                     <td className="px-3 text-end">

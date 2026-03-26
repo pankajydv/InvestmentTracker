@@ -23,6 +23,7 @@ app.use('/api/dashboard', require('./routes/dashboard')(db));
 app.use('/api/utils', require('./routes/utils')(db));
 app.use('/api/cas', require('./routes/cas')(db));
 app.use('/api/stocks', require('./routes/stocks')(db));
+app.use('/api/expenses', require('./routes/expenses')(db));
 
 // Serve static files in production
 if (process.env.NODE_ENV === 'production') {

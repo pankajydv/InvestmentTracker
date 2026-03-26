@@ -20,30 +20,29 @@ module.exports = function (db) {
     }
 
     // Build WHERE clause for portfolio filter
-    const portfolioFilter = portfolio_id ? ' AND i.portfolio_id = ?' : '';
+    const portfolioFilter = portfolio_id ? ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)' : '';
     const portfolioParams = portfolio_id ? [portfolio_id] : [];
 
     // Build hide-sold filter
     const soldFilter = hide_sold === 'true'
-      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(units,0) WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(units,0) ELSE 0 END) FROM transactions WHERE investment_id = i.id),0) > 0)`
+      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(t2.units,0) WHEN t2.transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t2.units,0) ELSE 0 END) FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}),0) > 0)`
       : '';
+    const soldParams = (hide_sold === 'true' && portfolio_id) ? [portfolio_id] : [];
 
     // Get individual investment summaries
     const investments = db.prepare(`
       SELECT
-        i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency, i.portfolio_id,
+        i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency,
         i.isin_code, i.display_name,
         dv.date, dv.price_per_unit, dv.total_units, dv.current_value,
         dv.invested_amount, dv.profit_loss, dv.profit_loss_pct,
-        dv.day_change, dv.day_change_pct,
-        p.name as portfolio_name, p.color as portfolio_color
+        dv.day_change, dv.day_change_pct
       FROM investments i
       LEFT JOIN daily_values dv ON i.id = dv.investment_id
         AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id)
-      LEFT JOIN portfolios p ON i.portfolio_id = p.id
       WHERE i.is_active = 1${portfolioFilter}${soldFilter}
       ORDER BY i.asset_type, i.name
-    `).all(...portfolioParams);
+    `).all(...portfolioParams, ...soldParams);
 
     // Group by asset type
     const byType = {};
@@ -73,6 +72,13 @@ module.exports = function (db) {
     // Get portfolio count info
     const portfolioCount = db.prepare('SELECT COUNT(*) as count FROM portfolios').get().count;
 
+    // Get expense totals
+    const expenseFilter = portfolio_id ? ' WHERE portfolio_id = ?' : '';
+    const expenseParams = portfolio_id ? [portfolio_id] : [];
+    const expenseTotals = db.prepare(
+      `SELECT COALESCE(SUM(amount), 0) as total_expenses FROM portfolio_expenses${expenseFilter}`
+    ).get(...expenseParams);
+
     res.json({
       portfolio: latest || {
         total_value: 0,
@@ -85,6 +91,7 @@ module.exports = function (db) {
       investments,
       byType,
       portfolioCount,
+      totalExpenses: expenseTotals.total_expenses,
       lastUpdate: db.prepare("SELECT value FROM config WHERE key = 'last_price_update'").get()?.value,
     });
   });
@@ -132,7 +139,7 @@ module.exports = function (db) {
     }
 
     // Per-investment performance
-    const investmentFilter = portfolio_id ? ' AND i.portfolio_id = ?' : '';
+    const investmentFilter = portfolio_id ? ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)' : '';
     const investmentParams = portfolio_id
       ? [startDate, endDate, portfolio_id]
       : [startDate, endDate];
@@ -198,7 +205,7 @@ module.exports = function (db) {
   // ─── Asset allocation breakdown ───────────────────────────────────────
   router.get('/allocation', (req, res) => {
     const { portfolio_id } = req.query;
-    const portfolioFilter = portfolio_id ? ' AND i.portfolio_id = ?' : '';
+    const portfolioFilter = portfolio_id ? ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)' : '';
     const params = portfolio_id ? [portfolio_id] : [];
 
     const allocation = db.prepare(`

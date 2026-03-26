@@ -48,7 +48,7 @@ async function updateAllPrices(db) {
 
   const getInvestedAmount = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'AMC')
+    FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS')
   `);
 
   const getSaleProceeds = db.prepare(`
@@ -213,9 +213,11 @@ function updatePortfolioDaily(db, date) {
       day_change_pct = excluded.day_change_pct
   `);
 
-  // Get all distinct portfolio_ids (including NULL for unassigned)
+  // Get all distinct portfolio_ids from transactions (including NULL for unassigned)
   const portfolioIds = db.prepare(`
-    SELECT DISTINCT portfolio_id FROM investments WHERE is_active = 1
+    SELECT DISTINCT t.portfolio_id FROM transactions t
+    JOIN investments i ON t.investment_id = i.id
+    WHERE i.is_active = 1
   `).all().map(r => r.portfolio_id);
 
   // Always include combined (null) snapshot
@@ -236,7 +238,7 @@ function updatePortfolioDaily(db, date) {
         WHERE dv.date = ? AND i.is_active = 1
       `).get(date);
     } else {
-      // Per-portfolio
+      // Per-portfolio: only investments that have transactions in this portfolio
       totals = db.prepare(`
         SELECT
           COALESCE(SUM(dv.current_value), 0) as total_value,
@@ -245,7 +247,8 @@ function updatePortfolioDaily(db, date) {
           COALESCE(SUM(dv.day_change), 0) as day_change
         FROM daily_values dv
         JOIN investments i ON dv.investment_id = i.id
-        WHERE dv.date = ? AND i.is_active = 1 AND i.portfolio_id = ?
+        WHERE dv.date = ? AND i.is_active = 1
+          AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)
       `).get(date, pid);
     }
 

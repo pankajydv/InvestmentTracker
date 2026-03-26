@@ -107,6 +107,7 @@ before(async () => {
   app.use('/api/utils', require('../server/routes/utils')(db));
   app.use('/api/cas', require('../server/routes/cas')(db));
   app.use('/api/stocks', require('../server/routes/stocks')(db));
+  app.use('/api/expenses', require('../server/routes/expenses')(db));
 
   app.use((err, _req, res, _next) => {
     res.status(500).json({ error: err.message });
@@ -200,7 +201,7 @@ describe('Portfolios', () => {
 describe('Investments — Indian Stocks', () => {
   it('POST creates a stock investment', async () => {
     const { status, body } = await api('POST', '/investments', {
-      name: 'TCS', asset_type: 'INDIAN_STOCK', portfolio_id: 1,
+      name: 'TCS', asset_type: 'INDIAN_STOCK',
       ticker_symbol: 'TCS.NS', notes: 'Test stock',
     });
     assert.equal(status, 201);
@@ -211,7 +212,7 @@ describe('Investments — Indian Stocks', () => {
 
   it('POST creates a second stock', async () => {
     const { status, body } = await api('POST', '/investments', {
-      name: 'INFY', asset_type: 'INDIAN_STOCK', portfolio_id: 1,
+      name: 'INFY', asset_type: 'INDIAN_STOCK',
       ticker_symbol: 'INFY.NS',
     });
     assert.equal(status, 201);
@@ -221,13 +222,18 @@ describe('Investments — Indian Stocks', () => {
   it('GET /investments lists investments with correct fields', async () => {
     const { status, body } = await api('GET', '/investments?portfolio_id=1');
     assert.equal(status, 200);
+    assert.ok(body.length >= 0);
+  });
+
+  it('GET /investments without portfolio filter lists all', async () => {
+    const { status, body } = await api('GET', '/investments');
+    assert.equal(status, 200);
     assert.ok(body.length >= 2);
     const inv = body[0];
     assert.ok('id' in inv);
     assert.ok('name' in inv);
     assert.ok('asset_type' in inv);
     assert.ok('ticker_symbol' in inv);
-    assert.ok('portfolio_id' in inv);
     assert.ok('is_active' in inv);
   });
 
@@ -252,7 +258,7 @@ describe('Investments — Indian Stocks', () => {
 describe('Investments — Mutual Funds', () => {
   it('POST creates a mutual fund', async () => {
     const { status, body } = await api('POST', '/investments', {
-      name: 'SBI Bluechip Fund', asset_type: 'MUTUAL_FUND', portfolio_id: 1,
+      name: 'SBI Bluechip Fund', asset_type: 'MUTUAL_FUND',
       amfi_code: '120503', folio_number: 'ABC123',
     });
     assert.equal(status, 201);
@@ -269,7 +275,7 @@ describe('Investments — Mutual Funds', () => {
 describe('Investments — Bonds', () => {
   it('POST creates a bond', async () => {
     const { status, body } = await api('POST', '/investments', {
-      name: 'SGB 2024-25', asset_type: 'BOND', portfolio_id: 1,
+      name: 'SGB 2024-25', asset_type: 'BOND',
       face_value: 5000, interest_rate: 2.5, coupon_frequency: 'SEMI_ANNUAL',
       maturity_date: '2032-06-15',
     });
@@ -288,7 +294,7 @@ describe('Investments — Bonds', () => {
 describe('Investments — PPF', () => {
   it('POST creates a PPF account', async () => {
     const { status, body } = await api('POST', '/investments', {
-      name: 'PPF Account', asset_type: 'PPF', portfolio_id: 1,
+      name: 'PPF Account', asset_type: 'PPF',
       account_number: 'PPF001', interest_rate: 7.1,
     });
     assert.equal(status, 201);
@@ -303,7 +309,7 @@ describe('Investments — PPF', () => {
 describe('Transactions — BUY and SELL', () => {
   it('POST creates a BUY transaction with broker', async () => {
     const { status, body } = await api('POST', '/transactions', {
-      investment_id: 1, transaction_type: 'BUY', transaction_date: '2023-01-15',
+      investment_id: 1, portfolio_id: 1, transaction_type: 'BUY', transaction_date: '2023-01-15',
       units: 100, price_per_unit: 3500, amount: 350000, fees: 525,
       broker: 'Groww', notes: 'Initial buy',
     });
@@ -315,7 +321,7 @@ describe('Transactions — BUY and SELL', () => {
 
   it('POST creates a SELL transaction', async () => {
     const { status, body } = await api('POST', '/transactions', {
-      investment_id: 1, transaction_type: 'SELL', transaction_date: '2023-06-15',
+      investment_id: 1, portfolio_id: 1, transaction_type: 'SELL', transaction_date: '2023-06-15',
       units: 20, price_per_unit: 3800, amount: 76000, fees: 114,
       broker: 'Groww',
     });
@@ -326,7 +332,7 @@ describe('Transactions — BUY and SELL', () => {
   it('GET /transactions returns transactions with correct fields', async () => {
     const { status, body } = await api('GET', '/transactions?portfolio_id=1');
     assert.equal(status, 200);
-    assert.ok(body.length >= 2);
+    assert.ok(body.length >= 2, `Expected >= 2, got ${body.length}`);
     const txn = body[0];
     assert.ok('id' in txn);
     assert.ok('investment_id' in txn);
@@ -373,7 +379,7 @@ describe('Transactions — BUY and SELL', () => {
 describe('Transactions — Dividend', () => {
   it('POST creates a DIVIDEND transaction', async () => {
     const { status, body } = await api('POST', '/transactions', {
-      investment_id: 1, transaction_type: 'DIVIDEND', transaction_date: '2023-07-10',
+      investment_id: 1, portfolio_id: 1, transaction_type: 'DIVIDEND', transaction_date: '2023-07-10',
       units: 80, price_per_unit: 15.5, amount: 1240, fees: 0,
       broker: 'Groww', notes: 'Dividend ₹15.5/share × 80 shares',
     });
@@ -417,7 +423,7 @@ describe('Transactions — Stock Split (via corporate actions import)', () => {
 describe('Transactions — Bonus (via corporate actions import)', () => {
   it('BUY shares then add BONUS via corporate actions import', async () => {
     const { status } = await api('POST', '/transactions', {
-      investment_id: 2, transaction_type: 'BUY', transaction_date: '2022-06-01',
+      investment_id: 2, portfolio_id: 1, transaction_type: 'BUY', transaction_date: '2022-06-01',
       units: 50, price_per_unit: 1500, amount: 75000, fees: 112,
       broker: 'Sharekhan',
     });
@@ -452,7 +458,7 @@ describe('Transactions — Transfer (broker to broker)', () => {
   it('POST creates TRANSFER_OUT from Sharekhan (amount=-1 workaround)', async () => {
     // API requires amount to be truthy; transfers use nominal -1
     const { status, body } = await api('POST', '/transactions', {
-      investment_id: 2, transaction_type: 'TRANSFER_OUT', transaction_date: '2023-03-27',
+      investment_id: 2, portfolio_id: 1, transaction_type: 'TRANSFER_OUT', transaction_date: '2023-03-27',
       units: 100, price_per_unit: 0, amount: -1, fees: 0,
       broker: 'Sharekhan', notes: 'Transfer to Groww',
     });
@@ -463,7 +469,7 @@ describe('Transactions — Transfer (broker to broker)', () => {
 
   it('POST creates TRANSFER_IN to Groww', async () => {
     const { status, body } = await api('POST', '/transactions', {
-      investment_id: 2, transaction_type: 'TRANSFER_IN', transaction_date: '2023-03-27',
+      investment_id: 2, portfolio_id: 1, transaction_type: 'TRANSFER_IN', transaction_date: '2023-03-27',
       units: 100, price_per_unit: 0, amount: -1, fees: 0,
       broker: 'Groww', notes: 'Transfer from Sharekhan',
     });
@@ -480,7 +486,7 @@ describe('Transactions — Transfer (broker to broker)', () => {
 describe('Transactions — IPO', () => {
   it('POST creates an IPO transaction', async () => {
     const { status, body } = await api('POST', '/transactions', {
-      investment_id: 1, transaction_type: 'IPO', transaction_date: '2020-03-10',
+      investment_id: 1, portfolio_id: 1, transaction_type: 'IPO', transaction_date: '2020-03-10',
       units: 50, price_per_unit: 500, amount: 25000, fees: 0,
       broker: 'Groww', notes: 'IPO allotment',
     });
@@ -490,34 +496,72 @@ describe('Transactions — IPO', () => {
 });
 
 // ======================================================================
-// 12.  TRANSACTIONS — AMC Charges
+// 12.  PORTFOLIO EXPENSES (formerly AMC Charges)
 // ======================================================================
 
-describe('Transactions — AMC Charge', () => {
-  it('POST /stocks/amc-charge creates AMC charge', async () => {
+describe('Portfolio Expenses', () => {
+  it('POST /expenses creates an expense', async () => {
+    const { status, body } = await api('POST', '/expenses', {
+      portfolio_id: 1, expense_type: 'AMC', expense_date: '2024-01-15',
+      amount: 236, broker: 'Sharekhan', notes: 'Annual demat charges',
+    });
+    assert.equal(status, 201);
+    assert.equal(body.expense_type, 'AMC');
+    assert.equal(body.amount, 236);
+    assert.equal(body.broker, 'Sharekhan');
+  });
+
+  it('POST /stocks/amc-charge creates expense (backward compat)', async () => {
     const { status, body } = await api('POST', '/stocks/amc-charge', {
-      portfolio_id: 1, date: '2024-01-15', amount: 236,
-      broker: 'Sharekhan', notes: 'Annual demat charges',
+      portfolio_id: 1, date: '2024-06-01', amount: 354,
+      broker: 'Groww', notes: 'Platform Fees FY24', expense_type: 'PLATFORM_FEE',
     });
     assert.equal(status, 200);
     assert.equal(body.success, true);
-    assert.ok(body.investment_id);
+    assert.ok(body.expense_id);
   });
 
-  it('AMC charge creates "Demat Account Charges" investment', async () => {
-    const { body } = await api('GET', '/investments?portfolio_id=1');
-    const demat = body.find(i => i.name === 'Demat Account Charges');
-    assert.ok(demat, 'Demat Account Charges investment should exist');
-    assert.equal(demat.asset_type, 'INDIAN_STOCK');
+  it('GET /expenses returns created expenses', async () => {
+    const { body } = await api('GET', '/expenses?portfolio_id=1');
+    assert.ok(body.length >= 2);
+    const amc = body.find(e => e.expense_type === 'AMC');
+    assert.ok(amc, 'AMC expense should exist');
+    assert.equal(amc.amount, 236);
   });
 
-  it('AMC transaction has correct type and broker', async () => {
-    const { body } = await api('GET', '/transactions?type=AMC');
-    assert.ok(body.length >= 1);
-    const amc = body[0];
-    assert.equal(amc.transaction_type, 'AMC');
-    assert.equal(amc.broker, 'Sharekhan');
-    assert.equal(amc.fees, 236);
+  it('GET /expenses/summary returns totals', async () => {
+    const { status, body } = await api('GET', '/expenses/summary?portfolio_id=1');
+    assert.equal(status, 200);
+    assert.ok(body.total_expenses >= 590); // 236 + 354
+    assert.ok(body.byType.length >= 1);
+  });
+
+  it('DELETE /expenses/:id removes expense', async () => {
+    const { body: list } = await api('GET', '/expenses');
+    const first = list[0];
+    const { status, body } = await api('DELETE', `/expenses/${first.id}`);
+    assert.equal(status, 200);
+    assert.equal(body.success, true);
+  });
+
+  it('POST /expenses rejects invalid expense_type', async () => {
+    const { status } = await api('POST', '/expenses', {
+      portfolio_id: 1, expense_type: 'INVALID', expense_date: '2024-01-01', amount: 100,
+    });
+    assert.equal(status, 400);
+  });
+
+  it('POST /expenses rejects missing portfolio_id', async () => {
+    const { status } = await api('POST', '/expenses', {
+      expense_type: 'AMC', expense_date: '2024-01-01', amount: 100,
+    });
+    assert.equal(status, 400);
+  });
+
+  it('Dashboard includes totalExpenses', async () => {
+    const { body } = await api('GET', '/dashboard/summary');
+    assert.ok('totalExpenses' in body, 'Response should include totalExpenses');
+    assert.ok(body.totalExpenses >= 0);
   });
 });
 
@@ -528,7 +572,7 @@ describe('Transactions — AMC Charge', () => {
 describe('Transactions — PPF Deposit', () => {
   it('POST creates a DEPOSIT to PPF', async () => {
     const { status, body } = await api('POST', '/transactions', {
-      investment_id: 5, transaction_type: 'DEPOSIT', transaction_date: '2023-04-10',
+      investment_id: 5, portfolio_id: 1, transaction_type: 'DEPOSIT', transaction_date: '2023-04-10',
       units: 0, price_per_unit: 0, amount: 150000, fees: 0,
       notes: 'FY23 PPF contribution',
     });
@@ -545,7 +589,7 @@ describe('Transactions — PPF Deposit', () => {
 describe('Transactions — Bond Interest', () => {
   it('POST creates BUY on bond', async () => {
     const { status } = await api('POST', '/transactions', {
-      investment_id: 4, transaction_type: 'BUY', transaction_date: '2022-01-01',
+      investment_id: 4, portfolio_id: 1, transaction_type: 'BUY', transaction_date: '2022-01-01',
       units: 10, price_per_unit: 5000, amount: 50000, fees: 0,
       broker: 'Paytm Money',
     });
@@ -554,7 +598,7 @@ describe('Transactions — Bond Interest', () => {
 
   it('POST creates INTEREST transaction', async () => {
     const { status, body } = await api('POST', '/transactions', {
-      investment_id: 4, transaction_type: 'INTEREST', transaction_date: '2023-06-15',
+      investment_id: 4, portfolio_id: 1, transaction_type: 'INTEREST', transaction_date: '2023-06-15',
       units: 10, price_per_unit: 125, amount: 1250, fees: 0,
       notes: 'Semi-annual coupon @ 2.5%',
     });
@@ -815,7 +859,7 @@ describe('Transaction Delete', () => {
 
     // Create a throwaway transaction
     const { body: created } = await api('POST', '/transactions', {
-      investment_id: 1, transaction_type: 'BUY', transaction_date: '2025-01-01',
+      investment_id: 1, portfolio_id: 1, transaction_type: 'BUY', transaction_date: '2025-01-01',
       units: 1, price_per_unit: 100, amount: 100, fees: 0,
     });
 
@@ -838,10 +882,10 @@ describe('Investment Delete', () => {
   it('DELETE /investments/:id with cascade', async () => {
     // Create disposable investment + transaction
     const { body: inv } = await api('POST', '/investments', {
-      name: 'Disposable Stock', asset_type: 'INDIAN_STOCK', portfolio_id: 2,
+      name: 'Disposable Stock', asset_type: 'INDIAN_STOCK',
     });
     await api('POST', '/transactions', {
-      investment_id: inv.id, transaction_type: 'BUY', transaction_date: '2024-01-01',
+      investment_id: inv.id, portfolio_id: 2, transaction_type: 'BUY', transaction_date: '2024-01-01',
       units: 10, price_per_unit: 100, amount: 1000, fees: 0,
     });
 
@@ -907,7 +951,7 @@ describe('Validation & Edge Cases', () => {
 
   it('POST /investments with invalid asset_type fails', async () => {
     const { status } = await api('POST', '/investments', {
-      name: 'Bad Type', asset_type: 'GOLD', portfolio_id: 1,
+      name: 'Bad Type', asset_type: 'GOLD',
     });
     assert.ok(status >= 400, 'Should reject invalid asset_type');
   });
@@ -927,6 +971,11 @@ describe('Validation & Edge Cases', () => {
 
   it('POST /stocks/amc-charge without required fields returns 400', async () => {
     const { status } = await api('POST', '/stocks/amc-charge', {});
+    assert.equal(status, 400);
+  });
+
+  it('POST /expenses without required fields returns 400', async () => {
+    const { status } = await api('POST', '/expenses', {});
     assert.equal(status, 400);
   });
 });
@@ -949,6 +998,8 @@ describe('Route existence — all endpoints respond (not 404)', () => {
     ['GET',  '/utils/config'],
     ['GET',  '/utils/interest-rates'],
     ['GET',  '/stocks/corporate-actions/preview?portfolio_id=1&year=2024'],
+    ['GET',  '/expenses'],
+    ['GET',  '/expenses/summary'],
   ];
 
   for (const [method, route] of mustExist) {

@@ -4,10 +4,12 @@ import { Card, Row, Col, Table, Button, Form, Spinner, Badge } from 'react-boots
 import { getInvestment, deleteInvestment, addTransaction, deleteTransaction } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Trash2, Plus, X, Settings } from 'lucide-react';
+import { usePortfolio } from '../context/PortfolioContext';
 
 export default function InvestmentDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { selectedId } = usePortfolio();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [showAddTxn, setShowAddTxn] = useState(false);
@@ -51,6 +53,7 @@ export default function InvestmentDetail() {
 
       await addTransaction({
         investment_id: parseInt(id),
+        portfolio_id: selectedId || null,
         transaction_type: txnForm.transaction_type,
         transaction_date: txnForm.transaction_date,
         units: txnForm.units ? parseFloat(txnForm.units) : null,
@@ -106,12 +109,6 @@ export default function InvestmentDetail() {
           <h1 className="h4 fw-bold mb-1">{data.display_name || data.name}</h1>
           <div className="d-flex align-items-center gap-2">
             <Badge bg="primary" className="bg-opacity-10 text-primary">{ASSET_TYPE_LABELS[data.asset_type]}</Badge>
-            {data.portfolio_name && (
-              <Badge bg="light" text="dark" className="border d-flex align-items-center gap-1">
-                <span className="portfolio-dot" style={{ backgroundColor: data.portfolio_color || '#6b7280', width: 8, height: 8 }} />
-                {data.portfolio_name}
-              </Badge>
-            )}
           </div>
         </div>
         <div className="d-flex gap-2">

@@ -26,7 +26,10 @@ module.exports = function (db) {
 
       // Check which holdings already exist in DB for this portfolio
       const existingInvestments = db.prepare(
-        'SELECT id, name, asset_type, ticker_symbol, amfi_code, folio_number FROM investments WHERE portfolio_id = ? AND is_active = 1'
+        `SELECT DISTINCT i.id, i.name, i.asset_type, i.ticker_symbol, i.amfi_code, i.folio_number
+         FROM investments i
+         JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
+         WHERE i.is_active = 1`
       ).all(portfolioId);
 
       // Mark each parsed holding with existing status
@@ -97,24 +100,24 @@ module.exports = function (db) {
       }
 
       const findByIsin = db.prepare(
-        'SELECT id, name FROM investments WHERE portfolio_id = ? AND isin_code = ? AND is_active = 1'
+        'SELECT id, name FROM investments WHERE isin_code = ? AND is_active = 1'
       );
       const findByTickerBase = db.prepare(
-        `SELECT id, name FROM investments WHERE portfolio_id = ? AND is_active = 1
+        `SELECT id, name FROM investments WHERE is_active = 1
          AND REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? LIMIT 1`
       );
       const findByFolio = db.prepare(
-        'SELECT id, name FROM investments WHERE portfolio_id = ? AND folio_number = ? AND is_active = 1'
+        'SELECT id, name FROM investments WHERE folio_number = ? AND is_active = 1'
       );
 
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, isin_code, currency, portfolio_id, notes)
-        VALUES (?, ?, ?, ?, ?, ?, 'INR', ?, ?)
+        INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, isin_code, currency, notes)
+        VALUES (?, ?, ?, ?, ?, ?, 'INR', ?)
       `);
 
       const insertTransaction = db.prepare(`
-        INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount)
-        VALUES (?, 'BUY', ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount)
+        VALUES (?, ?, 'BUY', ?, ?, ?, ?)
       `);
 
       const today = new Date().toISOString().split('T')[0];
@@ -131,16 +134,16 @@ module.exports = function (db) {
           // Check for existing investment by ISIN, ticker, or folio
           let existingId = null;
           if (h.isin) {
-            const byIsin = findByIsin.get(portfolio_id, h.isin);
+            const byIsin = findByIsin.get(h.isin);
             if (byIsin) existingId = byIsin.id;
           }
           if (!existingId && tickerSymbol) {
             const baseTicker = tickerSymbol.replace(/\.(NS|BO)$/, '');
-            const byTicker = findByTickerBase.get(portfolio_id, baseTicker);
+            const byTicker = findByTickerBase.get(baseTicker);
             if (byTicker) existingId = byTicker.id;
           }
           if (!existingId && folio) {
-            const byFolio = findByFolio.get(portfolio_id, folio);
+            const byFolio = findByFolio.get(folio);
             if (byFolio) existingId = byFolio.id;
           }
 
@@ -153,7 +156,7 @@ module.exports = function (db) {
             }
           } else {
             const inv = insertInvestment.run(
-              h.name, assetType, tickerSymbol, amfiCode, folio, h.isin || null, portfolio_id, notes
+              h.name, assetType, tickerSymbol, amfiCode, folio, h.isin || null, notes
             );
             investmentId = inv.lastInsertRowid;
           }
@@ -164,7 +167,7 @@ module.exports = function (db) {
           const amount = h.invested || h.value || (units * pricePerUnit);
 
           if (units > 0 && amount > 0) {
-            insertTransaction.run(investmentId, today, units, pricePerUnit, amount);
+            insertTransaction.run(investmentId, portfolio_id, today, units, pricePerUnit, amount);
           }
 
           results.push({

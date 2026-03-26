@@ -5,37 +5,43 @@ module.exports = function (db) {
   // ─── Get all investments ──────────────────────────────────────────────
   router.get('/', (req, res) => {
     const { type, active, portfolio_id, hide_sold } = req.query;
-    let query = 'SELECT * FROM investments WHERE 1=1';
+    let query = 'SELECT DISTINCT i.* FROM investments i';
     const params = [];
 
     if (portfolio_id) {
-      query += ' AND portfolio_id = ?';
+      query += ' JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?';
       params.push(portfolio_id);
     }
+
+    query += ' WHERE 1=1';
+
     if (type) {
-      query += ' AND asset_type = ?';
+      query += ' AND i.asset_type = ?';
       params.push(type);
     }
     if (active !== undefined) {
-      query += ' AND is_active = ?';
+      query += ' AND i.is_active = ?';
       params.push(active === 'true' ? 1 : 0);
     } else {
-      query += ' AND is_active = 1';
+      query += ' AND i.is_active = 1';
     }
     if (hide_sold === 'true') {
+      const portfolioTxnFilter = portfolio_id ? ' AND t2.portfolio_id = ?' : '';
+      const portfolioTxnParams = portfolio_id ? [portfolio_id] : [];
       query += ` AND (
-        asset_type IN ('PPF', 'PF') OR
+        i.asset_type IN ('PPF', 'PF') OR
         COALESCE((
           SELECT SUM(CASE
-            WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(units, 0)
-            WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(units, 0)
+            WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(t2.units, 0)
+            WHEN t2.transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t2.units, 0)
             ELSE 0 END)
-          FROM transactions WHERE investment_id = investments.id
+          FROM transactions t2 WHERE t2.investment_id = i.id${portfolioTxnFilter}
         ), 0) > 0
       )`;
+      params.push(...portfolioTxnParams);
     }
 
-    query += ' ORDER BY asset_type, COALESCE(display_name, name)';
+    query += ' ORDER BY i.asset_type, COALESCE(i.display_name, i.name)';
     const investments = db.prepare(query).all(...params);
     res.json(investments);
   });
@@ -43,9 +49,8 @@ module.exports = function (db) {
   // ─── Get single investment with details ───────────────────────────────
   router.get('/:id', (req, res) => {
     const inv = db.prepare(`
-      SELECT i.*, p.name as portfolio_name, p.color as portfolio_color
+      SELECT i.*
       FROM investments i
-      LEFT JOIN portfolios p ON i.portfolio_id = p.id
       WHERE i.id = ?
     `).get(req.params.id);
     if (!inv) return res.status(404).json({ error: 'Investment not found' });
@@ -83,7 +88,7 @@ module.exports = function (db) {
   router.post('/', (req, res) => {
     const {
       name, asset_type, ticker_symbol, amfi_code, folio_number,
-      account_number, interest_rate, currency, notes, portfolio_id,
+      account_number, interest_rate, currency, notes,
       face_value, coupon_frequency, maturity_date,
     } = req.body;
 
@@ -92,13 +97,13 @@ module.exports = function (db) {
     }
 
     const result = db.prepare(`
-      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes, portfolio_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(name, asset_type, ticker_symbol || null, amfi_code || null,
       folio_number || null, account_number || null, interest_rate || null,
       currency || 'INR', face_value || null,
       coupon_frequency || null, maturity_date || null,
-      notes || null, portfolio_id || null);
+      notes || null);
 
     const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json(inv);
@@ -118,7 +123,7 @@ module.exports = function (db) {
     const params = [];
 
     // Legacy fields: only update if provided (COALESCE pattern)
-    const coalesceFields = { name, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes, is_active, portfolio_id };
+    const coalesceFields = { name, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes, is_active };
     for (const [col, val] of Object.entries(coalesceFields)) {
       sets.push(`${col} = COALESCE(?, ${col})`);
       params.push(val !== undefined ? val : null);

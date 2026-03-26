@@ -16,9 +16,10 @@ module.exports = function (db) {
           COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
           COALESCE(SUM(dv.day_change), 0) as day_change
         FROM investments i
+        INNER JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
         LEFT JOIN daily_values dv ON i.id = dv.investment_id
           AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id)
-        WHERE i.is_active = 1 AND i.portfolio_id = ?
+        WHERE i.is_active = 1
       `).get(p.id);
 
       return { ...p, ...stats };
@@ -67,8 +68,8 @@ module.exports = function (db) {
 
   // ─── Delete portfolio ─────────────────────────────────────────────
   router.delete('/:id', (req, res) => {
-    // Unassign investments first (don't delete them)
-    db.prepare('UPDATE investments SET portfolio_id = NULL WHERE portfolio_id = ?').run(req.params.id);
+    // Unassign transactions first (don't delete them)
+    db.prepare('UPDATE transactions SET portfolio_id = NULL WHERE portfolio_id = ?').run(req.params.id);
     db.prepare('DELETE FROM portfolios WHERE id = ?').run(req.params.id);
     res.json({ success: true });
   });

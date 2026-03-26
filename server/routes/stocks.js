@@ -108,18 +108,18 @@ module.exports = function (db) {
       if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
 
       const findInvestment = db.prepare(
-        'SELECT id, name, ticker_symbol FROM investments WHERE portfolio_id = ? AND asset_type = ? AND (ticker_symbol = ? OR name = ?)'
+        'SELECT id, name, ticker_symbol FROM investments WHERE asset_type = ? AND (ticker_symbol = ? OR name = ?)'
       );
       const findByIsin = db.prepare(
-        'SELECT id, name, ticker_symbol FROM investments WHERE portfolio_id = ? AND isin_code = ? AND is_active = 1'
+        'SELECT id, name, ticker_symbol FROM investments WHERE isin_code = ? AND is_active = 1'
       );
       const findByTickerBase = db.prepare(
-        `SELECT id, name, ticker_symbol FROM investments WHERE portfolio_id = ? AND asset_type = 'INDIAN_STOCK' AND is_active = 1
+        `SELECT id, name, ticker_symbol FROM investments WHERE asset_type = 'INDIAN_STOCK' AND is_active = 1
          AND REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? LIMIT 1`
       );
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, portfolio_id, ticker_symbol, isin_code, currency, notes, is_active)
-        VALUES (?, 'INDIAN_STOCK', ?, ?, ?, 'INR', ?, 1)
+        INSERT INTO investments (name, asset_type, ticker_symbol, isin_code, currency, notes, is_active)
+        VALUES (?, 'INDIAN_STOCK', ?, ?, 'INR', ?, 1)
       `);
       // Idempotent: find existing transaction by key fields
       const findTransaction = db.prepare(`
@@ -127,8 +127,8 @@ module.exports = function (db) {
         WHERE investment_id = ? AND transaction_type = ? AND transaction_date = ? AND units = ? AND price_per_unit = ?
       `);
       const insertTransaction = db.prepare(`
-        INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const updateTransaction = db.prepare(`
         UPDATE transactions SET amount = ?, fees = ?, notes = ? WHERE id = ?
@@ -165,10 +165,10 @@ module.exports = function (db) {
 
           let existing = null;
           if (tickerSymbol) {
-            existing = findInvestment.get(portfolioId, 'INDIAN_STOCK', tickerSymbol, displayName);
+            existing = findInvestment.get('INDIAN_STOCK', tickerSymbol, displayName);
           }
           if (!existing) {
-            existing = findInvestment.get(portfolioId, 'INDIAN_STOCK', displayName, displayName);
+            existing = findInvestment.get('INDIAN_STOCK', displayName, displayName);
           }
 
           let investmentId;
@@ -180,7 +180,7 @@ module.exports = function (db) {
             }
           } else {
             const result = insertInvestment.run(
-              displayName, portfolioId, tickerSymbol, stock.isin || null,
+              displayName, tickerSymbol, stock.isin || null,
               `Imported from ${broker || 'broker'} contract note`
             );
             investmentId = result.lastInsertRowid;
@@ -207,7 +207,7 @@ module.exports = function (db) {
               }
             } else {
               insertTransaction.run(
-                investmentId, trade.type, trade.tradeDate, trade.quantity,
+                investmentId, portfolioId, trade.type, trade.tradeDate, trade.quantity,
                 trade.rate, amount, fees, broker || 'Unknown', notes
               );
               transactionsCreated++;
@@ -264,21 +264,21 @@ module.exports = function (db) {
       }
 
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, portfolio_id, ticker_symbol, currency, notes, is_active, isin_code)
-        VALUES (?, 'INDIAN_STOCK', ?, ?, 'INR', ?, 1, ?)
+        INSERT INTO investments (name, asset_type, ticker_symbol, currency, notes, is_active, isin_code)
+        VALUES (?, 'INDIAN_STOCK', ?, 'INR', ?, 1, ?)
       `);
       const findByIsin = db.prepare(
-        'SELECT id FROM investments WHERE portfolio_id = ? AND isin_code = ? AND is_active = 1'
+        'SELECT id FROM investments WHERE isin_code = ? AND is_active = 1'
       );
       const findByTickerBase = db.prepare(
-        "SELECT id FROM investments WHERE portfolio_id = ? AND REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? AND is_active = 1"
+        "SELECT id FROM investments WHERE REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? AND is_active = 1"
       );
       const findInvestment = db.prepare(
-        'SELECT id FROM investments WHERE portfolio_id = ? AND asset_type = ? AND (ticker_symbol = ? OR name = ?)'
+        'SELECT id FROM investments WHERE asset_type = ? AND (ticker_symbol = ? OR name = ?)'
       );
       const insertTransaction = db.prepare(`
-        INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       let investmentsCreated = 0;
@@ -301,17 +301,17 @@ module.exports = function (db) {
           // Match existing investment: ISIN first, then ticker base, then legacy match
           let existing = null;
           if (stock.isin) {
-            existing = findByIsin.get(portfolioId, stock.isin);
+            existing = findByIsin.get(stock.isin);
           }
           if (!existing && tickerSymbol) {
             const base = tickerSymbol.replace(/\.(NS|BO)$/, '');
-            existing = findByTickerBase.get(portfolioId, base);
+            existing = findByTickerBase.get(base);
           }
           if (!existing && tickerSymbol) {
-            existing = findInvestment.get(portfolioId, 'INDIAN_STOCK', tickerSymbol, displayName);
+            existing = findInvestment.get('INDIAN_STOCK', tickerSymbol, displayName);
           }
           if (!existing) {
-            existing = findInvestment.get(portfolioId, 'INDIAN_STOCK', displayName, displayName);
+            existing = findInvestment.get('INDIAN_STOCK', displayName, displayName);
           }
 
           let investmentId;
@@ -323,7 +323,7 @@ module.exports = function (db) {
             }
           } else {
             const result = insertInvestment.run(
-              displayName, portfolioId, tickerSymbol,
+              displayName, tickerSymbol,
               `Imported from ${broker} P&L statement`,
               stock.isin || null
             );
@@ -335,7 +335,7 @@ module.exports = function (db) {
             const amount = trade.quantity * trade.rate;
             const fees = trade.fees || 0;
             insertTransaction.run(
-              investmentId, trade.type, trade.tradeDate, trade.quantity,
+              investmentId, portfolioId, trade.type, trade.tradeDate, trade.quantity,
               trade.rate, amount, fees, broker, `${broker} P&L import`
             );
             transactionsCreated++;
@@ -359,13 +359,12 @@ module.exports = function (db) {
 
   /**
    * POST /api/stocks/amc-charge
-   * Record an AMC / maintenance charge or refund against the portfolio.
-   * Auto-creates a "Demat Account Charges" investment if it doesn't exist.
-   * Body: { portfolio_id, date, amount, broker, notes }
+   * Record an AMC / maintenance charge as a portfolio expense.
+   * Body: { portfolio_id, date, amount, broker, notes, expense_type }
    */
   router.post('/amc-charge', express.json(), (req, res) => {
     try {
-      const { portfolio_id, date, amount, broker, notes } = req.body;
+      const { portfolio_id, date, amount, broker, notes, expense_type } = req.body;
       if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
       if (!date) return res.status(400).json({ error: 'date is required' });
       if (!amount || amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
@@ -373,27 +372,14 @@ module.exports = function (db) {
       const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolio_id);
       if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
 
-      // Find or create the "Demat Account Charges" investment for this portfolio
-      const investmentName = 'Demat Account Charges';
-      let investment = db.prepare(
-        'SELECT * FROM investments WHERE name = ? AND asset_type = ? AND portfolio_id = ?'
-      ).get(investmentName, 'INDIAN_STOCK', portfolio_id);
+      const validTypes = ['AMC', 'PLATFORM_FEE', 'CDSL', 'ACCOUNT_OPENING', 'OTHER'];
+      const type = validTypes.includes(expense_type) ? expense_type : 'AMC';
 
-      if (!investment) {
-        const result = db.prepare(
-          'INSERT INTO investments (name, asset_type, portfolio_id, notes) VALUES (?, ?, ?, ?)'
-        ).run(investmentName, 'INDIAN_STOCK', portfolio_id, 'Demat/trading account charges');
-        investment = { id: result.lastInsertRowid };
-      }
+      const result = db.prepare(
+        'INSERT INTO portfolio_expenses (portfolio_id, expense_type, expense_date, amount, broker, notes) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(portfolio_id, type, date, parseFloat(amount), broker || null, notes || 'AMC/Maintenance charge');
 
-      // Store as AMC type: units=0, price=0, amount=0, fees=charge amount
-      const fees = parseFloat(amount);
-
-      db.prepare(
-        'INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes, broker) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-      ).run(investment.id, 'AMC', date, 0, 0, 0, fees, notes || 'AMC/Maintenance charge', broker || null);
-
-      res.json({ success: true, investment_id: investment.id });
+      res.json({ success: true, expense_id: result.lastInsertRowid });
     } catch (e) {
       console.error('AMC charge error:', e);
       res.status(500).json({ error: 'Failed to record charge: ' + e.message });
@@ -416,9 +402,10 @@ module.exports = function (db) {
 
       // Get all Indian stock investments in this portfolio that have a ticker
       const investments = db.prepare(`
-        SELECT i.id, i.name, i.ticker_symbol
+        SELECT DISTINCT i.id, i.name, i.ticker_symbol
         FROM investments i
-        WHERE i.portfolio_id = ? AND i.asset_type = 'INDIAN_STOCK' AND i.ticker_symbol IS NOT NULL
+        JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
+        WHERE i.asset_type = 'INDIAN_STOCK' AND i.ticker_symbol IS NOT NULL
       `).all(portfolioId);
 
       const suggestions = [];

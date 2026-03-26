@@ -35,7 +35,6 @@ function initializeDb(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND')),
-      portfolio_id INTEGER,          -- Owner (family member) portfolio
       ticker_symbol TEXT,          -- NSE symbol for Indian stocks, Yahoo ticker for foreign stocks
       amfi_code TEXT,              -- AMFI scheme code for mutual funds
       folio_number TEXT,           -- Folio number for MF
@@ -57,7 +56,8 @@ function initializeDb(db) {
     CREATE TABLE IF NOT EXISTS transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       investment_id INTEGER NOT NULL,
-      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'REDEMPTION', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'AMC')),
+      portfolio_id INTEGER,        -- Owner (family member) portfolio
+      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'REDEMPTION', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER')),
       transaction_date TEXT NOT NULL,
       units REAL,                  -- Number of units/shares bought or sold
       price_per_unit REAL,         -- Price at which transaction happened
@@ -126,7 +126,23 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
     CREATE INDEX IF NOT EXISTS idx_portfolio_daily_date ON portfolio_daily(date);
     CREATE INDEX IF NOT EXISTS idx_portfolio_daily_portfolio ON portfolio_daily(portfolio_id, date);
-    CREATE INDEX IF NOT EXISTS idx_investments_portfolio ON investments(portfolio_id);
+    CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id);
+
+    -- Portfolio-level expenses (AMC, platform fees, CDSL charges, etc.)
+    CREATE TABLE IF NOT EXISTS portfolio_expenses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      portfolio_id INTEGER NOT NULL,
+      expense_type TEXT NOT NULL CHECK(expense_type IN ('AMC', 'PLATFORM_FEE', 'CDSL', 'ACCOUNT_OPENING', 'OTHER')),
+      expense_date TEXT NOT NULL,
+      amount REAL NOT NULL,
+      broker TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (portfolio_id) REFERENCES portfolios(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_portfolio_expenses_portfolio ON portfolio_expenses(portfolio_id);
+    CREATE INDEX IF NOT EXISTS idx_portfolio_expenses_date ON portfolio_expenses(expense_date);
   `);
 
   // Seed default interest rates

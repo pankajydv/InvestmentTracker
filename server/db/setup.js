@@ -20,13 +20,13 @@ if (args.includes('--seed')) {
   const pankajId = db.prepare("SELECT id FROM portfolios WHERE name = 'Pankaj Yadav'").get().id;
 
   const insertInvestment = db.prepare(`
-    INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, currency, portfolio_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, currency)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
 
   const insertTransaction = db.prepare(`
-    INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
 
   // Anju's Mutual Funds (₹47.24L invested, ₹56.65L current)
@@ -51,18 +51,18 @@ if (args.includes('--seed')) {
   const seedTransaction = db.transaction(() => {
     for (const fund of anjuFunds) {
       const result = insertInvestment.run(
-        fund.name, 'MUTUAL_FUND', null, fund.amfi, fund.folio || null, 'INR', anjuId
+        fund.name, 'MUTUAL_FUND', null, fund.amfi, fund.folio || null, 'INR'
       );
       insertTransaction.run(
-        result.lastInsertRowid, 'BUY', '2023-01-15', fund.units, fund.costPerUnit, fund.totalCost
+        result.lastInsertRowid, anjuId, 'BUY', '2023-01-15', fund.units, fund.costPerUnit, fund.totalCost
       );
     }
     for (const fund of pankajFunds) {
       const result = insertInvestment.run(
-        fund.name, 'MUTUAL_FUND', null, fund.amfi, fund.folio || null, 'INR', pankajId
+        fund.name, 'MUTUAL_FUND', null, fund.amfi, fund.folio || null, 'INR'
       );
       insertTransaction.run(
-        result.lastInsertRowid, 'BUY', '2023-01-15', fund.units, fund.costPerUnit, fund.totalCost
+        result.lastInsertRowid, pankajId, 'BUY', '2023-01-15', fund.units, fund.costPerUnit, fund.totalCost
       );
     }
   });
