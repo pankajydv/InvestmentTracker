@@ -6,6 +6,9 @@ import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE
 import { ArrowLeft, Trash2, Plus, X, Settings } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
+const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'DEPOSIT'];
+const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'REDEMPTION'];
+
 export default function InvestmentDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -234,12 +237,26 @@ export default function InvestmentDetail() {
                   <th className="px-3 text-end">Price/Unit</th>
                   <th className="px-3 text-end">Amount</th>
                   <th className="px-3 text-end">Charges</th>
+                  <th className="px-3 text-end">Holding</th>
                   <th className="px-3">Notes</th>
                   <th className="px-3"></th>
                 </tr>
               </thead>
               <tbody>
-                {data.transactions.map((txn) => (
+                {(() => {
+                  // Compute running holding from oldest to newest
+                  // Corporate actions come before regular trades on the same date
+                  const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
+                  const txnSortKey = (t) => CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1;
+                  const sorted = [...data.transactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || txnSortKey(a) - txnSortKey(b) || a.id - b.id);
+                  const holdingMap = {};
+                  let balance = 0;
+                  for (const txn of sorted) {
+                    if (UNIT_ADD_TYPES.includes(txn.transaction_type)) balance += txn.units || 0;
+                    else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) balance -= txn.units || 0;
+                    holdingMap[txn.id] = balance;
+                  }
+                  return data.transactions.map((txn) => (
                   <tr key={txn.id}>
                     <td className="px-3">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3">
@@ -251,6 +268,7 @@ export default function InvestmentDetail() {
                     <td className="px-3 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>
                     <td className="px-3 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
                     <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
+                    <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 3) : '-'}</td>
                     <td className="px-3 text-muted">{txn.notes || '-'}</td>
                     <td className="px-3">
                       <button onClick={() => handleDeleteTxn(txn.id)} className="btn btn-link text-danger p-0" title="Delete">
@@ -258,7 +276,8 @@ export default function InvestmentDetail() {
                       </button>
                     </td>
                   </tr>
-                ))}
+                  ));
+                })()}
               </tbody>
             </Table>
           </div>

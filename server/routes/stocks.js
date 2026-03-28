@@ -446,12 +446,16 @@ module.exports = function (db) {
           ORDER BY transaction_date ASC
         `).all(inv.id);
 
-        // Compute holding at any given date, optionally excluding specific transaction IDs
-        function holdingAt(date, excludeIds) {
+        // Compute holding at any given date, optionally excluding specific transaction IDs.
+        // When excludeSameDayTrading is true, same-day BUY/SELL/IPO transactions are
+        // excluded so corporate actions are applied only to shares held at record date.
+        const CORPORATE_TYPES = ['BONUS', 'SPLIT', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST'];
+        function holdingAt(date, excludeIds, excludeSameDayTrading) {
           let units = 0;
           for (const t of allTxns) {
             if (t.transaction_date > date) break;
             if (excludeIds && excludeIds.has(t.id)) continue;
+            if (excludeSameDayTrading && t.transaction_date === date && !CORPORATE_TYPES.includes(t.transaction_type)) continue;
             if (['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'DEPOSIT'].includes(t.transaction_type)) {
               units += t.units || 0;
             } else if (['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION'].includes(t.transaction_type)) {
@@ -509,7 +513,7 @@ module.exports = function (db) {
 
         // Process dividends
         for (const div of actions.dividends) {
-          const holdingUnits = holdingAt(div.date);
+          const holdingUnits = holdingAt(div.date, null, true);
           if (holdingUnits <= 0) continue;
 
           const dividendAmount = Math.round(holdingUnits * div.amount * 100) / 100;
@@ -580,7 +584,7 @@ module.exports = function (db) {
           );
 
           const excludeIds = existing ? new Set([existing.id]) : null;
-          const holdingUnits = holdingAt(split.date, excludeIds);
+          const holdingUnits = holdingAt(split.date, excludeIds, true);
           if (holdingUnits <= 0) continue;
 
           const ratio = split.numerator / split.denominator;

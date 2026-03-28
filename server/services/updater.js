@@ -68,7 +68,7 @@ async function updateAllPrices(db) {
   `);
 
   const getPrevDay = db.prepare(`
-    SELECT current_value FROM daily_values
+    SELECT price_per_unit, current_value FROM daily_values
     WHERE investment_id = ? AND date < ?
     ORDER BY date DESC LIMIT 1
   `);
@@ -152,13 +152,16 @@ async function updateAllPrices(db) {
       const profitLossPct = investedAmount > 0 ? (profitLoss / investedAmount) * 100 : 0;
 
       // Get previous day's value for day change (0 when no holdings)
+      // Day change = totalUnits * (todayPrice - yesterdayPrice)
+      // This matches broker behaviour and is unaffected by unit corrections or new transactions.
       let dayChange = 0;
       let dayChangePct = 0;
       if (totalUnits > 0) {
         const prevDay = getPrevDay.get(inv.id, today);
-        const prevValue = prevDay ? prevDay.current_value : currentValue;
-        dayChange = currentValue - prevValue;
-        dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
+        if (prevDay && prevDay.price_per_unit > 0) {
+          dayChange = totalUnits * (pricePerUnit - prevDay.price_per_unit);
+          dayChangePct = ((pricePerUnit - prevDay.price_per_unit) / prevDay.price_per_unit) * 100;
+        }
       }
 
       upsertDaily.run(
@@ -211,6 +214,16 @@ function updatePortfolioDaily(db, date) {
       total_profit_loss_pct = excluded.total_profit_loss_pct,
       day_change = excluded.day_change,
       day_change_pct = excluded.day_change_pct
+  `);
+
+  // For NULL portfolio_id, ON CONFLICT doesn't work (NULL != NULL in SQLite),
+  // so delete-then-insert instead.
+  const deleteCombined = db.prepare(
+    'DELETE FROM portfolio_daily WHERE portfolio_id IS NULL AND date = ?'
+  );
+  const insertCombined = db.prepare(`
+    INSERT INTO portfolio_daily (portfolio_id, date, total_value, total_invested, total_profit_loss, total_profit_loss_pct, day_change, day_change_pct)
+    VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   // Get all distinct portfolio_ids from transactions (including NULL for unassigned)
@@ -269,16 +282,29 @@ function updatePortfolioDaily(db, date) {
     const prevValue = prevPortfolio ? prevPortfolio.total_value : totals.total_value;
     const dayChangePct = prevValue > 0 ? (totals.day_change / prevValue) * 100 : 0;
 
-    upsertPortfolioDaily.run(
-      pid,
-      date,
-      Math.round(totals.total_value * 100) / 100,
-      Math.round(totals.total_invested * 100) / 100,
-      Math.round(totals.total_profit_loss * 100) / 100,
-      Math.round(profitPct * 100) / 100,
-      Math.round(totals.day_change * 100) / 100,
-      Math.round(dayChangePct * 100) / 100
-    );
+    if (pid === null) {
+      deleteCombined.run(date);
+      insertCombined.run(
+        date,
+        Math.round(totals.total_value * 100) / 100,
+        Math.round(totals.total_invested * 100) / 100,
+        Math.round(totals.total_profit_loss * 100) / 100,
+        Math.round(profitPct * 100) / 100,
+        Math.round(totals.day_change * 100) / 100,
+        Math.round(dayChangePct * 100) / 100
+      );
+    } else {
+      upsertPortfolioDaily.run(
+        pid,
+        date,
+        Math.round(totals.total_value * 100) / 100,
+        Math.round(totals.total_invested * 100) / 100,
+        Math.round(totals.total_profit_loss * 100) / 100,
+        Math.round(profitPct * 100) / 100,
+        Math.round(totals.day_change * 100) / 100,
+        Math.round(dayChangePct * 100) / 100
+      );
+    }
   }
 }
 

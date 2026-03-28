@@ -12,6 +12,32 @@ const TRANSACTION_TYPES_DEFAULT = [
 // User-action types that can be edited/deleted (not corporate actions)
 const EDITABLE_TYPES = ['BUY', 'SELL', 'REDEMPTION', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER'];
 
+const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'DEPOSIT'];
+const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'REDEMPTION'];
+
+const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
+
+function txnSortKey(t) { return CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1; }
+
+function computeHoldingMap(transactions) {
+  // Group by investment_id, process oldest-first to build running balance
+  // Corporate actions come before regular trades on the same date
+  const byInvestment = {};
+  const sorted = [...transactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || txnSortKey(a) - txnSortKey(b) || a.id - b.id);
+  const map = {};
+  for (const txn of sorted) {
+    const key = txn.investment_id;
+    if (!(key in byInvestment)) byInvestment[key] = 0;
+    if (UNIT_ADD_TYPES.includes(txn.transaction_type)) {
+      byInvestment[key] += txn.units || 0;
+    } else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) {
+      byInvestment[key] -= txn.units || 0;
+    }
+    map[txn.id] = byInvestment[key];
+  }
+  return map;
+}
+
 const TYPE_BADGE = {
   BUY: 'badge-buy',
   DEPOSIT: 'badge-deposit',
@@ -45,6 +71,8 @@ export default function Transactions() {
   const [filterAssetType, setFilterAssetType] = useState('');
   const [filterBroker, setFilterBroker] = useState('');
   const [filterInvestment, setFilterInvestment] = useState('');
+  const [filterStartDate, setFilterStartDate] = useState('');
+  const [filterEndDate, setFilterEndDate] = useState('');
   const [typeDropdownOpen, setTypeDropdownOpen] = useState(false);
   const typeDropdownRef = useRef(null);
 
@@ -158,7 +186,7 @@ export default function Transactions() {
 
   useEffect(() => {
     loadTransactions();
-  }, [selectedId, filterType, filterAssetType, filterBroker, filterInvestment]);
+  }, [selectedId, filterType, filterAssetType, filterBroker, filterInvestment, filterStartDate, filterEndDate]);
 
   const loadTransactions = async () => {
     try {
@@ -169,6 +197,8 @@ export default function Transactions() {
       if (filterAssetType) params.asset_type = filterAssetType;
       if (filterBroker) params.broker = filterBroker;
       if (filterInvestment) params.investment_name = filterInvestment;
+      if (filterStartDate) params.from = filterStartDate;
+      if (filterEndDate) params.to = filterEndDate;
       const result = await getTransactions(params);
       setTransactions(result);
     } catch (e) {
@@ -182,6 +212,8 @@ export default function Transactions() {
     acc[t.transaction_type] = (acc[t.transaction_type] || 0) + 1;
     return acc;
   }, {});
+
+  const holdingMap = computeHoldingMap(transactions);
 
   return (
     <div className="d-flex flex-column gap-3">
@@ -321,9 +353,30 @@ export default function Transactions() {
           </div>
         )}
 
-        {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment) && (
+        <div className="d-flex align-items-center gap-2">
+          <label className="small fw-semibold text-muted text-uppercase">Date</label>
+          <Form.Control
+            type="date"
+            size="sm"
+            value={filterStartDate}
+            onChange={(e) => setFilterStartDate(e.target.value)}
+            style={{ width: 140 }}
+            placeholder="From"
+          />
+          <span className="text-muted small">to</span>
+          <Form.Control
+            type="date"
+            size="sm"
+            value={filterEndDate}
+            onChange={(e) => setFilterEndDate(e.target.value)}
+            style={{ width: 140 }}
+            placeholder="To"
+          />
+        </div>
+
+        {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment || filterStartDate || filterEndDate) && (
           <button
-            onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); }}
+            onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); setFilterStartDate(''); setFilterEndDate(''); }}
             className="btn btn-link btn-sm text-muted text-decoration-underline p-0"
           >
             Clear filters
@@ -359,8 +412,8 @@ export default function Transactions() {
         ) : transactions.length === 0 ? (
           <div className="p-5 text-center text-muted">
             <p>No transactions found.</p>
-            {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment) ? (
-              <button onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); }}
+            {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment || filterStartDate || filterEndDate) ? (
+              <button onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); setFilterStartDate(''); setFilterEndDate(''); }}
                 className="btn btn-link text-primary mt-2">
                 Clear filters
               </button>
@@ -382,6 +435,7 @@ export default function Transactions() {
                   <th className="px-3 py-2 text-end">Price/Unit</th>
                   <th className="px-3 py-2 text-end">Amount</th>
                   <th className="px-3 py-2 text-end">Charges</th>
+                  <th className="px-3 py-2 text-end">Holding</th>
                   <th className="px-3 py-2">Broker</th>
                   <th className="px-3 py-2">Notes</th>
                   <th className="px-3 py-2 text-center" style={{ width: 80 }}>Actions</th>
@@ -413,6 +467,7 @@ export default function Transactions() {
                     <td className="px-3 py-2 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>
                     <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
                     <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
+                    <td className="px-3 py-2 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 3) : '-'}</td>
                     <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>
                     <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                     <td className="px-3 py-2 text-center">
