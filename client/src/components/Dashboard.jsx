@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert } from 'react-bootstrap';
 import { getDashboardSummary } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
@@ -7,6 +7,7 @@ import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, Receipt } from
 import { usePortfolio } from '../context/PortfolioContext';
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const { selectedId, selectedPortfolio } = usePortfolio();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -96,7 +97,7 @@ export default function Dashboard() {
                 {formatPct(portfolio.total_profit_loss_pct)}
               </div>
               {totalExpenses > 0 && (
-                <div className="mt-2 pt-2 border-top">
+                <div className="mt-2 pt-2 border-top" style={{ cursor: 'pointer' }} onClick={() => navigate('/portfolios?tab=charges')} title="View all charges">
                   <div className="d-flex justify-content-between small text-muted">
                     <span><Receipt size={12} className="me-1" />Account Charges</span>
                     <span className="text-danger">-{formatINR(totalExpenses)}</span>

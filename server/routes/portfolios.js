@@ -16,10 +16,10 @@ module.exports = function (db) {
           COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
           COALESCE(SUM(dv.day_change), 0) as day_change
         FROM investments i
-        INNER JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
         LEFT JOIN daily_values dv ON i.id = dv.investment_id
           AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id)
         WHERE i.is_active = 1
+          AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)
       `).get(p.id);
 
       return { ...p, ...stats };

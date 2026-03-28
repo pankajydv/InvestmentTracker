@@ -244,7 +244,7 @@ export default function InvestmentDetail() {
                     <td className="px-3">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3">
                       <span className={`badge rounded-pill badge-${txn.transaction_type.toLowerCase()}`}>
-                        {txn.transaction_type}
+                        {txn.transaction_type.replace(/_/g, ' ')}
                       </span>
                     </td>
                     <td className="px-3 text-end">{txn.units ? formatNumber(txn.units, 3) : '-'}</td>

@@ -1,49 +1,26 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Form, Button } from 'react-bootstrap';
 import { usePortfolio } from '../context/PortfolioContext';
-import { ChevronDown, Users, Plus } from 'lucide-react';
+
+import { Link } from 'react-router-dom';
+import { ChevronDown, Users, Settings } from 'lucide-react';
 
 export default function PortfolioSelector() {
-  const { portfolios, selectedId, selectedPortfolio, selectPortfolio, refreshPortfolios } = usePortfolio();
+  const { portfolios, selectedId, selectedPortfolio, selectPortfolio } = usePortfolio();
   const [open, setOpen] = useState(false);
-  const [showAdd, setShowAdd] = useState(false);
-  const [newName, setNewName] = useState('');
-  const [newPan, setNewPan] = useState('');
-  const [newColor, setNewColor] = useState('#f59e0b');
   const ref = useRef(null);
 
   useEffect(() => {
     const handler = (e) => {
       if (ref.current && !ref.current.contains(e.target)) {
         setOpen(false);
-        setShowAdd(false);
       }
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  const handleAdd = async () => {
-    if (!newName.trim()) return;
-    try {
-      await fetch('/api/portfolios', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newName.trim(), color: newColor, pan_number: newPan.trim().toUpperCase() || null }),
-      });
-      setNewName('');
-      setNewPan('');
-      setShowAdd(false);
-      await refreshPortfolios();
-    } catch (e) {
-      alert('Failed to create portfolio: ' + e.message);
-    }
-  };
-
   const selectedCount = selectedId ? 1 : portfolios.length;
   const label = selectedPortfolio ? selectedPortfolio.name : 'All Portfolios';
-
-  const COLORS = ['#f59e0b', '#3b82f6', '#10b981', '#ef4444', '#8b5cf6', '#ec4899'];
 
   return (
     <div className="position-relative" ref={ref}>
@@ -122,66 +99,19 @@ export default function PortfolioSelector() {
 
           <hr className="my-0" />
 
-          {/* Add new portfolio */}
-          {!showAdd ? (
-            <button
-              onClick={() => setShowAdd(true)}
-              className="w-100 d-flex align-items-center gap-3 px-3 py-3 border-0 bg-transparent text-primary small fw-medium"
-              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#e8f0fe'}
-              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-            >
-              <Plus size={16} />
-              Add Family Member
-            </button>
-          ) : (
-            <div className="p-3 d-flex flex-column gap-2">
-              <Form.Control
-                size="sm"
-                type="text"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                placeholder="Name (e.g. Rahul Yadav)"
-                autoFocus
-                onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-              />
-              <Form.Control
-                size="sm"
-                type="text"
-                value={newPan}
-                onChange={(e) => setNewPan(e.target.value.toUpperCase())}
-                placeholder="PAN Number (e.g. ABCDE1234F)"
-                className="font-monospace"
-                maxLength={10}
-                onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-              />
-              <div className="d-flex align-items-center gap-2">
-                <span className="text-muted" style={{ fontSize: '0.75rem' }}>Color:</span>
-                {COLORS.map((c) => (
-                  <button
-                    key={c}
-                    onClick={() => setNewColor(c)}
-                    className="rounded-circle border-0 p-0"
-                    style={{
-                      width: 24,
-                      height: 24,
-                      backgroundColor: c,
-                      border: newColor === c ? '2px solid #333' : '2px solid transparent',
-                      transform: newColor === c ? 'scale(1.15)' : 'scale(1)',
-                      transition: 'transform 0.15s',
-                    }}
-                  />
-                ))}
-              </div>
-              <div className="d-flex gap-2">
-                <Button variant="primary" size="sm" className="flex-grow-1" onClick={handleAdd}>
-                  Add
-                </Button>
-                <Button variant="light" size="sm" onClick={() => { setShowAdd(false); setNewName(''); }}>
-                  Cancel
-                </Button>
-              </div>
-            </div>
-          )}
+          {/* Manage & Add */}
+          <Link
+            to="/portfolios"
+            onClick={() => setOpen(false)}
+            className="w-100 d-flex align-items-center gap-3 px-3 py-2 text-decoration-none text-secondary small fw-medium"
+            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f8f9fa'}
+            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
+          >
+            <Settings size={16} />
+            Manage Portfolios
+          </Link>
+
+
         </div>
       )}
     </div>

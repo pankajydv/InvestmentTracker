@@ -185,6 +185,9 @@ export default function Transactions() {
 
   return (
     <div className="d-flex flex-column gap-3">
+      <div style={{ position: 'sticky', top: 56, zIndex: 10, backgroundColor: '#f8f9fa', paddingBottom: '0.5rem', marginTop: '-0.5rem', paddingTop: '0.5rem' }}
+        className="d-flex flex-column gap-3"
+      >
       <div className="d-flex align-items-center justify-content-between">
         <h1 className="h4 fw-bold mb-0">Transactions</h1>
         <button onClick={() => navigate('/corporate-actions')} className="btn btn-outline-primary btn-sm">
@@ -345,6 +348,7 @@ export default function Transactions() {
             </svg>
           </button>
         </span>
+      </div>
       </div>
 
       <Card className="shadow-sm">

@@ -436,9 +436,28 @@ module.exports = function (db) {
           return Math.round(units * 1000) / 1000;
         }
 
+        // Determine which broker holds the shares at a given date within this portfolio.
+        // When multiple transactions share the same date, TRANSFER_IN takes priority
+        // over TRANSFER_OUT since the shares ended up at the new broker.
+        function brokerAt(date) {
+          let broker = null;
+          for (const t of allTxns) {
+            if (t.transaction_date > date) break;
+            if (t.portfolio_id !== portfolioId) continue;
+            if (t.broker) {
+              if (t.transaction_type !== 'TRANSFER_OUT') {
+                broker = t.broker;
+              } else if (!broker) {
+                broker = t.broker;
+              }
+            }
+          }
+          return broker;
+        }
+
         // Get existing corporate action transactions for this investment in this year
         const existingActions = db.prepare(`
-          SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes
+          SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes, locked
           FROM transactions
           WHERE investment_id = ? AND transaction_date BETWEEN ? AND ?
             AND transaction_type IN ('DIVIDEND', 'SPLIT', 'BONUS')
@@ -479,6 +498,10 @@ module.exports = function (db) {
 
           if (existing) {
             matchedExistingIds.add(existing.id);
+
+            // Locked transactions are never proposed as corrections
+            if (existing.locked) continue;
+
             const dateMatch = existing.transaction_date === div.date;
             const amountMatch = Math.abs(existing.amount - dividendAmount) < 1;
             const unitsMatch = existing.units === holdingUnits;
@@ -501,6 +524,8 @@ module.exports = function (db) {
               expected_units: holdingUnits,
               expected_amount: dividendAmount,
               expected_price_per_unit: div.amount,
+              broker: brokerAt(div.date),
+              portfolio_id: portfolioId,
               notes: `Dividend \u20B9${div.amount}/share \u00D7 ${holdingUnits} shares`,
             });
             continue;
@@ -515,6 +540,8 @@ module.exports = function (db) {
             price_per_unit: div.amount,
             amount: dividendAmount,
             fees: 0,
+            broker: brokerAt(div.date),
+            portfolio_id: portfolioId,
             notes: `Dividend \u20B9${div.amount}/share \u00D7 ${holdingUnits} shares`,
           });
         }
@@ -542,6 +569,10 @@ module.exports = function (db) {
 
           if (existing) {
             matchedExistingIds.add(existing.id);
+
+            // Locked transactions are never proposed as corrections
+            if (existing.locked) continue;
+
             const dateMatch = existing.transaction_date === split.date;
             const unitsMatch = (existing.units || 0) === newUnits;
             const typeMatch = existing.transaction_type === txnType;
@@ -563,6 +594,8 @@ module.exports = function (db) {
               expected_units: newUnits,
               expected_amount: 0,
               expected_price_per_unit: 0,
+              broker: brokerAt(split.date),
+              portfolio_id: portfolioId,
               notes: `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 +${newUnits} new shares`,
             });
             continue;
@@ -577,13 +610,15 @@ module.exports = function (db) {
             price_per_unit: 0,
             amount: 0,
             fees: 0,
+            broker: brokerAt(split.date),
+            portfolio_id: portfolioId,
             notes: `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 ${holdingUnits} held \u2192 +${newUnits} new shares`,
           });
         }
 
-        // Any existing actions NOT matched to Yahoo data → suggest deletion
+        // Any existing actions NOT matched to Yahoo data → suggest deletion (skip locked)
         for (const ea of existingActions) {
-          if (!matchedExistingIds.has(ea.id)) {
+          if (!matchedExistingIds.has(ea.id) && !ea.locked) {
             deletions.push({
               id: ea.id,
               investment_id: inv.id,
@@ -624,12 +659,12 @@ module.exports = function (db) {
       const { transactions, corrections, deletions } = req.body;
 
       const insert = db.prepare(`
-        INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes, broker, portfolio_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       const update = db.prepare(`
-        UPDATE transactions SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, notes = ? WHERE id = ?
+        UPDATE transactions SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, notes = ?, broker = ?, portfolio_id = ? WHERE id = ?
       `);
 
       const remove = db.prepare(`DELETE FROM transactions WHERE id = ?`);
@@ -654,7 +689,8 @@ module.exports = function (db) {
 
             insert.run(
               txn.investment_id, txn.transaction_type, txn.transaction_date,
-              txn.units || null, txn.price_per_unit || null, txn.amount, txn.fees || 0, txn.notes || null
+              txn.units || null, txn.price_per_unit || null, txn.amount, txn.fees || 0, txn.notes || null,
+              txn.broker || null, txn.portfolio_id || null
             );
             created++;
           }
@@ -665,7 +701,7 @@ module.exports = function (db) {
           for (const c of corrections) {
             const existing = db.prepare('SELECT id FROM transactions WHERE id = ?').get(c.id);
             if (!existing) continue;
-            update.run(c.transaction_date, c.expected_units, c.expected_price_per_unit, c.expected_amount, c.notes, c.id);
+            update.run(c.transaction_date, c.expected_units, c.expected_price_per_unit, c.expected_amount, c.notes, c.broker || null, c.portfolio_id || null, c.id);
             corrected++;
           }
         }

@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { path: '/investments', label: 'Investments', icon: List },
   { path: '/performance', label: 'Performance', icon: TrendingUp },
   { path: '/transactions', label: 'Transactions', icon: List },
+
   { path: '/investments/add', label: 'Add Investment', icon: PlusCircle },
 ];
 

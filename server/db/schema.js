@@ -145,6 +145,13 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_portfolio_expenses_date ON portfolio_expenses(expense_date);
   `);
 
+  // ── Migrations ───────────────────────────────────────────────────────────
+  // Add 'locked' column so manually-corrected transactions survive corporate-action sync
+  const txnCols = db.prepare("PRAGMA table_info(transactions)").all().map(c => c.name);
+  if (!txnCols.includes('locked')) {
+    db.exec("ALTER TABLE transactions ADD COLUMN locked INTEGER DEFAULT 0");
+  }
+
   // Seed default interest rates
   const existingRates = db.prepare('SELECT COUNT(*) as count FROM interest_rates').get();
   if (existingRates.count === 0) {

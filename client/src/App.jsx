@@ -12,6 +12,8 @@ import Transactions from './components/Transactions';
 import CorporateActions from './components/CorporateActions';
 import InvestmentSettings from './components/InvestmentSettings';
 
+import Portfolios from './components/Portfolios';
+
 export default function App() {
   return (
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
@@ -28,6 +30,8 @@ export default function App() {
               <Route path="/investments/:id/settings" element={<InvestmentSettings />} />
               <Route path="/performance" element={<Performance />} />
               <Route path="/transactions" element={<Transactions />} />
+  
+              <Route path="/portfolios" element={<Portfolios />} />
               <Route path="/corporate-actions" element={<CorporateActions />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
