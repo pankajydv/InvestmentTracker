@@ -370,36 +370,58 @@ function parseGrowwPDF(text, fileName) {
     }
   }
 
-  // Extract charges from summary section
+  // Extract charges from summary section using fullText (handles line-wrapped GST descriptions)
   let brokerage = 0, stt = 0, gst = 0, stampDuty = 0;
   let exchangeCharges = 0, sebiCharges = 0, ipftCharges = 0;
-  const lines = text.split('\n');
-  for (const line of lines) {
-    const nums = line.match(/([\-\d.]+)\s*$/);
-    if (!nums) continue;
-    const val = Math.abs(parseFloat(nums[1]));
-    if (isNaN(val) || val === 0) continue;
+  let dpCharges = 0;
+  const chargeVal = (regex) => {
+    const m = fullText.match(regex);
+    return m ? Math.abs(parseFloat(m[1])) : 0;
+  };
+  brokerage = chargeVal(/Taxable\s+Value\s+of\s+Supply\s*\(Brokerage\)\s+([\-\d.]+)/i);
+  exchangeCharges = chargeVal(/Exchange\s+Transaction\s+Charges\s+([\-\d.]+)/i);
+  stt = chargeVal(/Securities\s+Transaction\s+Tax\s+([\-\d.]+)/i);
+  sebiCharges = chargeVal(/SEBI\s+Turnover\s+Fees\s+([\-\d.]+)/i);
+  stampDuty = chargeVal(/Stamp\s+Duty\s+([\-\d.]+)/i);
+  ipftCharges = chargeVal(/IPFT\s+Charges\s+([\-\d.]+)/i);
+  // GST: match through closing ) to handle descriptions that wrap across lines
+  gst += chargeVal(/IGST\s*\([^)]*\)\s*([\-\d.]+)/i);
+  gst += chargeVal(/CGST\s*\([^)]*\)\s*([\-\d.]+)/i);
+  gst += chargeVal(/SGST\s*\([^)]*\)\s*([\-\d.]+)/i);
 
-    if (/Taxable\s+Value.*Brokerage/i.test(line)) brokerage = val;
-    else if (/Exchange\s+Transaction\s+Charges/i.test(line)) exchangeCharges = val;
-    else if (/IGST/i.test(line) && !/CGST|SGST/i.test(line)) gst += val;
-    else if (/CGST/i.test(line)) gst += val;
-    else if (/SGST/i.test(line)) gst += val;
-    else if (/Securities\s+Transaction\s+Tax/i.test(line)) stt = val;
-    else if (/SEBI\s+Turnover/i.test(line)) sebiCharges = val;
-    else if (/Stamp\s+Duty/i.test(line)) stampDuty = val;
-    else if (/IPFT\s+Charges/i.test(line)) ipftCharges = val;
+  // Extract DP charges from the separate DP section (only present when sells exist)
+  // Formats: "DP Charges 67.50 12.15 79.65" or "CDSL DP Charges ... / Groww DP Charges ..."
+  // The section ends with a "Total <amount>" line before "Amount Chargeable"
+  const dpTotalMatch = text.match(/Total\s+([\d.]+)\s*\nAmount\s+Chargeable/i);
+  if (dpTotalMatch) {
+    dpCharges = parseFloat(dpTotalMatch[1]) || 0;
   }
 
-  const totalCharges = brokerage + stt + gst + stampDuty + exchangeCharges + sebiCharges + ipftCharges;
+  const tradingCharges = brokerage + stt + gst + stampDuty + exchangeCharges + sebiCharges + ipftCharges;
+  const totalCharges = tradingCharges + dpCharges;
 
-  // Pro-rate all charges across trades by trade value
-  if (totalCharges > 0 && trades.length > 0) {
+  // Pro-rate trading charges across ALL trades by trade value,
+  // and DP charges across SELL trades only (DP is a depository debit fee on sells)
+  if (trades.length > 0) {
     const totalTradeValue = trades.reduce((s, t) => s + t.total, 0);
+    const sellTrades = trades.filter(t => t.type === 'SELL');
+    const totalSellValue = sellTrades.reduce((s, t) => s + t.total, 0);
+
     for (const trade of trades) {
-      trade.brokerage = totalTradeValue > 0
-        ? parseFloat(((trade.total / totalTradeValue) * totalCharges).toFixed(2))
-        : parseFloat((totalCharges / trades.length).toFixed(2));
+      let charge = 0;
+      // Trading charges pro-rated across all trades
+      if (tradingCharges > 0) {
+        charge += totalTradeValue > 0
+          ? (trade.total / totalTradeValue) * tradingCharges
+          : tradingCharges / trades.length;
+      }
+      // DP charges pro-rated across sell trades only
+      if (dpCharges > 0 && trade.type === 'SELL') {
+        charge += totalSellValue > 0
+          ? (trade.total / totalSellValue) * dpCharges
+          : dpCharges / sellTrades.length;
+      }
+      trade.brokerage = parseFloat(charge.toFixed(2));
     }
   }
 
@@ -410,7 +432,7 @@ function parseGrowwPDF(text, fileName) {
     trades,
     charges: {
       total: totalCharges, brokerage, stt, gst,
-      stampDuty, exchangeCharges, sebiCharges, ipftCharges,
+      stampDuty, exchangeCharges, sebiCharges, ipftCharges, dpCharges,
     },
   };
 }

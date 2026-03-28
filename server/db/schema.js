@@ -47,6 +47,7 @@ function initializeDb(db) {
       notes TEXT,
       display_name TEXT,              -- User-friendly display name (overrides 'name' in UI)
       isin_code TEXT,                -- ISIN for universal identification
+      previous_isin_codes TEXT,      -- Comma-separated historical ISINs (e.g. after stock splits)
       is_active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
@@ -150,6 +151,12 @@ function initializeDb(db) {
   const txnCols = db.prepare("PRAGMA table_info(transactions)").all().map(c => c.name);
   if (!txnCols.includes('locked')) {
     db.exec("ALTER TABLE transactions ADD COLUMN locked INTEGER DEFAULT 0");
+  }
+
+  // Add previous_isin_codes column if missing
+  const invCols = db.prepare("PRAGMA table_info(investments)").all().map(c => c.name);
+  if (!invCols.includes('previous_isin_codes')) {
+    db.exec("ALTER TABLE investments ADD COLUMN previous_isin_codes TEXT");
   }
 
   // Seed default interest rates

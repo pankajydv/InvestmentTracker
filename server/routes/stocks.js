@@ -67,6 +67,15 @@ module.exports = function (db) {
       const sells = trades.filter(t => t.type === 'SELL');
       const totalCharges = allParsed.reduce((s, n) => s + (n.charges?.total || 0), 0);
 
+      // Aggregate charges breakdown across all parsed notes
+      const chargesBreakdown = {};
+      for (const note of allParsed) {
+        if (!note.charges) continue;
+        for (const [key, val] of Object.entries(note.charges)) {
+          chargesBreakdown[key] = (chargesBreakdown[key] || 0) + (val || 0);
+        }
+      }
+
       res.json({
         broker,
         panNumber: notePAN,
@@ -81,7 +90,7 @@ module.exports = function (db) {
           totalSellValue: sells.reduce((s, t) => s + t.total, 0),
           totalSellShares: sells.reduce((s, t) => s + t.quantity, 0),
           totalBrokerage: totalCharges,
-          chargesBreakdown: allParsed[0].charges || {},
+          chargesBreakdown,
         },
       });
     } catch (e) {
@@ -112,6 +121,9 @@ module.exports = function (db) {
       );
       const findByIsin = db.prepare(
         'SELECT id, name, ticker_symbol FROM investments WHERE isin_code = ? AND is_active = 1'
+      );
+      const findByPreviousIsin = db.prepare(
+        "SELECT id, name, ticker_symbol FROM investments WHERE is_active = 1 AND (',' || previous_isin_codes || ',') LIKE '%,' || ? || ',%'"
       );
       const findByTickerBase = db.prepare(
         `SELECT id, name, ticker_symbol FROM investments WHERE asset_type = 'INDIAN_STOCK' AND is_active = 1
@@ -163,8 +175,15 @@ module.exports = function (db) {
           const tickerSymbol = ticker || null;
           const displayName = stock.security;
 
+          // Match existing investment: ISIN first (current + historical), then ticker, then name
           let existing = null;
-          if (tickerSymbol) {
+          if (stock.isin) {
+            existing = findByIsin.get(stock.isin);
+          }
+          if (!existing && stock.isin) {
+            existing = findByPreviousIsin.get(stock.isin);
+          }
+          if (!existing && tickerSymbol) {
             existing = findInvestment.get('INDIAN_STOCK', tickerSymbol, displayName);
           }
           if (!existing) {
@@ -270,6 +289,9 @@ module.exports = function (db) {
       const findByIsin = db.prepare(
         'SELECT id FROM investments WHERE isin_code = ? AND is_active = 1'
       );
+      const findByPreviousIsin = db.prepare(
+        "SELECT id FROM investments WHERE is_active = 1 AND (',' || previous_isin_codes || ',') LIKE '%,' || ? || ',%'"
+      );
       const findByTickerBase = db.prepare(
         "SELECT id FROM investments WHERE REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? AND is_active = 1"
       );
@@ -298,10 +320,13 @@ module.exports = function (db) {
           const tickerSymbol = ticker || null;
           const displayName = stock.security;
 
-          // Match existing investment: ISIN first, then ticker base, then legacy match
+          // Match existing investment: ISIN first (current + historical), then ticker base, then legacy match
           let existing = null;
           if (stock.isin) {
             existing = findByIsin.get(stock.isin);
+          }
+          if (!existing && stock.isin) {
+            existing = findByPreviousIsin.get(stock.isin);
           }
           if (!existing && tickerSymbol) {
             const base = tickerSymbol.replace(/\.(NS|BO)$/, '');

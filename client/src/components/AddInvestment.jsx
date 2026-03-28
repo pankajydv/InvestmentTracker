@@ -536,6 +536,31 @@ export default function AddInvestment() {
                       })()}
                     </span>
                   </div>
+                  {/* Charges breakdown */}
+                  {contractPreview.summary?.chargesBreakdown && (() => {
+                    const b = contractPreview.summary.chargesBreakdown;
+                    const items = [
+                      ['Brokerage', b.brokerage],
+                      ['STT', b.stt],
+                      ['GST', b.gst],
+                      ['Exchange', b.exchangeCharges],
+                      ['Stamp', b.stampDuty],
+                      ['SEBI', b.sebiCharges],
+                      ['IPFT', b.ipftCharges],
+                      ['DP', b.dpCharges],
+                    ].filter(([, v]) => v);
+                    if (!items.length) return null;
+                    const fmt = v => '₹' + v.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+                    return (
+                      <div className="mt-1 small text-muted">
+                        <strong>Charges:</strong>{' '}
+                        {items.map(([label, val], i) => (
+                          <span key={label}>{i > 0 && ' · '}{label}: {fmt(val)}</span>
+                        ))}
+                        {b.total ? <span> · <strong>Total: {fmt(b.total)}</strong></span> : null}
+                      </div>
+                    );
+                  })()}
                   <div className="d-flex gap-2 mt-3">
                     <Button
                       size="sm"
