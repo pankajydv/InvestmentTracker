@@ -75,6 +75,10 @@ export default function Transactions() {
   const [typeDropdownOpen, setTypeDropdownOpen] = useState(false);
   const typeDropdownRef = useRef(null);
 
+  // Pagination state
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+
   // Edit/Delete state
   const [editTxn, setEditTxn] = useState(null);
   const [editForm, setEditForm] = useState({});
@@ -206,6 +210,15 @@ export default function Transactions() {
       setLoading(false);
     }
   };
+
+  // Reset to page 1 when filters or transactions change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [filterType, filterAssetType, filterBroker, filterInvestment, filterStartDate, filterEndDate, transactions.length]);
+
+  // Pagination computed values
+  const totalPages = Math.max(1, Math.ceil(transactions.length / pageSize));
+  const paginatedTransactions = transactions.slice((currentPage - 1) * pageSize, currentPage * pageSize);
 
   const typeCounts = transactions.reduce((acc, t) => {
     acc[t.transaction_type] = (acc[t.transaction_type] || 0) + 1;
@@ -441,7 +454,7 @@ export default function Transactions() {
                 </tr>
               </thead>
               <tbody>
-                {transactions.map((txn) => (
+                {paginatedTransactions.map((txn) => (
                   <tr key={txn.id}>
                     <td className="px-3 py-2 text-nowrap">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3 py-2">
@@ -497,6 +510,45 @@ export default function Transactions() {
                 ))}
               </tbody>
             </Table>
+          </div>
+        )}
+        {/* Pagination controls */}
+        {transactions.length > 0 && (
+          <div className="d-flex align-items-center justify-content-between px-3 py-2 border-top small">
+            <div className="d-flex align-items-center gap-2">
+              <span className="text-muted">Rows per page:</span>
+              <Form.Select
+                size="sm"
+                value={pageSize}
+                onChange={(e) => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
+                style={{ width: 'auto' }}
+              >
+                {[10, 25, 50, 100].map(n => (
+                  <option key={n} value={n}>{n}</option>
+                ))}
+              </Form.Select>
+            </div>
+            <div className="d-flex align-items-center gap-2">
+              <span className="text-muted">
+                {(currentPage - 1) * pageSize + 1}–{Math.min(currentPage * pageSize, transactions.length)} of {transactions.length}
+              </span>
+              <Button
+                variant="outline-secondary"
+                size="sm"
+                disabled={currentPage <= 1}
+                onClick={() => setCurrentPage(p => p - 1)}
+              >
+                ‹ Prev
+              </Button>
+              <Button
+                variant="outline-secondary"
+                size="sm"
+                disabled={currentPage >= totalPages}
+                onClick={() => setCurrentPage(p => p + 1)}
+              >
+                Next ›
+              </Button>
+            </div>
           </div>
         )}
       </Card>
