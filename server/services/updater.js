@@ -83,6 +83,9 @@ async function updateAllPrices(db) {
       let investedAmount = getInvestedAmount.get(inv.id).total;
       let saleProceeds = getSaleProceeds.get(inv.id).total;
       let currentValue = 0;
+      // Per-share change from the API (used for stocks; null means fall back to DB).
+      let apiChange = null;
+      let apiChangePct = null;
 
       switch (inv.asset_type) {
         case 'MUTUAL_FUND': {
@@ -93,6 +96,20 @@ async function updateAllPrices(db) {
           const navData = await fetchMutualFundNAV(inv.amfi_code);
           pricePerUnit = navData.nav;
           currentValue = totalUnits * pricePerUnit;
+          // mfapi returns the NAV date (e.g. "28-03-2026"); use it so we
+          // compare against the previous *trading* day, not the calendar day.
+          if (navData.date) {
+            const parts = navData.date.split('-');
+            // Format: DD-MM-YYYY -> YYYY-MM-DD
+            if (parts.length === 3 && parts[2].length === 4) {
+              const navDateISO = `${parts[2]}-${parts[1]}-${parts[0]}`;
+              const prevDay = getPrevDay.get(inv.id, navDateISO);
+              if (prevDay && prevDay.price_per_unit > 0) {
+                apiChange = pricePerUnit - prevDay.price_per_unit;
+                apiChangePct = (apiChange / prevDay.price_per_unit) * 100;
+              }
+            }
+          }
           break;
         }
 
@@ -107,6 +124,10 @@ async function updateAllPrices(db) {
           const stockData = await fetchStockPrice(stockTicker);
           pricePerUnit = stockData.price;
           currentValue = totalUnits * pricePerUnit;
+          // Use Yahoo's per-share change (last close vs previous close)
+          // so weekends/holidays still show the last trading session's move.
+          apiChange = stockData.change;
+          apiChangePct = stockData.changePercent;
           break;
         }
 
@@ -120,6 +141,9 @@ async function updateAllPrices(db) {
           pricePerUnit = foreignData.price;
           // Convert to INR for portfolio aggregation
           currentValue = totalUnits * pricePerUnit * usdToInr;
+          // Use Yahoo's per-share change
+          apiChange = foreignData.change;
+          apiChangePct = foreignData.changePercent;
           break;
         }
 
@@ -151,16 +175,22 @@ async function updateAllPrices(db) {
       const profitLoss = currentValue + saleProceeds - investedAmount;
       const profitLossPct = investedAmount > 0 ? (profitLoss / investedAmount) * 100 : 0;
 
-      // Get previous day's value for day change (0 when no holdings)
-      // Day change = totalUnits * (todayPrice - yesterdayPrice)
-      // This matches broker behaviour and is unaffected by unit corrections or new transactions.
+      // Day change: prefer API-sourced per-share change (stocks get it from
+      // Yahoo, MFs compute it from NAV date). This ensures weekends/holidays
+      // show the last trading session's move, matching broker apps.
       let dayChange = 0;
       let dayChangePct = 0;
       if (totalUnits > 0) {
-        const prevDay = getPrevDay.get(inv.id, today);
-        if (prevDay && prevDay.price_per_unit > 0) {
-          dayChange = totalUnits * (pricePerUnit - prevDay.price_per_unit);
-          dayChangePct = ((pricePerUnit - prevDay.price_per_unit) / prevDay.price_per_unit) * 100;
+        if (apiChange != null && apiChangePct != null) {
+          dayChange = totalUnits * apiChange;
+          dayChangePct = apiChangePct;
+        } else {
+          // Fallback: compare against previous DB entry (for bonds etc.)
+          const prevDay = getPrevDay.get(inv.id, today);
+          if (prevDay && prevDay.price_per_unit > 0) {
+            dayChange = totalUnits * (pricePerUnit - prevDay.price_per_unit);
+            dayChangePct = ((pricePerUnit - prevDay.price_per_unit) / prevDay.price_per_unit) * 100;
+          }
         }
       }
 
