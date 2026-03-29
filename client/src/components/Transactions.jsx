@@ -540,6 +540,22 @@ export default function Transactions() {
               >
                 ‹ Prev
               </Button>
+              <span className="d-flex align-items-center gap-1 text-muted">
+                Page
+                <Form.Control
+                  type="number"
+                  size="sm"
+                  min={1}
+                  max={totalPages}
+                  value={currentPage}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value, 10);
+                    if (val >= 1 && val <= totalPages) setCurrentPage(val);
+                  }}
+                  style={{ width: 54, textAlign: 'center' }}
+                />
+                of {totalPages}
+              </span>
               <Button
                 variant="outline-secondary"
                 size="sm"
