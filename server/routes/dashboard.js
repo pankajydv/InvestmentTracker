@@ -25,7 +25,7 @@ module.exports = function (db) {
 
     // Build hide-sold filter
     const soldFilter = hide_sold === 'true'
-      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(t2.units,0) WHEN t2.transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t2.units,0) ELSE 0 END) FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}),0) > 0)`
+      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(t2.units,0) WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t2.units,0) ELSE 0 END) FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}),0) > 0)`
       : '';
     const soldParams = (hide_sold === 'true' && portfolio_id) ? [portfolio_id] : [];
 
@@ -37,7 +37,7 @@ module.exports = function (db) {
         dv.date, COALESCE(dv.price_per_unit, 0) as price_per_unit,
         COALESCE((SELECT SUM(CASE
           WHEN t3.transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','RIGHTS') THEN COALESCE(t3.units,0)
-          WHEN t3.transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t3.units,0)
+          WHEN t3.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t3.units,0)
           ELSE 0 END) FROM transactions t3 WHERE t3.investment_id = i.id), 0) as total_units,
         COALESCE(dv.current_value, 0) as current_value,
         COALESCE(dv.invested_amount,

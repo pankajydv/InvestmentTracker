@@ -6,14 +6,14 @@ import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters
 import { usePortfolio } from '../context/PortfolioContext';
 
 const TRANSACTION_TYPES_DEFAULT = [
-  'BUY', 'SELL', 'REDEMPTION', 'DIVIDEND', 'INTEREST', 'BONUS', 'IPO', 'AMC', 'TRANSFER',
+  'BUY', 'SELL', 'DIVIDEND', 'INTEREST', 'BONUS', 'IPO', 'AMC', 'TRANSFER',
 ];
 
 // User-action types that can be edited/deleted (not corporate actions)
-const EDITABLE_TYPES = ['BUY', 'SELL', 'REDEMPTION', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER'];
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'DEPOSIT'];
-const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'REDEMPTION'];
+const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
 
 const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
 
@@ -51,7 +51,6 @@ const TYPE_BADGE = {
   MERGER: 'badge-merger',
   CONSOLIDATION: 'badge-merger',
   SELL: 'badge-sell',
-  REDEMPTION: 'badge-sell',
   WITHDRAWAL: 'badge-withdrawal',
   TRANSFER_OUT: 'badge-sell',
   TRANSFER: 'badge-merger',

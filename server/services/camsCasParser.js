@@ -425,7 +425,7 @@ function parseSchemeBlock(lines, startIdx, amc) {
 
   flushPending();
 
-  scheme.transactions = transactions;
+  scheme.transactions = mergeFragmentedTransactions(transactions);
   scheme.latestNav = latestNav;
   scheme.latestNavDate = latestNavDate;
   scheme.marketValue = marketValue;
@@ -434,6 +434,47 @@ function parseSchemeBlock(lines, startIdx, amc) {
   scheme.totalCostValue = totalCostValue;
 
   return { scheme, nextIndex: i };
+}
+
+/**
+ * Merge fragmented transactions that are clearly parts of a single transaction.
+ * CAS PDFs sometimes split a single transfer/purchase into multiple lines
+ * (e.g., 0.001 units + 68.527 units on the same date at the same NAV).
+ * This merges consecutive transactions with the same date, type, and price.
+ */
+function mergeFragmentedTransactions(transactions) {
+  if (transactions.length <= 1) return transactions;
+
+  const merged = [];
+  let i = 0;
+
+  while (i < transactions.length) {
+    const current = { ...transactions[i] };
+    // Look ahead for consecutive transactions with same date, type, and price
+    while (i + 1 < transactions.length) {
+      const next = transactions[i + 1];
+      if (next.date === current.date &&
+          next.type === current.type &&
+          next.price === current.price) {
+        // Merge: sum units and amount, keep the later balance, combine descriptions
+        current.units = +(current.units + next.units).toFixed(4);
+        current.amount = +(current.amount + next.amount).toFixed(2);
+        current.stampDuty = (current.stampDuty || 0) + (next.stampDuty || 0);
+        current.stt = (current.stt || 0) + (next.stt || 0);
+        if (next.balance !== null) current.balance = next.balance;
+        if (next.description && next.description !== current.description) {
+          current.description = current.description + '; ' + next.description;
+        }
+        i++;
+      } else {
+        break;
+      }
+    }
+    merged.push(current);
+    i++;
+  }
+
+  return merged;
 }
 
 /**

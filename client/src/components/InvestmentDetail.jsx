@@ -7,7 +7,7 @@ import { ArrowLeft, Trash2, Plus, X, Settings } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'DEPOSIT'];
-const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'REDEMPTION'];
+const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
 
 export default function InvestmentDetail() {
   const { id } = useParams();
@@ -98,7 +98,7 @@ export default function InvestmentDetail() {
   const txnTypes = isPPF
     ? ['DEPOSIT', 'WITHDRAWAL', 'INTEREST']
     : isBond
-    ? ['BUY', 'SELL', 'REDEMPTION', 'INTEREST']
+    ? ['BUY', 'SELL', 'INTEREST']
     : ['BUY', 'SELL', 'DIVIDEND'];
 
   return (
