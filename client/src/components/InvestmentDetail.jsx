@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useParams, Link, useNavigate } from 'react-router-dom';
+import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge } from 'react-bootstrap';
 import { getInvestment, deleteInvestment, addTransaction, deleteTransaction } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS } from '../utils/formatters';
@@ -12,7 +12,10 @@ const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
 export default function InvestmentDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const { selectedId } = usePortfolio();
+  const cameFrom = location.state?.from;
+  const transactionsSearch = location.state?.transactionsSearch || '';
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [showAddTxn, setShowAddTxn] = useState(false);
@@ -106,8 +109,8 @@ export default function InvestmentDetail() {
       {/* Header */}
       <div className="d-flex flex-column flex-sm-row justify-content-between align-items-start gap-3 mb-4">
         <div>
-          <Link to="/investments" className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">
-            <ArrowLeft size={16} /> Back to Investments
+          <Link to={cameFrom === 'transactions' ? `/transactions${transactionsSearch}` : '/investments'} className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">
+            <ArrowLeft size={16} /> Back to {cameFrom === 'transactions' ? 'Transactions' : 'Investments'}
           </Link>
           <h1 className="h4 fw-bold mb-1">{data.display_name || data.name}</h1>
           <div className="d-flex align-items-center gap-2">
@@ -118,7 +121,7 @@ export default function InvestmentDetail() {
           <Button variant="primary" size="sm" onClick={() => setShowAddTxn(true)} className="d-flex align-items-center gap-1">
             <Plus size={16} /> Add Transaction
           </Button>
-          <Link to={`/investments/${id}/settings`} className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
+          <Link to={`/investments/${id}/settings`} state={{ from: cameFrom, transactionsSearch }} className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
             <Settings size={16} /> Settings
           </Link>
           <Button variant="outline-danger" size="sm" onClick={handleDelete} className="d-flex align-items-center gap-1">

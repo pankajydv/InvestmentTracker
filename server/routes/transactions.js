@@ -29,7 +29,7 @@ module.exports = function (db) {
   // ─── Get transactions for an investment ───────────────────────────────
   router.get('/investment/:investmentId', (req, res) => {
     const txns = db.prepare(
-      'SELECT * FROM transactions WHERE investment_id = ? ORDER BY transaction_date DESC'
+      'SELECT * FROM transactions WHERE investment_id = ? ORDER BY transaction_date DESC, id DESC'
     ).all(req.params.investmentId);
     res.json(txns);
   });
@@ -125,7 +125,7 @@ module.exports = function (db) {
     if (investment_name) { query += ' AND COALESCE(i.display_name, i.name) = ?'; params.push(investment_name); }
     if (req.query.asset_type) { query += ' AND i.asset_type = ?'; params.push(req.query.asset_type); }
 
-    query += ' ORDER BY t.transaction_date DESC LIMIT 500';
+    query += ' ORDER BY t.transaction_date DESC, t.id DESC LIMIT 500';
     const txns = db.prepare(query).all(...params);
     res.json(txns);
   });

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useLocation } from 'react-router-dom';
 import { Card, Form, Button, Row, Col, Spinner, Alert } from 'react-bootstrap';
 import { getInvestment, updateInvestment } from '../services/api';
 import { ArrowLeft, Save } from 'lucide-react';
@@ -7,6 +7,9 @@ import { ASSET_TYPE_LABELS } from '../utils/formatters';
 
 export default function InvestmentSettings() {
   const { id } = useParams();
+  const location = useLocation();
+  const cameFrom = location.state?.from;
+  const transactionsSearch = location.state?.transactionsSearch || '';
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -70,7 +73,7 @@ export default function InvestmentSettings() {
 
   return (
     <div>
-      <Link to={`/investments/${id}`} className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">
+      <Link to={`/investments/${id}`} state={{ from: cameFrom, transactionsSearch }} className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">
         <ArrowLeft size={16} /> Back to {data.display_name || data.name}
       </Link>
       <h1 className="h4 fw-bold mb-1">Settings</h1>

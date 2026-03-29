@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { Card, Table, Spinner, Form, Modal, Button } from 'react-bootstrap';
 import { getTransactions, getBrokers, getAssetTypes, getTransactionTypes, getInvestmentNames, updateTransaction, deleteTransaction } from '../services/api';
 import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters';
@@ -59,6 +59,9 @@ const TYPE_BADGE = {
 
 export default function Transactions() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const isInitialLoad = useRef(true);
   const { selectedId } = usePortfolio();
   const [transactions, setTransactions] = useState([]);
   const [brokers, setBrokers] = useState([]);
@@ -66,18 +69,64 @@ export default function Transactions() {
   const [transactionTypes, setTransactionTypes] = useState(TRANSACTION_TYPES_DEFAULT);
   const [investmentNames, setInvestmentNames] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [filterType, setFilterType] = useState([]);
-  const [filterAssetType, setFilterAssetType] = useState('');
-  const [filterBroker, setFilterBroker] = useState('');
-  const [filterInvestment, setFilterInvestment] = useState('');
-  const [filterStartDate, setFilterStartDate] = useState('');
-  const [filterEndDate, setFilterEndDate] = useState('');
+  const [filterType, setFilterType] = useState(() => {
+    const v = searchParams.get('type');
+    return v ? v.split(',') : [];
+  });
+  const [filterAssetType, setFilterAssetType] = useState(() => searchParams.get('asset_type') || '');
+  const [filterBroker, setFilterBroker] = useState(() => searchParams.get('broker') || '');
+  const [filterInvestment, setFilterInvestment] = useState(() => searchParams.get('investment') || '');
+  const [filterStartDate, setFilterStartDate] = useState(() => searchParams.get('from') || '');
+  const [filterEndDate, setFilterEndDate] = useState(() => searchParams.get('to') || '');
   const [typeDropdownOpen, setTypeDropdownOpen] = useState(false);
   const typeDropdownRef = useRef(null);
 
   // Pagination state
-  const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState(25);
+  const [currentPage, setCurrentPage] = useState(() => {
+    const v = parseInt(searchParams.get('page'), 10);
+    return v >= 1 ? v : 1;
+  });
+  const [pageSize, setPageSize] = useState(() => {
+    const v = parseInt(searchParams.get('size'), 10);
+    return [10, 25, 50, 100].includes(v) ? v : 25;
+  });
+
+  // Sync filter/pagination state → URL search params
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (filterType.length) params.set('type', filterType.join(','));
+    if (filterAssetType) params.set('asset_type', filterAssetType);
+    if (filterBroker) params.set('broker', filterBroker);
+    if (filterInvestment) params.set('investment', filterInvestment);
+    if (filterStartDate) params.set('from', filterStartDate);
+    if (filterEndDate) params.set('to', filterEndDate);
+    if (currentPage > 1) params.set('page', String(currentPage));
+    if (pageSize !== 25) params.set('size', String(pageSize));
+    setSearchParams(params, { replace: true });
+  }, [filterType, filterAssetType, filterBroker, filterInvestment, filterStartDate, filterEndDate, currentPage, pageSize]);
+
+  // Save scroll position before unload / navigation
+  useEffect(() => {
+    const saveScroll = () => sessionStorage.setItem('txn_scrollY', String(window.scrollY));
+    window.addEventListener('beforeunload', saveScroll);
+    return () => {
+      saveScroll();
+      window.removeEventListener('beforeunload', saveScroll);
+    };
+  }, []);
+
+  // Restore scroll position after initial data load
+  useEffect(() => {
+    if (!loading && isInitialLoad.current) {
+      isInitialLoad.current = false;
+      const saved = sessionStorage.getItem('txn_scrollY');
+      if (saved != null) {
+        // Use requestAnimationFrame to ensure DOM has rendered
+        requestAnimationFrame(() => window.scrollTo(0, parseInt(saved, 10)));
+        sessionStorage.removeItem('txn_scrollY');
+      }
+    }
+  }, [loading]);
 
   // Edit/Delete state
   const [editTxn, setEditTxn] = useState(null);
@@ -162,7 +211,10 @@ export default function Transactions() {
     getTransactionTypes(params).then(types => {
       setTransactionTypes(types.length ? types : TRANSACTION_TYPES_DEFAULT);
       // Clear any selected types that aren't available in the new list
-      setFilterType(prev => prev.filter(t => types.includes(t)));
+      setFilterType(prev => {
+        const next = prev.filter(t => types.includes(t));
+        return next.length === prev.length ? prev : next;
+      });
     }).catch(() => {});
   }, [filterAssetType]);
 
@@ -211,10 +263,8 @@ export default function Transactions() {
     }
   };
 
-  // Reset to page 1 when filters or transactions change
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [filterType, filterAssetType, filterBroker, filterInvestment, filterStartDate, filterEndDate, transactions.length]);
+  // Reset to page 1 — call from user-initiated filter changes only
+  const resetPage = () => setCurrentPage(1);
 
   // Pagination computed values
   const totalPages = Math.max(1, Math.ceil(transactions.length / pageSize));
@@ -247,7 +297,7 @@ export default function Transactions() {
             <Form.Select
               size="sm"
               value={filterAssetType}
-              onChange={(e) => setFilterAssetType(e.target.value)}
+              onChange={(e) => { setFilterAssetType(e.target.value); resetPage(); }}
               style={{ width: 'auto' }}
             >
               <option value="">All Asset Types</option>
@@ -273,7 +323,7 @@ export default function Transactions() {
                   <span key={t} className={`badge ${TYPE_BADGE[t] || 'bg-secondary'} d-inline-flex align-items-center`}>
                     {t.replace(/_/g, ' ')}
                     <button
-                      onClick={(e) => { e.stopPropagation(); setFilterType(filterType.filter(x => x !== t)); }}
+                      onClick={(e) => { e.stopPropagation(); setFilterType(filterType.filter(x => x !== t)); resetPage(); }}
                       className="btn-close btn-close-white ms-1"
                       style={{ fontSize: '0.5rem' }}
                     />
@@ -294,6 +344,7 @@ export default function Transactions() {
                     key={t}
                     onClick={() => {
                       setFilterType(selected ? filterType.filter(x => x !== t) : [...filterType, t]);
+                      resetPage();
                     }}
                     className={`d-flex align-items-center gap-2 w-100 text-start px-3 py-1 small border-0 bg-transparent ${selected ? 'fw-semibold' : ''}`}
                     style={{ cursor: 'pointer' }}
@@ -319,7 +370,7 @@ export default function Transactions() {
                 <>
                   <hr className="my-1" />
                   <button
-                    onClick={() => { setFilterType([]); setTypeDropdownOpen(false); }}
+                    onClick={() => { setFilterType([]); setTypeDropdownOpen(false); resetPage(); }}
                     className="w-100 text-start px-3 py-1 small text-muted border-0 bg-transparent"
                     style={{ cursor: 'pointer' }}
                     onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f8f9fa'}
@@ -338,7 +389,7 @@ export default function Transactions() {
           <Form.Select
             size="sm"
             value={filterInvestment}
-            onChange={(e) => setFilterInvestment(e.target.value)}
+              onChange={(e) => { setFilterInvestment(e.target.value); resetPage(); }}
             style={{ maxWidth: 220 }}
           >
             <option value="">All Investments</option>
@@ -354,7 +405,7 @@ export default function Transactions() {
             <Form.Select
               size="sm"
               value={filterBroker}
-              onChange={(e) => setFilterBroker(e.target.value)}
+              onChange={(e) => { setFilterBroker(e.target.value); resetPage(); }}
               style={{ width: 'auto' }}
             >
               <option value="">All Brokers</option>
@@ -371,7 +422,7 @@ export default function Transactions() {
             type="date"
             size="sm"
             value={filterStartDate}
-            onChange={(e) => setFilterStartDate(e.target.value)}
+            onChange={(e) => { setFilterStartDate(e.target.value); resetPage(); }}
             style={{ width: 140 }}
             placeholder="From"
           />
@@ -380,7 +431,7 @@ export default function Transactions() {
             type="date"
             size="sm"
             value={filterEndDate}
-            onChange={(e) => setFilterEndDate(e.target.value)}
+            onChange={(e) => { setFilterEndDate(e.target.value); resetPage(); }}
             style={{ width: 140 }}
             placeholder="To"
           />
@@ -388,7 +439,7 @@ export default function Transactions() {
 
         {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment || filterStartDate || filterEndDate) && (
           <button
-            onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); setFilterStartDate(''); setFilterEndDate(''); }}
+            onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); setFilterStartDate(''); setFilterEndDate(''); resetPage(); }}
             className="btn btn-link btn-sm text-muted text-decoration-underline p-0"
           >
             Clear filters
@@ -425,7 +476,7 @@ export default function Transactions() {
           <div className="p-5 text-center text-muted">
             <p>No transactions found.</p>
             {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment || filterStartDate || filterEndDate) ? (
-              <button onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); setFilterStartDate(''); setFilterEndDate(''); }}
+              <button onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); setFilterStartDate(''); setFilterEndDate(''); resetPage(); }}
                 className="btn btn-link text-primary mt-2">
                 Clear filters
               </button>
@@ -458,7 +509,7 @@ export default function Transactions() {
                   <tr key={txn.id}>
                     <td className="px-3 py-2 text-nowrap">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3 py-2">
-                      <Link to={`/investments/${txn.investment_id}`} className="text-primary fw-medium text-decoration-none">
+                      <Link to={`/investments/${txn.investment_id}`} state={{ from: 'transactions', transactionsSearch: window.location.search }} className="text-primary fw-medium text-decoration-none">
                         {txn.investment_name}
                       </Link>
                       <div className="d-flex align-items-center gap-2 mt-1">
