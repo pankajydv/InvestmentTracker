@@ -355,10 +355,52 @@ async function lookupTickerByISIN(isin) {
  * @param {number} year - Calendar year to fetch actions for
  * @returns {Promise<{dividends: Array, splits: Array}>}
  */
-function fetchCorporateActions(symbol, year) {
+async function fetchCorporateActions(symbol, year) {
   const period1 = Math.floor(new Date(`${year}-01-01`).getTime() / 1000);
   const period2 = Math.floor(new Date(`${year}-12-31T23:59:59`).getTime() / 1000);
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d&events=div%2Csplit`;
+
+  const { dividends, splits } = await _fetchChartEvents(symbol, period1, period2);
+
+  // Yahoo Finance returns split-adjusted dividend amounts for historical data.
+  // If a stock paid ₹10/share and later had a 1:1 bonus, Yahoo reports ₹5/share.
+  // We reverse this by fetching all splits from the dividend year to today and
+  // computing a cumulative adjustment factor for each dividend.
+  const currentYear = new Date().getFullYear();
+  if (dividends.length > 0 && year < currentYear) {
+    // Fetch splits from start of the requested year to today
+    const splitStart = period1;
+    const splitEnd = Math.floor(Date.now() / 1000);
+    const futureSplitData = await _fetchChartEvents(symbol, splitStart, splitEnd, true);
+    const allSplits = futureSplitData.splits;
+
+    for (const div of dividends) {
+      // Multiply by the ratio of every split that occurred AFTER this dividend date
+      let adjustmentFactor = 1;
+      for (const s of allSplits) {
+        if (s.date > div.date) {
+          adjustmentFactor *= s.numerator / s.denominator;
+        }
+      }
+      if (adjustmentFactor !== 1) {
+        div.amount = Math.round(div.amount * adjustmentFactor * 10000) / 10000;
+      }
+    }
+  }
+
+  return { dividends, splits };
+}
+
+/**
+ * Internal helper: fetch dividend and split events from Yahoo Finance v8 chart API.
+ * @param {string} symbol
+ * @param {number} period1 - Unix timestamp start
+ * @param {number} period2 - Unix timestamp end
+ * @param {boolean} [splitsOnly] - When true, only request split events (saves bandwidth)
+ * @returns {Promise<{dividends: Array, splits: Array}>}
+ */
+function _fetchChartEvents(symbol, period1, period2, splitsOnly) {
+  const events = splitsOnly ? 'split' : 'div%2Csplit';
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1mo&events=${events}`;
 
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
@@ -373,12 +415,12 @@ function fetchCorporateActions(symbol, year) {
             return;
           }
 
-          const events = result.events || {};
+          const evts = result.events || {};
           const dividends = [];
           const splits = [];
 
-          if (events.dividends) {
-            for (const [ts, div] of Object.entries(events.dividends)) {
+          if (evts.dividends) {
+            for (const [ts, div] of Object.entries(evts.dividends)) {
               dividends.push({
                 date: new Date(parseInt(ts) * 1000).toISOString().split('T')[0],
                 amount: div.amount,
@@ -386,8 +428,8 @@ function fetchCorporateActions(symbol, year) {
             }
           }
 
-          if (events.splits) {
-            for (const [ts, split] of Object.entries(events.splits)) {
+          if (evts.splits) {
+            for (const [ts, split] of Object.entries(evts.splits)) {
               splits.push({
                 date: new Date(parseInt(ts) * 1000).toISOString().split('T')[0],
                 numerator: split.numerator,
