@@ -13,6 +13,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const hideSold = localStorage.getItem('hideSoldInvestments') !== 'false';
+  const [sortConfigs, setSortConfigs] = useState({});
 
   useEffect(() => {
     loadData();
@@ -36,6 +37,49 @@ export default function Dashboard() {
 
   const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses } = data;
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
+
+  const handleSort = (type, key) => {
+    setSortConfigs(prev => {
+      const cur = prev[type] || { key: null, direction: 'asc' };
+      if (cur.key !== key) return { ...prev, [type]: { key, direction: 'asc' } };
+      if (cur.direction === 'asc') return { ...prev, [type]: { key, direction: 'desc' } };
+      return { ...prev, [type]: { key: null, direction: 'asc' } };
+    });
+  };
+
+  const sortInvestments = (type, investments) => {
+    const config = sortConfigs[type];
+    if (!config?.key) return investments;
+    const fieldMap = {
+      name: inv => inv.name,
+      price: inv => inv.price_per_unit,
+      dayChange: inv => inv.day_change,
+      totalCost: inv => inv.invested_amount,
+      currentValue: inv => inv.current_value,
+      portfolioPct: inv => inv.portfolio_pct || 0,
+      totalReturn: inv => inv.profit_loss,
+    };
+    const getValue = fieldMap[config.key];
+    if (!getValue) return investments;
+    return [...investments].sort((a, b) => {
+      const aVal = getValue(a);
+      const bVal = getValue(b);
+      const cmp = config.key === 'name'
+        ? String(aVal).localeCompare(String(bVal))
+        : (aVal || 0) - (bVal || 0);
+      return config.direction === 'desc' ? -cmp : cmp;
+    });
+  };
+
+  const sortColumns = [
+    { key: 'name', label: 'Name' },
+    { key: 'price', label: 'Last Price', end: true },
+    { key: 'dayChange', label: '1 Day Change', end: true },
+    { key: 'totalCost', label: 'Total Cost', end: true },
+    { key: 'currentValue', label: 'Current Value', end: true },
+    { key: 'portfolioPct', label: '% Portfolio', end: true },
+    { key: 'totalReturn', label: 'Total Return', end: true },
+  ];
 
   return (
     <div>
@@ -153,17 +197,28 @@ export default function Dashboard() {
             <Table hover size="sm" className="mb-0 small">
               <thead className="table-light">
                 <tr>
-                  <th className="px-3">Name</th>
-                  <th className="px-3 text-end">Last Price</th>
-                  <th className="px-3 text-end">1 Day Change</th>
-                  <th className="px-3 text-end">Total Cost</th>
-                  <th className="px-3 text-end">Current Value</th>
-                  <th className="px-3 text-end">% Portfolio</th>
-                  <th className="px-3 text-end">Total Return</th>
+                  {sortColumns.map(col => {
+                    const sc = sortConfigs[type];
+                    return (
+                      <th
+                        key={col.key}
+                        className={`px-3${col.end ? ' text-end' : ''}`}
+                        style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}
+                        onClick={() => handleSort(type, col.key)}
+                      >
+                        {col.label}
+                        {sc?.key === col.key && (
+                          <span className="ms-1" style={{ fontSize: '0.6rem' }}>
+                            {sc.direction === 'desc' ? '▼' : '▲'}
+                          </span>
+                        )}
+                      </th>
+                    );
+                  })}
                 </tr>
               </thead>
               <tbody>
-                {info.investments.map((inv) => (
+                {sortInvestments(type, info.investments).map((inv) => (
                   <tr key={inv.id}>
                     <td className="px-3">
                       <Link to={`/investments/${inv.id}`} className="fw-medium text-decoration-none">
