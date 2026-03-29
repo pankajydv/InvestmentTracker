@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Card, Button, Form, Alert, Table, Spinner } from 'react-bootstrap';
+import { Card, Button, Form, Alert, Table } from 'react-bootstrap';
 import { usePortfolio } from '../context/PortfolioContext';
 import { uploadCASPreview, importCASHoldings, triggerPriceUpdate } from '../services/api';
 import { ArrowLeft, Upload, FileText, CheckCircle, AlertCircle, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
@@ -19,13 +19,8 @@ export default function CASUpload() {
   const [error, setError] = useState('');
   const [preview, setPreview] = useState(null);
 
-  const [selectedStocks, setSelectedStocks] = useState(new Set());
   const [selectedMFs, setSelectedMFs] = useState(new Set());
-  const [selectedBonds, setSelectedBonds] = useState(new Set());
-
-  const [showStocks, setShowStocks] = useState(true);
   const [showMFs, setShowMFs] = useState(true);
-  const [showBonds, setShowBonds] = useState(true);
 
   const selectedPortfolio = portfolios.find(p => p.id === Number(portfolioId));
 
@@ -37,10 +32,13 @@ export default function CASUpload() {
     setUploading(true);
     try {
       const result = await uploadCASPreview(file, portfolioId);
+      if (result.casType === 'cams') {
+        // Redirect to AddInvestment page for CAMS CAS (has full transaction-level UI)
+        navigate('/investments/add', { state: { openCAS: true, message: 'CAMS/KFintech CAS detected. Please upload again here for full transaction-level import.' } });
+        return;
+      }
       setPreview(result);
-      setSelectedStocks(new Set(result.stocks.filter(h => h.isNew).map((_, i) => i)));
       setSelectedMFs(new Set(result.mutualFunds.filter(h => h.isNew).map((_, i) => i)));
-      setSelectedBonds(new Set(result.bonds.filter(h => h.isNew).map((_, i) => i)));
     } catch (e) {
       setError(e.message);
     } finally {
@@ -51,9 +49,7 @@ export default function CASUpload() {
   const handleImport = async () => {
     setError('');
     const holdings = [];
-    selectedStocks.forEach(idx => { if (preview.stocks[idx]) holdings.push(preview.stocks[idx]); });
     selectedMFs.forEach(idx => { if (preview.mutualFunds[idx]) holdings.push(preview.mutualFunds[idx]); });
-    selectedBonds.forEach(idx => { if (preview.bonds[idx]) holdings.push(preview.bonds[idx]); });
 
     if (holdings.length === 0) return setError('No holdings selected for import');
 
@@ -72,22 +68,7 @@ export default function CASUpload() {
     }
   };
 
-  const toggleAll = (items, selected, setSelected) => {
-    if (selected.size === items.length) {
-      setSelected(new Set());
-    } else {
-      setSelected(new Set(items.map((_, i) => i)));
-    }
-  };
-
-  const toggleItem = (idx, selected, setSelected) => {
-    const next = new Set(selected);
-    if (next.has(idx)) next.delete(idx);
-    else next.add(idx);
-    setSelected(next);
-  };
-
-  const totalSelected = selectedStocks.size + selectedMFs.size + selectedBonds.size;
+  const totalSelected = selectedMFs.size;
 
   return (
     <div className="mx-auto d-flex flex-column gap-4" style={{ maxWidth: 900 }}>
@@ -98,7 +79,7 @@ export default function CASUpload() {
         </button>
         <h1 className="h4 fw-bold">Import from CAS PDF</h1>
         <p className="small text-muted mt-1">
-          Upload your CDSL Consolidated Account Statement to bulk-import investments
+          Upload your Consolidated Account Statement (CAS) PDF — supports CAMS / KFintech (transaction history) and CDSL / NSDL (holdings snapshot) to bulk-import mutual fund holdings
         </p>
       </div>
 
@@ -164,7 +145,7 @@ export default function CASUpload() {
                   <div>
                     <Upload size={32} className="text-muted mx-auto mb-2" />
                     <div className="small text-muted">Click to select CAS PDF</div>
-                    <div className="text-muted mt-1" style={{ fontSize: '0.75rem' }}>CDSL Consolidated Account Statement (max 20MB)</div>
+                    <div className="text-muted mt-1" style={{ fontSize: '0.75rem' }}>CDSL / NSDL / CAMS Consolidated Account Statement (max 20MB)</div>
                   </div>
                 )}
               </div>
@@ -205,46 +186,17 @@ export default function CASUpload() {
                 <span className="small text-muted">{preview.investorName}</span>
               </div>
               <div className="row g-3 text-center">
-                <div className="col-6 col-sm-3">
+                <div className="col-6">
                   <div className="fs-5 fw-bold">{formatCurrency(preview.portfolioValue)}</div>
                   <div className="text-muted" style={{ fontSize: '0.75rem' }}>Total Value</div>
                 </div>
-                <div className="col-6 col-sm-3">
-                  <div className="fs-5 fw-bold text-primary">{preview.summary.totalStocks}</div>
-                  <div className="text-muted" style={{ fontSize: '0.75rem' }}>Stocks</div>
-                </div>
-                <div className="col-6 col-sm-3">
+                <div className="col-6">
                   <div className="fs-5 fw-bold text-success">{preview.summary.totalMFs}</div>
                   <div className="text-muted" style={{ fontSize: '0.75rem' }}>Mutual Funds</div>
-                </div>
-                <div className="col-6 col-sm-3">
-                  <div className="fs-5 fw-bold text-warning">{preview.summary.totalBonds}</div>
-                  <div className="text-muted" style={{ fontSize: '0.75rem' }}>Bonds</div>
                 </div>
               </div>
             </Card.Body>
           </Card>
-
-          {/* Stocks */}
-          {preview.stocks.length > 0 && (
-            <HoldingSection
-              title="Stocks"
-              emoji="📈"
-              items={preview.stocks}
-              selected={selectedStocks}
-              setSelected={setSelectedStocks}
-              open={showStocks}
-              toggle={() => setShowStocks(!showStocks)}
-              columns={['Name', 'ISIN', 'Units', 'Price', 'Value']}
-              renderRow={(h) => [
-                <span className="fw-medium">{h.name}</span>,
-                <span className="font-monospace" style={{ fontSize: '0.75rem' }}>{h.isin}</span>,
-                h.units?.toLocaleString('en-IN'),
-                formatCurrency(h.price),
-                formatCurrency(h.value),
-              ]}
-            />
-          )}
 
           {/* Mutual Funds */}
           {preview.mutualFunds.length > 0 && (
@@ -277,31 +229,10 @@ export default function CASUpload() {
             />
           )}
 
-          {/* Bonds */}
-          {preview.bonds.length > 0 && (
-            <HoldingSection
-              title="Bonds"
-              emoji="🏦"
-              items={preview.bonds}
-              selected={selectedBonds}
-              setSelected={setSelectedBonds}
-              open={showBonds}
-              toggle={() => setShowBonds(!showBonds)}
-              columns={['Name', 'ISIN', 'Quantity', 'Market Value', 'Total']}
-              renderRow={(h) => [
-                <span className="fw-medium">{h.name}</span>,
-                <span className="font-monospace" style={{ fontSize: '0.75rem' }}>{h.isin}</span>,
-                h.quantity,
-                formatCurrency(h.marketValue),
-                formatCurrency(h.value),
-              ]}
-            />
-          )}
-
           {/* Import Bar */}
           <div className="sticky-bottom bg-white border-top rounded shadow-lg p-3 d-flex align-items-center justify-content-between">
             <div className="small text-muted">
-              <strong>{totalSelected}</strong> of {(preview.stocks.length + preview.mutualFunds.length + preview.bonds.length)} holdings selected
+              <strong>{totalSelected}</strong> of {preview.mutualFunds.length} mutual funds selected
             </div>
             <div className="d-flex gap-2">
               <Button

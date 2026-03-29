@@ -29,3 +29,6 @@ npm-debug.log*
 
 # Scripts text dumps
 scripts/*.txt
+
+# Python cache
+__pycache__/

@@ -98,10 +98,11 @@ export const updateConfig = (data) =>
 export const getInterestRates = () => fetchJSON('/utils/interest-rates');
 
 // CAS Upload
-export const uploadCASPreview = async (file, portfolioId) => {
+export const uploadCASPreview = async (file, portfolioId, password) => {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('portfolio_id', portfolioId);
+  if (password) formData.append('password', password);
   const res = await fetch(`${API_BASE}/cas/preview`, { method: 'POST', body: formData });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -111,6 +112,9 @@ export const uploadCASPreview = async (file, portfolioId) => {
 };
 export const importCASHoldings = (portfolioId, holdings) =>
   fetchJSON('/cas/import', { method: 'POST', body: JSON.stringify({ portfolio_id: portfolioId, holdings }) });
+
+export const importCAMSCASTransactions = (portfolioId, schemes) =>
+  fetchJSON('/cas/cams-import', { method: 'POST', body: JSON.stringify({ portfolio_id: portfolioId, schemes }) });
 
 // Contract Notes - Preview (parse and validate, no import)
 export const previewContractNotes = async (files, portfolioId) => {
