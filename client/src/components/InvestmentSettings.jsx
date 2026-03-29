@@ -113,7 +113,8 @@ export default function InvestmentSettings() {
                 </Form.Group>
               </Col>
 
-              {/* NSE Ticker */}
+              {/* NSE Ticker (stocks only) */}
+              {!isMF && (
               <Col md={4}>
                 <Form.Group>
                   <Form.Label className="small fw-semibold">Symbol</Form.Label>
@@ -128,6 +129,7 @@ export default function InvestmentSettings() {
                   </Form.Text>
                 </Form.Group>
               </Col>
+              )}
 
               {/* ISIN (readonly) */}
               <Col md={4}>
@@ -159,7 +161,7 @@ export default function InvestmentSettings() {
                       placeholder="e.g. 125354"
                     />
                     <Form.Text className="text-muted">
-                      AMFI scheme code for mutual fund NAV lookups.
+                      Auto-resolved from ISIN during price updates. Edit manually if needed.
                     </Form.Text>
                   </Form.Group>
                 </Col>

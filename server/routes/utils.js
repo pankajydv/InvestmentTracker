@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = require('../services/priceService');
-const { updateAllPrices } = require('../services/updater');
+const { updateAllPrices, cancelUpdate } = require('../services/updater');
 
 module.exports = function (db) {
   // ─── Search mutual funds ──────────────────────────────────────────────
@@ -45,11 +45,22 @@ module.exports = function (db) {
   // ─── Trigger manual price update ──────────────────────────────────────
   router.post('/update-prices', async (req, res) => {
     try {
-      const result = await updateAllPrices(db);
+      const options = {};
+      // Accept optional assetType filter (single string or array)
+      if (req.body && req.body.assetTypes) {
+        options.assetTypes = Array.isArray(req.body.assetTypes)
+          ? req.body.assetTypes : [req.body.assetTypes];
+      }
+      const result = await updateAllPrices(db, options);
       res.json(result);
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
+  });
+
+  router.post('/cancel-update', (req, res) => {
+    cancelUpdate();
+    res.json({ cancelled: true });
   });
 
   // ─── Get/update config ────────────────────────────────────────────────

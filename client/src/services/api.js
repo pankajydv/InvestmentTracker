@@ -90,8 +90,13 @@ export const searchStockByName = (q, market) =>
   fetchJSON(`/utils/search-stock-name?q=${encodeURIComponent(q)}&market=${market || ''}`);
 export const searchStock = (symbol, market) =>
   fetchJSON(`/utils/search-stock?symbol=${encodeURIComponent(symbol)}&market=${market || ''}`);
-export const triggerPriceUpdate = () =>
-  fetchJSON('/utils/update-prices', { method: 'POST' });
+export const triggerPriceUpdate = (assetTypes) =>
+  fetchJSON('/utils/update-prices', {
+    method: 'POST',
+    body: assetTypes ? JSON.stringify({ assetTypes }) : undefined,
+  });
+export const cancelPriceUpdate = () =>
+  fetchJSON('/utils/cancel-update', { method: 'POST' });
 export const getConfig = () => fetchJSON('/utils/config');
 export const updateConfig = (data) =>
   fetchJSON('/utils/config', { method: 'PUT', body: JSON.stringify(data) });

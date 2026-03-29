@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Card, Row, Col, Table, Spinner, Alert } from 'react-bootstrap';
-import { getDashboardSummary } from '../services/api';
+import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
+import { getDashboardSummary, triggerPriceUpdate, cancelPriceUpdate } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, Receipt } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, Receipt, RefreshCw } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 export default function Dashboard() {
@@ -14,6 +14,23 @@ export default function Dashboard() {
   const [error, setError] = useState(null);
   const hideSold = localStorage.getItem('hideSoldInvestments') !== 'false';
   const [sortConfigs, setSortConfigs] = useState({});
+  const [updatingType, setUpdatingType] = useState(null);
+
+  const handleUpdateType = async (assetType) => {
+    setUpdatingType(assetType);
+    try {
+      await triggerPriceUpdate([assetType]);
+      await loadData();
+    } catch (e) {
+      alert('Price update failed: ' + e.message);
+    } finally {
+      setUpdatingType(null);
+    }
+  };
+
+  const handleCancelUpdate = async () => {
+    try { await cancelPriceUpdate(); } catch (_) { /* best effort */ }
+  };
 
   useEffect(() => {
     loadData();
@@ -189,9 +206,35 @@ export default function Dashboard() {
             <h2 className="h6 fw-semibold mb-0">
               {ASSET_TYPE_LABELS[type]} ({info.investments.length})
             </h2>
-            <Link to={`/investments?type=${type}`} className="small text-decoration-none d-flex align-items-center gap-1">
-              View All <ArrowRight size={12} />
-            </Link>
+            <div className="d-flex align-items-center gap-2">
+              {updatingType === type ? (
+                <Button
+                  variant="outline-danger"
+                  size="sm"
+                  className="d-flex align-items-center gap-1 py-0 px-2"
+                  style={{ fontSize: '0.75rem' }}
+                  onClick={handleCancelUpdate}
+                >
+                  <RefreshCw size={12} className="spinner-rotate" />
+                  Cancel
+                </Button>
+              ) : (
+                <Button
+                  variant="outline-success"
+                  size="sm"
+                  className="d-flex align-items-center gap-1 py-0 px-2"
+                  style={{ fontSize: '0.75rem' }}
+                  disabled={updatingType != null}
+                  onClick={() => handleUpdateType(type)}
+                >
+                  <RefreshCw size={12} />
+                  Update
+                </Button>
+              )}
+              <Link to={`/investments?type=${type}`} className="small text-decoration-none d-flex align-items-center gap-1">
+                View All <ArrowRight size={12} />
+              </Link>
+            </div>
           </Card.Header>
           <div className="responsive-table">
             <Table hover size="sm" className="mb-0 small">

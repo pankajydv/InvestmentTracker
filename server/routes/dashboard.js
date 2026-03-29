@@ -34,14 +34,19 @@ module.exports = function (db) {
       SELECT
         i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency,
         i.isin_code, i.display_name,
-        dv.date, dv.price_per_unit,
+        dv.date, COALESCE(dv.price_per_unit, 0) as price_per_unit,
         COALESCE((SELECT SUM(CASE
           WHEN t3.transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','RIGHTS') THEN COALESCE(t3.units,0)
           WHEN t3.transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t3.units,0)
           ELSE 0 END) FROM transactions t3 WHERE t3.investment_id = i.id), 0) as total_units,
-        dv.current_value,
-        dv.invested_amount, dv.profit_loss, dv.profit_loss_pct,
-        dv.day_change, dv.day_change_pct
+        COALESCE(dv.current_value, 0) as current_value,
+        COALESCE(dv.invested_amount,
+          (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
+           WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS'))) as invested_amount,
+        COALESCE(dv.profit_loss, 0) as profit_loss,
+        COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
+        COALESCE(dv.day_change, 0) as day_change,
+        COALESCE(dv.day_change_pct, 0) as day_change_pct
       FROM investments i
       LEFT JOIN daily_values dv ON i.id = dv.investment_id
         AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id)

@@ -13,13 +13,19 @@ const http = require('http');
 // ─── Mutual Fund NAV from AMFI ────────────────────────────────────────────────
 
 /**
- * Fetch latest NAV for a mutual fund scheme from mfapi.in
+ * Fetch latest NAV for a mutual fund scheme from mfapi.in.
+ * Uses date-range filtering (last 10 days) to get current + previous NAV
+ * in a single fast request, so day change can be computed like Yahoo does for stocks.
  * @param {string} amfiCode - AMFI scheme code
- * @returns {Promise<{nav: number, date: string}>}
+ * @returns {Promise<{nav: number, date: string, change: number, changePercent: number, schemeName: string}>}
  */
 async function fetchMutualFundNAV(amfiCode) {
   return new Promise((resolve, reject) => {
-    const url = `https://api.mfapi.in/mf/${amfiCode}/latest`;
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - 10);
+    const fmt = d => d.toISOString().split('T')[0];
+    const url = `https://api.mfapi.in/mf/${amfiCode}?startDate=${fmt(start)}&endDate=${fmt(end)}`;
     https.get(url, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
@@ -27,10 +33,17 @@ async function fetchMutualFundNAV(amfiCode) {
         try {
           const json = JSON.parse(data);
           if (json.data && json.data.length > 0) {
+            const currentNav = parseFloat(json.data[0].nav);
+            const prevNav = json.data.length > 1 ? parseFloat(json.data[1].nav) : null;
+            const change = prevNav != null ? currentNav - prevNav : 0;
+            const changePercent = prevNav != null && prevNav > 0
+              ? (change / prevNav) * 100 : 0;
             resolve({
-              nav: parseFloat(json.data[0].nav),
+              nav: currentNav,
               date: json.data[0].date,
               schemeName: json.meta?.scheme_name || '',
+              change: Math.round(change * 10000) / 10000,
+              changePercent: Math.round(changePercent * 100) / 100,
             });
           } else {
             reject(new Error(`No NAV data for scheme ${amfiCode}`));
@@ -451,6 +464,55 @@ function _fetchChartEvents(symbol, period1, period2, splitsOnly) {
   });
 }
 
+// ─── Resolve AMFI Code by ISIN ───────────────────────────────────────────────
+
+/**
+ * Download the full AMFI NAV file and find scheme codes for multiple ISINs.
+ * The file format has lines like:
+ *   SchemeCode;ISIN Div Payout/ISIN Growth;ISIN Div Reinvestment;SchemeName;NAV;Date
+ * @param {string[]} isins - Array of ISIN codes to look up
+ * @returns {Promise<Map<string, {schemeCode: string, schemeName: string}>>} Map of ISIN → result
+ */
+function resolveAmfiCodeByISIN(isins) {
+  const isinSet = new Set(Array.isArray(isins) ? isins : [isins]);
+
+  function fetchWithRedirect(url) {
+    return new Promise((resolve, reject) => {
+      https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          fetchWithRedirect(res.headers.location).then(resolve, reject);
+          return;
+        }
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => resolve(data));
+        res.on('error', reject);
+      }).on('error', reject);
+    });
+  }
+
+  return fetchWithRedirect('https://www.amfiindia.com/spages/NAVAll.txt').then(data => {
+    const results = new Map();
+    const lines = data.split('\n');
+    for (const line of lines) {
+      const parts = line.split(';');
+      if (parts.length >= 4) {
+        const isinGrowth = (parts[1] || '').trim();
+        const isinReinvest = (parts[2] || '').trim();
+        for (const isin of [isinGrowth, isinReinvest]) {
+          if (isin && isinSet.has(isin)) {
+            results.set(isin, {
+              schemeCode: parts[0].trim(),
+              schemeName: parts[3].trim(),
+            });
+          }
+        }
+      }
+    }
+    return results;
+  });
+}
+
 module.exports = {
   fetchMutualFundNAV,
   searchMutualFunds,
@@ -463,4 +525,5 @@ module.exports = {
   toNSETicker,
   lookupTickerByISIN,
   searchStocks,
+  resolveAmfiCodeByISIN,
 };

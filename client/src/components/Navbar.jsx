@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button } from 'react-bootstrap';
 import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw } from 'lucide-react';
-import { triggerPriceUpdate } from '../services/api';
+import { triggerPriceUpdate, cancelPriceUpdate } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 
 const NAV_ITEMS = [
@@ -30,6 +30,10 @@ export default function Navbar() {
     }
   };
 
+  const handleCancel = async () => {
+    try { await cancelPriceUpdate(); } catch (_) { /* best effort */ }
+  };
+
   return (
     <BsNavbar bg="white" expand="md" sticky="top" className="shadow-sm border-bottom">
       <Container>
@@ -44,10 +48,9 @@ export default function Navbar() {
 
         <div className="d-flex align-items-center gap-2 d-md-none">
           <Button
-            variant="success"
+            variant={updating ? 'danger' : 'success'}
             size="sm"
-            onClick={handleUpdate}
-            disabled={updating}
+            onClick={updating ? handleCancel : handleUpdate}
           >
             <RefreshCw size={18} className={updating ? 'spinner-rotate' : ''} />
           </Button>
@@ -73,14 +76,13 @@ export default function Navbar() {
               </Nav.Link>
             ))}
             <Button
-              variant="success"
+              variant={updating ? 'danger' : 'success'}
               size="sm"
-              onClick={handleUpdate}
-              disabled={updating}
+              onClick={updating ? handleCancel : handleUpdate}
               className="d-none d-md-flex align-items-center gap-1 ms-2"
             >
               <RefreshCw size={16} className={updating ? 'spinner-rotate' : ''} />
-              {updating ? 'Updating...' : 'Update Prices'}
+              {updating ? 'Cancel' : 'Update Prices'}
             </Button>
           </Nav>
         </BsNavbar.Collapse>

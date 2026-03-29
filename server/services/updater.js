@@ -9,19 +9,58 @@ const {
   fetchUSDToINR,
   calculatePPFValue,
   toNSETicker,
+  resolveAmfiCodeByISIN,
 } = require('./priceService');
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-/**
- * Update prices for all active investments
- * @param {import('better-sqlite3').Database} db
- */
-async function updateAllPrices(db) {
-  const today = new Date().toISOString().split('T')[0];
-  console.log(`[${new Date().toISOString()}] Starting daily price update for ${today}...`);
+// ─── Cancellation support ──────────────────────────────────────────────────
+let _cancelled = false;
 
-  const investments = db.prepare('SELECT * FROM investments WHERE is_active = 1').all();
+function cancelUpdate() {
+  _cancelled = true;
+}
+
+/**
+ * Update prices for active investments, optionally filtered by asset type.
+ * @param {import('better-sqlite3').Database} db
+ * @param {Object} [options]
+ * @param {string[]} [options.assetTypes] - If provided, only update these asset types (e.g. ['MUTUAL_FUND'])
+ */
+async function updateAllPrices(db, options = {}) {
+  _cancelled = false;
+  const today = new Date().toISOString().split('T')[0];
+  const typeFilter = options.assetTypes;
+  const label = typeFilter ? typeFilter.join(', ') : 'ALL';
+  console.log(`[${new Date().toISOString()}] Starting price update (${label}) for ${today}...`);
+
+  let investments = db.prepare('SELECT * FROM investments WHERE is_active = 1').all();
+  if (typeFilter && typeFilter.length > 0) {
+    investments = investments.filter(i => typeFilter.includes(i.asset_type));
+  }
+
+  // Auto-resolve missing AMFI codes for mutual funds using ISIN (single download)
+  const mfsWithoutAmfi = investments.filter(i => i.asset_type === 'MUTUAL_FUND' && !i.amfi_code && i.isin_code);
+  if (mfsWithoutAmfi.length > 0) {
+    console.log(`  Resolving AMFI codes for ${mfsWithoutAmfi.length} mutual fund(s)...`);
+    try {
+      const isinList = mfsWithoutAmfi.map(mf => mf.isin_code);
+      const amfiMap = await resolveAmfiCodeByISIN(isinList);
+      const updateAmfi = db.prepare('UPDATE investments SET amfi_code = ? WHERE id = ?');
+      for (const mf of mfsWithoutAmfi) {
+        const result = amfiMap.get(mf.isin_code);
+        if (result) {
+          updateAmfi.run(result.schemeCode, mf.id);
+          mf.amfi_code = result.schemeCode;
+          console.log(`    ✓ ${mf.name} → AMFI ${result.schemeCode}`);
+        } else {
+          console.warn(`    ✗ ${mf.name}: No AMFI match for ISIN ${mf.isin_code}`);
+        }
+      }
+    } catch (e) {
+      console.warn(`  AMFI bulk lookup failed: ${e.message}`);
+    }
+  }
 
   // Fetch USD/INR rate for foreign stocks
   let usdToInr = parseFloat(db.prepare("SELECT value FROM config WHERE key = 'usd_to_inr'").get()?.value || '83.5');
@@ -77,6 +116,10 @@ async function updateAllPrices(db) {
   let errorCount = 0;
 
   for (const inv of investments) {
+    if (_cancelled) {
+      console.log('  ⏹ Update cancelled by user.');
+      break;
+    }
     try {
       let pricePerUnit = 0;
       let totalUnits = getTotalUnits.get(inv.id).total;
@@ -89,26 +132,14 @@ async function updateAllPrices(db) {
 
       switch (inv.asset_type) {
         case 'MUTUAL_FUND': {
-          if (!inv.amfi_code) {
-            console.warn(`  Skipping ${inv.name}: No AMFI code`);
-            continue;
-          }
-          const navData = await fetchMutualFundNAV(inv.amfi_code);
-          pricePerUnit = navData.nav;
-          currentValue = totalUnits * pricePerUnit;
-          // mfapi returns the NAV date (e.g. "28-03-2026"); use it so we
-          // compare against the previous *trading* day, not the calendar day.
-          if (navData.date) {
-            const parts = navData.date.split('-');
-            // Format: DD-MM-YYYY -> YYYY-MM-DD
-            if (parts.length === 3 && parts[2].length === 4) {
-              const navDateISO = `${parts[2]}-${parts[1]}-${parts[0]}`;
-              const prevDay = getPrevDay.get(inv.id, navDateISO);
-              if (prevDay && prevDay.price_per_unit > 0) {
-                apiChange = pricePerUnit - prevDay.price_per_unit;
-                apiChangePct = (apiChange / prevDay.price_per_unit) * 100;
-              }
-            }
+          if (inv.amfi_code) {
+            const navData = await fetchMutualFundNAV(inv.amfi_code);
+            pricePerUnit = navData.nav;
+            currentValue = totalUnits * pricePerUnit;
+            apiChange = navData.change;
+            apiChangePct = navData.changePercent;
+          } else {
+            console.warn(`  ${inv.name}: No AMFI code, computing from transactions only`);
           }
           break;
         }
@@ -225,8 +256,10 @@ async function updateAllPrices(db) {
   db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'last_price_update'")
     .run(new Date().toISOString());
 
-  console.log(`[${new Date().toISOString()}] Price update done. Success: ${successCount}, Errors: ${errorCount}`);
-  return { successCount, errorCount, date: today };
+  const cancelled = _cancelled;
+  _cancelled = false;
+  console.log(`[${new Date().toISOString()}] Price update ${cancelled ? 'cancelled' : 'done'}. Success: ${successCount}, Errors: ${errorCount}`);
+  return { successCount, errorCount, cancelled, date: today };
 }
 
 /**
@@ -338,4 +371,4 @@ function updatePortfolioDaily(db, date) {
   }
 }
 
-module.exports = { updateAllPrices, updatePortfolioDaily };
+module.exports = { updateAllPrices, updatePortfolioDaily, cancelUpdate };
