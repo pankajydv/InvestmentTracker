@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse } from 'react-bootstrap';
-import { createInvestment, addTransaction, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, addAmcCharge } from '../services/api';
+import { createInvestment, addTransaction, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
-import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, Wallet } from 'lucide-react';
+import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'PPF', 'PF', 'BOND'];
@@ -58,10 +58,7 @@ export default function AddInvestment() {
   const [pnlUploading, setPnlUploading] = useState(false);
   const [pnlResult, setPnlResult] = useState(null);
 
-  // AMC charges state
-  const [amcForm, setAmcForm] = useState({ date: new Date().toISOString().split('T')[0], amount: '', broker: 'Sharekhan', notes: '', expense_type: 'AMC' });
-  const [amcSubmitting, setAmcSubmitting] = useState(false);
-  const [amcResult, setAmcResult] = useState(null);
+
 
   // Accordion state for Indian Stocks sections (null = all collapsed)
   const [expandedSection, setExpandedSection] = useState(null);
@@ -324,21 +321,7 @@ export default function AddInvestment() {
     }
   };
 
-  const handleAmcSubmit = async () => {
-    setError('');
-    if (!portfolioId) return setError('Please select a portfolio first');
-    if (!amcForm.amount || parseFloat(amcForm.amount) <= 0) return setError('Please enter a valid amount');
-    setAmcSubmitting(true);
-    try {
-      await addAmcCharge({ portfolio_id: portfolioId, expense_type: amcForm.expense_type, expense_date: amcForm.date, amount: parseFloat(amcForm.amount), broker: amcForm.broker, notes: amcForm.notes });
-      setAmcResult(`₹${Math.abs(parseFloat(amcForm.amount)).toLocaleString('en-IN')} recorded.`);
-      setAmcForm({ date: new Date().toISOString().split('T')[0], amount: '', broker: amcForm.broker, notes: '', expense_type: amcForm.expense_type });
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setAmcSubmitting(false);
-    }
-  };
+
 
   const brokerOptions = [
     { value: 'Sharekhan', label: 'Sharekhan' },
@@ -832,105 +815,7 @@ export default function AddInvestment() {
             </Collapse>
           </Card>
 
-          {/* Account Expenses / Charges */}
-          <Card className="shadow-sm">
-            <Card.Header
-              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
-              style={{ cursor: 'pointer' }}
-              onClick={() => toggleSection('amc')}
-            >
-              <Wallet size={20} className="text-warning" />
-              <span className="h6 fw-semibold mb-0 flex-grow-1">Account Expenses / Charges</span>
-              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
-                style={{ transition: 'transform 0.2s', transform: expandedSection === 'amc' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-              </svg>
-            </Card.Header>
-            <Collapse in={expandedSection === 'amc'}>
-              <div>
-                <Card.Body className="pt-2">
-              <p className="small text-muted mb-3">
-                Record demat account AMC, platform fees, CDSL charges, and other account-level expenses.
-              </p>
 
-              <Row className="g-3 align-items-end">
-                <Col md={3}>
-                  <Form.Label className="small">Type</Form.Label>
-                  <Form.Select
-                    size="sm"
-                    value={amcForm.expense_type}
-                    onChange={(e) => setAmcForm({ ...amcForm, expense_type: e.target.value })}
-                  >
-                    <option value="AMC">AMC</option>
-                    <option value="PLATFORM_FEE">Platform Fee</option>
-                    <option value="CDSL">CDSL Charges</option>
-                    <option value="ACCOUNT_OPENING">Account Opening</option>
-                    <option value="OTHER">Other</option>
-                  </Form.Select>
-                </Col>
-                <Col md={3}>
-                  <Form.Label className="small">Broker</Form.Label>
-                  <Form.Select
-                    size="sm"
-                    value={amcForm.broker}
-                    onChange={(e) => setAmcForm({ ...amcForm, broker: e.target.value })}
-                  >
-                    {brokerOptions.map(b => (
-                      <option key={b.value} value={b.value}>{b.label}</option>
-                    ))}
-                  </Form.Select>
-                </Col>
-                <Col md={2}>
-                  <Form.Label className="small">Date</Form.Label>
-                  <Form.Control
-                    size="sm"
-                    type="date"
-                    value={amcForm.date}
-                    onChange={(e) => setAmcForm({ ...amcForm, date: e.target.value })}
-                  />
-                </Col>
-                <Col md={2}>
-                  <Form.Label className="small">Amount (₹)</Form.Label>
-                  <Form.Control
-                    size="sm"
-                    type="number"
-                    step="0.01"
-                    value={amcForm.amount}
-                    onChange={(e) => setAmcForm({ ...amcForm, amount: e.target.value })}
-                    placeholder="e.g., 300"
-                  />
-                </Col>
-                <Col md={2}>
-                  <Form.Label className="small">Notes</Form.Label>
-                  <Form.Control
-                    size="sm"
-                    type="text"
-                    value={amcForm.notes}
-                    onChange={(e) => setAmcForm({ ...amcForm, notes: e.target.value })}
-                    placeholder="e.g., Annual AMC"
-                  />
-                </Col>
-              </Row>
-              <div className="mt-3">
-                <Button
-                  size="sm"
-                  variant="warning"
-                  onClick={handleAmcSubmit}
-                  disabled={amcSubmitting || !amcForm.amount}
-                >
-                  {amcSubmitting ? 'Recording...' : 'Record'}
-                </Button>
-              </div>
-              {amcResult && (
-                <Alert variant="success" className="mt-3 small py-2" dismissible onClose={() => setAmcResult(null)}>
-                  <CheckCircle size={14} className="me-1" />
-                  {amcResult}
-                </Alert>
-              )}
-            </Card.Body>
-              </div>
-            </Collapse>
-          </Card>
         </>
       )}
 
