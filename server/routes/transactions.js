@@ -45,15 +45,19 @@ module.exports = function (db) {
     res.json(types);
   });
 
-  // ─── Get distinct transaction types (optionally filtered by asset type) ───
+  // ─── Get distinct transaction types (optionally filtered by asset type / portfolio) ───
   router.get('/transaction-types', (req, res) => {
-    const { asset_type } = req.query;
+    const { asset_type, portfolio_id } = req.query;
     let sql = `SELECT DISTINCT t.transaction_type FROM transactions t
-       JOIN investments i ON t.investment_id = i.id`;
+       JOIN investments i ON t.investment_id = i.id WHERE 1=1`;
     const params = [];
     if (asset_type) {
-      sql += ` WHERE i.asset_type = ?`;
+      sql += ` AND i.asset_type = ?`;
       params.push(asset_type);
+    }
+    if (portfolio_id) {
+      sql += ` AND t.portfolio_id = ?`;
+      params.push(portfolio_id);
     }
     sql += ` ORDER BY t.transaction_type`;
     const types = db.prepare(sql).all(...params).map(r => r.transaction_type);
@@ -62,7 +66,7 @@ module.exports = function (db) {
 
   // ─── Get distinct brokers ─────────────────────────────────────────────
   router.get('/brokers', (req, res) => {
-    const { asset_type } = req.query;
+    const { asset_type, portfolio_id } = req.query;
     let sql = `SELECT DISTINCT t.broker FROM transactions t
        INNER JOIN investments i ON t.investment_id = i.id
        WHERE t.broker IS NOT NULL AND t.broker != ''`;
@@ -70,6 +74,10 @@ module.exports = function (db) {
     if (asset_type) {
       sql += ` AND i.asset_type = ?`;
       params.push(asset_type);
+    }
+    if (portfolio_id) {
+      sql += ` AND t.portfolio_id = ?`;
+      params.push(portfolio_id);
     }
     sql += ` ORDER BY t.broker`;
     const brokers = db.prepare(sql).all(...params).map(r => r.broker);
@@ -135,10 +143,10 @@ module.exports = function (db) {
     const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Transaction not found' });
 
-    const { transaction_date, units, price_per_unit, amount, fees, notes, broker } = req.body;
+    const { transaction_date, units, price_per_unit, amount, fees, notes, broker, folio_number } = req.body;
     db.prepare(`
       UPDATE transactions
-      SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?, broker = ?
+      SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?, broker = ?, folio_number = ?
       WHERE id = ?
     `).run(
       transaction_date || existing.transaction_date,
@@ -148,6 +156,7 @@ module.exports = function (db) {
       fees ?? existing.fees,
       notes !== undefined ? notes : existing.notes,
       broker !== undefined ? broker : existing.broker,
+      folio_number !== undefined ? folio_number : existing.folio_number,
       req.params.id
     );
 

@@ -4,7 +4,7 @@ const router = express.Router();
 module.exports = function (db) {
   // ─── Get all investments ──────────────────────────────────────────────
   router.get('/', (req, res) => {
-    const { type, active, portfolio_id, hide_sold } = req.query;
+    const { type, portfolio_id, hide_sold } = req.query;
     let query = 'SELECT DISTINCT i.* FROM investments i';
     const params = [];
 
@@ -19,12 +19,6 @@ module.exports = function (db) {
       query += ' AND i.asset_type = ?';
       params.push(type);
     }
-    if (active !== undefined) {
-      query += ' AND i.is_active = ?';
-      params.push(active === 'true' ? 1 : 0);
-    } else {
-      query += ' AND i.is_active = 1';
-    }
     if (hide_sold === 'true') {
       const portfolioTxnFilter = portfolio_id ? ' AND t2.portfolio_id = ?' : '';
       const portfolioTxnParams = portfolio_id ? [portfolio_id] : [];
@@ -32,11 +26,11 @@ module.exports = function (db) {
         i.asset_type IN ('PPF', 'PF') OR
         COALESCE((
           SELECT SUM(CASE
-            WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(t2.units, 0)
-            WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t2.units, 0)
+            WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SWITCH_IN','SPLIT') THEN COALESCE(t2.units, 0)
+            WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION') THEN -COALESCE(t2.units, 0)
             ELSE 0 END)
           FROM transactions t2 WHERE t2.investment_id = i.id${portfolioTxnFilter}
-        ), 0) > 0
+        ), 0) > 0.001
       )`;
       params.push(...portfolioTxnParams);
     }
@@ -55,24 +49,35 @@ module.exports = function (db) {
     `).get(req.params.id);
     if (!inv) return res.status(404).json({ error: 'Investment not found' });
 
-    // Get latest daily value
-    const latestValue = db.prepare(
-      'SELECT * FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1'
-    ).get(inv.id);
+    // Get latest daily value (portfolio-scoped or combined)
+    const portfolioId = req.query.portfolio_id;
+    let latestValue;
+    if (portfolioId) {
+      latestValue = db.prepare(
+        'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
+      ).get(inv.id, parseInt(portfolioId));
+    } else {
+      latestValue = db.prepare(
+        'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+      ).get(inv.id);
+    }
 
     // Get total units and invested amount
+    const portfolioFilter = portfolioId ? ' AND portfolio_id = ?' : '';
+    const portfolioParams = portfolioId ? [parseInt(portfolioId)] : [];
+
     const totals = db.prepare(`
       SELECT
-        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'RIGHTS') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
+        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
         COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO') THEN amount + COALESCE(fees, 0) ELSE 0 END), 0) as total_invested,
         COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'WITHDRAWAL') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
-      FROM transactions WHERE investment_id = ?
-    `).get(inv.id);
+      FROM transactions WHERE investment_id = ?${portfolioFilter}
+    `).get(inv.id, ...portfolioParams);
 
     // Get transactions
     const transactions = db.prepare(
-      'SELECT * FROM transactions WHERE investment_id = ? ORDER BY transaction_date DESC'
-    ).all(inv.id);
+      `SELECT * FROM transactions WHERE investment_id = ?${portfolioFilter} ORDER BY transaction_date DESC`
+    ).all(inv.id, ...portfolioParams);
 
     res.json({
       ...inv,
@@ -87,7 +92,7 @@ module.exports = function (db) {
   // ─── Create investment ────────────────────────────────────────────────
   router.post('/', (req, res) => {
     const {
-      name, asset_type, ticker_symbol, amfi_code, folio_number,
+      name, asset_type, ticker_symbol, amfi_code,
       account_number, interest_rate, currency, notes,
       face_value, coupon_frequency, maturity_date,
     } = req.body;
@@ -97,10 +102,10 @@ module.exports = function (db) {
     }
 
     const result = db.prepare(`
-      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(name, asset_type, ticker_symbol || null, amfi_code || null,
-      folio_number || null, account_number || null, interest_rate || null,
+      account_number || null, interest_rate || null,
       currency || 'INR', face_value || null,
       coupon_frequency || null, maturity_date || null,
       notes || null);
@@ -112,8 +117,8 @@ module.exports = function (db) {
   // ─── Update investment ────────────────────────────────────────────────
   router.put('/:id', (req, res) => {
     const {
-      name, ticker_symbol, amfi_code, folio_number,
-      account_number, interest_rate, currency, notes, is_active, portfolio_id,
+      name, ticker_symbol, amfi_code,
+      account_number, interest_rate, currency, notes, portfolio_id,
       face_value, coupon_frequency, maturity_date,
       display_name, isin_code,
     } = req.body;
@@ -123,7 +128,7 @@ module.exports = function (db) {
     const params = [];
 
     // Legacy fields: only update if provided (COALESCE pattern)
-    const coalesceFields = { name, ticker_symbol, amfi_code, folio_number, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes, is_active };
+    const coalesceFields = { name, ticker_symbol, amfi_code, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes };
     for (const [col, val] of Object.entries(coalesceFields)) {
       sets.push(`${col} = COALESCE(?, ${col})`);
       params.push(val !== undefined ? val : null);

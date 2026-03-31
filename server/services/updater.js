@@ -34,7 +34,7 @@ async function updateAllPrices(db, options = {}) {
   const label = typeFilter ? typeFilter.join(', ') : 'ALL';
   console.log(`[${new Date().toISOString()}] Starting price update (${label}) for ${today}...`);
 
-  let investments = db.prepare('SELECT * FROM investments WHERE is_active = 1').all();
+  let investments = db.prepare('SELECT * FROM investments').all();
   if (typeFilter && typeFilter.length > 0) {
     investments = investments.filter(i => typeFilter.includes(i.asset_type));
   }
@@ -72,9 +72,9 @@ async function updateAllPrices(db, options = {}) {
   }
 
   const upsertDaily = db.prepare(`
-    INSERT INTO daily_values (investment_id, date, price_per_unit, total_units, current_value, invested_amount, profit_loss, profit_loss_pct, day_change, day_change_pct)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(investment_id, date) DO UPDATE SET
+    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, profit_loss, profit_loss_pct, day_change, day_change_pct)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
       price_per_unit = excluded.price_per_unit,
       total_units = excluded.total_units,
       current_value = excluded.current_value,
@@ -85,31 +85,68 @@ async function updateAllPrices(db, options = {}) {
       day_change_pct = excluded.day_change_pct
   `);
 
+  // For combined (NULL portfolio_id) rows, ON CONFLICT doesn't work
+  // (SQLite treats NULLs as distinct), so delete-then-insert.
+  const deleteDailyCombined = db.prepare(
+    'DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL AND date = ?'
+  );
+  const insertDailyCombined = db.prepare(`
+    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, profit_loss, profit_loss_pct, day_change, day_change_pct)
+    VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
   const getInvestedAmount = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
     FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS')
+  `);
+  const getInvestedAmountPortfolio = db.prepare(`
+    SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
+    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS')
   `);
 
   const getSaleProceeds = db.prepare(`
     SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) as total
     FROM transactions WHERE investment_id = ? AND transaction_type IN ('SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST')
   `);
+  const getSaleProceedsPortfolio = db.prepare(`
+    SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) as total
+    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_type IN ('SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST')
+  `);
 
   const getTotalUnits = db.prepare(`
     SELECT COALESCE(
       SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'RIGHTS') THEN COALESCE(units, 0)
-        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0)
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0)
         ELSE 0
       END), 0
     ) as total
     FROM transactions WHERE investment_id = ?
   `);
+  const getTotalUnitsPortfolio = db.prepare(`
+    SELECT COALESCE(
+      SUM(CASE
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0)
+        ELSE 0
+      END), 0
+    ) as total
+    FROM transactions WHERE investment_id = ? AND portfolio_id = ?
+  `);
 
   const getPrevDay = db.prepare(`
     SELECT price_per_unit, current_value FROM daily_values
-    WHERE investment_id = ? AND date < ?
+    WHERE investment_id = ? AND portfolio_id IS NULL AND date < ?
     ORDER BY date DESC LIMIT 1
+  `);
+  const getPrevDayPortfolio = db.prepare(`
+    SELECT price_per_unit, current_value FROM daily_values
+    WHERE investment_id = ? AND portfolio_id = ? AND date < ?
+    ORDER BY date DESC LIMIT 1
+  `);
+
+  const getDistinctPortfolios = db.prepare(`
+    SELECT DISTINCT portfolio_id FROM transactions WHERE investment_id = ? AND portfolio_id IS NOT NULL
   `);
 
   let successCount = 0;
@@ -122,10 +159,6 @@ async function updateAllPrices(db, options = {}) {
     }
     try {
       let pricePerUnit = 0;
-      let totalUnits = getTotalUnits.get(inv.id).total;
-      let investedAmount = getInvestedAmount.get(inv.id).total;
-      let saleProceeds = getSaleProceeds.get(inv.id).total;
-      let currentValue = 0;
       // Per-share change from the API (used for stocks; null means fall back to DB).
       let apiChange = null;
       let apiChangePct = null;
@@ -135,7 +168,6 @@ async function updateAllPrices(db, options = {}) {
           if (inv.amfi_code) {
             const navData = await fetchMutualFundNAV(inv.amfi_code);
             pricePerUnit = navData.nav;
-            currentValue = totalUnits * pricePerUnit;
             apiChange = navData.change;
             apiChangePct = navData.changePercent;
           } else {
@@ -154,7 +186,6 @@ async function updateAllPrices(db, options = {}) {
           const stockTicker = inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol);
           const stockData = await fetchStockPrice(stockTicker);
           pricePerUnit = stockData.price;
-          currentValue = totalUnits * pricePerUnit;
           // Use Yahoo's per-share change (last close vs previous close)
           // so weekends/holidays still show the last trading session's move.
           apiChange = stockData.change;
@@ -170,9 +201,7 @@ async function updateAllPrices(db, options = {}) {
           await delay(500); // Avoid Yahoo Finance rate limiting
           const foreignData = await fetchStockPrice(inv.ticker_symbol);
           pricePerUnit = foreignData.price;
-          // Convert to INR for portfolio aggregation
-          currentValue = totalUnits * pricePerUnit * usdToInr;
-          // Use Yahoo's per-share change
+          // For foreign stocks, pricePerUnit stays in USD; currentValue converted to INR below
           apiChange = foreignData.change;
           apiChangePct = foreignData.changePercent;
           break;
@@ -180,7 +209,6 @@ async function updateAllPrices(db, options = {}) {
 
         case 'BOND': {
           pricePerUnit = inv.face_value || 1000;
-          currentValue = totalUnits * pricePerUnit;
           break;
         }
 
@@ -189,55 +217,101 @@ async function updateAllPrices(db, options = {}) {
           const rateRow = db.prepare(
             'SELECT rate FROM interest_rates WHERE rate_type = ? ORDER BY effective_from DESC LIMIT 1'
           ).get(inv.asset_type);
-          const rate = rateRow ? rateRow.rate : (inv.asset_type === 'PPF' ? 7.1 : 8.25);
-
-          const txns = db.prepare(
-            "SELECT transaction_date as date, amount FROM transactions WHERE investment_id = ? AND transaction_type IN ('DEPOSIT', 'BUY')"
-          ).all(inv.id);
-
-          currentValue = calculatePPFValue(txns, rate);
-          pricePerUnit = rate; // Store rate as "price"
-          totalUnits = 1; // PPF doesn't have units concept
+          pricePerUnit = rateRow ? rateRow.rate : (inv.asset_type === 'PPF' ? 7.1 : 8.25);
           break;
         }
       }
 
-      // Calculate profit/loss: current value + sale proceeds - purchase cost
-      const profitLoss = currentValue + saleProceeds - investedAmount;
-      const profitLossPct = investedAmount > 0 ? (profitLoss / investedAmount) * 100 : 0;
+      // Get distinct portfolios this investment belongs to
+      const portfolioIds = getDistinctPortfolios.all(inv.id).map(r => r.portfolio_id);
+      // Process each portfolio + combined (null)
+      const pidsToProcess = [...portfolioIds, null];
 
-      // Day change: prefer API-sourced per-share change (stocks get it from
-      // Yahoo, MFs compute it from NAV date). This ensures weekends/holidays
-      // show the last trading session's move, matching broker apps.
-      let dayChange = 0;
-      let dayChangePct = 0;
-      if (totalUnits > 0) {
-        if (apiChange != null && apiChangePct != null) {
-          dayChange = totalUnits * apiChange;
-          dayChangePct = apiChangePct;
-        } else {
-          // Fallback: compare against previous DB entry (for bonds etc.)
-          const prevDay = getPrevDay.get(inv.id, today);
-          if (prevDay && prevDay.price_per_unit > 0) {
-            dayChange = totalUnits * (pricePerUnit - prevDay.price_per_unit);
-            dayChangePct = ((pricePerUnit - prevDay.price_per_unit) / prevDay.price_per_unit) * 100;
+      for (const pid of pidsToProcess) {
+        let totalUnits, investedAmount, saleProceeds, currentValue;
+
+        if (inv.asset_type === 'PPF' || inv.asset_type === 'PF') {
+          // PPF/PF: compute value from deposits + interest rate
+          const rate = pricePerUnit; // stored rate as price
+          const txnFilter = pid !== null ? " AND portfolio_id = ?" : "";
+          const txnParams = pid !== null ? [inv.id, pid] : [inv.id];
+          const txns = db.prepare(
+            `SELECT transaction_date as date, amount FROM transactions WHERE investment_id = ? AND transaction_type IN ('DEPOSIT', 'BUY')${txnFilter}`
+          ).all(...txnParams);
+          currentValue = calculatePPFValue(txns, rate);
+          totalUnits = 1;
+          if (pid !== null) {
+            investedAmount = getInvestedAmountPortfolio.get(inv.id, pid).total;
+            saleProceeds = getSaleProceedsPortfolio.get(inv.id, pid).total;
+          } else {
+            investedAmount = getInvestedAmount.get(inv.id).total;
+            saleProceeds = getSaleProceeds.get(inv.id).total;
           }
+        } else {
+          if (pid !== null) {
+            totalUnits = getTotalUnitsPortfolio.get(inv.id, pid).total;
+            investedAmount = getInvestedAmountPortfolio.get(inv.id, pid).total;
+            saleProceeds = getSaleProceedsPortfolio.get(inv.id, pid).total;
+          } else {
+            totalUnits = getTotalUnits.get(inv.id).total;
+            investedAmount = getInvestedAmount.get(inv.id).total;
+            saleProceeds = getSaleProceeds.get(inv.id).total;
+          }
+          if (inv.asset_type === 'FOREIGN_STOCK') {
+            currentValue = totalUnits * pricePerUnit * usdToInr;
+          } else {
+            currentValue = totalUnits * pricePerUnit;
+          }
+        }
+
+        const profitLoss = currentValue + saleProceeds - investedAmount;
+        const profitLossPct = investedAmount > 0 ? (profitLoss / investedAmount) * 100 : 0;
+
+        // Day change: prefer API-sourced per-share change scaled by this portfolio's units
+        let dayChange = 0;
+        let dayChangePct = 0;
+        if (totalUnits > 0) {
+          if (apiChange != null && apiChangePct != null) {
+            dayChange = totalUnits * apiChange;
+            dayChangePct = apiChangePct;
+          } else {
+            const prevDay = pid !== null
+              ? getPrevDayPortfolio.get(inv.id, pid, today)
+              : getPrevDay.get(inv.id, today);
+            if (prevDay && prevDay.price_per_unit > 0) {
+              dayChange = totalUnits * (pricePerUnit - prevDay.price_per_unit);
+              dayChangePct = ((pricePerUnit - prevDay.price_per_unit) / prevDay.price_per_unit) * 100;
+            }
+          }
+        }
+
+        const r = (v) => Math.round(v * 100) / 100;
+        if (pid !== null) {
+          upsertDaily.run(
+            inv.id, pid, today,
+            r(pricePerUnit), Math.round(totalUnits * 1000) / 1000,
+            r(currentValue), r(investedAmount), r(profitLoss), r(profitLossPct),
+            r(dayChange), r(dayChangePct)
+          );
+        } else {
+          deleteDailyCombined.run(inv.id, today);
+          insertDailyCombined.run(
+            inv.id, today,
+            r(pricePerUnit), Math.round(totalUnits * 1000) / 1000,
+            r(currentValue), r(investedAmount), r(profitLoss), r(profitLossPct),
+            r(dayChange), r(dayChangePct)
+          );
         }
       }
 
-      upsertDaily.run(
-        inv.id, today,
-        Math.round(pricePerUnit * 100) / 100,
-        Math.round(totalUnits * 1000) / 1000,
-        Math.round(currentValue * 100) / 100,
-        Math.round(investedAmount * 100) / 100,
-        Math.round(profitLoss * 100) / 100,
-        Math.round(profitLossPct * 100) / 100,
-        Math.round(dayChange * 100) / 100,
-        Math.round(dayChangePct * 100) / 100
-      );
-
-      console.log(`  ✓ ${inv.name}: ₹${Math.round(currentValue).toLocaleString()} (${profitLoss >= 0 ? '+' : ''}${Math.round(profitLoss).toLocaleString()})`);
+      const combinedUnits = getTotalUnits.get(inv.id).total;
+      const combinedValue = inv.asset_type === 'FOREIGN_STOCK'
+        ? combinedUnits * pricePerUnit * usdToInr
+        : (inv.asset_type === 'PPF' || inv.asset_type === 'PF')
+          ? (() => { const txns = db.prepare("SELECT transaction_date as date, amount FROM transactions WHERE investment_id = ? AND transaction_type IN ('DEPOSIT', 'BUY')").all(inv.id); return calculatePPFValue(txns, pricePerUnit); })()
+          : combinedUnits * pricePerUnit;
+      const combinedPL = combinedValue + getSaleProceeds.get(inv.id).total - getInvestedAmount.get(inv.id).total;
+      console.log(`  ✓ ${inv.name}: ₹${Math.round(combinedValue).toLocaleString()} (${combinedPL >= 0 ? '+' : ''}${Math.round(combinedPL).toLocaleString()})`);
       successCount++;
 
       // Small delay to avoid rate limiting
@@ -289,20 +363,20 @@ function updatePortfolioDaily(db, date) {
     VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  // Get all distinct portfolio_ids from transactions (including NULL for unassigned)
+  // Get all distinct portfolio_ids from transactions
   const portfolioIds = db.prepare(`
     SELECT DISTINCT t.portfolio_id FROM transactions t
     JOIN investments i ON t.investment_id = i.id
-    WHERE i.is_active = 1
+    WHERE t.portfolio_id IS NOT NULL
   `).all().map(r => r.portfolio_id);
 
   // Always include combined (null) snapshot
-  const allIds = [...new Set([null, ...portfolioIds])];
+  const allIds = [null, ...portfolioIds];
 
   for (const pid of allIds) {
     let totals;
     if (pid === null) {
-      // Combined: all investments
+      // Combined: sum from combined (NULL portfolio_id) daily_values rows
       totals = db.prepare(`
         SELECT
           COALESCE(SUM(dv.current_value), 0) as total_value,
@@ -310,11 +384,10 @@ function updatePortfolioDaily(db, date) {
           COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
           COALESCE(SUM(dv.day_change), 0) as day_change
         FROM daily_values dv
-        JOIN investments i ON dv.investment_id = i.id
-        WHERE dv.date = ? AND i.is_active = 1
+        WHERE dv.portfolio_id IS NULL AND dv.date = ?
       `).get(date);
     } else {
-      // Per-portfolio: only investments that have transactions in this portfolio
+      // Per-portfolio: sum from portfolio-scoped daily_values rows
       totals = db.prepare(`
         SELECT
           COALESCE(SUM(dv.current_value), 0) as total_value,
@@ -322,10 +395,8 @@ function updatePortfolioDaily(db, date) {
           COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
           COALESCE(SUM(dv.day_change), 0) as day_change
         FROM daily_values dv
-        JOIN investments i ON dv.investment_id = i.id
-        WHERE dv.date = ? AND i.is_active = 1
-          AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)
-      `).get(date, pid);
+        WHERE dv.portfolio_id = ? AND dv.date = ?
+      `).get(pid, date);
     }
 
     const profitPct = totals.total_invested > 0

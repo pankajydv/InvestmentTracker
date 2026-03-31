@@ -90,7 +90,7 @@ export default function Investments() {
         <Row className="g-3">
           {investments.map((inv) => (
             <Col key={inv.id} md={6} lg={4}>
-              <Card as={Link} to={`/investments/${inv.id}`} className="shadow-sm h-100 text-decoration-none" style={{ transition: 'box-shadow 0.2s' }}>
+              <Card as={Link} to={`/investments/${inv.id}`} state={{ investmentsSearch: searchParams.toString() }} className="shadow-sm h-100 text-decoration-none" style={{ transition: 'box-shadow 0.2s' }}>
                 <Card.Body>
                   <div className="d-flex justify-content-between align-items-start mb-2">
                     <div>
@@ -100,9 +100,9 @@ export default function Investments() {
                   </div>
                   <div className="small text-muted">
                     {inv.ticker_symbol && <div>Symbol: <span className="text-body">{inv.ticker_symbol.replace(/\.(NS|BO)$/, '')}</span></div>}
+                    {inv.isin_code && <div>ISIN: <span className="text-body">{inv.isin_code}</span></div>}
                     {inv.amfi_code && <div>AMFI: <span className="text-body">{inv.amfi_code}</span></div>}
-                    {inv.folio_number && <div>Folio: <span className="text-body">{inv.folio_number}</span></div>}
-                    <div>Currency: <span className="text-body">{inv.currency}</span></div>
+                    {inv.category && <div>Category: <span className="text-body">{inv.category}</span></div>}
                   </div>
                 </Card.Body>
               </Card>

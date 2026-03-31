@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw } from 'lucide-react';
-import { triggerPriceUpdate, cancelPriceUpdate } from '../services/api';
+import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download } from 'lucide-react';
+import { triggerPriceUpdate, cancelPriceUpdate, exportData } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 
 const NAV_ITEMS = [
@@ -17,6 +17,7 @@ const NAV_ITEMS = [
 export default function Navbar() {
   const location = useLocation();
   const [updating, setUpdating] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   const handleUpdate = async () => {
     setUpdating(true);
@@ -34,6 +35,17 @@ export default function Navbar() {
     try { await cancelPriceUpdate(); } catch (_) { /* best effort */ }
   };
 
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      await exportData();
+    } catch (e) {
+      alert('Export failed: ' + e.message);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <BsNavbar bg="white" expand="md" sticky="top" className="shadow-sm border-bottom">
       <Container>
@@ -47,6 +59,9 @@ export default function Navbar() {
         </div>
 
         <div className="d-flex align-items-center gap-2 d-md-none">
+          <Button variant="outline-secondary" size="sm" onClick={handleExport} disabled={exporting}>
+            <Download size={18} className={exporting ? 'spinner-rotate' : ''} />
+          </Button>
           <Button
             variant={updating ? 'danger' : 'success'}
             size="sm"
@@ -75,6 +90,16 @@ export default function Navbar() {
                 {label}
               </Nav.Link>
             ))}
+            <Button
+              variant="outline-secondary"
+              size="sm"
+              onClick={handleExport}
+              disabled={exporting}
+              className="d-none d-md-flex align-items-center gap-1 ms-2"
+            >
+              <Download size={16} className={exporting ? 'spinner-rotate' : ''} />
+              {exporting ? 'Exporting...' : 'Export'}
+            </Button>
             <Button
               variant={updating ? 'danger' : 'success'}
               size="sm"

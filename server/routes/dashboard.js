@@ -25,9 +25,18 @@ module.exports = function (db) {
 
     // Build hide-sold filter
     const soldFilter = hide_sold === 'true'
-      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SPLIT') THEN COALESCE(t2.units,0) WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t2.units,0) ELSE 0 END) FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}),0) > 0)`
+      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SWITCH_IN','SPLIT') THEN COALESCE(t2.units,0) WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION') THEN -COALESCE(t2.units,0) ELSE 0 END) FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}),0) > 0.001)`
       : '';
     const soldParams = (hide_sold === 'true' && portfolio_id) ? [portfolio_id] : [];
+
+    // Build daily_values portfolio filter
+    const dvPortfolioJoin = portfolio_id
+      ? 'AND dv.portfolio_id = ?'
+      : 'AND dv.portfolio_id IS NULL';
+    const dvPortfolioSub = portfolio_id
+      ? 'AND portfolio_id = ?'
+      : 'AND portfolio_id IS NULL';
+    const dvParams = portfolio_id ? [portfolio_id] : [];
 
     // Get individual investment summaries
     const investments = db.prepare(`
@@ -35,10 +44,7 @@ module.exports = function (db) {
         i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency,
         i.isin_code, i.display_name,
         dv.date, COALESCE(dv.price_per_unit, 0) as price_per_unit,
-        COALESCE((SELECT SUM(CASE
-          WHEN t3.transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','RIGHTS') THEN COALESCE(t3.units,0)
-          WHEN t3.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','CONSOLIDATION') THEN -COALESCE(t3.units,0)
-          ELSE 0 END) FROM transactions t3 WHERE t3.investment_id = i.id), 0) as total_units,
+        COALESCE(dv.total_units, 0) as total_units,
         COALESCE(dv.current_value, 0) as current_value,
         COALESCE(dv.invested_amount,
           (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
@@ -49,10 +55,11 @@ module.exports = function (db) {
         COALESCE(dv.day_change_pct, 0) as day_change_pct
       FROM investments i
       LEFT JOIN daily_values dv ON i.id = dv.investment_id
-        AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id)
-      WHERE i.is_active = 1${portfolioFilter}${soldFilter}
+        ${dvPortfolioJoin}
+        AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id ${dvPortfolioSub})
+      WHERE 1=1${portfolioFilter}${soldFilter}
       ORDER BY i.asset_type, i.name
-    `).all(...portfolioParams, ...soldParams);
+    `).all(...dvParams, ...dvParams, ...portfolioParams, ...soldParams);
 
     // Group by asset type
     const byType = {};
@@ -148,17 +155,18 @@ module.exports = function (db) {
       `).all(startDate, endDate);
     }
 
-    // Per-investment performance
+    // Per-investment performance (portfolio-scoped daily_values)
+    const dvFilter = portfolio_id ? 'AND dv.portfolio_id = ?' : 'AND dv.portfolio_id IS NULL';
     const investmentFilter = portfolio_id ? ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)' : '';
     const investmentParams = portfolio_id
-      ? [startDate, endDate, portfolio_id]
+      ? [startDate, endDate, portfolio_id, portfolio_id]
       : [startDate, endDate];
 
     const investmentData = db.prepare(`
       SELECT dv.*, COALESCE(i.display_name, i.name) as name, i.asset_type
       FROM daily_values dv
       JOIN investments i ON dv.investment_id = i.id
-      WHERE dv.date BETWEEN ? AND ? AND i.is_active = 1${investmentFilter}
+      WHERE dv.date BETWEEN ? AND ? ${dvFilter}${investmentFilter}
       ORDER BY dv.date ASC, i.name ASC
     `).all(...investmentParams);
 
@@ -187,7 +195,7 @@ module.exports = function (db) {
 
   // ─── Individual investment performance ────────────────────────────────
   router.get('/performance/:investmentId', (req, res) => {
-    const { period } = req.query;
+    const { period, portfolio_id } = req.query;
     const now = new Date();
     let startDate;
 
@@ -203,11 +211,14 @@ module.exports = function (db) {
       default: { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); startDate = d.toISOString().split('T')[0]; }
     }
 
+    const dvPidFilter = portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL';
+    const dvPidParams = portfolio_id ? [portfolio_id] : [];
+
     const data = db.prepare(`
       SELECT * FROM daily_values
-      WHERE investment_id = ? AND date >= ?
+      WHERE investment_id = ? ${dvPidFilter} AND date >= ?
       ORDER BY date ASC
-    `).all(req.params.investmentId, startDate);
+    `).all(req.params.investmentId, ...dvPidParams, startDate);
 
     res.json(data);
   });
@@ -216,7 +227,10 @@ module.exports = function (db) {
   router.get('/allocation', (req, res) => {
     const { portfolio_id } = req.query;
     const portfolioFilter = portfolio_id ? ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)' : '';
-    const params = portfolio_id ? [portfolio_id] : [];
+    const dvJoin = portfolio_id ? 'AND dv.portfolio_id = ?' : 'AND dv.portfolio_id IS NULL';
+    const dvSub = portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL';
+    const dvParams = portfolio_id ? [portfolio_id] : [];
+    const pfParams = portfolio_id ? [portfolio_id] : [];
 
     const allocation = db.prepare(`
       SELECT
@@ -227,10 +241,11 @@ module.exports = function (db) {
         COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
       FROM investments i
       LEFT JOIN daily_values dv ON i.id = dv.investment_id
-        AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id)
-      WHERE i.is_active = 1${portfolioFilter}
+        ${dvJoin}
+        AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id ${dvSub})
+      WHERE 1=1${portfolioFilter}
       GROUP BY i.asset_type
-    `).all(...params);
+    `).all(...dvParams, ...dvParams, ...pfParams);
 
     res.json(allocation);
   });

@@ -51,7 +51,12 @@ export const getInvestments = (type, portfolioId, { hideSold } = {}) => {
   if (hideSold) params.set('hide_sold', 'true');
   return fetchJSON(`/investments?${params}`);
 };
-export const getInvestment = (id) => fetchJSON(`/investments/${id}`);
+export const getInvestment = (id, portfolioId) => {
+  const params = new URLSearchParams();
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  const qs = params.toString();
+  return fetchJSON(`/investments/${id}${qs ? `?${qs}` : ''}`);
+};
 export const createInvestment = (data) =>
   fetchJSON('/investments', { method: 'POST', body: JSON.stringify(data) });
 export const updateInvestment = (id, data) =>
@@ -177,3 +182,23 @@ export const previewCorporateActions = (portfolioId, year) =>
   fetchJSON(`/stocks/corporate-actions/preview?portfolio_id=${portfolioId}&year=${year}`);
 export const importCorporateActions = ({ transactions, corrections, deletions }) =>
   fetchJSON('/stocks/corporate-actions/import', { method: 'POST', body: JSON.stringify({ transactions, corrections, deletions }) });
+
+// Export all data as XLSX download
+export const exportData = async () => {
+  const res = await fetch(`${API_BASE}/utils/export`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Export failed');
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const cd = res.headers.get('Content-Disposition') || '';
+  const match = cd.match(/filename="?([^"]+)"?/);
+  a.download = match ? match[1] : `InvestmentTracker_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};

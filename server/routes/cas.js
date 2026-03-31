@@ -13,11 +13,11 @@ module.exports = function (db) {
 
   /**
    * Build a set of existing transaction keys for fast delta lookup.
-   * Key = isin|date|type|amount|units (rounded to avoid float mismatch)
+   * Key = isin|date|type|amount|units|folio (rounded to avoid float mismatch)
    */
   function getExistingTransactionKeys(portfolioId) {
     const rows = db.prepare(`
-      SELECT i.isin_code, t.transaction_date, t.transaction_type, t.amount, t.units
+      SELECT i.isin_code, t.transaction_date, t.transaction_type, t.amount, t.units, t.folio_number
       FROM transactions t
       JOIN investments i ON i.id = t.investment_id
       WHERE t.portfolio_id = ? AND i.asset_type = 'MUTUAL_FUND'
@@ -29,22 +29,34 @@ module.exports = function (db) {
       const key = [
         r.isin_code,
         r.transaction_date,
-        r.transaction_type,
+        normalizeTxnType(r.transaction_type),
         Math.round(Math.abs(r.amount || 0) * 100),
         Math.round(Math.abs(r.units || 0) * 1000),
+        (r.folio_number || '').replace(/\s/g, ''),
       ].join('|');
       keys.add(key);
     }
     return keys;
   }
 
-  function makeTxnKey(isin, date, type, amount, units) {
+  /**
+   * Normalize transaction type for duplicate comparison.
+   * SWITCH_IN and BUY are equivalent, SWITCH_OUT and SELL are equivalent.
+   */
+  function normalizeTxnType(type) {
+    if (type === 'SWITCH_IN') return 'BUY';
+    if (type === 'SWITCH_OUT') return 'SELL';
+    return type;
+  }
+
+  function makeTxnKey(isin, date, type, amount, units, folio) {
     return [
       isin,
       date,
-      type,
+      normalizeTxnType(type),
       Math.round(Math.abs(amount || 0) * 100),
       Math.round(Math.abs(units || 0) * 1000),
+      (folio || '').replace(/\s/g, ''),
     ].join('|');
   }
 
@@ -79,10 +91,10 @@ module.exports = function (db) {
         // Find existing investments by ISIN for matching
         const existingByIsin = {};
         const invRows = db.prepare(
-          `SELECT DISTINCT i.id, i.name, i.isin_code, i.folio_number
+          `SELECT DISTINCT i.id, i.name, i.isin_code
            FROM investments i
            JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
-           WHERE i.is_active = 1 AND i.asset_type = 'MUTUAL_FUND'`
+           WHERE i.asset_type = 'MUTUAL_FUND'`
         ).all(portfolioId);
         for (const inv of invRows) {
           if (inv.isin_code) existingByIsin[inv.isin_code] = inv;
@@ -91,7 +103,7 @@ module.exports = function (db) {
         const schemes = camsParsed.schemes.map(s => {
           const existingInv = existingByIsin[s.isin] || null;
           const transactions = s.transactions.map(t => {
-            const key = makeTxnKey(s.isin, t.date, t.type, t.amount, t.units);
+            const key = makeTxnKey(s.isin, t.date, t.type, t.amount, t.units, s.folio);
             return { ...t, isNew: !existingKeys.has(key) };
           });
           const newTxns = transactions.filter(t => t.isNew);
@@ -144,15 +156,17 @@ module.exports = function (db) {
       if (cdslParsed && cdslParsed.mutualFunds.length > 0) {
         // Check which holdings already exist in DB for this portfolio
         const existingInvestments = db.prepare(
-          `SELECT DISTINCT i.id, i.name, i.asset_type, i.ticker_symbol, i.amfi_code, i.folio_number
+          `SELECT DISTINCT i.id, i.name, i.asset_type, i.ticker_symbol, i.amfi_code, i.isin_code,
+                  (SELECT GROUP_CONCAT(DISTINCT t2.folio_number) FROM transactions t2 WHERE t2.investment_id = i.id AND t2.folio_number IS NOT NULL) as folios
            FROM investments i
            JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
-           WHERE i.is_active = 1`
+           WHERE 1=1`
         ).all(portfolioId);
 
         const markExisting = (holding) => {
           const match = existingInvestments.find(inv => {
-            if (holding.folio && inv.folio_number && inv.folio_number === holding.folio) return true;
+            if (holding.isin && inv.isin_code && inv.isin_code === holding.isin) return true;
+            if (holding.folio && inv.folios && inv.folios.split(',').some(f => f.trim() === holding.folio)) return true;
             const nameNorm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
             if (nameNorm(inv.name).includes(nameNorm(holding.name).substring(0, 15))) return true;
             if (nameNorm(holding.name).includes(nameNorm(inv.name).substring(0, 15))) return true;
@@ -187,16 +201,17 @@ module.exports = function (db) {
 
       if (nsdlParsed && nsdlParsed.mutualFunds.length > 0) {
         const existingInvestments = db.prepare(
-          `SELECT DISTINCT i.id, i.name, i.asset_type, i.ticker_symbol, i.amfi_code, i.folio_number
+          `SELECT DISTINCT i.id, i.name, i.asset_type, i.ticker_symbol, i.amfi_code, i.isin_code,
+                  (SELECT GROUP_CONCAT(DISTINCT t2.folio_number) FROM transactions t2 WHERE t2.investment_id = i.id AND t2.folio_number IS NOT NULL) as folios
            FROM investments i
            JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
-           WHERE i.is_active = 1`
+           WHERE 1=1`
         ).all(portfolioId);
 
         const markExistingNSDL = (holding) => {
           const match = existingInvestments.find(inv => {
             if (holding.isin && inv.isin_code && inv.isin_code === holding.isin) return true;
-            if (holding.folio && inv.folio_number && inv.folio_number === holding.folio) return true;
+            if (holding.folio && inv.folios && inv.folios.split(',').some(f => f.trim() === holding.folio)) return true;
             const nameNorm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
             if (nameNorm(inv.name).includes(nameNorm(holding.name).substring(0, 15))) return true;
             if (nameNorm(holding.name).includes(nameNorm(inv.name).substring(0, 15))) return true;
@@ -250,17 +265,16 @@ module.exports = function (db) {
       const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolioId);
       if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
 
-      const findByIsin = db.prepare('SELECT id, name FROM investments WHERE isin_code = ? AND is_active = 1');
-      const findByFolio = db.prepare('SELECT id, name FROM investments WHERE folio_number = ? AND is_active = 1');
+      const findByIsin = db.prepare('SELECT id, name FROM investments WHERE isin_code = ?');
 
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, ticker_symbol, folio_number, isin_code, currency, notes)
-        VALUES (?, 'MUTUAL_FUND', NULL, ?, ?, 'INR', ?)
+        INSERT INTO investments (name, asset_type, ticker_symbol, isin_code, currency, notes)
+        VALUES (?, 'MUTUAL_FUND', NULL, ?, 'INR', ?)
       `);
 
       const insertTransaction = db.prepare(`
-        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, folio_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       // Build existing keys to skip duplicates (double safety — preview already filtered)
@@ -273,35 +287,30 @@ module.exports = function (db) {
       const importTxn = db.transaction(() => {
         for (const scheme of schemes) {
           const isin = scheme.isin;
-          const folio = scheme.folio || null;
+          const folio = scheme.folio ? scheme.folio.replace(/\s/g, '') : null;
           const schemeName = scheme.schemeName;
 
-          // Find or create investment
+          // Find or create investment (match by ISIN only — folios are per-transaction)
           let investmentId = null;
           if (isin) {
             const byIsin = findByIsin.get(isin);
             if (byIsin) investmentId = byIsin.id;
           }
-          if (!investmentId && folio) {
-            const byFolio = findByFolio.get(folio);
-            if (byFolio) investmentId = byFolio.id;
-          }
           if (!investmentId) {
             const inv = insertInvestment.run(
-              schemeName, folio, isin,
+              schemeName, isin,
               `Imported from CAMS/KFintech CAS. AMC: ${scheme.amc || ''}`
             );
             investmentId = inv.lastInsertRowid;
           } else {
-            // Backfill isin/folio if missing
+            // Backfill isin if missing
             if (isin) db.prepare('UPDATE investments SET isin_code = COALESCE(isin_code, ?) WHERE id = ?').run(isin, investmentId);
-            if (folio) db.prepare('UPDATE investments SET folio_number = COALESCE(folio_number, ?) WHERE id = ?').run(folio, investmentId);
           }
 
           let schemeImported = 0;
           for (const t of (scheme.transactions || [])) {
             // Skip non-new transactions
-            const key = makeTxnKey(isin, t.date, t.type, t.amount, t.units);
+            const key = makeTxnKey(isin, t.date, t.type, t.amount, t.units, folio);
             if (existingKeys.has(key)) { skippedCount++; continue; }
 
             const fees = (t.stampDuty || 0) + (t.stt || 0);
@@ -314,7 +323,7 @@ module.exports = function (db) {
               investmentId, portfolioId,
               t.type, t.date,
               Math.abs(t.units || 0), t.price || 0, Math.abs(t.amount || 0),
-              fees, 'CAMS CAS', notes
+              fees, 'CAMS CAS', notes, folio
             );
             existingKeys.add(key); // prevent duplicates within same import
             importedCount++;
@@ -361,20 +370,17 @@ module.exports = function (db) {
       }
 
       const findByIsin = db.prepare(
-        'SELECT id, name FROM investments WHERE isin_code = ? AND is_active = 1'
-      );
-      const findByFolio = db.prepare(
-        'SELECT id, name FROM investments WHERE folio_number = ? AND is_active = 1'
+        'SELECT id, name FROM investments WHERE isin_code = ?'
       );
 
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, folio_number, isin_code, currency, notes)
-        VALUES (?, 'MUTUAL_FUND', ?, ?, 'INR', ?)
+        INSERT INTO investments (name, asset_type, isin_code, currency, notes)
+        VALUES (?, 'MUTUAL_FUND', ?, 'INR', ?)
       `);
 
       const insertTransaction = db.prepare(`
-        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount)
-        VALUES (?, ?, 'BUY', ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, folio_number)
+        VALUES (?, ?, 'BUY', ?, ?, ?, ?, ?)
       `);
 
       const today = new Date().toISOString().split('T')[0];
@@ -385,15 +391,11 @@ module.exports = function (db) {
           const folio = h.folio || null;
           const notes = `Imported from CAS PDF. ISIN: ${h.isin}`;
 
-          // Check for existing investment by ISIN or folio
+          // Check for existing investment by ISIN (folios are per-transaction)
           let existingId = null;
           if (h.isin) {
             const byIsin = findByIsin.get(h.isin);
             if (byIsin) existingId = byIsin.id;
-          }
-          if (!existingId && folio) {
-            const byFolio = findByFolio.get(folio);
-            if (byFolio) existingId = byFolio.id;
           }
 
           let investmentId;
@@ -405,7 +407,7 @@ module.exports = function (db) {
             }
           } else {
             const inv = insertInvestment.run(
-              h.name, folio, h.isin || null, notes
+              h.name, h.isin || null, notes
             );
             investmentId = inv.lastInsertRowid;
           }
@@ -416,7 +418,7 @@ module.exports = function (db) {
           const amount = h.invested || h.value || (units * pricePerUnit);
 
           if (units > 0 && amount > 0) {
-            insertTransaction.run(investmentId, portfolio_id, today, units, pricePerUnit, amount);
+            insertTransaction.run(investmentId, portfolio_id, today, units, pricePerUnit, amount, folio);
           }
 
           results.push({

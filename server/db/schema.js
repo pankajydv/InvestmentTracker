@@ -37,7 +37,6 @@ function initializeDb(db) {
       asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND')),
       ticker_symbol TEXT,          -- NSE symbol for Indian stocks, Yahoo ticker for foreign stocks
       amfi_code TEXT,              -- AMFI scheme code for mutual funds
-      folio_number TEXT,           -- Folio number for MF
       account_number TEXT,         -- For PPF/PF accounts
       interest_rate REAL,          -- For PPF/PF (annual %)
       currency TEXT DEFAULT 'INR', -- INR or USD
@@ -48,7 +47,6 @@ function initializeDb(db) {
       display_name TEXT,              -- User-friendly display name (overrides 'name' in UI)
       isin_code TEXT,                -- ISIN for universal identification
       previous_isin_codes TEXT,      -- Comma-separated historical ISINs (e.g. after stock splits)
-      is_active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -58,7 +56,7 @@ function initializeDb(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       investment_id INTEGER NOT NULL,
       portfolio_id INTEGER,        -- Owner (family member) portfolio
-      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER')),
+      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT')),
       transaction_date TEXT NOT NULL,
       units REAL,                  -- Number of units/shares bought or sold
       price_per_unit REAL,         -- Price at which transaction happened
@@ -70,10 +68,11 @@ function initializeDb(db) {
       FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
     );
 
-    -- Daily snapshot of each investment's value
+    -- Daily snapshot of each investment's value (per portfolio + combined)
     CREATE TABLE IF NOT EXISTS daily_values (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       investment_id INTEGER NOT NULL,
+      portfolio_id INTEGER,          -- NULL = combined/all portfolios
       date TEXT NOT NULL,
       price_per_unit REAL,         -- NAV or stock price
       total_units REAL,            -- Total units held on that day
@@ -85,7 +84,7 @@ function initializeDb(db) {
       day_change_pct REAL DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
-      UNIQUE(investment_id, date)
+      UNIQUE(investment_id, portfolio_id, date)
     );
 
     -- Portfolio-level daily snapshot (one row per portfolio per day, plus NULL portfolio_id = combined)
@@ -122,7 +121,6 @@ function initializeDb(db) {
 
     -- Indexes for faster queries
     CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date);
-    CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date);
     CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
     CREATE INDEX IF NOT EXISTS idx_portfolio_daily_date ON portfolio_daily(date);
@@ -159,6 +157,23 @@ function initializeDb(db) {
     db.exec("ALTER TABLE investments ADD COLUMN previous_isin_codes TEXT");
   }
 
+  // Add folio_number to transactions (folio is per-transaction, not per-investment)
+  if (!txnCols.includes('folio_number')) {
+    db.exec("ALTER TABLE transactions ADD COLUMN folio_number TEXT");
+  }
+
+  // Add category to investments (Equity, Debt, Hybrid, ELSS, etc.)
+  if (!invCols.includes('category')) {
+    db.exec("ALTER TABLE investments ADD COLUMN category TEXT");
+    // Auto-populate category for mutual funds from name heuristics
+    const mfs = db.prepare("SELECT id, name FROM investments WHERE asset_type = 'MUTUAL_FUND' AND category IS NULL").all();
+    const updateCat = db.prepare("UPDATE investments SET category = ? WHERE id = ?");
+    for (const mf of mfs) {
+      const cat = inferMFCategory(mf.name);
+      if (cat) updateCat.run(cat, mf.id);
+    }
+  }
+
   // Seed default interest rates
   const existingRates = db.prepare('SELECT COUNT(*) as count FROM interest_rates').get();
   if (existingRates.count === 0) {
@@ -176,6 +191,79 @@ function initializeDb(db) {
     insertConfig.run('auto_update_enabled', 'true');
     insertConfig.run('update_time', '18:00'); // 6 PM IST
   }
+
+  // ── Migration: add portfolio_id to daily_values ──────────────────────
+  const dvCols = db.prepare("PRAGMA table_info(daily_values)").all().map(c => c.name);
+  if (!dvCols.includes('portfolio_id')) {
+    console.log('Migrating daily_values: adding portfolio_id column (dropping old data)...');
+    db.exec('DROP TABLE IF EXISTS daily_values');
+    db.exec('DROP TABLE IF EXISTS portfolio_daily');
+    db.exec(`
+      CREATE TABLE daily_values (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        investment_id INTEGER NOT NULL,
+        portfolio_id INTEGER,
+        date TEXT NOT NULL,
+        price_per_unit REAL,
+        total_units REAL,
+        current_value REAL NOT NULL,
+        invested_amount REAL NOT NULL,
+        profit_loss REAL NOT NULL,
+        profit_loss_pct REAL,
+        day_change REAL DEFAULT 0,
+        day_change_pct REAL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
+        UNIQUE(investment_id, portfolio_id, date)
+      );
+      CREATE TABLE portfolio_daily (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        portfolio_id INTEGER,
+        date TEXT NOT NULL,
+        total_value REAL NOT NULL,
+        total_invested REAL NOT NULL,
+        total_profit_loss REAL NOT NULL,
+        total_profit_loss_pct REAL,
+        day_change REAL DEFAULT 0,
+        day_change_pct REAL DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(portfolio_id, date)
+      );
+      CREATE INDEX idx_daily_values_date ON daily_values(date);
+      CREATE INDEX idx_daily_values_investment_date ON daily_values(investment_id, portfolio_id, date);
+      CREATE INDEX idx_daily_values_portfolio ON daily_values(portfolio_id, date);
+      CREATE INDEX idx_portfolio_daily_date ON portfolio_daily(date);
+      CREATE INDEX idx_portfolio_daily_portfolio ON portfolio_daily(portfolio_id, date);
+    `);
+    console.log('Migration complete: daily_values and portfolio_daily recreated with portfolio_id support.');
+  }
+}
+
+/**
+ * Infer mutual fund category from scheme name
+ */
+function inferMFCategory(name) {
+  const n = name.toLowerCase();
+  if (n.includes('elss') || n.includes('tax saver') || n.includes('tax saving')) return 'ELSS';
+  if (n.includes('liquid') || n.includes('money market') || n.includes('overnight')) return 'Liquid';
+  if (n.includes('gilt') || n.includes('debt') || n.includes('bond') || n.includes('income') ||
+      n.includes('credit risk') || n.includes('banking & psu') || n.includes('banking and psu') ||
+      n.includes('corporate bond') || n.includes('dynamic bond') || n.includes('short duration') ||
+      n.includes('medium duration') || n.includes('long duration') || n.includes('ultra short') ||
+      n.includes('low duration') || n.includes('floater') || n.includes('floating rate')) return 'Debt';
+  if (n.includes('hybrid') || n.includes('balanced') || n.includes('equity savings') ||
+      n.includes('multi asset') || n.includes('arbitrage')) return 'Hybrid';
+  if (n.includes('index') || n.includes('nifty') || n.includes('sensex') || n.includes('etf')) return 'Index/ETF';
+  if (n.includes('international') || n.includes('global') || n.includes('us equity') ||
+      n.includes('nasdaq') || n.includes('emerging market') || n.includes('world')) return 'International';
+  if (n.includes('large cap') || n.includes('largecap') || n.includes('mid cap') || n.includes('midcap') ||
+      n.includes('small cap') || n.includes('smallcap') || n.includes('flexi cap') || n.includes('flexicap') ||
+      n.includes('multi cap') || n.includes('multicap') || n.includes('focused') || n.includes('value') ||
+      n.includes('contra') || n.includes('dividend yield') || n.includes('opportunities') ||
+      n.includes('sectoral') || n.includes('thematic') || n.includes('consumption') ||
+      n.includes('infrastructure') || n.includes('pharma') || n.includes('banking') ||
+      n.includes('technology') || n.includes('equity') || n.includes('growth')) return 'Equity';
+  return 'Equity';
 }
 
 module.exports = { getDb, initializeDb };

@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom';
-import { Card, Table, Spinner, Form, Modal, Button } from 'react-bootstrap';
+import { Card, Table, Spinner, Form, Modal, Button, Row, Col } from 'react-bootstrap';
 import { getTransactions, getBrokers, getAssetTypes, getTransactionTypes, getInvestmentNames, updateTransaction, deleteTransaction } from '../services/api';
 import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -10,10 +10,10 @@ const TRANSACTION_TYPES_DEFAULT = [
 ];
 
 // User-action types that can be edited/deleted (not corporate actions)
-const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT'];
 
-const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'DEPOSIT'];
-const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
+const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT'];
+const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
 
 const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
 
@@ -33,7 +33,7 @@ function computeHoldingMap(transactions) {
     } else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) {
       byInvestment[key] -= txn.units || 0;
     }
-    map[txn.id] = byInvestment[key];
+    map[txn.id] = Math.round(byInvestment[key] * 1000) / 1000;
   }
   return map;
 }
@@ -53,6 +53,8 @@ const TYPE_BADGE = {
   SELL: 'badge-sell',
   WITHDRAWAL: 'badge-withdrawal',
   TRANSFER_OUT: 'badge-sell',
+  SWITCH_IN: 'badge-buy',
+  SWITCH_OUT: 'badge-sell',
   TRANSFER: 'badge-merger',
   AMC: 'badge-withdrawal',
 };
@@ -139,11 +141,13 @@ export default function Transactions() {
   const getChanges = () => {
     if (!editTxn) return [];
     const changes = [];
+    if ((editForm.folio_number || '') !== (editTxn.folio_number || '')) changes.push('Folio');
     if (editForm.transaction_date !== editTxn.transaction_date) changes.push('Date');
     if (String(editForm.units || '') !== String(editTxn.units || '')) changes.push('Units');
     if (String(editForm.price_per_unit || '') !== String(editTxn.price_per_unit || '')) changes.push('Price/Unit');
     if (String(editForm.amount || '') !== String(editTxn.amount || '')) changes.push('Amount');
     if (String(editForm.fees || '') !== String(editTxn.fees || '')) changes.push('Charges');
+    if ((editForm.broker || '') !== (editTxn.broker || '')) changes.push('Broker');
     if ((editForm.notes || '') !== (editTxn.notes || '')) changes.push('Notes');
     return changes;
   };
@@ -153,11 +157,13 @@ export default function Transactions() {
   const handleEdit = (txn) => {
     setEditTxn(txn);
     setEditForm({
+      folio_number: txn.folio_number || '',
       transaction_date: txn.transaction_date,
       units: txn.units || '',
       price_per_unit: txn.price_per_unit || '',
       amount: txn.amount || '',
       fees: txn.fees || '',
+      broker: txn.broker || '',
       notes: txn.notes || '',
     });
   };
@@ -166,11 +172,13 @@ export default function Transactions() {
     try {
       setSaving(true);
       await updateTransaction(editTxn.id, {
+        folio_number: editForm.folio_number || null,
         transaction_date: editForm.transaction_date,
         units: editForm.units ? Number(editForm.units) : null,
         price_per_unit: editForm.price_per_unit ? Number(editForm.price_per_unit) : null,
         amount: Number(editForm.amount),
         fees: editForm.fees ? Number(editForm.fees) : 0,
+        broker: editForm.broker || null,
         notes: editForm.notes || null,
       });
       setEditTxn(null);
@@ -196,18 +204,22 @@ export default function Transactions() {
     getAssetTypes().then(setAssetTypes).catch(() => {});
   }, []);
 
-  // Load brokers based on selected asset type
+  // Load brokers based on selected asset type + portfolio
   useEffect(() => {
-    const params = filterAssetType ? { asset_type: filterAssetType } : {};
+    const params = {};
+    if (selectedId) params.portfolio_id = selectedId;
+    if (filterAssetType) params.asset_type = filterAssetType;
     getBrokers(params).then(b => {
       setBrokers(b);
       setFilterBroker(prev => b.includes(prev) ? prev : '');
     }).catch(() => {});
-  }, [filterAssetType]);
+  }, [selectedId, filterAssetType]);
 
-  // Load transaction types based on selected asset type
+  // Load transaction types based on selected asset type + portfolio
   useEffect(() => {
-    const params = filterAssetType ? { asset_type: filterAssetType } : {};
+    const params = {};
+    if (selectedId) params.portfolio_id = selectedId;
+    if (filterAssetType) params.asset_type = filterAssetType;
     getTransactionTypes(params).then(types => {
       setTransactionTypes(types.length ? types : TRANSACTION_TYPES_DEFAULT);
       // Clear any selected types that aren't available in the new list
@@ -216,7 +228,7 @@ export default function Transactions() {
         return next.length === prev.length ? prev : next;
       });
     }).catch(() => {});
-  }, [filterAssetType]);
+  }, [selectedId, filterAssetType]);
 
   // Close type dropdown on outside click
   useEffect(() => {
@@ -497,7 +509,6 @@ export default function Transactions() {
                   <th className="px-3 py-2 text-end">Units</th>
                   <th className="px-3 py-2 text-end">Price/Unit</th>
                   <th className="px-3 py-2 text-end">Amount</th>
-                  <th className="px-3 py-2 text-end">Charges</th>
                   <th className="px-3 py-2 text-end">Holding</th>
                   <th className="px-3 py-2">Broker</th>
                   <th className="px-3 py-2">Notes</th>
@@ -529,7 +540,6 @@ export default function Transactions() {
                     <td className="px-3 py-2 text-end">{txn.units ? formatNumber(txn.units, 3) : '-'}</td>
                     <td className="px-3 py-2 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>
                     <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
-                    <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
                     <td className="px-3 py-2 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 3) : '-'}</td>
                     <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>
                     <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }} title={txn.notes || ''}>{txn.notes || '-'}</td>
@@ -621,7 +631,7 @@ export default function Transactions() {
       </Card>
 
       {/* Edit Modal */}
-      <Modal show={!!editTxn} onHide={() => setEditTxn(null)} centered>
+      <Modal show={!!editTxn} onHide={() => setEditTxn(null)} centered size="lg">
         <Modal.Header closeButton>
           <Modal.Title className="h6">
             Edit {editTxn?.transaction_type?.replace(/_/g, ' ')} — {editTxn?.investment_name}
@@ -630,59 +640,97 @@ export default function Transactions() {
         <Modal.Body>
           {editTxn && (
             <div className="d-flex flex-column gap-3">
-              <Form.Group>
-                <Form.Label className="small fw-semibold">Date</Form.Label>
-                <Form.Control
-                  type="date"
-                  size="sm"
-                  value={editForm.transaction_date || ''}
-                  onChange={(e) => setEditForm({ ...editForm, transaction_date: e.target.value })}
-                />
-              </Form.Group>
+              <Row className="g-3">
+                <Col sm={6}>
+                  <Form.Group>
+                    <Form.Label className="small fw-semibold">Folio</Form.Label>
+                    <Form.Control
+                      type="text"
+                      size="sm"
+                      value={editForm.folio_number}
+                      onChange={(e) => setEditForm({ ...editForm, folio_number: e.target.value })}
+                    />
+                  </Form.Group>
+                </Col>
+                <Col sm={6}>
+                  <Form.Group>
+                    <Form.Label className="small fw-semibold">Date</Form.Label>
+                    <Form.Control
+                      type="date"
+                      size="sm"
+                      value={editForm.transaction_date || ''}
+                      onChange={(e) => setEditForm({ ...editForm, transaction_date: e.target.value })}
+                    />
+                  </Form.Group>
+                </Col>
+              </Row>
               {editTxn.transaction_type !== 'AMC' && (
-                <>
-                  <Form.Group>
-                    <Form.Label className="small fw-semibold">Units</Form.Label>
-                    <Form.Control
-                      type="number"
-                      size="sm"
-                      step="any"
-                      value={editForm.units}
-                      onChange={(e) => setEditForm({ ...editForm, units: e.target.value })}
-                    />
-                  </Form.Group>
-                  <Form.Group>
-                    <Form.Label className="small fw-semibold">Price/Unit</Form.Label>
-                    <Form.Control
-                      type="number"
-                      size="sm"
-                      step="any"
-                      value={editForm.price_per_unit}
-                      onChange={(e) => setEditForm({ ...editForm, price_per_unit: e.target.value })}
-                    />
-                  </Form.Group>
-                </>
+                <Row className="g-3">
+                  <Col sm={6}>
+                    <Form.Group>
+                      <Form.Label className="small fw-semibold">Units</Form.Label>
+                      <Form.Control
+                        type="number"
+                        size="sm"
+                        step="any"
+                        value={editForm.units}
+                        onChange={(e) => setEditForm({ ...editForm, units: e.target.value })}
+                      />
+                    </Form.Group>
+                  </Col>
+                  <Col sm={6}>
+                    <Form.Group>
+                      <Form.Label className="small fw-semibold">Price/Unit</Form.Label>
+                      <Form.Control
+                        type="number"
+                        size="sm"
+                        step="any"
+                        value={editForm.price_per_unit}
+                        onChange={(e) => setEditForm({ ...editForm, price_per_unit: e.target.value })}
+                      />
+                    </Form.Group>
+                  </Col>
+                </Row>
               )}
-              <Form.Group>
-                <Form.Label className="small fw-semibold">Amount</Form.Label>
-                <Form.Control
-                  type="number"
-                  size="sm"
-                  step="any"
-                  value={editForm.amount}
-                  onChange={(e) => setEditForm({ ...editForm, amount: e.target.value })}
-                />
-              </Form.Group>
-              <Form.Group>
-                <Form.Label className="small fw-semibold">Charges</Form.Label>
-                <Form.Control
-                  type="number"
-                  size="sm"
-                  step="any"
-                  value={editForm.fees}
-                  onChange={(e) => setEditForm({ ...editForm, fees: e.target.value })}
-                />
-              </Form.Group>
+              <Row className="g-3">
+                <Col sm={6}>
+                  <Form.Group>
+                    <Form.Label className="small fw-semibold">Amount</Form.Label>
+                    <Form.Control
+                      type="number"
+                      size="sm"
+                      step="any"
+                      value={editForm.amount}
+                      onChange={(e) => setEditForm({ ...editForm, amount: e.target.value })}
+                    />
+                  </Form.Group>
+                </Col>
+                <Col sm={6}>
+                  <Form.Group>
+                    <Form.Label className="small fw-semibold">Charges</Form.Label>
+                    <Form.Control
+                      type="number"
+                      size="sm"
+                      step="any"
+                      value={editForm.fees}
+                      onChange={(e) => setEditForm({ ...editForm, fees: e.target.value })}
+                    />
+                  </Form.Group>
+                </Col>
+              </Row>
+              <Row className="g-3">
+                <Col sm={6}>
+                  <Form.Group>
+                    <Form.Label className="small fw-semibold">Broker</Form.Label>
+                    <Form.Control
+                      type="text"
+                      size="sm"
+                      value={editForm.broker}
+                      onChange={(e) => setEditForm({ ...editForm, broker: e.target.value })}
+                    />
+                  </Form.Group>
+                </Col>
+              </Row>
               <Form.Group>
                 <Form.Label className="small fw-semibold">Notes</Form.Label>
                 <Form.Control

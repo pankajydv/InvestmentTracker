@@ -33,8 +33,8 @@ function parseNum(s) {
 /** Map CAS description to our DB transaction_type */
 function mapTransactionType(desc) {
   const d = desc.toLowerCase();
-  if (d.includes('lateral shift out') || d.includes('switch out'))  return 'SELL';
-  if (d.includes('lateral shift in')  || d.includes('switch in'))   return 'BUY';
+  if (d.includes('lateral shift out') || d.includes('switch out'))  return 'SWITCH_OUT';
+  if (d.includes('lateral shift in')  || d.includes('switch in'))   return 'SWITCH_IN';
   if (d.includes('redemption'))                                      return 'SELL';
   if (d.includes('purchase') || d.includes('new purchase'))          return 'BUY';
   if (d.includes('dividend') && d.includes('reinvest'))              return 'BUY';
@@ -340,12 +340,12 @@ function parseSchemeBlock(lines, startIdx, amc) {
       const stampMatch = rest.match(/^([\d,.]+)\s+\*{3}\s*Stamp Duty\s*\*{3}/i);
       if (stampMatch) {
         const stampDuty = parseNum(stampMatch[1]);
-        // Attach to most recent BUY transaction
-        if (pendingTxn && pendingTxn.type === 'BUY') {
+        // Attach to most recent BUY/SWITCH_IN transaction
+        if (pendingTxn && (pendingTxn.type === 'BUY' || pendingTxn.type === 'SWITCH_IN')) {
           pendingTxn.stampDuty = (pendingTxn.stampDuty || 0) + stampDuty;
         } else if (transactions.length > 0) {
           const last = transactions[transactions.length - 1];
-          if (last.type === 'BUY') last.stampDuty = (last.stampDuty || 0) + stampDuty;
+          if (last.type === 'BUY' || last.type === 'SWITCH_IN') last.stampDuty = (last.stampDuty || 0) + stampDuty;
         }
         i++;
         continue;
@@ -355,12 +355,12 @@ function parseSchemeBlock(lines, startIdx, amc) {
       const sttMatch = rest.match(/^([\d,.]+)\s+\*{3}\s*STT Paid\s*\*{3}/i);
       if (sttMatch) {
         const stt = parseNum(sttMatch[1]);
-        // Attach to most recent SELL transaction
-        if (pendingTxn && pendingTxn.type === 'SELL') {
+        // Attach to most recent SELL/SWITCH_OUT transaction
+        if (pendingTxn && (pendingTxn.type === 'SELL' || pendingTxn.type === 'SWITCH_OUT')) {
           pendingTxn.stt = (pendingTxn.stt || 0) + stt;
         } else if (transactions.length > 0) {
           const last = transactions[transactions.length - 1];
-          if (last.type === 'SELL') last.stt = (last.stt || 0) + stt;
+          if (last.type === 'SELL' || last.type === 'SWITCH_OUT') last.stt = (last.stt || 0) + stt;
         }
         i++;
         continue;
@@ -495,7 +495,7 @@ function parseSchemeHeader(headerText, amc) {
 
   // Extract folio (digits, spaces, slashes only – avoid capturing investor name)
   const folioMatch = headerText.match(/Folio No:\s*([\d\s/]+)/);
-  const folio = folioMatch ? folioMatch[1].trim() : '';
+  const folio = folioMatch ? folioMatch[1].replace(/\s/g, '').trim() : '';
 
   // Extract registrar
   const regMatch = headerText.match(/Registrar\s*:\s*(CAMS|KFINTECH|KARVY)/i);

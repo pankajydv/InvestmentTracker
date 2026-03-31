@@ -120,18 +120,18 @@ module.exports = function (db) {
         'SELECT id, name, ticker_symbol FROM investments WHERE asset_type = ? AND (ticker_symbol = ? OR name = ?)'
       );
       const findByIsin = db.prepare(
-        'SELECT id, name, ticker_symbol FROM investments WHERE isin_code = ? AND is_active = 1'
+        'SELECT id, name, ticker_symbol FROM investments WHERE isin_code = ?'
       );
       const findByPreviousIsin = db.prepare(
-        "SELECT id, name, ticker_symbol FROM investments WHERE is_active = 1 AND (',' || previous_isin_codes || ',') LIKE '%,' || ? || ',%'"
+        "SELECT id, name, ticker_symbol FROM investments WHERE (',' || previous_isin_codes || ',') LIKE '%,' || ? || ',%'"
       );
       const findByTickerBase = db.prepare(
-        `SELECT id, name, ticker_symbol FROM investments WHERE asset_type = 'INDIAN_STOCK' AND is_active = 1
+        `SELECT id, name, ticker_symbol FROM investments WHERE asset_type = 'INDIAN_STOCK'
          AND REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? LIMIT 1`
       );
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, ticker_symbol, isin_code, currency, notes, is_active)
-        VALUES (?, 'INDIAN_STOCK', ?, ?, 'INR', ?, 1)
+        INSERT INTO investments (name, asset_type, ticker_symbol, isin_code, currency, notes)
+        VALUES (?, 'INDIAN_STOCK', ?, ?, 'INR', ?)
       `);
       // Idempotent: find existing transaction by key fields
       const findTransaction = db.prepare(`
@@ -283,17 +283,17 @@ module.exports = function (db) {
       }
 
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, ticker_symbol, currency, notes, is_active, isin_code)
-        VALUES (?, 'INDIAN_STOCK', ?, 'INR', ?, 1, ?)
+        INSERT INTO investments (name, asset_type, ticker_symbol, currency, notes, isin_code)
+        VALUES (?, 'INDIAN_STOCK', ?, 'INR', ?, ?)
       `);
       const findByIsin = db.prepare(
-        'SELECT id FROM investments WHERE isin_code = ? AND is_active = 1'
+        'SELECT id FROM investments WHERE isin_code = ?'
       );
       const findByPreviousIsin = db.prepare(
-        "SELECT id FROM investments WHERE is_active = 1 AND (',' || previous_isin_codes || ',') LIKE '%,' || ? || ',%'"
+        "SELECT id FROM investments WHERE (',' || previous_isin_codes || ',') LIKE '%,' || ? || ',%'"
       );
       const findByTickerBase = db.prepare(
-        "SELECT id FROM investments WHERE REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ? AND is_active = 1"
+        "SELECT id FROM investments WHERE REPLACE(REPLACE(ticker_symbol, '.NS', ''), '.BO', '') = ?"
       );
       const findInvestment = db.prepare(
         'SELECT id FROM investments WHERE asset_type = ? AND (ticker_symbol = ? OR name = ?)'
@@ -456,9 +456,9 @@ module.exports = function (db) {
             if (t.transaction_date > date) break;
             if (excludeIds && excludeIds.has(t.id)) continue;
             if (excludeSameDayTrading && t.transaction_date === date && !CORPORATE_TYPES.includes(t.transaction_type)) continue;
-            if (['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'DEPOSIT'].includes(t.transaction_type)) {
+            if (['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT'].includes(t.transaction_type)) {
               units += t.units || 0;
-            } else if (['SELL', 'TRANSFER_OUT', 'WITHDRAWAL', 'CONSOLIDATION'].includes(t.transaction_type)) {
+            } else if (['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION'].includes(t.transaction_type)) {
               units -= t.units || 0;
             }
           }
@@ -474,7 +474,7 @@ module.exports = function (db) {
             if (t.transaction_date > date) break;
             if (t.portfolio_id !== portfolioId) continue;
             if (t.broker) {
-              if (t.transaction_type !== 'TRANSFER_OUT') {
+              if (t.transaction_type !== 'TRANSFER_OUT' && t.transaction_type !== 'SWITCH_OUT') {
                 broker = t.broker;
               } else if (!broker) {
                 broker = t.broker;

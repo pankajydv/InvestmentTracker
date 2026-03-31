@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardSummary, triggerPriceUpdate, cancelPriceUpdate } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, Receipt, RefreshCw } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, Receipt, RefreshCw, EyeOff, Eye } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 export default function Dashboard() {
@@ -12,7 +12,7 @@ export default function Dashboard() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const hideSold = localStorage.getItem('hideSoldInvestments') !== 'false';
+  const [hideSold, setHideSold] = useState(() => localStorage.getItem('hideSoldInvestments') !== 'false');
   const [sortConfigs, setSortConfigs] = useState({});
   const [updatingType, setUpdatingType] = useState(null);
 
@@ -32,9 +32,17 @@ export default function Dashboard() {
     try { await cancelPriceUpdate(); } catch (_) { /* best effort */ }
   };
 
+  const toggleHideSold = () => {
+    setHideSold(prev => {
+      const next = !prev;
+      localStorage.setItem('hideSoldInvestments', String(next));
+      return next;
+    });
+  };
+
   useEffect(() => {
     loadData();
-  }, [selectedId]);
+  }, [selectedId, hideSold]);
 
   const loadData = async () => {
     try {
@@ -101,16 +109,28 @@ export default function Dashboard() {
   return (
     <div>
       {/* Portfolio Header */}
-      {selectedPortfolio ? (
-        <div className="d-flex align-items-center gap-2 mb-4">
-          <span className="portfolio-dot" style={{ backgroundColor: selectedPortfolio.color }} />
-          <h1 className="h4 fw-bold mb-0">{selectedPortfolio.name}</h1>
-        </div>
-      ) : portfolioCount > 0 ? (
-        <h1 className="h4 fw-bold mb-4">
-          {portfolioCount} Portfolio{portfolioCount !== 1 ? 's' : ''} Combined
-        </h1>
-      ) : null}
+      <div className="d-flex justify-content-between align-items-center mb-4">
+        {selectedPortfolio ? (
+          <div className="d-flex align-items-center gap-2">
+            <span className="portfolio-dot" style={{ backgroundColor: selectedPortfolio.color }} />
+            <h1 className="h4 fw-bold mb-0">{selectedPortfolio.name}</h1>
+          </div>
+        ) : portfolioCount > 0 ? (
+          <h1 className="h4 fw-bold mb-0">
+            {portfolioCount} Portfolio{portfolioCount !== 1 ? 's' : ''} Combined
+          </h1>
+        ) : <div />}
+        <Button
+          variant={hideSold ? 'outline-warning' : 'outline-secondary'}
+          size="sm"
+          onClick={toggleHideSold}
+          className="d-flex align-items-center gap-1"
+          title={hideSold ? 'Showing active holdings only' : 'Showing all investments'}
+        >
+          {hideSold ? <EyeOff size={16} /> : <Eye size={16} />}
+          {hideSold ? 'Sold hidden' : 'Showing all'}
+        </Button>
+      </div>
 
       {/* Portfolio Summary Cards */}
       <Row className="g-3 mb-4">
@@ -187,7 +207,7 @@ export default function Dashboard() {
                   className="rounded p-3 border"
                   style={{ borderLeftColor: ASSET_TYPE_COLORS[type], borderLeftWidth: '4px', borderLeftStyle: 'solid' }}
                 >
-                  <div className="text-muted" style={{ fontSize: '0.75rem' }}>{ASSET_TYPE_LABELS[type]}</div>
+                  <a href={`#section-${type}`} className="text-decoration-underline fw-semibold" style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}>{ASSET_TYPE_LABELS[type]} ↓</a>
                   <div className="fs-6 fw-semibold">{formatINR(info.totalValue)}</div>
                   <div className={profitColor(info.totalProfitLoss)} style={{ fontSize: '0.75rem' }}>
                     {info.totalProfitLoss >= 0 ? '+' : ''}{formatINR(info.totalProfitLoss)}
@@ -201,7 +221,7 @@ export default function Dashboard() {
 
       {/* Investment-wise Breakdown Tables */}
       {Object.entries(byType).map(([type, info]) => (
-        <Card key={type} className="shadow-sm mb-4">
+        <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
           <Card.Header className="bg-white d-flex justify-content-between align-items-center">
             <h2 className="h6 fw-semibold mb-0">
               {ASSET_TYPE_LABELS[type]} ({info.investments.length})

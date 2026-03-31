@@ -6,7 +6,7 @@ module.exports = function (db) {
   router.get('/', (req, res) => {
     const portfolios = db.prepare('SELECT * FROM portfolios ORDER BY name').all();
 
-    // Enrich with summary stats from latest daily_values
+    // Enrich with summary stats from portfolio-scoped daily_values
     const enriched = portfolios.map((p) => {
       const stats = db.prepare(`
         SELECT
@@ -17,10 +17,10 @@ module.exports = function (db) {
           COALESCE(SUM(dv.day_change), 0) as day_change
         FROM investments i
         LEFT JOIN daily_values dv ON i.id = dv.investment_id
-          AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id)
-        WHERE i.is_active = 1
-          AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)
-      `).get(p.id);
+          AND dv.portfolio_id = ?
+          AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+        WHERE EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)
+      `).get(p.id, p.id, p.id);
 
       return { ...p, ...stats };
     });

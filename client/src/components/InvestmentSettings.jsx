@@ -10,6 +10,7 @@ export default function InvestmentSettings() {
   const location = useLocation();
   const cameFrom = location.state?.from;
   const transactionsSearch = location.state?.transactionsSearch || '';
+  const investmentsSearch = location.state?.investmentsSearch || '';
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -73,7 +74,7 @@ export default function InvestmentSettings() {
 
   return (
     <div>
-      <Link to={`/investments/${id}`} state={{ from: cameFrom, transactionsSearch }} className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">
+      <Link to={`/investments/${id}`} state={{ from: cameFrom, transactionsSearch, investmentsSearch }} className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">
         <ArrowLeft size={16} /> Back to {data.display_name || data.name}
       </Link>
       <h1 className="h4 fw-bold mb-1">Settings</h1>

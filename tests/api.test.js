@@ -234,7 +234,7 @@ describe('Investments — Indian Stocks', () => {
     assert.ok('name' in inv);
     assert.ok('asset_type' in inv);
     assert.ok('ticker_symbol' in inv);
-    assert.ok('is_active' in inv);
+    assert.ok('asset_type' in inv);
   });
 
   it('GET /investments/:id returns detail with transactions array', async () => {
@@ -259,12 +259,11 @@ describe('Investments — Mutual Funds', () => {
   it('POST creates a mutual fund', async () => {
     const { status, body } = await api('POST', '/investments', {
       name: 'SBI Bluechip Fund', asset_type: 'MUTUAL_FUND',
-      amfi_code: '120503', folio_number: 'ABC123',
+      amfi_code: '120503',
     });
     assert.equal(status, 201);
     assert.equal(body.asset_type, 'MUTUAL_FUND');
     assert.equal(body.amfi_code, '120503');
-    assert.equal(body.folio_number, 'ABC123');
   });
 });
 
