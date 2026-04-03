@@ -27,11 +27,11 @@ export default function Portfolios() {
 
   // Portfolio edit state
   const [editId, setEditId] = useState(null);
-  const [editForm, setEditForm] = useState({ name: '', pan_number: '', color: '' });
+  const [editForm, setEditForm] = useState({ name: '', pan_number: '', email: '', color: '' });
 
   // Portfolio add state
   const [showAdd, setShowAdd] = useState(false);
-  const [addForm, setAddForm] = useState({ name: '', pan_number: '', color: '#3b82f6' });
+  const [addForm, setAddForm] = useState({ name: '', pan_number: '', email: '', color: '#3b82f6' });
   const [saving, setSaving] = useState(false);
 
   // Portfolio delete state
@@ -94,7 +94,7 @@ export default function Portfolios() {
 
   const startEdit = (p) => {
     setEditId(p.id);
-    setEditForm({ name: p.name, pan_number: p.pan_number || '', color: p.color });
+    setEditForm({ name: p.name, pan_number: p.pan_number || '', email: p.email || '', color: p.color });
   };
 
   const cancelEdit = () => setEditId(null);
@@ -105,6 +105,7 @@ export default function Portfolios() {
       await updatePortfolio(editId, {
         name: editForm.name,
         pan_number: editForm.pan_number || null,
+        email: editForm.email || null,
         color: editForm.color,
       });
       setEditId(null);
@@ -124,10 +125,11 @@ export default function Portfolios() {
       await createPortfolio({
         name: addForm.name.trim(),
         pan_number: addForm.pan_number.trim().toUpperCase() || null,
+        email: addForm.email.trim().toLowerCase() || null,
         color: addForm.color,
       });
       setShowAdd(false);
-      setAddForm({ name: '', pan_number: '', color: '#3b82f6' });
+      setAddForm({ name: '', pan_number: '', email: '', color: '#3b82f6' });
       await loadPortfolios();
       refreshPortfolios();
     } catch (e) {
@@ -246,6 +248,13 @@ export default function Portfolios() {
                         className="font-monospace"
                         maxLength={10}
                       />
+                      <Form.Control
+                        size="sm"
+                        type="email"
+                        value={editForm.email}
+                        onChange={(e) => setEditForm({ ...editForm, email: e.target.value.toLowerCase() })}
+                        placeholder="Email (e.g. user@example.com)"
+                      />
                       <div className="d-flex align-items-center gap-1">
                         <span className="text-muted small me-1">Color:</span>
                         {COLORS.map((c) => (
@@ -280,6 +289,9 @@ export default function Portfolios() {
                             <div className="fw-bold">{p.name}</div>
                             {p.pan_number && (
                               <div className="text-muted font-monospace" style={{ fontSize: '0.75rem' }}>PAN: {p.pan_number}</div>
+                            )}
+                            {p.email && (
+                              <div className="text-muted" style={{ fontSize: '0.75rem' }}>{p.email}</div>
                             )}
                           </div>
                         </div>
@@ -440,6 +452,15 @@ export default function Portfolios() {
                 placeholder="e.g. ABCDE1234F"
                 className="font-monospace"
                 maxLength={10}
+              />
+            </Form.Group>
+            <Form.Group>
+              <Form.Label className="small fw-semibold">Email</Form.Label>
+              <Form.Control
+                type="email"
+                value={addForm.email}
+                onChange={(e) => setAddForm({ ...addForm, email: e.target.value.toLowerCase() })}
+                placeholder="e.g. user@example.com"
               />
             </Form.Group>
             <div>

@@ -7,6 +7,7 @@ import Investments from './components/Investments';
 import InvestmentDetail from './components/InvestmentDetail';
 import AddInvestment from './components/AddInvestment';
 import CASUpload from './components/CASUpload';
+import NPSUpload from './components/NPSUpload';
 import Performance from './components/Performance';
 import Transactions from './components/Transactions';
 import CorporateActions from './components/CorporateActions';
@@ -26,6 +27,7 @@ export default function App() {
               <Route path="/investments" element={<Investments />} />
               <Route path="/investments/add" element={<AddInvestment />} />
               <Route path="/investments/import-cas" element={<CASUpload />} />
+              <Route path="/investments/import-nps" element={<NPSUpload />} />
               <Route path="/investments/:id" element={<InvestmentDetail />} />
               <Route path="/investments/:id/settings" element={<InvestmentSettings />} />
               <Route path="/performance" element={<Performance />} />

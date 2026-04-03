@@ -165,6 +165,22 @@ export const uploadPnLStatement = async (file, broker, portfolioId) => {
 export const addAmcCharge = (data) =>
   fetchJSON('/expenses', { method: 'POST', body: JSON.stringify(data) });
 
+// NPS Statement Upload
+export const previewNPSStatements = async (files, portfolioId) => {
+  const formData = new FormData();
+  files.forEach(f => formData.append('files', f));
+  formData.append('portfolio_id', portfolioId);
+  const res = await fetch(`${API_BASE}/nps/preview`, { method: 'POST', body: formData });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Upload failed');
+  }
+  return res.json();
+};
+
+export const importNPSTransactions = (portfolioId, pran, schemes) =>
+  fetchJSON('/nps/import', { method: 'POST', body: JSON.stringify({ portfolio_id: portfolioId, pran, schemes }) });
+
 // Portfolio Expenses
 export const getExpenses = (params = {}) => {
   const qs = new URLSearchParams(params);

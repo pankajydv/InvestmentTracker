@@ -26,6 +26,7 @@ function initializeDb(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL UNIQUE,
       pan_number TEXT,
+      email TEXT,
       color TEXT DEFAULT '#f59e0b',
       created_at TEXT DEFAULT (datetime('now'))
     );
@@ -34,7 +35,7 @@ function initializeDb(db) {
     CREATE TABLE IF NOT EXISTS investments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
-      asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND')),
+      asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND', 'NPS')),
       ticker_symbol TEXT,          -- NSE symbol for Indian stocks, Yahoo ticker for foreign stocks
       amfi_code TEXT,              -- AMFI scheme code for mutual funds
       account_number TEXT,         -- For PPF/PF accounts
@@ -47,6 +48,7 @@ function initializeDb(db) {
       display_name TEXT,              -- User-friendly display name (overrides 'name' in UI)
       isin_code TEXT,                -- ISIN for universal identification
       previous_isin_codes TEXT,      -- Comma-separated historical ISINs (e.g. after stock splits)
+      is_active INTEGER DEFAULT 1,   -- 1 = active (price updates), 0 = inactive (delisted etc.)
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -56,7 +58,7 @@ function initializeDb(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       investment_id INTEGER NOT NULL,
       portfolio_id INTEGER,        -- Owner (family member) portfolio
-      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT')),
+      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES')),
       transaction_date TEXT NOT NULL,
       units REAL,                  -- Number of units/shares bought or sold
       price_per_unit REAL,         -- Price at which transaction happened
@@ -145,6 +147,12 @@ function initializeDb(db) {
   `);
 
   // ── Migrations ───────────────────────────────────────────────────────────
+  // Add email column to portfolios
+  const portCols = db.prepare("PRAGMA table_info(portfolios)").all().map(c => c.name);
+  if (!portCols.includes('email')) {
+    db.exec("ALTER TABLE portfolios ADD COLUMN email TEXT");
+  }
+
   // Add 'locked' column so manually-corrected transactions survive corporate-action sync
   const txnCols = db.prepare("PRAGMA table_info(transactions)").all().map(c => c.name);
   if (!txnCols.includes('locked')) {
@@ -160,6 +168,11 @@ function initializeDb(db) {
   // Add folio_number to transactions (folio is per-transaction, not per-investment)
   if (!txnCols.includes('folio_number')) {
     db.exec("ALTER TABLE transactions ADD COLUMN folio_number TEXT");
+  }
+
+  // Add is_active column (default active) for skipping price updates on delisted investments
+  if (!invCols.includes('is_active')) {
+    db.exec("ALTER TABLE investments ADD COLUMN is_active INTEGER DEFAULT 1");
   }
 
   // Add category to investments (Equity, Debt, Hybrid, ELSS, etc.)
@@ -190,6 +203,89 @@ function initializeDb(db) {
     insertConfig.run('last_price_update', '');
     insertConfig.run('auto_update_enabled', 'true');
     insertConfig.run('update_time', '18:00'); // 6 PM IST
+  }
+
+  // ── Migration: add NPS asset_type and new transaction types ──────────
+  // SQLite doesn't allow ALTER CHECK, so we recreate the tables if needed.
+  const hasNPS = (() => {
+    try {
+      db.exec("INSERT INTO investments (name, asset_type) VALUES ('__nps_check__', 'NPS')");
+      db.exec("DELETE FROM investments WHERE name = '__nps_check__'");
+      return true;
+    } catch { return false; }
+  })();
+
+  if (!hasNPS) {
+    console.log('Migrating: adding NPS asset_type and new transaction types...');
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      // Recreate investments table with NPS
+      db.exec(`
+        CREATE TABLE investments_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND', 'NPS')),
+          ticker_symbol TEXT,
+          amfi_code TEXT,
+          account_number TEXT,
+          interest_rate REAL,
+          currency TEXT DEFAULT 'INR',
+          face_value REAL,
+          coupon_frequency TEXT,
+          maturity_date TEXT,
+          notes TEXT,
+          display_name TEXT,
+          isin_code TEXT,
+          previous_isin_codes TEXT,
+          is_active INTEGER DEFAULT 1,
+          category TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now'))
+        )
+      `);
+      db.exec("INSERT INTO investments_new SELECT id, name, asset_type, ticker_symbol, amfi_code, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes, display_name, isin_code, previous_isin_codes, COALESCE(is_active, 1), category, created_at, updated_at FROM investments");
+      db.exec("DROP TABLE investments");
+      db.exec("ALTER TABLE investments_new RENAME TO investments");
+
+      // Recreate transactions table with new types
+      db.exec(`
+        CREATE TABLE transactions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          portfolio_id INTEGER,
+          transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES')),
+          transaction_date TEXT NOT NULL,
+          units REAL,
+          price_per_unit REAL,
+          amount REAL NOT NULL,
+          fees REAL DEFAULT 0,
+          broker TEXT,
+          notes TEXT,
+          locked INTEGER DEFAULT 0,
+          folio_number TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+        )
+      `);
+      db.exec("INSERT INTO transactions_new SELECT id, investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, locked, folio_number, created_at FROM transactions");
+      db.exec("DROP TABLE transactions");
+      db.exec("ALTER TABLE transactions_new RENAME TO transactions");
+
+      // Recreate indexes
+      db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id)");
+
+      db.exec('COMMIT');
+      console.log('Migration complete: NPS and new transaction types added.');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('NPS migration failed:', err);
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
   }
 
   // ── Migration: add portfolio_id to daily_values ──────────────────────

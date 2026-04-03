@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse, Table } from 'react-bootstrap';
-import { createInvestment, addTransaction, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate } from '../services/api';
+import { createInvestment, addTransaction, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'PPF', 'PF', 'BOND'];
+const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'NPS', 'PPF', 'PF', 'BOND'];
 const STOCK_TXN_TYPES = ['BUY', 'SELL'];
 
 export default function AddInvestment() {
@@ -80,6 +80,24 @@ export default function AddInvestment() {
   // Accordion state for Indian Stocks sections (null = all collapsed)
   const [expandedSection, setExpandedSection] = useState(null);
   const toggleSection = (key) => setExpandedSection(prev => prev === key ? null : key);
+
+  // NPS state
+  const npsFileRef = useRef(null);
+  const [npsFiles, setNpsFiles] = useState([]);
+  const [npsUploading, setNpsUploading] = useState(false);
+  const [npsImporting, setNpsImporting] = useState(false);
+  const [npsError, setNpsError] = useState('');
+  const [npsPreview, setNpsPreview] = useState(null);
+  const [npsResult, setNpsResult] = useState(null);
+  const [npsSelectedSchemes, setNpsSelectedSchemes] = useState(new Set());
+  const [npsExpandedScheme, setNpsExpandedScheme] = useState(null);
+  const [npsForm, setNpsForm] = useState({ name: '', account_number: '', notes: '' });
+  const [npsTxn, setNpsTxn] = useState({
+    transaction_type: 'BUY',
+    transaction_date: new Date().toISOString().split('T')[0],
+    units: '', price_per_unit: '', amount: '', fees: '0',
+    source: 'Employer',
+  });
 
   // Sync local portfolioId when navbar portfolio changes
   useEffect(() => {
@@ -303,6 +321,118 @@ export default function AddInvestment() {
 
   const casTotalSelected = casSelectedMFs.size;
 
+  // NPS upload handlers
+  const handleNPSUpload = async () => {
+    setNpsError('');
+    if (!portfolioId) return setNpsError('Please select a portfolio first');
+    if (!npsFiles.length) return setNpsError('Please select NPS statement files');
+    setNpsUploading(true);
+    try {
+      const data = await previewNPSStatements(npsFiles, portfolioId);
+      setNpsPreview(data);
+      setNpsSelectedSchemes(new Set(
+        data.schemes.map((s, i) => s.newTransactionCount > 0 ? i : null).filter(i => i !== null)
+      ));
+    } catch (e) {
+      setNpsError(e.message);
+    } finally {
+      setNpsUploading(false);
+    }
+  };
+
+  const handleNPSImport = async () => {
+    setNpsError('');
+    if (!npsPreview) return;
+    const schemes = [];
+    npsSelectedSchemes.forEach(idx => {
+      const s = npsPreview.schemes[idx];
+      if (!s) return;
+      const newTxns = s.transactions.filter(t => t.isNew);
+      if (newTxns.length > 0) {
+        schemes.push({ schemeName: s.schemeName, transactions: newTxns });
+      }
+    });
+    if (schemes.length === 0) return setNpsError('No new transactions to import');
+    setNpsImporting(true);
+    try {
+      const res = await importNPSTransactions(portfolioId, npsPreview.pran, schemes);
+      setNpsResult(res);
+      setNpsPreview(null);
+      await refreshPortfolios();
+    } catch (e) {
+      setNpsError(e.message);
+    } finally {
+      setNpsImporting(false);
+    }
+  };
+
+  const handleNPSReset = () => {
+    setNpsPreview(null);
+    setNpsResult(null);
+    setNpsFiles([]);
+    setNpsError('');
+    setNpsSelectedSchemes(new Set());
+    setNpsExpandedScheme(null);
+    if (npsFileRef.current) npsFileRef.current.value = '';
+  };
+
+  const NPS_TXN_TYPES = [
+    { value: 'BUY', label: 'Buy / Contribution' },
+    { value: 'SELL', label: 'Sell / Redemption' },
+    { value: 'TRANSFER_IN', label: 'Transfer In' },
+    { value: 'CHARGES', label: 'Charges' },
+  ];
+
+  const NPS_SOURCES = [
+    { value: 'Employer', label: 'Employer Contribution' },
+    { value: 'Voluntary', label: 'Voluntary Contribution' },
+    { value: 'Rebalancing', label: 'Rebalancing' },
+    { value: '', label: 'Other' },
+  ];
+
+  const updateNpsTxn = (field, value) => {
+    const updated = { ...npsTxn, [field]: value };
+    if ((field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
+      updated.amount = (parseFloat(updated.units) * parseFloat(updated.price_per_unit)).toFixed(2);
+    }
+    setNpsTxn(updated);
+  };
+
+  const handleNPSManualSubmit = async () => {
+    setError('');
+    setSubmitting(true);
+    try {
+      if (!npsForm.name) { setError('Scheme name is required'); setSubmitting(false); return; }
+      if (!npsTxn.amount || parseFloat(npsTxn.amount) <= 0) { setError('Amount is required'); setSubmitting(false); return; }
+
+      const inv = await createInvestment({
+        name: npsForm.name,
+        asset_type: 'NPS',
+        account_number: npsForm.account_number || null,
+        currency: 'INR',
+        notes: npsForm.notes || null,
+      });
+
+      await addTransaction({
+        investment_id: inv.id,
+        portfolio_id: portfolioId || null,
+        transaction_type: npsTxn.transaction_type,
+        transaction_date: npsTxn.transaction_date,
+        units: npsTxn.units ? parseFloat(npsTxn.units) : null,
+        price_per_unit: npsTxn.price_per_unit ? parseFloat(npsTxn.price_per_unit) : null,
+        amount: parseFloat(npsTxn.amount),
+        fees: parseFloat(npsTxn.fees) || 0,
+        broker: npsTxn.source || null,
+      });
+
+      navigate(`/investments/${inv.id}`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const handlePnlUpload = async () => {
     setError('');
     if (!portfolioId) return setError('Please select a portfolio first');
@@ -421,6 +551,7 @@ export default function AddInvestment() {
   const isForeignStock = assetType === 'FOREIGN_STOCK';
   const isStock = isIndianStock || isForeignStock;
   const isBond = assetType === 'BOND';
+  const isNPS = assetType === 'NPS';
 
   // Bond-specific form state
   const [bondForm, setBondForm] = useState({
@@ -1173,6 +1304,393 @@ export default function AddInvestment() {
         </>
       )}
 
+      {/* NPS: collapsible sections */}
+      {isNPS && (
+        <>
+          {/* Upload NPS Statements */}
+          <Card className="shadow-sm">
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('nps-upload')}
+            >
+              <Upload size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Upload NPS Statements</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'nps-upload' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'nps-upload'}>
+              <div>
+                <Card.Body className="pt-2">
+                  <p className="small text-muted mb-3">
+                    Upload NPS transaction statements (CSV from Protean e-NPS or PDF from Karvy/Protean).
+                  </p>
+
+                  {npsError && (
+                    <Alert variant="danger" className="small py-2 d-flex align-items-center gap-2">
+                      <AlertCircle size={14} className="flex-shrink-0" />
+                      {npsError}
+                    </Alert>
+                  )}
+
+                  {npsResult && (
+                    <Alert variant="success" className="small py-2">
+                      <CheckCircle size={14} className="me-1" />
+                      Imported {npsResult.imported} transaction{npsResult.imported !== 1 ? 's' : ''} across {npsResult.schemes?.length || 0} scheme{(npsResult.schemes?.length || 0) !== 1 ? 's' : ''}.
+                      {npsResult.skipped > 0 && <span className="text-muted ms-1">({npsResult.skipped} duplicates skipped)</span>}
+                      <button className="btn btn-link btn-sm p-0 ms-2" onClick={handleNPSReset}>Upload more</button>
+                    </Alert>
+                  )}
+
+                  {!npsPreview && !npsResult && (
+                    <>
+                      <Row className="g-3 align-items-end">
+                        <Col md={12}>
+                          <Form.Label className="small">Statement Files (CSV / PDF)</Form.Label>
+                          <Form.Control
+                            ref={npsFileRef}
+                            size="sm"
+                            type="file"
+                            accept=".csv,.pdf"
+                            multiple
+                            onChange={(e) => setNpsFiles(Array.from(e.target.files))}
+                          />
+                        </Col>
+                      </Row>
+                      {npsFiles.length > 0 && (
+                        <div className="mt-2 small text-muted">
+                          {npsFiles.length} file{npsFiles.length > 1 ? 's' : ''} selected
+                        </div>
+                      )}
+                      <div className="mt-3">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={handleNPSUpload}
+                          disabled={npsUploading || !npsFiles.length}
+                        >
+                          {npsUploading ? <><Spinner size="sm" className="me-1" /> Parsing...</> : <><Upload size={14} className="me-1" /> Parse & Preview</>}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+
+                  {/* NPS Preview */}
+                  {npsPreview && (
+                    <div className="mt-3">
+                      <div className="d-flex align-items-center gap-2 mb-2 flex-wrap">
+                        <span className="badge bg-info">NPS</span>
+                        {npsPreview.pran && <span className="badge bg-secondary">PRAN: {npsPreview.pran}</span>}
+                        {npsPreview.subscriberName && <span className="badge bg-secondary">{npsPreview.subscriberName}</span>}
+                        <span className="small text-muted ms-auto">
+                          {npsPreview.summary.totalSchemes} scheme{npsPreview.summary.totalSchemes !== 1 ? 's' : ''} ·{' '}
+                          <span className="text-success fw-medium">{npsPreview.summary.newTransactions} new</span>
+                          {npsPreview.summary.existingTransactions > 0 && <> · {npsPreview.summary.existingTransactions} in DB</>}
+                        </span>
+                      </div>
+
+                      {/* Select All */}
+                      <div className="d-flex align-items-center gap-2 mb-2">
+                        <Form.Check
+                          type="checkbox"
+                          checked={npsSelectedSchemes.size === npsPreview.schemes.filter(s => s.newTransactionCount > 0).length}
+                          onChange={() => {
+                            const withNew = npsPreview.schemes.map((s, i) => s.newTransactionCount > 0 ? i : null).filter(i => i !== null);
+                            if (npsSelectedSchemes.size === withNew.length) setNpsSelectedSchemes(new Set());
+                            else setNpsSelectedSchemes(new Set(withNew));
+                          }}
+                          label={<span className="small text-muted">Select all schemes with new transactions</span>}
+                        />
+                      </div>
+
+                      {/* Scheme List */}
+                      {npsPreview.schemes.map((scheme, idx) => {
+                        const isExpanded = npsExpandedScheme === idx;
+                        const isSelected = npsSelectedSchemes.has(idx);
+                        const hasNew = scheme.newTransactionCount > 0;
+                        const NPS_TYPE_COLORS = {
+                          EMPLOYER_CONTRIBUTION: 'bg-success', VOLUNTARY_CONTRIBUTION: 'bg-info',
+                          CHARGES: 'bg-warning text-dark', BUY: 'bg-success', SELL: 'bg-danger',
+                          TRANSFER_IN: 'bg-primary', TRANSFER_OUT: 'bg-danger',
+                        };
+                        const NPS_TYPE_LABELS = {
+                          EMPLOYER_CONTRIBUTION: 'Employer', VOLUNTARY_CONTRIBUTION: 'Voluntary',
+                          CHARGES: 'Charges', BUY: 'Buy', SELL: 'Sell',
+                          TRANSFER_IN: 'Transfer In', TRANSFER_OUT: 'Transfer Out',
+                        };
+
+                        return (
+                          <div key={idx} className="border rounded mb-2 overflow-hidden" style={{ opacity: hasNew ? 1 : 0.6 }}>
+                            <div className="d-flex align-items-center px-3 py-2" style={{ backgroundColor: isSelected ? '#eff6ff' : 'transparent' }}>
+                              <Form.Check
+                                type="checkbox"
+                                checked={isSelected}
+                                disabled={!hasNew}
+                                onChange={() => {
+                                  const next = new Set(npsSelectedSchemes);
+                                  if (next.has(idx)) next.delete(idx);
+                                  else next.add(idx);
+                                  setNpsSelectedSchemes(next);
+                                }}
+                                className="me-2"
+                              />
+                              <button
+                                onClick={() => setNpsExpandedScheme(isExpanded ? null : idx)}
+                                className="flex-grow-1 bg-transparent border-0 text-start p-0 d-flex align-items-center"
+                                style={{ cursor: 'pointer' }}
+                              >
+                                <div className="flex-grow-1">
+                                  <div className="small fw-medium">{scheme.schemeName}</div>
+                                  <div className="d-flex align-items-center gap-2" style={{ fontSize: '0.7rem' }}>
+                                    {scheme.pran && <span className="text-muted font-monospace">PRAN: {scheme.pran}</span>}
+                                    {scheme.isNew && <span className="badge" style={{ fontSize: '0.6rem', backgroundColor: '#dbeafe', color: '#1d4ed8' }}>New Investment</span>}
+                                  </div>
+                                </div>
+                                <div className="d-flex align-items-center gap-2 ms-2">
+                                  {hasNew ? (
+                                    <span className="badge" style={{ fontSize: '0.65rem', backgroundColor: '#dcfce7', color: '#15803d' }}>{scheme.newTransactionCount} new</span>
+                                  ) : (
+                                    <span className="badge bg-light text-muted" style={{ fontSize: '0.65rem' }}>all in DB</span>
+                                  )}
+                                  {scheme.existingTransactionCount > 0 && (
+                                    <span className="badge bg-light text-muted" style={{ fontSize: '0.65rem' }}>{scheme.existingTransactionCount} existing</span>
+                                  )}
+                                  <ChevronDown size={14} className="text-muted" style={{ transition: 'transform 0.2s', transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)' }} />
+                                </div>
+                              </button>
+                            </div>
+                            {isExpanded && (
+                              <div className="border-top">
+                                <div className="table-responsive" style={{ maxHeight: 300, overflowY: 'auto' }}>
+                                  <Table size="sm" className="mb-0" style={{ fontSize: '0.75rem' }}>
+                                    <thead className="table-light">
+                                      <tr>
+                                        <th className="px-2 py-1">Date</th>
+                                        <th className="px-2 py-1">Type</th>
+                                        <th className="px-2 py-1 text-end">Amount</th>
+                                        <th className="px-2 py-1 text-end">NAV</th>
+                                        <th className="px-2 py-1 text-end">Units</th>
+                                        <th className="px-2 py-1">Description</th>
+                                        <th className="px-2 py-1">Status</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {scheme.transactions.map((t, ti) => (
+                                        <tr key={ti} style={{ opacity: t.isNew ? 1 : 0.5 }}>
+                                          <td className="px-2 py-1 text-nowrap">{t.date}</td>
+                                          <td className="px-2 py-1">
+                                            <span className={`badge ${NPS_TYPE_COLORS[t.type] || 'bg-secondary'}`} style={{ fontSize: '0.65rem' }}>
+                                              {NPS_TYPE_LABELS[t.type] || t.type}
+                                            </span>
+                                          </td>
+                                          <td className="px-2 py-1 text-end">{formatCurrency(t.amount)}</td>
+                                          <td className="px-2 py-1 text-end">{t.nav ? t.nav.toFixed(4) : '-'}</td>
+                                          <td className="px-2 py-1 text-end">{t.units ? t.units.toFixed(4) : '-'}</td>
+                                          <td className="px-2 py-1 text-muted text-truncate" style={{ maxWidth: 180 }}>{t.particulars}</td>
+                                          <td className="px-2 py-1">
+                                            {t.isNew ? (
+                                              <span className="badge" style={{ fontSize: '0.6rem', backgroundColor: '#dcfce7', color: '#15803d' }}>New</span>
+                                            ) : (
+                                              <span className="badge bg-light text-muted" style={{ fontSize: '0.6rem' }}>In DB</span>
+                                            )}
+                                          </td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </Table>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+
+                      {/* Import Bar */}
+                      <div className="bg-light border rounded p-2 mt-3 d-flex align-items-center justify-content-between">
+                        <div className="small text-muted">
+                          <strong>{npsPreview.schemes.filter((_, i) => npsSelectedSchemes.has(i)).reduce((s, sc) => s + sc.newTransactionCount, 0)}</strong> new transactions selected
+                        </div>
+                        <div className="d-flex gap-2">
+                          <Button size="sm" variant="outline-secondary" onClick={handleNPSReset}>Cancel</Button>
+                          <Button
+                            size="sm" variant="success"
+                            onClick={handleNPSImport}
+                            disabled={npsImporting || npsSelectedSchemes.size === 0}
+                          >
+                            {npsImporting ? <><Spinner size="sm" className="me-1" /> Importing...</> : <><CheckCircle size={14} className="me-1" /> Approve & Import</>}
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </Card.Body>
+              </div>
+            </Collapse>
+          </Card>
+
+          {/* Add NPS Manually */}
+          <Card className="shadow-sm">
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('nps-manual')}
+            >
+              <Search size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Add NPS Transaction Manually</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'nps-manual' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'nps-manual'}>
+              <div>
+                <Card.Body className="pt-2">
+                  <p className="small text-muted mb-3">Enter NPS scheme and transaction details manually.</p>
+
+                  {/* Transaction Type */}
+                  <div className="mb-3">
+                    <Form.Label className="small fw-medium">Transaction Type</Form.Label>
+                    <div className="d-flex flex-wrap gap-2 mt-1">
+                      {NPS_TXN_TYPES.map((t) => (
+                        <Form.Check
+                          key={t.value}
+                          inline
+                          type="radio"
+                          name="npsTxnType"
+                          id={`nps-txn-${t.value}`}
+                          label={t.label}
+                          checked={npsTxn.transaction_type === t.value}
+                          onChange={() => setNpsTxn({ ...npsTxn, transaction_type: t.value })}
+                          className="small"
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Source (Employer/Voluntary) — only for BUY */}
+                  {npsTxn.transaction_type === 'BUY' && (
+                    <div className="mb-3">
+                      <Form.Label className="small fw-medium">Contribution Source</Form.Label>
+                      <div className="d-flex flex-wrap gap-2 mt-1">
+                        {NPS_SOURCES.map((s) => (
+                          <Form.Check
+                            key={s.value}
+                            inline
+                            type="radio"
+                            name="npsSource"
+                            id={`nps-src-${s.value || 'other'}`}
+                            label={s.label}
+                            checked={npsTxn.source === s.value}
+                            onChange={() => setNpsTxn({ ...npsTxn, source: s.value })}
+                            className="small"
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <Row className="g-3">
+                    <Col md={8}>
+                      <Form.Label className="small">NPS Scheme Name</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="text"
+                        value={npsForm.name}
+                        onChange={(e) => setNpsForm({ ...npsForm, name: e.target.value })}
+                        placeholder="e.g., SBI PENSION FUND SCHEME E - TIER I"
+                        required
+                      />
+                    </Col>
+                    <Col md={4}>
+                      <Form.Label className="small">PRAN</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="text"
+                        value={npsForm.account_number}
+                        onChange={(e) => setNpsForm({ ...npsForm, account_number: e.target.value })}
+                        placeholder="PRAN number"
+                      />
+                    </Col>
+                    <Col md={6}>
+                      <Form.Label className="small">Date</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="date"
+                        value={npsTxn.transaction_date}
+                        onChange={(e) => updateNpsTxn('transaction_date', e.target.value)}
+                      />
+                    </Col>
+                    <Col md={6}>
+                      <Form.Label className="small">Amount (₹)</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="number"
+                        step="0.01"
+                        value={npsTxn.amount}
+                        onChange={(e) => updateNpsTxn('amount', e.target.value)}
+                        placeholder="Transaction amount"
+                      />
+                    </Col>
+                    <Col md={4}>
+                      <Form.Label className="small">NAV</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="number"
+                        step="0.0001"
+                        value={npsTxn.price_per_unit}
+                        onChange={(e) => updateNpsTxn('price_per_unit', e.target.value)}
+                        placeholder="NAV at transaction"
+                      />
+                    </Col>
+                    <Col md={4}>
+                      <Form.Label className="small">Units</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="number"
+                        step="0.0001"
+                        value={npsTxn.units}
+                        onChange={(e) => updateNpsTxn('units', e.target.value)}
+                        placeholder="Number of units"
+                      />
+                    </Col>
+                    <Col md={4}>
+                      <Form.Label className="small">Charges (₹)</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="number"
+                        step="0.01"
+                        value={npsTxn.fees}
+                        onChange={(e) => setNpsTxn({ ...npsTxn, fees: e.target.value })}
+                        placeholder="0"
+                      />
+                    </Col>
+                    <Col md={12}>
+                      <Form.Label className="small">Notes</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="text"
+                        value={npsForm.notes}
+                        onChange={(e) => setNpsForm({ ...npsForm, notes: e.target.value })}
+                        placeholder="Optional notes"
+                      />
+                    </Col>
+                  </Row>
+
+                  <div className="d-flex justify-content-end gap-2 mt-4">
+                    <Button variant="outline-secondary" size="sm" onClick={() => navigate(-1)}>Cancel</Button>
+                    <Button variant="primary" size="sm" onClick={handleNPSManualSubmit} disabled={submitting}>
+                      {submitting ? 'Adding...' : 'Add NPS Transaction'}
+                    </Button>
+                  </div>
+                </Card.Body>
+              </div>
+            </Collapse>
+          </Card>
+        </>
+      )}
+
       {/* Mutual Funds: collapsible sections */}
       {isMF && (
         <>
@@ -1546,8 +2064,8 @@ export default function AddInvestment() {
         </>
       )}
 
-      {/* Non-Indian-Stock / Non-Bond / Non-MF: original flow (PPF, PF) */}
-      {!isIndianStock && !isBond && !isMF && (
+      {/* Non-Indian-Stock / Non-Bond / Non-MF / Non-NPS: original flow (PPF, PF) */}
+      {!isIndianStock && !isBond && !isMF && !isNPS && (
         <>
           {/* Step 2: Investment Details */}
           <Card className="shadow-sm">

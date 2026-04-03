@@ -137,6 +137,7 @@ module.exports = function (db) {
     // New fields: only update if explicitly present in body
     if (display_name !== undefined) { sets.push('display_name = ?'); params.push(display_name || null); }
     if (isin_code !== undefined) { sets.push('isin_code = ?'); params.push(isin_code || null); }
+    if (req.body.is_active !== undefined) { sets.push('is_active = ?'); params.push(req.body.is_active ? 1 : 0); }
 
     sets.push("updated_at = datetime('now')");
     params.push(req.params.id);

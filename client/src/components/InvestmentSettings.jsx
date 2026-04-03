@@ -21,6 +21,7 @@ export default function InvestmentSettings() {
     ticker_symbol: '',
     isin_code: '',
     amfi_code: '',
+    is_active: true,
   });
 
   useEffect(() => { loadData(); }, [id]);
@@ -35,6 +36,7 @@ export default function InvestmentSettings() {
         ticker_symbol: (result.ticker_symbol || '').replace(/\.(NS|BO)$/, ''),
         isin_code: result.isin_code || '',
         amfi_code: result.amfi_code || '',
+        is_active: result.is_active !== 0,
       });
     } catch (e) {
       setError(e.message);
@@ -57,6 +59,7 @@ export default function InvestmentSettings() {
         ticker_symbol: tickerToSave,
         isin_code: form.isin_code || null,
         amfi_code: form.amfi_code || null,
+        is_active: form.is_active,
       });
       setSuccess(true);
       setTimeout(() => setSuccess(false), 3000);
@@ -170,6 +173,21 @@ export default function InvestmentSettings() {
                   </Form.Group>
                 </Col>
               )}
+
+              <Col xs={12} className="mt-3">
+                <Form.Group className="d-flex align-items-center gap-2">
+                  <Form.Check
+                    type="switch"
+                    id="is-active-switch"
+                    checked={form.is_active}
+                    onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+                    label={form.is_active ? 'Active' : 'Inactive'}
+                  />
+                  <Form.Text className="text-muted ms-2">
+                    Inactive investments are excluded from price updates (e.g. delisted stocks).
+                  </Form.Text>
+                </Form.Group>
+              </Col>
 
               <Col xs={12} className="mt-3">
                 <Button type="submit" variant="primary" disabled={saving} className="d-flex align-items-center gap-2">

@@ -1,0 +1,235 @@
+/**
+ * NPS Statement Upload Routes
+ *
+ * POST /api/nps/preview   — Upload NPS statement files, get preview
+ * POST /api/nps/import    — Import selected transactions from preview
+ */
+const express = require('express');
+const multer = require('multer');
+const { parseNPSStatements } = require('../services/npsStatementParser');
+
+const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+module.exports = function (db) {
+
+  /**
+   * Build a set of existing NPS transaction keys for delta detection.
+   * Key = schemeName|date|type|amount|units
+   */
+  function getExistingNPSKeys(portfolioId) {
+    const rows = db.prepare(`
+      SELECT i.name, t.transaction_date, t.transaction_type, t.amount, t.units
+      FROM transactions t
+      JOIN investments i ON i.id = t.investment_id
+      WHERE t.portfolio_id = ? AND i.asset_type = 'NPS'
+    `).all(portfolioId);
+
+    const keys = new Set();
+    for (const r of rows) {
+      keys.add(makeNPSKey(r.name, r.transaction_date, r.transaction_type, r.amount, r.units));
+    }
+    return keys;
+  }
+
+  function makeNPSKey(schemeName, date, type, amount, units) {
+    return [
+      schemeName,
+      date,
+      type,
+      Math.round(Math.abs(amount || 0) * 100),
+      Math.round(Math.abs(units || 0) * 1000),
+    ].join('|');
+  }
+
+  /**
+   * POST /api/nps/preview
+   * Upload NPS CSV/PDF files and get a preview of transactions per scheme.
+   * Body (multipart): files[] (CSV/PDF), portfolio_id
+   */
+  router.post('/preview', upload.array('files', 20), async (req, res) => {
+    try {
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No files uploaded' });
+      }
+      if (!req.body.portfolio_id) {
+        return res.status(400).json({ error: 'portfolio_id is required' });
+      }
+
+      const portfolioId = parseInt(req.body.portfolio_id);
+      const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolioId);
+      if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
+
+      const parsed = await parseNPSStatements(req.files);
+
+      if (!parsed.schemes.length && !parsed.transactions.length) {
+        return res.status(400).json({ error: 'No NPS transactions found in the uploaded files.' });
+      }
+
+      // Validate subscriber name matches the selected portfolio
+      if (parsed.subscriberName) {
+        const portfolioNameLower = portfolio.name.toLowerCase().trim();
+        const subscriberNameLower = parsed.subscriberName.toLowerCase().trim();
+        // Check if portfolio name is contained in subscriber name or vice versa
+        const portfolioParts = portfolioNameLower.split(/\s+/);
+        const subscriberParts = subscriberNameLower.split(/\s+/);
+        const matchingParts = portfolioParts.filter(p => subscriberParts.includes(p));
+        // Require at least 2 matching name parts, or full match for single-word names
+        const nameMatches = portfolioParts.length === 1
+          ? subscriberParts.includes(portfolioParts[0])
+          : matchingParts.length >= 2;
+        if (!nameMatches) {
+          return res.status(400).json({
+            error: `Subscriber name "${parsed.subscriberName}" in the NPS statement does not match the selected portfolio "${portfolio.name}". Please select the correct portfolio.`
+          });
+        }
+      }
+
+      // Get existing keys for delta detection
+      const existingKeys = getExistingNPSKeys(portfolioId);
+
+      // Find existing NPS investments for this portfolio
+      const existingInvestments = db.prepare(`
+        SELECT DISTINCT i.id, i.name, i.account_number
+        FROM investments i
+        JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
+        WHERE i.asset_type = 'NPS'
+      `).all(portfolioId);
+
+      // Group transactions by scheme
+      const schemeMap = {};
+      for (const txn of parsed.transactions) {
+        if (!schemeMap[txn.schemeName]) {
+          const existing = existingInvestments.find(inv => inv.name === txn.schemeName);
+          schemeMap[txn.schemeName] = {
+            schemeName: txn.schemeName,
+            pran: parsed.pran,
+            existingInvestmentId: existing?.id || null,
+            existingName: existing?.name || null,
+            isNew: !existing,
+            transactions: [],
+            newTransactionCount: 0,
+            existingTransactionCount: 0,
+          };
+        }
+        const key = makeNPSKey(txn.schemeName, txn.date, txn.type, txn.amount, txn.units);
+        const isNew = !existingKeys.has(key);
+        schemeMap[txn.schemeName].transactions.push({ ...txn, isNew });
+        if (isNew) schemeMap[txn.schemeName].newTransactionCount++;
+        else schemeMap[txn.schemeName].existingTransactionCount++;
+      }
+
+      const schemes = Object.values(schemeMap);
+      const totalTxns = schemes.reduce((s, sc) => s + sc.transactions.length, 0);
+      const newTxns = schemes.reduce((s, sc) => s + sc.newTransactionCount, 0);
+
+      return res.json({
+        pran: parsed.pran,
+        subscriberName: parsed.subscriberName,
+        schemeChoice: parsed.schemeChoice,
+        schemes,
+        summary: {
+          totalSchemes: schemes.length,
+          totalTransactions: totalTxns,
+          newTransactions: newTxns,
+          existingTransactions: totalTxns - newTxns,
+        },
+      });
+    } catch (e) {
+      console.error('NPS preview error:', e);
+      res.status(500).json({ error: 'Failed to parse NPS statements: ' + e.message });
+    }
+  });
+
+  /**
+   * POST /api/nps/import
+   * Import selected NPS transactions.
+   * Body (JSON): { portfolio_id, pran, schemes: [{ schemeName, transactions: [{ date, type, amount, nav, units }] }] }
+   */
+  router.post('/import', express.json(), async (req, res) => {
+    try {
+      const { portfolio_id, pran, schemes } = req.body;
+      if (!portfolio_id || !schemes?.length) {
+        return res.status(400).json({ error: 'portfolio_id and schemes array required' });
+      }
+
+      const portfolioId = parseInt(portfolio_id);
+      const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolioId);
+      if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
+
+      const findByName = db.prepare('SELECT id FROM investments WHERE name = ? AND asset_type = ?');
+
+      const insertInvestment = db.prepare(`
+        INSERT INTO investments (name, asset_type, account_number, currency, notes)
+        VALUES (?, 'NPS', ?, 'INR', ?)
+      `);
+
+      const insertTransaction = db.prepare(`
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const existingKeys = getExistingNPSKeys(portfolioId);
+
+      let importedCount = 0;
+      let skippedCount = 0;
+      const results = [];
+
+      const importTxn = db.transaction(() => {
+        for (const scheme of schemes) {
+          const schemeName = scheme.schemeName;
+
+          // Find or create investment
+          let investmentId = null;
+          const existing = findByName.get(schemeName, 'NPS');
+          if (existing) {
+            investmentId = existing.id;
+            // Update PRAN if not set
+            if (pran) {
+              db.prepare('UPDATE investments SET account_number = COALESCE(account_number, ?) WHERE id = ?').run(pran, investmentId);
+            }
+          } else {
+            const inv = insertInvestment.run(schemeName, pran || null, `PRAN: ${pran || 'N/A'}`);
+            investmentId = inv.lastInsertRowid;
+          }
+
+          let schemeImported = 0;
+          for (const t of (scheme.transactions || [])) {
+            const key = makeNPSKey(schemeName, t.date, t.type, t.amount, t.units);
+            if (existingKeys.has(key)) { skippedCount++; continue; }
+
+            insertTransaction.run(
+              investmentId, portfolioId,
+              t.type, t.date,
+              Math.abs(t.units || 0),
+              Math.abs(t.nav || 0),
+              Math.abs(t.amount || 0),
+              Math.abs(t.charges || 0),
+              t.broker || '',
+              t.particulars || ''
+            );
+            existingKeys.add(key);
+            importedCount++;
+            schemeImported++;
+          }
+
+          results.push({ id: investmentId, name: schemeName, imported: schemeImported });
+        }
+      });
+
+      importTxn();
+
+      res.json({
+        success: true,
+        imported: importedCount,
+        skipped: skippedCount,
+        schemes: results,
+      });
+    } catch (e) {
+      console.error('NPS import error:', e);
+      res.status(500).json({ error: 'Failed to import NPS transactions: ' + e.message });
+    }
+  });
+
+  return router;
+};

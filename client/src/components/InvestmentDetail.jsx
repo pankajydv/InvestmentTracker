@@ -182,6 +182,7 @@ export default function InvestmentDetail() {
           <h1 className="h4 fw-bold mb-1">{data.display_name || data.name}</h1>
           <div className="d-flex align-items-center gap-2">
             <Badge bg="primary" className="bg-opacity-10 text-primary">{ASSET_TYPE_LABELS[data.asset_type]}</Badge>
+            {data.is_active === 0 && <Badge bg="secondary">Inactive</Badge>}
           </div>
         </div>
         <div className="d-flex gap-2">

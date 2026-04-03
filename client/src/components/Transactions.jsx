@@ -10,10 +10,10 @@ const TRANSACTION_TYPES_DEFAULT = [
 ];
 
 // User-action types that can be edited/deleted (not corporate actions)
-const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'CHARGES'];
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT'];
-const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
+const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES'];
 
 const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
 
@@ -57,6 +57,7 @@ const TYPE_BADGE = {
   SWITCH_OUT: 'badge-sell',
   TRANSFER: 'badge-merger',
   AMC: 'badge-withdrawal',
+  CHARGES: 'badge-withdrawal',
 };
 
 export default function Transactions() {

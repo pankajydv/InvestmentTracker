@@ -75,6 +75,7 @@ export const ASSET_TYPE_LABELS = {
   PPF: 'PPF',
   PF: 'PF',
   BOND: 'Bonds',
+  NPS: 'NPS',
 };
 
 /**
@@ -87,6 +88,7 @@ export const ASSET_TYPE_COLORS = {
   PPF: '#f59e0b',
   PF: '#ef4444',
   BOND: '#f97316',
+  NPS: '#06b6d4',
 };
 
 /**

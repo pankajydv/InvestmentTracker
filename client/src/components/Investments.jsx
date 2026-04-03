@@ -96,6 +96,7 @@ export default function Investments() {
                     <div>
                       <h6 className="fw-semibold mb-1">{inv.display_name || inv.name}</h6>
                       <span className="badge bg-primary bg-opacity-10 text-primary">{ASSET_TYPE_LABELS[inv.asset_type]}</span>
+                      {inv.is_active === 0 && <span className="badge bg-secondary ms-1">Inactive</span>}
                     </div>
                   </div>
                   <div className="small text-muted">

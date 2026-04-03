@@ -37,11 +37,11 @@ module.exports = function (db) {
 
   // ─── Create portfolio ─────────────────────────────────────────────
   router.post('/', (req, res) => {
-    const { name, color, pan_number } = req.body;
+    const { name, color, pan_number, email } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     try {
-      const result = db.prepare('INSERT INTO portfolios (name, color, pan_number) VALUES (?, ?, ?)').run(name, color || '#f59e0b', pan_number || null);
+      const result = db.prepare('INSERT INTO portfolios (name, color, pan_number, email) VALUES (?, ?, ?, ?)').run(name, color || '#f59e0b', pan_number || null, email || null);
       const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(result.lastInsertRowid);
       res.status(201).json(portfolio);
     } catch (e) {
@@ -54,14 +54,15 @@ module.exports = function (db) {
 
   // ─── Update portfolio ─────────────────────────────────────────────
   router.put('/:id', (req, res) => {
-    const { name, color, pan_number } = req.body;
+    const { name, color, pan_number, email } = req.body;
     db.prepare(`
       UPDATE portfolios SET
         name = COALESCE(?, name),
         color = COALESCE(?, color),
-        pan_number = COALESCE(?, pan_number)
+        pan_number = COALESCE(?, pan_number),
+        email = COALESCE(?, email)
       WHERE id = ?
-    `).run(name, color, pan_number, req.params.id);
+    `).run(name, color, pan_number, email, req.params.id);
     const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(req.params.id);
     res.json(portfolio);
   });
