@@ -208,11 +208,8 @@ function initializeDb(db) {
   // ── Migration: add NPS asset_type and new transaction types ──────────
   // SQLite doesn't allow ALTER CHECK, so we recreate the tables if needed.
   const hasNPS = (() => {
-    try {
-      db.exec("INSERT INTO investments (name, asset_type) VALUES ('__nps_check__', 'NPS')");
-      db.exec("DELETE FROM investments WHERE name = '__nps_check__'");
-      return true;
-    } catch { return false; }
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='investments'").get();
+    return row && row.sql.includes("'NPS'");
   })();
 
   if (!hasNPS) {
