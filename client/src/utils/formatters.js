@@ -69,11 +69,11 @@ export function profitBg(value) {
  * Asset type display names
  */
 export const ASSET_TYPE_LABELS = {
-  MUTUAL_FUND: 'Mutual Funds',
+  MUTUAL_FUND: 'MF',
   INDIAN_STOCK: 'Stocks',
   FOREIGN_STOCK: 'Foreign Stocks',
   PPF: 'PPF',
-  SSY: 'SSY (Sukanya Samriddhi)',
+  SSY: 'SSY',
   PF: 'PF',
   BOND: 'Bonds',
   NPS: 'NPS',

@@ -292,7 +292,25 @@ export default function Transactions() {
     return acc;
   }, {});
 
+  const isDebtLike = ['PPF', 'SSY', 'PF'].includes(filterAssetType);
   const holdingMap = computeHoldingMap(transactions);
+
+  // Compute running balance map for debt-like assets (PPF/SSY/PF)
+  const balanceMap = {};
+  if (isDebtLike) {
+    const byInvestment = {};
+    const sorted = [...transactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || a.id - b.id);
+    for (const txn of sorted) {
+      const key = txn.investment_id;
+      if (!(key in byInvestment)) byInvestment[key] = 0;
+      if (['DEPOSIT', 'INTEREST', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'].includes(txn.transaction_type)) {
+        byInvestment[key] += txn.amount || 0;
+      } else if (txn.transaction_type === 'WITHDRAWAL') {
+        byInvestment[key] -= txn.amount || 0;
+      }
+      balanceMap[txn.id] = byInvestment[key];
+    }
+  }
 
   return (
     <div className="d-flex flex-column gap-3">
@@ -511,12 +529,12 @@ export default function Transactions() {
                   <th className="px-3 py-2">Date</th>
                   <th className="px-3 py-2">Investment</th>
                   <th className="px-3 py-2">Type</th>
-                  <th className="px-3 py-2 text-end">Units</th>
-                  <th className="px-3 py-2 text-end">Price/Unit</th>
+                  {!isDebtLike && <th className="px-3 py-2 text-end">Units</th>}
+                  {!isDebtLike && <th className="px-3 py-2 text-end">Price/Unit</th>}
                   <th className="px-3 py-2 text-end">Amount</th>
-                  <th className="px-3 py-2 text-end">Fees</th>
-                  <th className="px-3 py-2 text-end">Holding</th>
-                  <th className="px-3 py-2">Broker</th>
+                  {!isDebtLike && <th className="px-3 py-2 text-end">Fees</th>}
+                  {isDebtLike ? <th className="px-3 py-2 text-end">Balance</th> : <th className="px-3 py-2 text-end">Holding</th>}
+                  {!isDebtLike && <th className="px-3 py-2">Broker</th>}
                   <th className="px-3 py-2">Notes</th>
                   <th className="px-3 py-2 text-center" style={{ width: 80 }}>Actions</th>
                 </tr>
@@ -543,12 +561,14 @@ export default function Transactions() {
                         {TYPE_LABELS[txn.transaction_type] || txn.transaction_type.replace(/_/g, ' ')}
                       </span>
                     </td>
-                    <td className="px-3 py-2 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>
-                    <td className="px-3 py-2 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>
+                    {!isDebtLike && <td className="px-3 py-2 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>}
+                    {!isDebtLike && <td className="px-3 py-2 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>}
                     <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
-                    <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
-                    <td className="px-3 py-2 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>
-                    <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>
+                    {!isDebtLike && <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
+                    {isDebtLike
+                      ? <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>
+                      : <td className="px-3 py-2 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
+                    {!isDebtLike && <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>}
                     <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                     <td className="px-3 py-2 text-center">
                       {EDITABLE_TYPES.includes(txn.transaction_type) && (
@@ -648,7 +668,7 @@ export default function Transactions() {
           {editTxn && (
             <div className="d-flex flex-column gap-3">
               <Row className="g-3">
-                <Col sm={6}>
+                {!isDebtLike && <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Folio</Form.Label>
                     <Form.Control
@@ -658,7 +678,7 @@ export default function Transactions() {
                       onChange={(e) => setEditForm({ ...editForm, folio_number: e.target.value })}
                     />
                   </Form.Group>
-                </Col>
+                </Col>}
                 <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Date</Form.Label>
@@ -671,7 +691,7 @@ export default function Transactions() {
                   </Form.Group>
                 </Col>
               </Row>
-              {editTxn.transaction_type !== 'AMC' && (
+              {editTxn.transaction_type !== 'AMC' && !isDebtLike && (
                 <Row className="g-3">
                   <Col sm={6}>
                     <Form.Group>
@@ -712,7 +732,7 @@ export default function Transactions() {
                     />
                   </Form.Group>
                 </Col>
-                <Col sm={6}>
+                {!isDebtLike && <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Charges</Form.Label>
                     <Form.Control
@@ -723,9 +743,9 @@ export default function Transactions() {
                       onChange={(e) => setEditForm({ ...editForm, fees: e.target.value })}
                     />
                   </Form.Group>
-                </Col>
+                </Col>}
               </Row>
-              <Row className="g-3">
+              {!isDebtLike && <Row className="g-3">
                 <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Broker</Form.Label>
@@ -737,7 +757,7 @@ export default function Transactions() {
                     />
                   </Form.Group>
                 </Col>
-              </Row>
+              </Row>}
               <Form.Group>
                 <Form.Label className="small fw-semibold">Notes</Form.Label>
                 <Form.Control

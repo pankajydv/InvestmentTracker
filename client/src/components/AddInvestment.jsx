@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse, Table } from 'react-bootstrap';
-import { createInvestment, addTransaction, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions } from '../services/api';
+import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -100,12 +100,37 @@ export default function AddInvestment() {
     source: 'Employer',
   });
 
+  // PPF/SSY existing accounts state
+  const [ppfAccounts, setPpfAccounts] = useState([]);
+  const [selectedPpfAccount, setSelectedPpfAccount] = useState(''); // '' = create new, or investment id
+
+  // PPF/SSY upload state
+  const ppfFileRef = useRef(null);
+  const [ppfFiles, setPpfFiles] = useState([]);
+  const [ppfUploading, setPpfUploading] = useState(false);
+  const [ppfImporting, setPpfImporting] = useState(false);
+  const [ppfError, setPpfError] = useState('');
+  const [ppfPreview, setPpfPreview] = useState(null);
+  const [ppfResult, setPpfResult] = useState(null);
+  const [ppfPassword, setPpfPassword] = useState('');
+  const [ppfShowTxns, setPpfShowTxns] = useState(false);
+
   // Sync local portfolioId when navbar portfolio changes
   useEffect(() => {
     setPortfolioId(selectedId || '');
     setError('');
     setContractPreview(null);
   }, [selectedId]);
+
+  // Fetch existing PPF/SSY accounts when asset type changes
+  useEffect(() => {
+    if (assetType === 'PPF' || assetType === 'SSY') {
+      getInvestments(assetType).then(data => {
+        setPpfAccounts(data || []);
+        setSelectedPpfAccount('');
+      }).catch(() => setPpfAccounts([]));
+    }
+  }, [assetType]);
 
   const updateTxn = (field, value) => {
     const updated = { ...txn, [field]: value };
@@ -435,6 +460,63 @@ export default function AddInvestment() {
     }
   };
 
+  // PPF/SSY upload handlers
+  const handlePPFUpload = async () => {
+    setPpfError('');
+    if (!portfolioId) return setPpfError('Please select a portfolio first');
+    if (!ppfFiles.length) return setPpfError('Please select PPF/SSY statement files');
+    setPpfUploading(true);
+    try {
+      const data = await previewPPFStatements(ppfFiles, portfolioId, ppfPassword);
+      setPpfPreview(data);
+    } catch (e) {
+      setPpfError(e.message);
+    } finally {
+      setPpfUploading(false);
+    }
+  };
+
+  const handlePPFImport = async () => {
+    setPpfError('');
+    if (!ppfPreview) return;
+    const newTxns = ppfPreview.transactions.filter(t => t.isNew);
+    if (newTxns.length === 0) return setPpfError('No new transactions to import');
+    setPpfImporting(true);
+    try {
+      const res = await importPPFTransactions(portfolioId, {
+        accountName: ppfPreview.accountName,
+        accountNumber: ppfPreview.accountNumber,
+        accountType: ppfPreview.accountType,
+        interestRate: ppfPreview.interestRate,
+        openDate: ppfPreview.openDate,
+        maturityDate: ppfPreview.maturityDate,
+        openingBalance: ppfPreview.openingBalance || 0,
+        transactions: newTxns,
+      });
+      setPpfResult(res);
+      setPpfPreview(null);
+      await refreshPortfolios();
+    } catch (e) {
+      setPpfError(e.message);
+    } finally {
+      setPpfImporting(false);
+    }
+  };
+
+  const handlePPFReset = () => {
+    setPpfPreview(null);
+    setPpfResult(null);
+    setPpfFiles([]);
+    setPpfError('');
+    setPpfPassword('');
+    setPpfShowTxns(false);
+    if (ppfFileRef.current) ppfFileRef.current.value = '';
+  };
+
+  const PPF_TYPE_COLORS = {
+    DEPOSIT: 'bg-success', INTEREST: 'bg-info', WITHDRAWAL: 'bg-danger',
+  };
+
   const handlePnlUpload = async () => {
     setError('');
     if (!portfolioId) return setError('Please select a portfolio first');
@@ -507,28 +589,36 @@ export default function AddInvestment() {
     setError('');
     setSubmitting(true);
     try {
-      if (!form.name) {
-        setError('Name is required');
-        setSubmitting(false);
-        return;
-      }
+      const isPpfSsy = assetType === 'PPF' || assetType === 'SSY';
+      let invId;
 
-      const inv = await createInvestment({
-        name: form.name,
-        asset_type: assetType,
-        ticker_symbol: form.ticker_symbol || null,
-        amfi_code: form.amfi_code || null,
-        folio_number: form.folio_number || null,
-        account_number: form.account_number || null,
-        interest_rate: form.interest_rate ? parseFloat(form.interest_rate) : null,
-        currency: form.currency,
-        notes: form.notes || null,
-      });
+      if (isPpfSsy && selectedPpfAccount) {
+        // Adding transaction to existing account
+        invId = parseInt(selectedPpfAccount);
+      } else {
+        if (!form.name) {
+          setError('Name is required');
+          setSubmitting(false);
+          return;
+        }
+        const inv = await createInvestment({
+          name: form.name,
+          asset_type: assetType,
+          ticker_symbol: form.ticker_symbol || null,
+          amfi_code: form.amfi_code || null,
+          folio_number: form.folio_number || null,
+          account_number: form.account_number || null,
+          interest_rate: form.interest_rate ? parseFloat(form.interest_rate) : null,
+          currency: form.currency,
+          notes: form.notes || null,
+        });
+        invId = inv.id;
+      }
 
       if (txn.amount && parseFloat(txn.amount) > 0) {
         const isPPF = assetType === 'PPF' || assetType === 'SSY' || assetType === 'PF';
         await addTransaction({
-          investment_id: inv.id,
+          investment_id: invId,
           portfolio_id: portfolioId || null,
           transaction_type: isPPF ? 'DEPOSIT' : txn.transaction_type,
           transaction_date: txn.transaction_date,
@@ -536,10 +626,11 @@ export default function AddInvestment() {
           price_per_unit: txn.price_per_unit ? parseFloat(txn.price_per_unit) : null,
           amount: parseFloat(txn.amount),
           fees: parseFloat(txn.fees) || 0,
+          notes: txn.notes || null,
         });
       }
 
-      navigate(`/investments/${inv.id}`);
+      navigate(`/investments/${invId}`);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -670,6 +761,7 @@ export default function AddInvestment() {
                       ? 'btn-outline-primary border-primary bg-primary bg-opacity-10'
                       : 'btn-outline-secondary'
                   }`}
+                  title={type === 'SSY' ? 'Sukanya Samriddhi Yojana' : type === 'MUTUAL_FUND' ? 'Mutual Funds' : type === 'PPF' ? 'Public Provident Fund' : type === 'PF' ? 'Provident Fund' : undefined}
                 >
                   {ASSET_TYPE_LABELS[type]}
                 </button>
@@ -2080,8 +2172,315 @@ export default function AddInvestment() {
         </>
       )}
 
-      {/* Non-Indian-Stock / Non-Bond / Non-MF / Non-NPS: original flow (PPF, PF) */}
-      {!isIndianStock && !isBond && !isMF && !isNPS && (
+      {/* PPF / SSY: collapsible upload + manual */}
+      {(assetType === 'PPF' || assetType === 'SSY') && (
+        <>
+          {/* Upload PPF/SSY Statements */}
+          <Card className="shadow-sm">
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('ppf-upload')}
+            >
+              <Upload size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Upload {assetType} Statements</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'ppf-upload' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'ppf-upload'}>
+              <div>
+                <Card.Body className="pt-2">
+                  <p className="small text-muted mb-3">
+                    Upload {assetType} account statement PDFs (SBI passbook format). Multiple year statements can be uploaded together.
+                  </p>
+
+                  {ppfError && (
+                    <Alert variant="danger" className="small py-2 d-flex align-items-center gap-2">
+                      <AlertCircle size={14} className="flex-shrink-0" />
+                      {ppfError}
+                    </Alert>
+                  )}
+
+                  {ppfResult && (
+                    <Alert variant="success" className="small py-2">
+                      <CheckCircle size={14} className="me-1" />
+                      Imported {ppfResult.imported} transaction{ppfResult.imported !== 1 ? 's' : ''}.
+                      {ppfResult.skipped > 0 && <span className="text-muted ms-1">({ppfResult.skipped} duplicates skipped)</span>}
+                      <button className="btn btn-link btn-sm p-0 ms-2" onClick={handlePPFReset}>Upload more</button>
+                    </Alert>
+                  )}
+
+                  {!ppfPreview && !ppfResult && (
+                    <>
+                      <Row className="g-3 align-items-end">
+                        <Col md={12}>
+                          <Form.Label className="small">Statement Files (PDF)</Form.Label>
+                          <Form.Control
+                            ref={ppfFileRef}
+                            size="sm"
+                            type="file"
+                            accept=".pdf"
+                            multiple
+                            onChange={(e) => setPpfFiles(Array.from(e.target.files))}
+                          />
+                        </Col>
+                      </Row>
+                      <Row className="g-3 mt-0">
+                        <Col md={6}>
+                          <Form.Label className="small">PDF Password <span className="text-muted">(if protected)</span></Form.Label>
+                          <Form.Control
+                            size="sm"
+                            type="password"
+                            placeholder="Enter PDF password"
+                            value={ppfPassword}
+                            onChange={(e) => setPpfPassword(e.target.value)}
+                          />
+                        </Col>
+                      </Row>
+                      {ppfFiles.length > 0 && (
+                        <div className="mt-2 small text-muted">
+                          {ppfFiles.length} file{ppfFiles.length > 1 ? 's' : ''} selected
+                        </div>
+                      )}
+                      <div className="mt-3">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={handlePPFUpload}
+                          disabled={ppfUploading || !ppfFiles.length}
+                        >
+                          {ppfUploading ? <><Spinner size="sm" className="me-1" /> Parsing...</> : <><Upload size={14} className="me-1" /> Parse & Preview</>}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+
+                  {/* PPF Preview */}
+                  {ppfPreview && (
+                    <div className="mt-3">
+                      <div className="d-flex align-items-center gap-2 mb-2 flex-wrap">
+                        <span className={`badge ${ppfPreview.accountType === 'SSY' ? 'bg-pink' : 'bg-warning text-dark'}`} style={ppfPreview.accountType === 'SSY' ? { backgroundColor: '#ec4899', color: '#fff' } : undefined}>
+                          {ppfPreview.accountType}
+                        </span>
+                        {ppfPreview.accountNumber && <span className="badge bg-secondary">A/c: {ppfPreview.accountNumber}</span>}
+                        {ppfPreview.accountName && <span className="badge bg-secondary">{ppfPreview.accountName}</span>}
+                        {ppfPreview.interestRate && <span className="badge bg-info">{ppfPreview.interestRate}% p.a.</span>}
+                        {ppfPreview.isNew && <span className="badge" style={{ fontSize: '0.6rem', backgroundColor: '#dbeafe', color: '#1d4ed8' }}>New Investment</span>}
+                      </div>
+
+                      <div className="small text-muted mb-2">
+                        {ppfPreview.openDate && <span>Opened: {ppfPreview.openDate}</span>}
+                        {ppfPreview.maturityDate && <span className="ms-3">Matures: {ppfPreview.maturityDate}</span>}
+                      </div>
+
+                      <div className="small mb-2">
+                        <span className="text-success fw-medium">{ppfPreview.summary.newTransactions} new</span>
+                        {ppfPreview.summary.existingTransactions > 0 && <span className="text-muted"> · {ppfPreview.summary.existingTransactions} already in DB</span>}
+                        <span className="text-muted"> · {ppfPreview.summary.totalTransactions} total</span>
+                      </div>
+
+                      {/* Transaction Table */}
+                      <div className="border rounded overflow-hidden">
+                        <button
+                          onClick={() => setPpfShowTxns(!ppfShowTxns)}
+                          className="w-100 bg-transparent border-0 text-start px-3 py-2 d-flex align-items-center"
+                          style={{ cursor: 'pointer' }}
+                        >
+                          <span className="small fw-medium flex-grow-1">Transactions ({ppfPreview.transactions.length})</span>
+                          <ChevronDown size={14} className="text-muted" style={{ transition: 'transform 0.2s', transform: ppfShowTxns ? 'rotate(180deg)' : 'rotate(0deg)' }} />
+                        </button>
+                        {ppfShowTxns && (
+                          <div className="border-top">
+                            <div className="table-responsive" style={{ maxHeight: 350, overflowY: 'auto' }}>
+                              <Table size="sm" className="mb-0" style={{ fontSize: '0.75rem' }}>
+                                <thead className="table-light">
+                                  <tr>
+                                    <th className="px-2 py-1">Date</th>
+                                    <th className="px-2 py-1">Type</th>
+                                    <th className="px-2 py-1 text-end">Amount</th>
+                                    <th className="px-2 py-1 text-end">Balance</th>
+                                    <th className="px-2 py-1">Description</th>
+                                    <th className="px-2 py-1">Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {ppfPreview.transactions.map((t, ti) => (
+                                    <tr key={ti} style={{ opacity: t.isNew ? 1 : 0.5 }}>
+                                      <td className="px-2 py-1 text-nowrap">{t.date}</td>
+                                      <td className="px-2 py-1">
+                                        <span className={`badge ${PPF_TYPE_COLORS[t.type] || 'bg-secondary'}`} style={{ fontSize: '0.65rem' }}>
+                                          {t.type}
+                                        </span>
+                                      </td>
+                                      <td className="px-2 py-1 text-end">{formatCurrency(t.amount)}</td>
+                                      <td className="px-2 py-1 text-end">{formatCurrency(t.balance)}</td>
+                                      <td className="px-2 py-1 text-muted text-truncate" style={{ maxWidth: 200 }}>{t.description}</td>
+                                      <td className="px-2 py-1">
+                                        {t.isNew ? (
+                                          <span className="badge" style={{ fontSize: '0.6rem', backgroundColor: '#dcfce7', color: '#15803d' }}>New</span>
+                                        ) : (
+                                          <span className="badge bg-light text-muted" style={{ fontSize: '0.6rem' }}>In DB</span>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </Table>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Import Bar */}
+                      <div className="bg-light border rounded p-2 mt-3 d-flex align-items-center justify-content-between">
+                        <div className="small text-muted">
+                          <strong>{ppfPreview.summary.newTransactions}</strong> new transactions to import
+                        </div>
+                        <div className="d-flex gap-2">
+                          <Button size="sm" variant="outline-secondary" onClick={handlePPFReset}>Cancel</Button>
+                          <Button
+                            size="sm" variant="success"
+                            onClick={handlePPFImport}
+                            disabled={ppfImporting || ppfPreview.summary.newTransactions === 0}
+                          >
+                            {ppfImporting ? <><Spinner size="sm" className="me-1" /> Importing...</> : <><CheckCircle size={14} className="me-1" /> Approve & Import</>}
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </Card.Body>
+              </div>
+            </Collapse>
+          </Card>
+
+          {/* Add PPF/SSY Manually */}
+          <Card className="shadow-sm">
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('ppf-manual')}
+            >
+              <Search size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Add {assetType} Manually</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'ppf-manual' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'ppf-manual'}>
+              <div>
+                <Card.Body className="pt-2">
+                  <p className="small text-muted mb-3">Select an existing {assetType} account or create a new one, then add a transaction.</p>
+
+                  <Row className="g-3">
+                    <Col md={12}>
+                      <Form.Label className="small">Account</Form.Label>
+                      <Form.Select
+                        size="sm"
+                        value={selectedPpfAccount}
+                        onChange={(e) => {
+                          setSelectedPpfAccount(e.target.value);
+                          if (e.target.value) {
+                            const acct = ppfAccounts.find(a => a.id === parseInt(e.target.value));
+                            if (acct) setForm({ ...form, name: acct.name, account_number: acct.account_number || '' });
+                          } else {
+                            setForm({ ...form, name: '', account_number: '' });
+                          }
+                        }}
+                      >
+                        <option value="">+ Create New Account</option>
+                        {ppfAccounts.map(acct => (
+                          <option key={acct.id} value={acct.id}>
+                            {acct.name}{acct.account_number ? ` (${acct.account_number})` : ''}
+                          </option>
+                        ))}
+                      </Form.Select>
+                    </Col>
+                  </Row>
+
+                  {/* New account fields - only when creating */}
+                  {!selectedPpfAccount && (
+                    <Row className="g-3 mt-1">
+                      <Col md={6}>
+                        <Form.Label className="small">Account Name</Form.Label>
+                        <Form.Control
+                          size="sm"
+                          type="text"
+                          value={form.name}
+                          onChange={(e) => setForm({ ...form, name: e.target.value })}
+                          placeholder={`e.g., ${assetType} - Pankaj Yadav`}
+                          required
+                        />
+                      </Col>
+                      <Col md={6}>
+                        <Form.Label className="small">Account Number</Form.Label>
+                        <Form.Control
+                          size="sm"
+                          type="text"
+                          value={form.account_number}
+                          onChange={(e) => setForm({ ...form, account_number: e.target.value })}
+                          placeholder="Account number"
+                        />
+                      </Col>
+                    </Row>
+                  )}
+
+                  <hr className="my-3" />
+                  <h6 className="small fw-semibold mb-2">Transaction {!selectedPpfAccount && <span className="fw-normal text-muted">(optional)</span>}</h6>
+
+                  <Row className="g-3">
+                    <Col md={6}>
+                      <Form.Label className="small">Date</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="date"
+                        value={txn.transaction_date}
+                        onChange={(e) => updateTxn('transaction_date', e.target.value)}
+                      />
+                    </Col>
+                    <Col md={6}>
+                      <Form.Label className="small">Amount (₹)</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="number"
+                        step="0.01"
+                        value={txn.amount}
+                        onChange={(e) => updateTxn('amount', e.target.value)}
+                        placeholder="Deposit amount"
+                      />
+                    </Col>
+                    <Col md={12}>
+                      <Form.Label className="small">Notes</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="text"
+                        value={txn.notes || ''}
+                        onChange={(e) => setTxn({ ...txn, notes: e.target.value })}
+                        placeholder="Optional transaction notes"
+                      />
+                    </Col>
+                  </Row>
+
+                  <div className="mt-3 d-flex justify-content-center gap-3">
+                    <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
+                      {submitting ? <><Spinner size="sm" className="me-1" /> Adding...</> : selectedPpfAccount ? `+ Add Deposit` : `+ Add ${assetType} Investment`}
+                    </Button>
+                    <Button variant="link" className="text-muted" onClick={() => navigate(-1)}>
+                      Close
+                    </Button>
+                  </div>
+                </Card.Body>
+              </div>
+            </Collapse>
+          </Card>
+        </>
+      )}
+
+      {/* Non-Indian-Stock / Non-Bond / Non-MF / Non-NPS / Non-PPF / Non-SSY: original flow (PF) */}
+      {!isIndianStock && !isBond && !isMF && !isNPS && assetType !== 'PPF' && assetType !== 'SSY' && (
         <>
           {/* Step 2: Investment Details */}
           <Card className="shadow-sm">

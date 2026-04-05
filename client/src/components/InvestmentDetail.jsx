@@ -230,8 +230,12 @@ export default function InvestmentDetail() {
             {data.amfi_code && <Col xs={6} md={3}><Detail label="AMFI Code" value={data.amfi_code} /></Col>}
             {data.category && <Col xs={6} md={3}><Detail label="Category" value={data.category} /></Col>}
             {!isPPF && <Col xs={6} md={3}><Detail label="Total Units" value={formatNumber(data.totalUnits, 4)} /></Col>}
-            {data.latestValue && <Col xs={6} md={3}><Detail label="Last Price" value={`₹${formatNumber(data.latestValue.price_per_unit, 2)}`} /></Col>}
-            {data.latestValue && <Col xs={6} md={3}><Detail label="1 Day Change" value={formatNumber(data.latestValue.day_change, 0)} color={profitColor(data.latestValue.day_change)} /></Col>}
+            {isPPF && data.account_number && <Col xs={6} md={3}><Detail label="Account Number" value={data.account_number} /></Col>}
+            {isPPF && data.interest_rate && <Col xs={6} md={3}><Detail label="Interest Rate" value={`${data.interest_rate}% p.a.`} /></Col>}
+            {isPPF && data.maturity_date && <Col xs={6} md={3}><Detail label="Maturity Date" value={formatDate(data.maturity_date)} /></Col>}
+            {isPPF && data.opening_balance > 0 && <Col xs={6} md={3}><Detail label="Opening Balance" value={`₹${formatNumber(data.opening_balance, 2)}`} /></Col>}
+            {!isPPF && data.latestValue && <Col xs={6} md={3}><Detail label="Last Price" value={`₹${formatNumber(data.latestValue.price_per_unit, 2)}`} /></Col>}
+            {!isPPF && data.latestValue && <Col xs={6} md={3}><Detail label="1 Day Change" value={formatNumber(data.latestValue.day_change, 0)} color={profitColor(data.latestValue.day_change)} /></Col>}
             <Col xs={6} md={3}><Detail label="Currency" value={data.currency} /></Col>
           </Row>
         </Card.Body>
@@ -306,13 +310,14 @@ export default function InvestmentDetail() {
                 <tr>
                   <th className="px-3">Date</th>
                   <th className="px-3">Type</th>
-                  <th className="px-3 text-end">Units</th>
-                  <th className="px-3 text-end">Price/Unit</th>
+                  {!isPPF && <th className="px-3 text-end">Units</th>}
+                  {!isPPF && <th className="px-3 text-end">Price/Unit</th>}
                   <th className="px-3 text-end">Amount</th>
-                  <th className="px-3 text-end">Charges</th>
-                  <th className="px-3 text-end">Holding</th>
-                  {data.transactions.some(t => t.folio_number) && <th className="px-3">Folio</th>}
-                  {!isNPS && <th className="px-3">Broker</th>}
+                  {!isPPF && <th className="px-3 text-end">Charges</th>}
+                  {isPPF && <th className="px-3 text-end">Balance</th>}
+                  {!isPPF && <th className="px-3 text-end">Holding</th>}
+                  {!isPPF && data.transactions.some(t => t.folio_number) && <th className="px-3">Folio</th>}
+                  {!isNPS && !isPPF && <th className="px-3">Broker</th>}
                   <th className="px-3" style={isNPS ? {} : { width: 150 }}>Notes</th>
                   <th className="px-3 text-center" style={{ width: 80 }}>Actions</th>
                 </tr>
@@ -325,12 +330,18 @@ export default function InvestmentDetail() {
                   const txnSortKey = (t) => CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1;
                   const sorted = [...data.transactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || txnSortKey(a) - txnSortKey(b) || a.id - b.id);
                   const holdingMap = {};
-                  let balance = 0;
+                  const balanceMap = {};
+                  let unitBal = 0;
+                  let amtBal = data.opening_balance || 0;
                   for (const txn of sorted) {
-                    if (UNIT_ADD_TYPES.includes(txn.transaction_type)) balance += txn.units || 0;
-                    else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) balance -= txn.units || 0;
-                    if (Math.abs(balance) < 1e-6) balance = 0;
-                    holdingMap[txn.id] = balance;
+                    if (UNIT_ADD_TYPES.includes(txn.transaction_type)) unitBal += txn.units || 0;
+                    else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) unitBal -= txn.units || 0;
+                    if (Math.abs(unitBal) < 1e-6) unitBal = 0;
+                    holdingMap[txn.id] = unitBal;
+                    // PPF/SSY balance: deposits & interest add, withdrawals subtract
+                    if (['DEPOSIT', 'INTEREST'].includes(txn.transaction_type)) amtBal += txn.amount || 0;
+                    else if (txn.transaction_type === 'WITHDRAWAL') amtBal -= txn.amount || 0;
+                    balanceMap[txn.id] = amtBal;
                   }
                   const hasFolio = data.transactions.some(t => t.folio_number);
                   return [...sorted].reverse().map((txn) => (
@@ -341,13 +352,14 @@ export default function InvestmentDetail() {
                         {TYPE_LABELS[txn.transaction_type] || txn.transaction_type.replace(/_/g, ' ')}
                       </span>
                     </td>
-                    <td className="px-3 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>
-                    <td className="px-3 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>
+                    {!isPPF && <td className="px-3 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>}
+                    {!isPPF && <td className="px-3 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>}
                     <td className="px-3 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
-                    <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
-                    <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>
-                    {hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
-                    {!isNPS && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.broker || '-'}</td>}
+                    {!isPPF && <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
+                    {isPPF && <td className="px-3 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>}
+                    {!isPPF && <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
+                    {!isPPF && hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
+                    {!isNPS && !isPPF && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.broker || '-'}</td>}
                     <td className="px-3 text-muted" style={isNPS ? {} : { maxWidth: 150, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                     <td className="px-3">
                       {EDITABLE_TYPES.includes(txn.transaction_type) && (
@@ -381,7 +393,7 @@ export default function InvestmentDetail() {
           {editTxn && (
             <div className="d-flex flex-column gap-3">
               <Row className="g-3">
-                <Col sm={6}>
+                {!isPPF && <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Folio</Form.Label>
                     <Form.Control
@@ -391,7 +403,7 @@ export default function InvestmentDetail() {
                       onChange={(e) => setEditForm({ ...editForm, folio_number: e.target.value })}
                     />
                   </Form.Group>
-                </Col>
+                </Col>}
                 <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Date</Form.Label>
@@ -404,7 +416,7 @@ export default function InvestmentDetail() {
                   </Form.Group>
                 </Col>
               </Row>
-              {editTxn.transaction_type !== 'AMC' && (
+              {editTxn.transaction_type !== 'AMC' && !isPPF && (
                 <Row className="g-3">
                   <Col sm={6}>
                     <Form.Group>
@@ -459,7 +471,7 @@ export default function InvestmentDetail() {
                 </Col>
               </Row>
               <Row className="g-3">
-                <Col sm={6}>
+                {!isPPF && <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Broker</Form.Label>
                     <Form.Control
@@ -469,7 +481,7 @@ export default function InvestmentDetail() {
                       onChange={(e) => setEditForm({ ...editForm, broker: e.target.value })}
                     />
                   </Form.Group>
-                </Col>
+                </Col>}
               </Row>
               <Form.Group>
                 <Form.Label className="small fw-semibold">Notes</Form.Label>

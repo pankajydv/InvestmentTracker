@@ -182,6 +182,23 @@ export const previewNPSStatements = async (files, portfolioId, password) => {
 export const importNPSTransactions = (portfolioId, pran, schemes) =>
   fetchJSON('/nps/import', { method: 'POST', body: JSON.stringify({ portfolio_id: portfolioId, pran, schemes }) });
 
+// PPF/SSY Statement Upload
+export const previewPPFStatements = async (files, portfolioId, password) => {
+  const formData = new FormData();
+  files.forEach(f => formData.append('files', f));
+  formData.append('portfolio_id', portfolioId);
+  if (password) formData.append('password', password);
+  const res = await fetch(`${API_BASE}/ppf/preview`, { method: 'POST', body: formData });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Upload failed');
+  }
+  return res.json();
+};
+
+export const importPPFTransactions = (portfolioId, data) =>
+  fetchJSON('/ppf/import', { method: 'POST', body: JSON.stringify({ portfolio_id: portfolioId, ...data }) });
+
 // Portfolio Expenses
 export const getExpenses = (params = {}) => {
   const qs = new URLSearchParams(params);

@@ -24,6 +24,7 @@ app.use('/api/utils', require('./routes/utils')(db));
 app.use('/api/cas', require('./routes/cas')(db));
 app.use('/api/stocks', require('./routes/stocks')(db));
 app.use('/api/nps', require('./routes/nps')(db));
+app.use('/api/ppf', require('./routes/ppf')(db));
 app.use('/api/expenses', require('./routes/expenses')(db));
 
 // Serve static files in production

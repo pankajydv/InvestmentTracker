@@ -48,6 +48,7 @@ function initializeDb(db) {
       display_name TEXT,              -- User-friendly display name (overrides 'name' in UI)
       isin_code TEXT,                -- ISIN for universal identification
       previous_isin_codes TEXT,      -- Comma-separated historical ISINs (e.g. after stock splits)
+      opening_balance REAL DEFAULT 0, -- For PPF/SSY/PF: balance carried forward from before first imported statement
       is_active INTEGER DEFAULT 1,   -- 1 = active (price updates), 0 = inactive (delisted etc.)
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
@@ -204,6 +205,11 @@ function initializeDb(db) {
     insertConfig.run('last_price_update', '');
     insertConfig.run('auto_update_enabled', 'true');
     insertConfig.run('update_time', '18:00'); // 6 PM IST
+  }
+
+  // Add opening_balance to investments (for PPF/SSY/PF: balance carried forward from before first imported statement)
+  if (!invCols.includes('opening_balance')) {
+    db.exec("ALTER TABLE investments ADD COLUMN opening_balance REAL DEFAULT 0");
   }
 
   // ── Migration: add NPS asset_type and new transaction types ──────────
