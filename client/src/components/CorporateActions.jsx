@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Button, Form, Alert, Spinner, Table } from 'react-bootstrap';
-import { ArrowLeft, CheckCircle, AlertTriangle, Trash2, Pencil, Plus } from 'lucide-react';
-import { previewCorporateActions, importCorporateActions } from '../services/api';
+import { ArrowLeft, CheckCircle, AlertTriangle, Trash2, Pencil, Plus, Info } from 'lucide-react';
+import { previewCorporateActions, importCorporateActions, previewInterestRateSync, importInterestRateSync } from '../services/api';
 import { formatNumber, formatDate } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 
@@ -12,24 +12,38 @@ const TYPE_BADGE = {
   BONUS: 'badge-bonus',
 };
 
+const ASSET_TYPE_OPTIONS = [
+  { value: 'INDIAN_STOCK', label: 'Stocks' },
+  { value: 'PPF', label: 'PPF' },
+  { value: 'SSY', label: 'SSY' },
+  { value: 'PF', label: 'PF' },
+];
+
+const RATE_TYPES = new Set(['PPF', 'SSY', 'PF']);
+
 export default function CorporateActions() {
   const navigate = useNavigate();
   const { portfolios, selectedId } = usePortfolio();
-  const [portfolioId, setPortfolioId] = useState(selectedId || '');
+  const [assetType, setAssetType] = useState('INDIAN_STOCK');
   const [year, setYear] = useState(new Date().getFullYear() - 1);
   const [loading, setLoading] = useState(false);
   const [suggestions, setSuggestions] = useState(null);
   const [corrections, setCorrections] = useState(null);
   const [deletions, setDeletions] = useState(null);
+  const [investmentCorrections, setInvestmentCorrections] = useState(null);
   const [errors, setErrors] = useState([]);
   const [importing, setImporting] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
+  const [datasetVersion, setDatasetVersion] = useState('');
 
   // Checked state per section
   const [checkedAdd, setCheckedAdd] = useState({});
   const [checkedFix, setCheckedFix] = useState({});
   const [checkedDel, setCheckedDel] = useState({});
+  const [checkedInvFix, setCheckedInvFix] = useState({});
+
+  const isRateSync = RATE_TYPES.has(assetType);
 
   const currentYear = new Date().getFullYear();
   const years = [];
@@ -39,27 +53,45 @@ export default function CorporateActions() {
     setSuggestions(null);
     setCorrections(null);
     setDeletions(null);
+    setInvestmentCorrections(null);
+    setErrors([]);
   };
 
   const handleFetch = async () => {
-    if (!portfolioId) { setError('Please select a portfolio'); return; }
     setError('');
     setResult(null);
     clearPreview();
     setLoading(true);
     try {
-      const data = await previewCorporateActions(portfolioId, year);
-      setSuggestions(data.suggestions || []);
-      setCorrections(data.corrections || []);
-      setDeletions(data.deletions || []);
-      setErrors(data.errors || []);
-      // All checked by default
-      const initAdd = {}; (data.suggestions || []).forEach((_, i) => { initAdd[i] = true; });
-      const initFix = {}; (data.corrections || []).forEach((_, i) => { initFix[i] = true; });
-      const initDel = {}; // deletions unchecked by default (destructive)
-      setCheckedAdd(initAdd);
-      setCheckedFix(initFix);
-      setCheckedDel(initDel);
+      if (isRateSync) {
+        const data = await previewInterestRateSync(assetType, selectedId || null);
+        setSuggestions(data.suggestions || []);
+        setCorrections(data.corrections || []);
+        setDeletions(data.deletions || []);
+        setInvestmentCorrections(data.investmentCorrections || []);
+        setDatasetVersion(data.datasetVersion || '');
+        // Init checked states
+        const initAdd = {}; (data.suggestions || []).forEach((_, i) => { initAdd[i] = true; });
+        const initFix = {}; (data.corrections || []).forEach((_, i) => { initFix[i] = true; });
+        const initDel = {}; // destructive — unchecked by default
+        const initInvFix = {}; (data.investmentCorrections || []).forEach((_, i) => { initInvFix[i] = true; });
+        setCheckedAdd(initAdd);
+        setCheckedFix(initFix);
+        setCheckedDel(initDel);
+        setCheckedInvFix(initInvFix);
+      } else {
+        const data = await previewCorporateActions(selectedId || null, year, assetType);
+        setSuggestions(data.suggestions || []);
+        setCorrections(data.corrections || []);
+        setDeletions(data.deletions || []);
+        setErrors(data.errors || []);
+        const initAdd = {}; (data.suggestions || []).forEach((_, i) => { initAdd[i] = true; });
+        const initFix = {}; (data.corrections || []).forEach((_, i) => { initFix[i] = true; });
+        const initDel = {};
+        setCheckedAdd(initAdd);
+        setCheckedFix(initFix);
+        setCheckedDel(initDel);
+      }
     } catch (e) {
       setError(e.message);
     } finally {
@@ -68,21 +100,38 @@ export default function CorporateActions() {
   };
 
   const handleImport = async () => {
-    const selAdd = (suggestions || []).filter((_, i) => checkedAdd[i]);
-    const selFix = (corrections || []).filter((_, i) => checkedFix[i]);
-    const selDel = (deletions || []).filter((_, i) => checkedDel[i]);
-    const totalSelected = selAdd.length + selFix.length + selDel.length;
-    if (!totalSelected) { setError('No actions selected'); return; }
     setError('');
     setImporting(true);
     try {
-      const data = await importCorporateActions({
-        transactions: selAdd,
-        corrections: selFix,
-        deletions: selDel,
-      });
-      setResult(data);
-      clearPreview();
+      if (isRateSync) {
+        const selAdd = (suggestions || []).filter((_, i) => checkedAdd[i]);
+        const selFix = (corrections || []).filter((_, i) => checkedFix[i]);
+        const selDel = (deletions || []).filter((_, i) => checkedDel[i]);
+        const selInvFix = (investmentCorrections || []).filter((_, i) => checkedInvFix[i]);
+        const totalSel = selAdd.length + selFix.length + selDel.length + selInvFix.length;
+        if (!totalSel) { setError('No actions selected'); setImporting(false); return; }
+        const data = await importInterestRateSync({
+          additions: selAdd,
+          corrections: selFix,
+          deletions: selDel,
+          investmentCorrections: selInvFix,
+        });
+        setResult(data);
+        clearPreview();
+      } else {
+        const selAdd = (suggestions || []).filter((_, i) => checkedAdd[i]);
+        const selFix = (corrections || []).filter((_, i) => checkedFix[i]);
+        const selDel = (deletions || []).filter((_, i) => checkedDel[i]);
+        const totalSel = selAdd.length + selFix.length + selDel.length;
+        if (!totalSel) { setError('No actions selected'); setImporting(false); return; }
+        const data = await importCorporateActions({
+          transactions: selAdd,
+          corrections: selFix,
+          deletions: selDel,
+        });
+        setResult(data);
+        clearPreview();
+      }
     } catch (e) {
       setError(e.message);
     } finally {
@@ -100,10 +149,15 @@ export default function CorporateActions() {
   const addCount = countChecked(suggestions, checkedAdd);
   const fixCount = countChecked(corrections, checkedFix);
   const delCount = countChecked(deletions, checkedDel);
-  const totalSelected = addCount + fixCount + delCount;
+  const invFixCount = countChecked(investmentCorrections, checkedInvFix);
+  const totalSelected = addCount + fixCount + delCount + invFixCount;
 
   const hasData = suggestions !== null;
-  const totalItems = (suggestions?.length || 0) + (corrections?.length || 0) + (deletions?.length || 0);
+  const totalItems = (suggestions?.length || 0) + (corrections?.length || 0) + (deletions?.length || 0) + (investmentCorrections?.length || 0);
+
+  const portfolioLabel = selectedId
+    ? portfolios.find(p => p.id === selectedId)?.name || 'Selected portfolio'
+    : 'All Portfolios';
 
   return (
     <div className="mx-auto d-flex flex-column gap-4" style={{ maxWidth: 960 }}>
@@ -113,7 +167,9 @@ export default function CorporateActions() {
         </button>
         <h1 className="h4 fw-bold">Sync Corporate Actions</h1>
         <p className="text-muted small mb-0">
-          Fetch dividends, splits and bonus issues from Yahoo Finance — add missing, correct wrong, and remove invalid entries.
+          {isRateSync
+            ? `Sync ${assetType} interest rates from the reference dataset — add missing, correct wrong, and update investment rates.`
+            : 'Fetch dividends, splits and bonus issues from Yahoo Finance — add missing, correct wrong, and remove invalid entries.'}
         </p>
       </div>
 
@@ -124,26 +180,38 @@ export default function CorporateActions() {
         <Card.Body>
           <div className="d-flex flex-wrap align-items-end gap-3">
             <Form.Group>
-              <Form.Label className="small fw-semibold">Portfolio</Form.Label>
-              <Form.Select size="sm" value={portfolioId} onChange={(e) => setPortfolioId(e.target.value)} style={{ width: 200 }}>
-                <option value="">Select portfolio...</option>
-                {portfolios.map(p => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
+              <Form.Label className="small fw-semibold">Asset Type</Form.Label>
+              <Form.Select size="sm" value={assetType} onChange={(e) => { setAssetType(e.target.value); clearPreview(); setResult(null); }} style={{ width: 140 }}>
+                {ASSET_TYPE_OPTIONS.map(o => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
                 ))}
               </Form.Select>
             </Form.Group>
-            <Form.Group>
-              <Form.Label className="small fw-semibold">Year</Form.Label>
-              <Form.Select size="sm" value={year} onChange={(e) => setYear(parseInt(e.target.value))} style={{ width: 120 }}>
-                {years.map(y => <option key={y} value={y}>{y}</option>)}
-              </Form.Select>
-            </Form.Group>
-            <Button size="sm" variant="primary" onClick={handleFetch} disabled={loading || !portfolioId}>
-              {loading ? <><Spinner size="sm" className="me-1" /> Fetching...</> : 'Fetch & Analyze'}
-            </Button>
+            {!isRateSync && (
+              <Form.Group>
+                <Form.Label className="small fw-semibold">Year</Form.Label>
+                <Form.Select size="sm" value={year} onChange={(e) => setYear(parseInt(e.target.value))} style={{ width: 120 }}>
+                  {years.map(y => <option key={y} value={y}>{y}</option>)}
+                </Form.Select>
+              </Form.Group>
+            )}
+            <div className="d-flex flex-column">
+              <span className="small text-muted mb-1">Portfolio: <strong>{portfolioLabel}</strong></span>
+              <Button size="sm" variant="primary" onClick={handleFetch} disabled={loading}>
+                {loading ? <><Spinner size="sm" className="me-1" /> Fetching...</> : 'Fetch & Analyze'}
+              </Button>
+            </div>
           </div>
         </Card.Body>
       </Card>
+
+      {/* Dataset version for rate sync */}
+      {isRateSync && datasetVersion && hasData && (
+        <Alert variant="info" className="small py-2 d-flex align-items-center gap-1">
+          <Info size={14} />
+          Rates current as of: <strong>{datasetVersion}</strong>
+        </Alert>
+      )}
 
       {/* Errors from Yahoo Finance */}
       {errors.length > 0 && (
@@ -156,12 +224,14 @@ export default function CorporateActions() {
       {/* No changes needed */}
       {hasData && totalItems === 0 && (
         <Alert variant="info" className="small py-2">
-          No changes needed for {year}. Everything is up to date!
+          {isRateSync
+            ? `All ${assetType} interest rates are up to date!`
+            : `No changes needed for ${year}. Everything is up to date!`}
         </Alert>
       )}
 
-      {/* ── Section: New (ADD) ──────────────────────────────── */}
-      {suggestions && suggestions.length > 0 && (
+      {/* ── Stock mode: Add Missing ────────────────────────── */}
+      {!isRateSync && suggestions && suggestions.length > 0 && (
         <SectionCard
           icon={<Plus size={14} />}
           title="Add Missing"
@@ -196,8 +266,34 @@ export default function CorporateActions() {
         />
       )}
 
-      {/* ── Section: Corrections ───────────────────────────── */}
-      {corrections && corrections.length > 0 && (
+      {/* ── Rate mode: Add Missing Rates ───────────────────── */}
+      {isRateSync && suggestions && suggestions.length > 0 && (
+        <SectionCard
+          icon={<Plus size={14} />}
+          title="Add Missing Rates"
+          variant="success"
+          items={suggestions}
+          checked={checkedAdd}
+          setChecked={setCheckedAdd}
+          toggleAll={(val) => toggleAll(suggestions, setCheckedAdd, val)}
+          selectedCount={addCount}
+          columns={['Effective From', 'Effective To', 'Rate (%)']}
+          renderRow={(s, i) => (
+            <tr key={i} className={!checkedAdd[i] ? 'text-muted' : ''}>
+              <td className="px-3 py-2">
+                <Form.Check type="checkbox" checked={!!checkedAdd[i]}
+                  onChange={(e) => setCheckedAdd({ ...checkedAdd, [i]: e.target.checked })} />
+              </td>
+              <td className="px-3 py-2 text-nowrap">{formatDate(s.effective_from)}</td>
+              <td className="px-3 py-2 text-nowrap">{s.effective_to ? formatDate(s.effective_to) : '—'}</td>
+              <td className="px-3 py-2 fw-medium">{s.rate}%</td>
+            </tr>
+          )}
+        />
+      )}
+
+      {/* ── Stock mode: Corrections ────────────────────────── */}
+      {!isRateSync && corrections && corrections.length > 0 && (
         <SectionCard
           icon={<Pencil size={14} />}
           title="Correct Existing"
@@ -244,36 +340,113 @@ export default function CorporateActions() {
         />
       )}
 
-      {/* ── Section: Deletions ─────────────────────────────── */}
+      {/* ── Rate mode: Correct Existing Rates ──────────────── */}
+      {isRateSync && corrections && corrections.length > 0 && (
+        <SectionCard
+          icon={<Pencil size={14} />}
+          title="Correct Existing Rates"
+          variant="warning"
+          items={corrections}
+          checked={checkedFix}
+          setChecked={setCheckedFix}
+          toggleAll={(val) => toggleAll(corrections, setCheckedFix, val)}
+          selectedCount={fixCount}
+          columns={['Effective From', 'Current', '', 'Corrected']}
+          renderRow={(c, i) => (
+            <tr key={i} className={!checkedFix[i] ? 'text-muted' : ''}>
+              <td className="px-3 py-2">
+                <Form.Check type="checkbox" checked={!!checkedFix[i]}
+                  onChange={(e) => setCheckedFix({ ...checkedFix, [i]: e.target.checked })} />
+              </td>
+              <td className="px-3 py-2 text-nowrap">{formatDate(c.effective_from)}</td>
+              <td className="px-3 py-2 text-end">
+                <span className="text-danger text-decoration-line-through">{c.current_rate}%</span>
+              </td>
+              <td className="px-3 py-2 text-center text-muted">→</td>
+              <td className="px-3 py-2 text-end">
+                <span className="text-success fw-medium">{c.expected_rate}%</span>
+              </td>
+            </tr>
+          )}
+        />
+      )}
+
+      {/* ── Rate mode: Update Investment Rates ─────────────── */}
+      {isRateSync && investmentCorrections && investmentCorrections.length > 0 && (
+        <SectionCard
+          icon={<Pencil size={14} />}
+          title="Update Investment Rates"
+          variant="info"
+          items={investmentCorrections}
+          checked={checkedInvFix}
+          setChecked={setCheckedInvFix}
+          toggleAll={(val) => toggleAll(investmentCorrections, setCheckedInvFix, val)}
+          selectedCount={invFixCount}
+          columns={['Investment', 'Current Rate', '', 'Latest Rate']}
+          renderRow={(c, i) => (
+            <tr key={i} className={!checkedInvFix[i] ? 'text-muted' : ''}>
+              <td className="px-3 py-2">
+                <Form.Check type="checkbox" checked={!!checkedInvFix[i]}
+                  onChange={(e) => setCheckedInvFix({ ...checkedInvFix, [i]: e.target.checked })} />
+              </td>
+              <td className="px-3 py-2 fw-medium">{c.name}</td>
+              <td className="px-3 py-2 text-end">
+                <span className="text-danger text-decoration-line-through">{c.current_rate ? `${c.current_rate}%` : 'Not set'}</span>
+              </td>
+              <td className="px-3 py-2 text-center text-muted">→</td>
+              <td className="px-3 py-2 text-end">
+                <span className="text-success fw-medium">{c.expected_rate}%</span>
+              </td>
+            </tr>
+          )}
+        />
+      )}
+
+      {/* ── Deletions (both modes) ─────────────────────────── */}
       {deletions && deletions.length > 0 && (
         <SectionCard
           icon={<Trash2 size={14} />}
-          title="Remove Unverified"
+          title={isRateSync ? 'Remove Unknown Rates' : 'Remove Unverified'}
           variant="danger"
           items={deletions}
           checked={checkedDel}
           setChecked={setCheckedDel}
           toggleAll={(val) => toggleAll(deletions, setCheckedDel, val)}
           selectedCount={delCount}
-          columns={['Date', 'Stock', 'Type', 'Amount / Units', 'Existing Notes', 'Reason']}
-          renderRow={(d, i) => (
-            <tr key={i} className={!checkedDel[i] ? 'text-muted' : ''}>
-              <td className="px-3 py-2">
-                <Form.Check type="checkbox" checked={!!checkedDel[i]}
-                  onChange={(e) => setCheckedDel({ ...checkedDel, [i]: e.target.checked })} />
-              </td>
-              <td className="px-3 py-2 text-nowrap">{formatDate(d.transaction_date)}</td>
-              <td className="px-3 py-2 fw-medium">{d.investment_name}</td>
-              <td className="px-3 py-2"><TypeBadge type={d.transaction_type} /></td>
-              <td className="px-3 py-2 text-end">
-                {d.transaction_type === 'DIVIDEND'
-                  ? `₹${formatNumber(d.amount, 2)}`
-                  : `${formatNumber(d.units, 4)} shares`}
-              </td>
-              <td className="px-3 py-2 text-muted small">{d.notes || '-'}</td>
-              <td className="px-3 py-2 text-danger small">{d.reason}</td>
-            </tr>
-          )}
+          columns={isRateSync
+            ? ['Effective From', 'Effective To', 'Rate (%)', 'Reason']
+            : ['Date', 'Stock', 'Type', 'Amount / Units', 'Existing Notes', 'Reason']}
+          renderRow={isRateSync
+            ? (d, i) => (
+              <tr key={i} className={!checkedDel[i] ? 'text-muted' : ''}>
+                <td className="px-3 py-2">
+                  <Form.Check type="checkbox" checked={!!checkedDel[i]}
+                    onChange={(e) => setCheckedDel({ ...checkedDel, [i]: e.target.checked })} />
+                </td>
+                <td className="px-3 py-2 text-nowrap">{formatDate(d.effective_from)}</td>
+                <td className="px-3 py-2 text-nowrap">{d.effective_to ? formatDate(d.effective_to) : '—'}</td>
+                <td className="px-3 py-2 fw-medium">{d.rate}%</td>
+                <td className="px-3 py-2 text-danger small">{d.reason}</td>
+              </tr>
+            )
+            : (d, i) => (
+              <tr key={i} className={!checkedDel[i] ? 'text-muted' : ''}>
+                <td className="px-3 py-2">
+                  <Form.Check type="checkbox" checked={!!checkedDel[i]}
+                    onChange={(e) => setCheckedDel({ ...checkedDel, [i]: e.target.checked })} />
+                </td>
+                <td className="px-3 py-2 text-nowrap">{formatDate(d.transaction_date)}</td>
+                <td className="px-3 py-2 fw-medium">{d.investment_name}</td>
+                <td className="px-3 py-2"><TypeBadge type={d.transaction_type} /></td>
+                <td className="px-3 py-2 text-end">
+                  {d.transaction_type === 'DIVIDEND'
+                    ? `₹${formatNumber(d.amount, 2)}`
+                    : `${formatNumber(d.units, 4)} shares`}
+                </td>
+                <td className="px-3 py-2 text-muted small">{d.notes || '-'}</td>
+                <td className="px-3 py-2 text-danger small">{d.reason}</td>
+              </tr>
+            )}
         />
       )}
 
@@ -284,6 +457,7 @@ export default function CorporateActions() {
             <span className="small text-muted">
               {addCount > 0 && <span className="me-3"><strong>{addCount}</strong> to add</span>}
               {fixCount > 0 && <span className="me-3"><strong>{fixCount}</strong> to correct</span>}
+              {invFixCount > 0 && <span className="me-3"><strong>{invFixCount}</strong> investments to update</span>}
               {delCount > 0 && <span className="me-3 text-danger"><strong>{delCount}</strong> to delete</span>}
             </span>
             <div className="d-flex gap-2">
@@ -306,6 +480,7 @@ export default function CorporateActions() {
           {result.corrected > 0 && `Corrected ${result.corrected}. `}
           {result.deleted > 0 && `Deleted ${result.deleted}. `}
           {result.skipped > 0 && `Skipped ${result.skipped} (duplicates). `}
+          {result.investmentsUpdated > 0 && `Updated ${result.investmentsUpdated} investment(s). `}
           <button className="btn btn-link btn-sm p-0 ms-2" onClick={() => { setResult(null); handleFetch(); }}>
             Check again
           </button>

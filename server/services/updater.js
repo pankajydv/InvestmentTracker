@@ -221,6 +221,11 @@ async function updateAllPrices(db, options = {}) {
             'SELECT rate FROM interest_rates WHERE rate_type = ? ORDER BY effective_from DESC LIMIT 1'
           ).get(inv.asset_type);
           pricePerUnit = rateRow ? rateRow.rate : (inv.asset_type === 'PPF' ? 7.1 : inv.asset_type === 'SSY' ? 8.2 : 8.25);
+          // Fetch full rate history for historical compounding
+          const rateHistory = db.prepare(
+            'SELECT rate, effective_from, effective_to FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
+          ).all(inv.asset_type);
+          inv._rateHistory = rateHistory.length > 0 ? rateHistory : null;
           break;
         }
 
@@ -245,14 +250,14 @@ async function updateAllPrices(db, options = {}) {
         let totalUnits, investedAmount, saleProceeds, currentValue;
 
         if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF') {
-          // PPF/SSY/PF: compute value from deposits + interest rate
-          const rate = pricePerUnit; // stored rate as price
+          // PPF/SSY/PF: compute value from deposits + interest rate(s)
+          const rateParam = inv._rateHistory || pricePerUnit; // use historical rates if available, else single rate
           const txnFilter = pid !== null ? " AND portfolio_id = ?" : "";
           const txnParams = pid !== null ? [inv.id, pid] : [inv.id];
           const txns = db.prepare(
             `SELECT transaction_date as date, amount FROM transactions WHERE investment_id = ? AND transaction_type IN ('DEPOSIT', 'BUY')${txnFilter}`
           ).all(...txnParams);
-          currentValue = calculatePPFValue(txns, rate);
+          currentValue = calculatePPFValue(txns, rateParam);
           totalUnits = 1;
           if (pid !== null) {
             investedAmount = getInvestedAmountPortfolio.get(inv.id, pid).total;

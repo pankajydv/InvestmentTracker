@@ -212,10 +212,24 @@ export const deleteExpense = (id) =>
   fetchJSON(`/expenses/${id}`, { method: 'DELETE' });
 
 // Corporate Actions
-export const previewCorporateActions = (portfolioId, year) =>
-  fetchJSON(`/stocks/corporate-actions/preview?portfolio_id=${portfolioId}&year=${year}`);
+export const previewCorporateActions = (portfolioId, year, assetType) => {
+  const params = new URLSearchParams();
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  params.set('year', year);
+  if (assetType) params.set('asset_type', assetType);
+  return fetchJSON(`/stocks/corporate-actions/preview?${params}`);
+};
 export const importCorporateActions = ({ transactions, corrections, deletions }) =>
   fetchJSON('/stocks/corporate-actions/import', { method: 'POST', body: JSON.stringify({ transactions, corrections, deletions }) });
+
+// Interest Rate Sync
+export const previewInterestRateSync = (assetType, portfolioId) => {
+  const params = new URLSearchParams({ asset_type: assetType });
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/investments/interest-rate-sync/preview?${params}`);
+};
+export const importInterestRateSync = (data) =>
+  fetchJSON('/investments/interest-rate-sync/import', { method: 'POST', body: JSON.stringify(data) });
 
 // Export all data as XLSX download
 export const exportData = async () => {

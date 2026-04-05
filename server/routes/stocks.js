@@ -420,18 +420,30 @@ module.exports = function (db) {
   router.get('/corporate-actions/preview', async (req, res) => {
     try {
       const { portfolio_id, year } = req.query;
-      if (!portfolio_id || !year) return res.status(400).json({ error: 'portfolio_id and year are required' });
+      if (!year) return res.status(400).json({ error: 'year is required' });
 
       const yearNum = parseInt(year);
-      const portfolioId = parseInt(portfolio_id);
+      const portfolioId = portfolio_id ? parseInt(portfolio_id) : null;
 
-      // Get all Indian stock investments in this portfolio that have a ticker
-      const investments = db.prepare(`
-        SELECT DISTINCT i.id, i.name, i.ticker_symbol
-        FROM investments i
-        JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
-        WHERE i.asset_type = 'INDIAN_STOCK' AND i.ticker_symbol IS NOT NULL
-      `).all(portfolioId);
+      // Get all Indian stock investments (optionally scoped to portfolio) that have a ticker
+      let investmentQuery;
+      let investmentParams;
+      if (portfolioId) {
+        investmentQuery = `
+          SELECT DISTINCT i.id, i.name, i.ticker_symbol
+          FROM investments i
+          JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
+          WHERE i.asset_type = 'INDIAN_STOCK' AND i.ticker_symbol IS NOT NULL`;
+        investmentParams = [portfolioId];
+      } else {
+        investmentQuery = `
+          SELECT DISTINCT i.id, i.name, i.ticker_symbol
+          FROM investments i
+          WHERE i.asset_type = 'INDIAN_STOCK' AND i.ticker_symbol IS NOT NULL
+            AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id)`;
+        investmentParams = [];
+      }
+      const investments = db.prepare(investmentQuery).all(...investmentParams);
 
       const suggestions = [];
       const corrections = [];
@@ -439,12 +451,32 @@ module.exports = function (db) {
       const errors = [];
 
       for (const inv of investments) {
-        // Get all transactions for this investment up to end of year, ordered by date
+        // Get all transactions for this investment, ordered by date
         const allTxns = db.prepare(`
           SELECT * FROM transactions
           WHERE investment_id = ?
           ORDER BY transaction_date ASC
         `).all(inv.id);
+
+        // Fetch from Yahoo Finance (once per investment, outside portfolio loop)
+        const ticker = inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol);
+        let actions;
+        try {
+          actions = await fetchCorporateActions(ticker, yearNum);
+        } catch (e) {
+          errors.push({ investment: inv.name, error: e.message });
+          continue;
+        }
+
+        // Determine which portfolios to process
+        const processPortfolios = portfolioId
+          ? [portfolioId]
+          : [...new Set(allTxns.filter(t => t.portfolio_id).map(t => t.portfolio_id))];
+
+        // When processing all portfolios, scope holdingAt to each portfolio
+        const scopeByPortfolio = !portfolioId;
+
+        for (const pid of processPortfolios) {
 
         // Compute holding at any given date, optionally excluding specific transaction IDs.
         // When excludeSameDayTrading is true, same-day BUY/SELL/IPO transactions are
@@ -454,6 +486,7 @@ module.exports = function (db) {
           let units = 0;
           for (const t of allTxns) {
             if (t.transaction_date > date) break;
+            if (scopeByPortfolio && t.portfolio_id !== pid) continue;
             if (excludeIds && excludeIds.has(t.id)) continue;
             if (excludeSameDayTrading && t.transaction_date === date && !CORPORATE_TYPES.includes(t.transaction_type)) continue;
             if (['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT'].includes(t.transaction_type)) {
@@ -466,13 +499,11 @@ module.exports = function (db) {
         }
 
         // Determine which broker holds the shares at a given date within this portfolio.
-        // When multiple transactions share the same date, TRANSFER_IN takes priority
-        // over TRANSFER_OUT since the shares ended up at the new broker.
         function brokerAt(date) {
           let broker = null;
           for (const t of allTxns) {
             if (t.transaction_date > date) break;
-            if (t.portfolio_id !== portfolioId) continue;
+            if (t.portfolio_id !== pid) continue;
             if (t.broker) {
               if (t.transaction_type !== 'TRANSFER_OUT' && t.transaction_type !== 'SWITCH_OUT') {
                 broker = t.broker;
@@ -484,23 +515,19 @@ module.exports = function (db) {
           return broker;
         }
 
-        // Get existing corporate action transactions for this investment in this year
-        const existingActions = db.prepare(`
-          SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes, locked
-          FROM transactions
-          WHERE investment_id = ? AND transaction_date BETWEEN ? AND ?
-            AND transaction_type IN ('DIVIDEND', 'SPLIT', 'BONUS')
-        `).all(inv.id, `${yearNum}-01-01`, `${yearNum}-12-31`);
-
-        // Fetch from Yahoo Finance
-        const ticker = inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol);
-        let actions;
-        try {
-          actions = await fetchCorporateActions(ticker, yearNum);
-        } catch (e) {
-          errors.push({ investment: inv.name, error: e.message });
-          continue;
-        }
+        // Get existing corporate action transactions for this investment/portfolio in this year
+        const existingActionsQuery = scopeByPortfolio
+          ? `SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes, locked
+             FROM transactions
+             WHERE investment_id = ? AND portfolio_id = ? AND transaction_date BETWEEN ? AND ?
+               AND transaction_type IN ('DIVIDEND', 'SPLIT', 'BONUS')`
+          : `SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes, locked
+             FROM transactions
+             WHERE investment_id = ? AND transaction_date BETWEEN ? AND ?
+               AND transaction_type IN ('DIVIDEND', 'SPLIT', 'BONUS')`;
+        const existingActions = scopeByPortfolio
+          ? db.prepare(existingActionsQuery).all(inv.id, pid, `${yearNum}-01-01`, `${yearNum}-12-31`)
+          : db.prepare(existingActionsQuery).all(inv.id, `${yearNum}-01-01`, `${yearNum}-12-31`);
 
         // Track which existing actions are matched to Yahoo data
         const matchedExistingIds = new Set();
@@ -554,7 +581,7 @@ module.exports = function (db) {
               expected_amount: dividendAmount,
               expected_price_per_unit: div.amount,
               broker: brokerAt(div.date),
-              portfolio_id: portfolioId,
+              portfolio_id: pid,
               notes: `Dividend \u20B9${div.amount}/share \u00D7 ${holdingUnits} shares`,
             });
             continue;
@@ -570,7 +597,7 @@ module.exports = function (db) {
             amount: dividendAmount,
             fees: 0,
             broker: brokerAt(div.date),
-            portfolio_id: portfolioId,
+            portfolio_id: pid,
             notes: `Dividend \u20B9${div.amount}/share \u00D7 ${holdingUnits} shares`,
           });
         }
@@ -624,7 +651,7 @@ module.exports = function (db) {
               expected_amount: 0,
               expected_price_per_unit: 0,
               broker: brokerAt(split.date),
-              portfolio_id: portfolioId,
+              portfolio_id: pid,
               notes: `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 +${newUnits} new shares`,
             });
             continue;
@@ -640,7 +667,7 @@ module.exports = function (db) {
             amount: 0,
             fees: 0,
             broker: brokerAt(split.date),
-            portfolio_id: portfolioId,
+            portfolio_id: pid,
             notes: `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 ${holdingUnits} held \u2192 +${newUnits} new shares`,
           });
         }
@@ -662,6 +689,8 @@ module.exports = function (db) {
             });
           }
         }
+
+        } // end portfolio loop
 
         // Small delay to avoid rate limiting
         await new Promise(r => setTimeout(r, 300));

@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { INTEREST_RATES, DATASET_VERSION } = require('../data/interest-rates');
 
 module.exports = function (db) {
   // ─── Get all investments ──────────────────────────────────────────────
@@ -152,6 +153,175 @@ module.exports = function (db) {
   router.delete('/:id', (req, res) => {
     db.prepare('DELETE FROM investments WHERE id = ?').run(req.params.id);
     res.json({ success: true });
+  });
+
+  // ─── Interest Rate Sync: Preview ──────────────────────────────────────
+  /**
+   * GET /api/investments/interest-rate-sync/preview?asset_type=PPF[&portfolio_id=1]
+   * Compare hardcoded rate dataset with what's in the interest_rates table.
+   * Also checks investments.interest_rate against the latest effective rate.
+   */
+  router.get('/interest-rate-sync/preview', (req, res) => {
+    try {
+      const { asset_type, portfolio_id } = req.query;
+      if (!asset_type || !['PPF', 'SSY', 'PF'].includes(asset_type)) {
+        return res.status(400).json({ error: 'asset_type must be PPF, SSY, or PF' });
+      }
+
+      const datasetRates = INTEREST_RATES.filter(r => r.rate_type === asset_type);
+      const dbRates = db.prepare(
+        'SELECT * FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
+      ).all(asset_type);
+
+      const suggestions = [];
+      const corrections = [];
+      const deletions = [];
+
+      // Index DB rates by effective_from for fast lookup
+      const dbByDate = {};
+      for (const r of dbRates) { dbByDate[r.effective_from] = r; }
+
+      const matchedDbIds = new Set();
+
+      // Compare dataset → DB
+      for (const expected of datasetRates) {
+        const existing = dbByDate[expected.effective_from];
+
+        if (existing) {
+          matchedDbIds.add(existing.id);
+          const rateMatch = Math.abs(existing.rate - expected.rate) < 0.001;
+          const endMatch = (existing.effective_to || null) === (expected.effective_to || null);
+
+          if (rateMatch && endMatch) continue; // perfect match
+
+          corrections.push({
+            id: existing.id,
+            rate_type: asset_type,
+            effective_from: expected.effective_from,
+            effective_to: expected.effective_to,
+            current_rate: existing.rate,
+            current_effective_to: existing.effective_to,
+            expected_rate: expected.rate,
+            expected_effective_to: expected.effective_to,
+          });
+        } else {
+          suggestions.push({
+            rate_type: asset_type,
+            rate: expected.rate,
+            effective_from: expected.effective_from,
+            effective_to: expected.effective_to,
+          });
+        }
+      }
+
+      // DB entries not in dataset → propose deletion
+      for (const r of dbRates) {
+        if (!matchedDbIds.has(r.id)) {
+          deletions.push({
+            id: r.id,
+            rate_type: r.rate_type,
+            rate: r.rate,
+            effective_from: r.effective_from,
+            effective_to: r.effective_to,
+            reason: 'No matching rate in the reference dataset',
+          });
+        }
+      }
+
+      // Check investments with this asset type — is their interest_rate correct?
+      const latestRate = datasetRates.filter(r => !r.effective_to).pop()
+        || datasetRates[datasetRates.length - 1];
+
+      let investmentQuery = 'SELECT i.id, i.name, i.display_name, i.interest_rate FROM investments i WHERE i.asset_type = ?';
+      const investmentParams = [asset_type];
+      if (portfolio_id) {
+        investmentQuery += ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)';
+        investmentParams.push(parseInt(portfolio_id));
+      }
+      const investments = db.prepare(investmentQuery).all(...investmentParams);
+
+      const investmentCorrections = [];
+      for (const inv of investments) {
+        if (!inv.interest_rate || Math.abs(inv.interest_rate - latestRate.rate) >= 0.001) {
+          investmentCorrections.push({
+            id: inv.id,
+            name: inv.display_name || inv.name,
+            current_rate: inv.interest_rate,
+            expected_rate: latestRate.rate,
+          });
+        }
+      }
+
+      res.json({
+        suggestions,
+        corrections,
+        deletions,
+        investmentCorrections,
+        latestRate: latestRate.rate,
+        datasetVersion: DATASET_VERSION,
+        rateType: asset_type,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to preview interest rate sync: ' + e.message });
+    }
+  });
+
+  // ─── Interest Rate Sync: Import ───────────────────────────────────────
+  /**
+   * POST /api/investments/interest-rate-sync/import
+   * Apply interest rate changes: add, correct, delete rates + update investment interest_rate.
+   */
+  router.post('/interest-rate-sync/import', (req, res) => {
+    try {
+      const { additions, corrections, deletions, investmentCorrections } = req.body;
+
+      let created = 0, corrected = 0, deleted = 0, investmentsUpdated = 0;
+
+      const runAll = db.transaction(() => {
+        if (additions && additions.length) {
+          const insert = db.prepare(
+            'INSERT INTO interest_rates (rate_type, rate, effective_from, effective_to) VALUES (?, ?, ?, ?)'
+          );
+          for (const a of additions) {
+            insert.run(a.rate_type, a.rate, a.effective_from, a.effective_to || null);
+            created++;
+          }
+        }
+
+        if (corrections && corrections.length) {
+          const update = db.prepare(
+            'UPDATE interest_rates SET rate = ?, effective_to = ? WHERE id = ?'
+          );
+          for (const c of corrections) {
+            update.run(c.expected_rate, c.expected_effective_to || null, c.id);
+            corrected++;
+          }
+        }
+
+        if (deletions && deletions.length) {
+          const remove = db.prepare('DELETE FROM interest_rates WHERE id = ?');
+          for (const d of deletions) {
+            remove.run(d.id);
+            deleted++;
+          }
+        }
+
+        if (investmentCorrections && investmentCorrections.length) {
+          const updateInv = db.prepare(
+            "UPDATE investments SET interest_rate = ?, updated_at = datetime('now') WHERE id = ?"
+          );
+          for (const ic of investmentCorrections) {
+            updateInv.run(ic.expected_rate, ic.id);
+            investmentsUpdated++;
+          }
+        }
+      });
+
+      runAll();
+      res.json({ created, corrected, deleted, investmentsUpdated });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to import interest rate changes: ' + e.message });
+    }
   });
 
   return router;

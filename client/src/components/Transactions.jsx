@@ -319,9 +319,6 @@ export default function Transactions() {
       >
       <div className="d-flex align-items-center justify-content-between">
         <h1 className="h4 fw-bold mb-0">Transactions</h1>
-        <button onClick={() => navigate('/corporate-actions')} className="btn btn-outline-primary btn-sm">
-          Sync Corporate Actions
-        </button>
       </div>
 
       {/* Filter bar */}

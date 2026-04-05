@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { Row, Col, Card, Spinner, Form, Button } from 'react-bootstrap';
 import { getInvestments } from '../services/api';
 import { formatINR, ASSET_TYPE_LABELS } from '../utils/formatters';
-import { PlusCircle, Filter, EyeOff, Eye } from 'lucide-react';
+import { PlusCircle, Filter, EyeOff, Eye, RefreshCw } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const ASSET_TYPES = ['', 'MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND'];
@@ -69,6 +69,9 @@ export default function Investments() {
             {hideSold ? <EyeOff size={16} /> : <Eye size={16} />}
             {hideSold ? 'Sold hidden' : 'Showing all'}
           </Button>
+          <Link to="/corporate-actions" className="btn btn-outline-primary btn-sm d-flex align-items-center gap-1">
+            <RefreshCw size={16} /> Sync Corporate Actions
+          </Link>
           <Link to="/investments/add" className="btn btn-primary btn-sm d-flex align-items-center gap-1">
             <PlusCircle size={16} /> Add Investment
           </Link>

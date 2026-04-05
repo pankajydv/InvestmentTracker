@@ -244,17 +244,52 @@ async function fetchUSDToINR() {
  * @param {number} annualRate - Annual interest rate (e.g., 7.1)
  * @returns {number} Current value
  */
-function calculatePPFValue(transactions, annualRate) {
-  // PPF interest is calculated monthly on the lowest balance between 5th and end of month
-  // Simplified: compound annually
-  const rate = annualRate / 100;
-  let totalValue = 0;
+function calculatePPFValue(transactions, annualRateOrHistory) {
   const now = new Date();
+
+  // Support both single rate (backward compat) and rate history array
+  if (typeof annualRateOrHistory === 'number') {
+    const rate = annualRateOrHistory / 100;
+    let totalValue = 0;
+    for (const txn of transactions) {
+      const depositDate = new Date(txn.date);
+      const yearsHeld = (now - depositDate) / (365.25 * 24 * 60 * 60 * 1000);
+      totalValue += txn.amount * Math.pow(1 + rate, yearsHeld);
+    }
+    return Math.round(totalValue * 100) / 100;
+  }
+
+  // Historical rate mode: annualRateOrHistory is an array of { rate, effective_from, effective_to }
+  // sorted by effective_from ascending
+  const rates = annualRateOrHistory;
+  if (!rates || rates.length === 0) return 0;
+
+  let totalValue = 0;
 
   for (const txn of transactions) {
     const depositDate = new Date(txn.date);
-    const yearsHeld = (now - depositDate) / (365.25 * 24 * 60 * 60 * 1000);
-    totalValue += txn.amount * Math.pow(1 + rate, yearsHeld);
+    if (depositDate >= now) continue;
+
+    // Compound across rate periods
+    let value = txn.amount;
+    let periodStart = depositDate;
+
+    for (const r of rates) {
+      const rateStart = new Date(r.effective_from);
+      const rateEnd = r.effective_to ? new Date(r.effective_to) : now;
+
+      // Find overlap between [periodStart, now] and [rateStart, rateEnd]
+      const overlapStart = periodStart > rateStart ? periodStart : rateStart;
+      const overlapEnd = now < rateEnd ? now : rateEnd;
+
+      if (overlapStart >= overlapEnd) continue;
+      if (overlapStart >= now) break;
+
+      const yearsInPeriod = (overlapEnd - overlapStart) / (365.25 * 24 * 60 * 60 * 1000);
+      value *= Math.pow(1 + r.rate / 100, yearsInPeriod);
+    }
+
+    totalValue += value;
   }
 
   return Math.round(totalValue * 100) / 100;
