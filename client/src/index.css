@@ -50,6 +50,9 @@ tr:hover .row-actions {
 .badge-split { background-color: #dbeafe !important; color: #1d4ed8 !important; }
 .badge-interest { background-color: #dbeafe !important; color: #1d4ed8 !important; }
 .badge-merger { background-color: #f3e8ff !important; color: #7c3aed !important; }
+.badge-charges { background-color: #fef3c7 !important; color: #b45309 !important; }
+.badge-employer_contribution { background-color: #dcfce7 !important; color: #15803d !important; }
+.badge-voluntary_contribution { background-color: #dbeafe !important; color: #1d4ed8 !important; }
 .badge-transfer_in { background-color: #d1fae5 !important; color: #047857 !important; }
 .badge-transfer_out { background-color: #fef3c7 !important; color: #b45309 !important; }
 .badge-switch_in { background-color: #d1fae5 !important; color: #047857 !important; }

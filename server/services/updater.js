@@ -99,11 +99,11 @@ async function updateAllPrices(db, options = {}) {
 
   const getInvestedAmount = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS')
+    FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION')
   `);
   const getInvestedAmountPortfolio = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS')
+    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION')
   `);
 
   const getSaleProceeds = db.prepare(`
@@ -118,8 +118,8 @@ async function updateAllPrices(db, options = {}) {
   const getTotalUnits = db.prepare(`
     SELECT COALESCE(
       SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS') THEN COALESCE(units, 0)
-        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0)
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES') THEN -COALESCE(units, 0)
         ELSE 0
       END), 0
     ) as total
@@ -128,8 +128,8 @@ async function updateAllPrices(db, options = {}) {
   const getTotalUnitsPortfolio = db.prepare(`
     SELECT COALESCE(
       SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS') THEN COALESCE(units, 0)
-        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION') THEN -COALESCE(units, 0)
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES') THEN -COALESCE(units, 0)
         ELSE 0
       END), 0
     ) as total
@@ -215,11 +215,23 @@ async function updateAllPrices(db, options = {}) {
         }
 
         case 'PPF':
+        case 'SSY':
         case 'PF': {
           const rateRow = db.prepare(
             'SELECT rate FROM interest_rates WHERE rate_type = ? ORDER BY effective_from DESC LIMIT 1'
           ).get(inv.asset_type);
-          pricePerUnit = rateRow ? rateRow.rate : (inv.asset_type === 'PPF' ? 7.1 : 8.25);
+          pricePerUnit = rateRow ? rateRow.rate : (inv.asset_type === 'PPF' ? 7.1 : inv.asset_type === 'SSY' ? 8.2 : 8.25);
+          break;
+        }
+
+        case 'NPS': {
+          // No external API; use latest transaction NAV as fallback price
+          const latestNav = db.prepare(
+            'SELECT price_per_unit FROM transactions WHERE investment_id = ? AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1'
+          ).get(inv.id);
+          if (latestNav) {
+            pricePerUnit = latestNav.price_per_unit;
+          }
           break;
         }
       }
@@ -232,8 +244,8 @@ async function updateAllPrices(db, options = {}) {
       for (const pid of pidsToProcess) {
         let totalUnits, investedAmount, saleProceeds, currentValue;
 
-        if (inv.asset_type === 'PPF' || inv.asset_type === 'PF') {
-          // PPF/PF: compute value from deposits + interest rate
+        if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF') {
+          // PPF/SSY/PF: compute value from deposits + interest rate
           const rate = pricePerUnit; // stored rate as price
           const txnFilter = pid !== null ? " AND portfolio_id = ?" : "";
           const txnParams = pid !== null ? [inv.id, pid] : [inv.id];
@@ -309,7 +321,7 @@ async function updateAllPrices(db, options = {}) {
       const combinedUnits = getTotalUnits.get(inv.id).total;
       const combinedValue = inv.asset_type === 'FOREIGN_STOCK'
         ? combinedUnits * pricePerUnit * usdToInr
-        : (inv.asset_type === 'PPF' || inv.asset_type === 'PF')
+        : (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF')
           ? (() => { const txns = db.prepare("SELECT transaction_date as date, amount FROM transactions WHERE investment_id = ? AND transaction_type IN ('DEPOSIT', 'BUY')").all(inv.id); return calculatePPFValue(txns, pricePerUnit); })()
           : combinedUnits * pricePerUnit;
       const combinedPL = combinedValue + getSaleProceeds.get(inv.id).total - getInvestedAmount.get(inv.id).total;

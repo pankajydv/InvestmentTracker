@@ -181,14 +181,14 @@ export default function CorporateActions() {
               <td className="px-3 py-2 text-nowrap">{formatDate(s.transaction_date)}</td>
               <td className="px-3 py-2 fw-medium">{s.investment_name}</td>
               <td className="px-3 py-2"><TypeBadge type={s.transaction_type} /></td>
-              <td className="px-3 py-2 text-end">{formatNumber(s.units, 0)}</td>
+              <td className="px-3 py-2 text-end">{formatNumber(s.units, 4)}</td>
               <td className="px-3 py-2 text-end">
                 {s.transaction_type === 'DIVIDEND' ? `₹${formatNumber(s.price_per_unit, 2)}` : '-'}
               </td>
               <td className="px-3 py-2 text-end fw-medium">
                 {s.transaction_type === 'DIVIDEND'
                   ? `₹${formatNumber(s.amount, 2)}`
-                  : `+${formatNumber(s.units, 0)} shares`}
+                  : `+${formatNumber(s.units, 4)} shares`}
               </td>
               <td className="px-3 py-2 text-muted small">{s.notes}</td>
             </tr>
@@ -212,10 +212,10 @@ export default function CorporateActions() {
             const dateChanged = c.current_date && c.current_date !== c.transaction_date;
             const currentVal = c.transaction_type === 'DIVIDEND'
               ? `₹${formatNumber(c.current_amount, 2)}`
-              : `${formatNumber(c.current_units, 0)} shares`;
+              : `${formatNumber(c.current_units, 4)} shares`;
             const expectedVal = c.transaction_type === 'DIVIDEND'
               ? `₹${formatNumber(c.expected_amount, 2)}`
-              : `${formatNumber(c.expected_units, 0)} shares`;
+              : `${formatNumber(c.expected_units, 4)} shares`;
             return (
             <tr key={i} className={!checkedFix[i] ? 'text-muted' : ''}>
               <td className="px-3 py-2">
@@ -268,7 +268,7 @@ export default function CorporateActions() {
               <td className="px-3 py-2 text-end">
                 {d.transaction_type === 'DIVIDEND'
                   ? `₹${formatNumber(d.amount, 2)}`
-                  : `${formatNumber(d.units, 0)} shares`}
+                  : `${formatNumber(d.units, 4)} shares`}
               </td>
               <td className="px-3 py-2 text-muted small">{d.notes || '-'}</td>
               <td className="px-3 py-2 text-danger small">{d.reason}</td>

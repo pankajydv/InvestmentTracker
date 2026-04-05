@@ -6,9 +6,10 @@ import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT'];
-const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
-const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT'];
+const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
+const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
+const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY' };
 
 export default function InvestmentDetail() {
   const { id } = useParams();
@@ -163,8 +164,9 @@ export default function InvestmentDetail() {
   if (loading) return <div className="d-flex justify-content-center py-5"><Spinner animation="border" variant="primary" /></div>;
   if (!data) return <div className="text-danger">Investment not found</div>;
 
-  const isPPF = data.asset_type === 'PPF' || data.asset_type === 'PF';
+  const isPPF = data.asset_type === 'PPF' || data.asset_type === 'SSY' || data.asset_type === 'PF';
   const isBond = data.asset_type === 'BOND';
+  const isNPS = data.asset_type === 'NPS';
   const txnTypes = isPPF
     ? ['DEPOSIT', 'WITHDRAWAL', 'INTEREST']
     : isBond
@@ -227,7 +229,7 @@ export default function InvestmentDetail() {
             {data.isin_code && <Col xs={6} md={3}><Detail label="ISIN" value={data.isin_code} /></Col>}
             {data.amfi_code && <Col xs={6} md={3}><Detail label="AMFI Code" value={data.amfi_code} /></Col>}
             {data.category && <Col xs={6} md={3}><Detail label="Category" value={data.category} /></Col>}
-            {!isPPF && <Col xs={6} md={3}><Detail label="Total Units" value={formatNumber(data.totalUnits, 3)} /></Col>}
+            {!isPPF && <Col xs={6} md={3}><Detail label="Total Units" value={formatNumber(data.totalUnits, 4)} /></Col>}
             {data.latestValue && <Col xs={6} md={3}><Detail label="Last Price" value={`₹${formatNumber(data.latestValue.price_per_unit, 2)}`} /></Col>}
             {data.latestValue && <Col xs={6} md={3}><Detail label="1 Day Change" value={formatNumber(data.latestValue.day_change, 0)} color={profitColor(data.latestValue.day_change)} /></Col>}
             <Col xs={6} md={3}><Detail label="Currency" value={data.currency} /></Col>
@@ -310,8 +312,8 @@ export default function InvestmentDetail() {
                   <th className="px-3 text-end">Charges</th>
                   <th className="px-3 text-end">Holding</th>
                   {data.transactions.some(t => t.folio_number) && <th className="px-3">Folio</th>}
-                  <th className="px-3">Broker</th>
-                  <th className="px-3" style={{ width: 150 }}>Notes</th>
+                  {!isNPS && <th className="px-3">Broker</th>}
+                  <th className="px-3" style={isNPS ? {} : { width: 150 }}>Notes</th>
                   <th className="px-3 text-center" style={{ width: 80 }}>Actions</th>
                 </tr>
               </thead>
@@ -327,6 +329,7 @@ export default function InvestmentDetail() {
                   for (const txn of sorted) {
                     if (UNIT_ADD_TYPES.includes(txn.transaction_type)) balance += txn.units || 0;
                     else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) balance -= txn.units || 0;
+                    if (Math.abs(balance) < 1e-6) balance = 0;
                     holdingMap[txn.id] = balance;
                   }
                   const hasFolio = data.transactions.some(t => t.folio_number);
@@ -335,17 +338,17 @@ export default function InvestmentDetail() {
                     <td className="px-3">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3">
                       <span className={`badge rounded-pill badge-${txn.transaction_type.toLowerCase()}`}>
-                        {txn.transaction_type.replace(/_/g, ' ')}
+                        {TYPE_LABELS[txn.transaction_type] || txn.transaction_type.replace(/_/g, ' ')}
                       </span>
                     </td>
-                    <td className="px-3 text-end">{txn.units ? formatNumber(txn.units, 3) : '-'}</td>
+                    <td className="px-3 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>
                     <td className="px-3 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>
                     <td className="px-3 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
                     <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
-                    <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 3) : '-'}</td>
+                    <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>
                     {hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
-                    <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.broker || '-'}</td>
-                    <td className="px-3 text-muted" style={{ maxWidth: 150, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
+                    {!isNPS && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.broker || '-'}</td>}
+                    <td className="px-3 text-muted" style={isNPS ? {} : { maxWidth: 150, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                     <td className="px-3">
                       {EDITABLE_TYPES.includes(txn.transaction_type) && (
                         <div className="d-flex gap-1 row-actions">

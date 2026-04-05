@@ -302,13 +302,13 @@ export default function Dashboard() {
                     <td className="px-3 text-end">
                       <div className="fw-medium">{formatNumber(inv.invested_amount, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {inv.total_units > 1 ? formatNumber(inv.invested_amount / inv.total_units, 2) : ''}
+                        {inv.total_units > 0.0001 ? formatNumber(inv.invested_amount / inv.total_units, 2) : ''}
                       </div>
                     </td>
                     <td className="px-3 text-end">
                       <div className="fw-medium">{formatNumber(inv.current_value, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {inv.total_units > 1 ? `${formatNumber(inv.total_units, 0)} Units` : ''}
+                        {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
                       </div>
                     </td>
                     <td className="px-3 text-end">{(inv.portfolio_pct || 0).toFixed(1)}</td>

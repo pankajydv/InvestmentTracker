@@ -6,7 +6,7 @@ import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'NPS', 'PPF', 'PF', 'BOND'];
+const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND'];
 const STOCK_TXN_TYPES = ['BUY', 'SELL'];
 
 export default function AddInvestment() {
@@ -91,6 +91,7 @@ export default function AddInvestment() {
   const [npsResult, setNpsResult] = useState(null);
   const [npsSelectedSchemes, setNpsSelectedSchemes] = useState(new Set());
   const [npsExpandedScheme, setNpsExpandedScheme] = useState(null);
+  const [npsPassword, setNpsPassword] = useState('');
   const [npsForm, setNpsForm] = useState({ name: '', account_number: '', notes: '' });
   const [npsTxn, setNpsTxn] = useState({
     transaction_type: 'BUY',
@@ -328,7 +329,7 @@ export default function AddInvestment() {
     if (!npsFiles.length) return setNpsError('Please select NPS statement files');
     setNpsUploading(true);
     try {
-      const data = await previewNPSStatements(npsFiles, portfolioId);
+      const data = await previewNPSStatements(npsFiles, portfolioId, npsPassword);
       setNpsPreview(data);
       setNpsSelectedSchemes(new Set(
         data.schemes.map((s, i) => s.newTransactionCount > 0 ? i : null).filter(i => i !== null)
@@ -373,6 +374,7 @@ export default function AddInvestment() {
     setNpsError('');
     setNpsSelectedSchemes(new Set());
     setNpsExpandedScheme(null);
+    setNpsPassword('');
     if (npsFileRef.current) npsFileRef.current.value = '';
   };
 
@@ -524,7 +526,7 @@ export default function AddInvestment() {
       });
 
       if (txn.amount && parseFloat(txn.amount) > 0) {
-        const isPPF = assetType === 'PPF' || assetType === 'PF';
+        const isPPF = assetType === 'PPF' || assetType === 'SSY' || assetType === 'PF';
         await addTransaction({
           investment_id: inv.id,
           portfolio_id: portfolioId || null,
@@ -545,7 +547,7 @@ export default function AddInvestment() {
     }
   };
 
-  const isPPF = assetType === 'PPF' || assetType === 'PF';
+  const isPPF = assetType === 'PPF' || assetType === 'SSY' || assetType === 'PF';
   const isMF = assetType === 'MUTUAL_FUND';
   const isIndianStock = assetType === 'INDIAN_STOCK';
   const isForeignStock = assetType === 'FOREIGN_STOCK';
@@ -1325,7 +1327,7 @@ export default function AddInvestment() {
               <div>
                 <Card.Body className="pt-2">
                   <p className="small text-muted mb-3">
-                    Upload NPS transaction statements (CSV from Protean e-NPS or PDF from Karvy/Protean).
+                    Upload NPS transaction statements (CSV from Protean e-NPS or PDF from Karvy/KFintech).
                   </p>
 
                   {npsError && (
@@ -1359,6 +1361,20 @@ export default function AddInvestment() {
                           />
                         </Col>
                       </Row>
+                      {npsFiles.some(f => f.name.toLowerCase().endsWith('.pdf')) && (
+                        <Row className="g-3 mt-0">
+                          <Col md={6}>
+                            <Form.Label className="small">PDF Password <span className="text-muted">(usually PRAN)</span></Form.Label>
+                            <Form.Control
+                              size="sm"
+                              type="password"
+                              placeholder="Enter PDF password"
+                              value={npsPassword}
+                              onChange={(e) => setNpsPassword(e.target.value)}
+                            />
+                          </Col>
+                        </Row>
+                      )}
                       {npsFiles.length > 0 && (
                         <div className="mt-2 small text-muted">
                           {npsFiles.length} file{npsFiles.length > 1 ? 's' : ''} selected
@@ -1823,7 +1839,7 @@ export default function AddInvestment() {
                             }}>
                               {h.source === 'demat' ? 'Demat' : 'RTA'}
                             </span>,
-                            h.units?.toLocaleString('en-IN', { maximumFractionDigits: 3 }),
+                            h.units?.toLocaleString('en-IN', { maximumFractionDigits: 4 }),
                             formatCurrency(h.nav || h.price),
                             formatCurrency(h.value),
                           ]}
@@ -2215,7 +2231,7 @@ export default function AddInvestment() {
                         step="0.01"
                         value={form.interest_rate}
                         onChange={(e) => setForm({ ...form, interest_rate: e.target.value })}
-                        placeholder={assetType === 'PPF' ? '7.1' : '8.25'}
+                        placeholder={assetType === 'PPF' ? '7.1' : assetType === 'SSY' ? '8.2' : '8.25'}
                       />
                     </Col>
                   </>
@@ -2511,7 +2527,7 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
                     </span>
                   )}
                   {scheme.closingBalance > 0 && (
-                    <span className="small text-muted">{scheme.closingBalance.toLocaleString('en-IN', { maximumFractionDigits: 3 })} units</span>
+                    <span className="small text-muted">{scheme.closingBalance.toLocaleString('en-IN', { maximumFractionDigits: 4 })} units</span>
                   )}
                   <ChevronDown size={14} className="text-muted" style={{ transition: 'transform 0.2s', transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)' }} />
                 </div>
@@ -2550,7 +2566,7 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
                             </span>
                           </td>
                           <td className="px-2 py-1 text-end">{formatCurrency(t.amount)}</td>
-                          <td className="px-2 py-1 text-end">{Math.abs(t.units || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 })}</td>
+                          <td className="px-2 py-1 text-end">{Math.abs(t.units || 0).toLocaleString('en-IN', { maximumFractionDigits: 4 })}</td>
                           <td className="px-2 py-1 text-end">{formatCurrency(t.price)}</td>
                           <td className="px-2 py-1 text-muted text-truncate" style={{ maxWidth: 180 }}>{t.description}</td>
                           <td className="px-2 py-1">

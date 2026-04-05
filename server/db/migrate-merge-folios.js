@@ -154,7 +154,7 @@ if (uncategorized.length > 0) {
 // Also set category for non-MF asset types
 if (!dryRun) {
   db.prepare("UPDATE investments SET category = 'Equity' WHERE asset_type IN ('INDIAN_STOCK', 'FOREIGN_STOCK') AND (category IS NULL OR category = '')").run();
-  db.prepare("UPDATE investments SET category = 'Debt' WHERE asset_type IN ('PPF', 'PF', 'BOND') AND (category IS NULL OR category = '')").run();
+  db.prepare("UPDATE investments SET category = 'Debt' WHERE asset_type IN ('PPF', 'SSY', 'PF', 'BOND') AND (category IS NULL OR category = '')").run();
 }
 
 console.log('\n✓ Migration complete.' + (dryRun ? ' (dry run — no changes made)' : ''));

@@ -12,9 +12,10 @@ const TRANSACTION_TYPES_DEFAULT = [
 // User-action types that can be edited/deleted (not corporate actions)
 const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'CHARGES'];
 
-const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT'];
+const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
 const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES'];
 
+const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY' };
 const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
 
 function txnSortKey(t) { return CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1; }
@@ -33,7 +34,8 @@ function computeHoldingMap(transactions) {
     } else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) {
       byInvestment[key] -= txn.units || 0;
     }
-    map[txn.id] = Math.round(byInvestment[key] * 1000) / 1000;
+    const rounded = Math.round(byInvestment[key] * 10000) / 10000;
+    map[txn.id] = rounded === 0 ? 0 : rounded; // avoid -0
   }
   return map;
 }
@@ -56,8 +58,10 @@ const TYPE_BADGE = {
   SWITCH_IN: 'badge-buy',
   SWITCH_OUT: 'badge-sell',
   TRANSFER: 'badge-merger',
-  AMC: 'badge-withdrawal',
-  CHARGES: 'badge-withdrawal',
+  AMC: 'badge-charges',
+  CHARGES: 'badge-charges',
+  EMPLOYER_CONTRIBUTION: 'badge-buy',
+  VOLUNTARY_CONTRIBUTION: 'badge-buy',
 };
 
 export default function Transactions() {
@@ -333,7 +337,7 @@ export default function Transactions() {
             ) : (
               <span className="d-flex flex-wrap gap-1">
                 {filterType.map(t => (
-                  <span key={t} className={`badge ${TYPE_BADGE[t] || 'bg-secondary'} d-inline-flex align-items-center`}>
+                  <span key={t} className={`badge ${TYPE_BADGE[t] || 'bg-secondary text-white'} d-inline-flex align-items-center`}>
                     {t.replace(/_/g, ' ')}
                     <button
                       onClick={(e) => { e.stopPropagation(); setFilterType(filterType.filter(x => x !== t)); resetPage(); }}
@@ -373,7 +377,7 @@ export default function Transactions() {
                     >
                       {selected && '✓'}
                     </span>
-                    <span className={`badge ${TYPE_BADGE[t] || 'bg-secondary'}`}>
+                    <span className={`badge ${TYPE_BADGE[t] || 'bg-secondary text-white'}`}>
                       {t.replace(/_/g, ' ')}
                     </span>
                   </button>
@@ -510,6 +514,7 @@ export default function Transactions() {
                   <th className="px-3 py-2 text-end">Units</th>
                   <th className="px-3 py-2 text-end">Price/Unit</th>
                   <th className="px-3 py-2 text-end">Amount</th>
+                  <th className="px-3 py-2 text-end">Fees</th>
                   <th className="px-3 py-2 text-end">Holding</th>
                   <th className="px-3 py-2">Broker</th>
                   <th className="px-3 py-2">Notes</th>
@@ -534,14 +539,15 @@ export default function Transactions() {
                       </div>
                     </td>
                     <td className="px-3 py-2">
-                      <span className={`badge ${TYPE_BADGE[txn.transaction_type] || 'bg-secondary'}`}>
-                        {txn.transaction_type.replace(/_/g, ' ')}
+                      <span className={`badge ${TYPE_BADGE[txn.transaction_type] || 'bg-secondary text-white'}`}>
+                        {TYPE_LABELS[txn.transaction_type] || txn.transaction_type.replace(/_/g, ' ')}
                       </span>
                     </td>
-                    <td className="px-3 py-2 text-end">{txn.units ? formatNumber(txn.units, 3) : '-'}</td>
+                    <td className="px-3 py-2 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>
                     <td className="px-3 py-2 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>
                     <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
-                    <td className="px-3 py-2 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 3) : '-'}</td>
+                    <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>
+                    <td className="px-3 py-2 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>
                     <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>
                     <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                     <td className="px-3 py-2 text-center">

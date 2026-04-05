@@ -39,6 +39,7 @@ export default function NPSUpload() {
   const [result, setResult] = useState(null);
   const [selectedSchemes, setSelectedSchemes] = useState(new Set());
   const [expandedScheme, setExpandedScheme] = useState(null);
+  const [password, setPassword] = useState('');
 
   const handleUpload = async () => {
     setError('');
@@ -46,7 +47,7 @@ export default function NPSUpload() {
     if (!files.length) return setError('Please select at least one NPS statement file');
     setUploading(true);
     try {
-      const data = await previewNPSStatements(files, portfolioId);
+      const data = await previewNPSStatements(files, portfolioId, password);
       setPreview(data);
       // Auto-select schemes with new transactions
       setSelectedSchemes(new Set(
@@ -97,6 +98,7 @@ export default function NPSUpload() {
     setError('');
     setSelectedSchemes(new Set());
     setExpandedScheme(null);
+    setPassword('');
     if (fileRef.current) fileRef.current.value = '';
   };
 
@@ -119,7 +121,7 @@ export default function NPSUpload() {
         </button>
         <h1 className="h4 fw-bold">Import NPS Statements</h1>
         <p className="text-muted small mb-0">
-          Upload NPS transaction statements (CSV from Protean e-NPS or PDF from Karvy/Protean).
+          Upload NPS transaction statements (CSV from Protean e-NPS or PDF from Karvy/KFintech).
           Each scheme becomes a separate investment.
         </p>
       </div>
@@ -173,6 +175,20 @@ export default function NPSUpload() {
                 />
               </Col>
             </Row>
+            {files.some(f => f.name.toLowerCase().endsWith('.pdf')) && (
+              <Row className="g-3 mt-0">
+                <Col md={6}>
+                  <Form.Label className="small">PDF Password <span className="text-muted">(usually PRAN)</span></Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="password"
+                    placeholder="Enter PDF password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                </Col>
+              </Row>
+            )}
             {files.length > 0 && (
               <div className="mt-2 small text-muted">
                 {files.length} file{files.length > 1 ? 's' : ''} selected: {files.map(f => f.name).join(', ')}

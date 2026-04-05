@@ -222,7 +222,7 @@ export default function CASUpload() {
                   }}>
                   {h.source === 'demat' ? 'Demat' : 'RTA'}
                 </span>,
-                h.units?.toLocaleString('en-IN', { maximumFractionDigits: 3 }),
+                h.units?.toLocaleString('en-IN', { maximumFractionDigits: 4 }),
                 formatCurrency(h.nav || h.price),
                 formatCurrency(h.value),
               ]}

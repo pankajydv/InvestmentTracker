@@ -34,7 +34,7 @@ module.exports = function (db) {
 
   function makeNPSKey(schemeName, date, type, amount, units) {
     return [
-      schemeName,
+      schemeName.toUpperCase(),
       date,
       type,
       Math.round(Math.abs(amount || 0) * 100),
@@ -44,8 +44,8 @@ module.exports = function (db) {
 
   /**
    * POST /api/nps/preview
-   * Upload NPS CSV/PDF files and get a preview of transactions per scheme.
-   * Body (multipart): files[] (CSV/PDF), portfolio_id
+   * Upload NPS CSV files and get a preview of transactions per scheme.
+   * Body (multipart): files[] (CSV), portfolio_id
    */
   router.post('/preview', upload.array('files', 20), async (req, res) => {
     try {
@@ -60,7 +60,7 @@ module.exports = function (db) {
       const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolioId);
       if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
 
-      const parsed = await parseNPSStatements(req.files);
+      const parsed = await parseNPSStatements(req.files, req.body.password || '');
 
       if (!parsed.schemes.length && !parsed.transactions.length) {
         return res.status(400).json({ error: 'No NPS transactions found in the uploaded files.' });
@@ -100,7 +100,7 @@ module.exports = function (db) {
       const schemeMap = {};
       for (const txn of parsed.transactions) {
         if (!schemeMap[txn.schemeName]) {
-          const existing = existingInvestments.find(inv => inv.name === txn.schemeName);
+          const existing = existingInvestments.find(inv => inv.name.toUpperCase() === txn.schemeName.toUpperCase());
           schemeMap[txn.schemeName] = {
             schemeName: txn.schemeName,
             pran: parsed.pran,
@@ -157,7 +157,7 @@ module.exports = function (db) {
       const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolioId);
       if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
 
-      const findByName = db.prepare('SELECT id FROM investments WHERE name = ? AND asset_type = ?');
+      const findByName = db.prepare('SELECT id FROM investments WHERE UPPER(name) = UPPER(?) AND asset_type = ?');
 
       const insertInvestment = db.prepare(`
         INSERT INTO investments (name, asset_type, account_number, currency, notes)
@@ -170,6 +170,32 @@ module.exports = function (db) {
       `);
 
       const existingKeys = getExistingNPSKeys(portfolioId);
+
+      // Pre-compute tier totals per (date, type) for contribution notes
+      // Key: "date|type|tier" → total amount across all schemes in that tier
+      const tierTotals = {};
+      for (const scheme of schemes) {
+        for (const t of (scheme.transactions || [])) {
+          if (t.type !== 'EMPLOYER_CONTRIBUTION' && t.type !== 'VOLUNTARY_CONTRIBUTION') continue;
+          const tierMatch = scheme.schemeName.match(/TIER\s+(I{1,2})/i);
+          const tier = tierMatch ? tierMatch[1].toUpperCase() : 'I';
+          const key = `${t.date}|${t.type}|${tier}`;
+          tierTotals[key] = (tierTotals[key] || 0) + Math.abs(t.amount || 0);
+        }
+      }
+
+      /** Generate notes for a contribution transaction */
+      function makeContribNotes(schemeName, date, type, amount) {
+        const tierMatch = schemeName.match(/TIER\s+(I{1,2})/i);
+        const tier = tierMatch ? tierMatch[1].toUpperCase() : 'I';
+        const schemeMatch = schemeName.match(/SCHEME\s+([A-Z])\s*-/i);
+        const schemeLetter = schemeMatch ? schemeMatch[1] : '?';
+        const key = `${date}|${type}|${tier}`;
+        const total = tierTotals[key] || Math.abs(amount);
+        const pct = total > 0 ? Math.round((Math.abs(amount) / total) * 100) : 0;
+        const fmtTotal = total.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        return `Investment in Tier ${tier} = ${fmtTotal}, Scheme ${schemeLetter} = ${pct}%`;
+      }
 
       let importedCount = 0;
       let skippedCount = 0;
@@ -198,15 +224,19 @@ module.exports = function (db) {
             const key = makeNPSKey(schemeName, t.date, t.type, t.amount, t.units);
             if (existingKeys.has(key)) { skippedCount++; continue; }
 
+            const notes = (t.type === 'EMPLOYER_CONTRIBUTION' || t.type === 'VOLUNTARY_CONTRIBUTION')
+              ? makeContribNotes(schemeName, t.date, t.type, t.amount)
+              : (t.particulars || '');
+
             insertTransaction.run(
               investmentId, portfolioId,
               t.type, t.date,
               Math.abs(t.units || 0),
               Math.abs(t.nav || 0),
               Math.abs(t.amount || 0),
-              Math.abs(t.charges || 0),
+              t.type === 'CHARGES' ? 0 : Math.abs(t.charges || 0),
               t.broker || '',
-              t.particulars || ''
+              notes
             );
             existingKeys.add(key);
             importedCount++;

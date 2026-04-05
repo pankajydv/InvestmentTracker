@@ -31,15 +31,15 @@ function initializeDb(db) {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
-    -- Asset types: INDIAN_STOCK, MUTUAL_FUND, FOREIGN_STOCK, PPF, PF, BOND
+    -- Asset types: INDIAN_STOCK, MUTUAL_FUND, FOREIGN_STOCK, PPF, SSY, PF, BOND
     CREATE TABLE IF NOT EXISTS investments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
-      asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND', 'NPS')),
+      asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS')),
       ticker_symbol TEXT,          -- NSE symbol for Indian stocks, Yahoo ticker for foreign stocks
       amfi_code TEXT,              -- AMFI scheme code for mutual funds
-      account_number TEXT,         -- For PPF/PF accounts
-      interest_rate REAL,          -- For PPF/PF (annual %)
+      account_number TEXT,         -- For PPF/SSY/PF accounts
+      interest_rate REAL,          -- For PPF/SSY/PF (annual %)
       currency TEXT DEFAULT 'INR', -- INR or USD
       face_value REAL,              -- Face/par value per unit (for bonds)
       coupon_frequency TEXT,        -- MONTHLY, QUARTERLY, SEMI_ANNUAL, ANNUAL (for bonds)
@@ -104,10 +104,10 @@ function initializeDb(db) {
       UNIQUE(portfolio_id, date)
     );
 
-    -- PPF/PF interest rates history
+    -- PPF/SSY/PF interest rates history
     CREATE TABLE IF NOT EXISTS interest_rates (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      rate_type TEXT NOT NULL CHECK(rate_type IN ('PPF', 'PF')),
+      rate_type TEXT NOT NULL CHECK(rate_type IN ('PPF', 'SSY', 'PF')),
       rate REAL NOT NULL,
       effective_from TEXT NOT NULL,
       effective_to TEXT,
@@ -192,6 +192,7 @@ function initializeDb(db) {
   if (existingRates.count === 0) {
     const insertRate = db.prepare('INSERT INTO interest_rates (rate_type, rate, effective_from) VALUES (?, ?, ?)');
     insertRate.run('PPF', 7.1, '2020-04-01');
+    insertRate.run('SSY', 8.2, '2024-04-01');
     insertRate.run('PF', 8.25, '2024-04-01');
   }
 
@@ -222,7 +223,7 @@ function initializeDb(db) {
         CREATE TABLE investments_new (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           name TEXT NOT NULL,
-          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'PF', 'BOND', 'NPS')),
+          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS')),
           ticker_symbol TEXT,
           amfi_code TEXT,
           account_number TEXT,
@@ -279,6 +280,80 @@ function initializeDb(db) {
     } catch (err) {
       db.exec('ROLLBACK');
       console.error('NPS migration failed:', err);
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+  }
+
+  // ── Migration: add SSY asset_type and interest rate ──────────────────
+  const hasSSY = (() => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='investments'").get();
+    return row && row.sql.includes("'SSY'");
+  })();
+
+  if (!hasSSY) {
+    console.log('Migrating: adding SSY asset_type...');
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      // Recreate investments table with SSY
+      db.exec(`
+        CREATE TABLE investments_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS')),
+          ticker_symbol TEXT,
+          amfi_code TEXT,
+          account_number TEXT,
+          interest_rate REAL,
+          currency TEXT DEFAULT 'INR',
+          face_value REAL,
+          coupon_frequency TEXT,
+          maturity_date TEXT,
+          notes TEXT,
+          display_name TEXT,
+          isin_code TEXT,
+          previous_isin_codes TEXT,
+          is_active INTEGER DEFAULT 1,
+          category TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now'))
+        )
+      `);
+      db.exec("INSERT INTO investments_new SELECT id, name, asset_type, ticker_symbol, amfi_code, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes, display_name, isin_code, previous_isin_codes, COALESCE(is_active, 1), category, created_at, updated_at FROM investments");
+      db.exec("DROP TABLE investments");
+      db.exec("ALTER TABLE investments_new RENAME TO investments");
+
+      // Recreate indexes on investments
+      db.exec("CREATE INDEX IF NOT EXISTS idx_investments_asset_type ON investments(asset_type)");
+
+      // Recreate interest_rates table with SSY rate_type
+      db.exec(`
+        CREATE TABLE interest_rates_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          rate_type TEXT NOT NULL CHECK(rate_type IN ('PPF', 'SSY', 'PF')),
+          rate REAL NOT NULL,
+          effective_from TEXT NOT NULL,
+          effective_to TEXT,
+          created_at TEXT DEFAULT (datetime('now'))
+        )
+      `);
+      db.exec("INSERT INTO interest_rates_new SELECT * FROM interest_rates");
+      db.exec("DROP TABLE interest_rates");
+      db.exec("ALTER TABLE interest_rates_new RENAME TO interest_rates");
+
+      // Seed SSY rate if not already present
+      const ssyExists = db.prepare("SELECT COUNT(*) as count FROM interest_rates WHERE rate_type = 'SSY'").get();
+      if (ssyExists.count === 0) {
+        db.prepare("INSERT INTO interest_rates (rate_type, rate, effective_from) VALUES ('SSY', 8.2, '2024-04-01')").run();
+      }
+
+      db.exec('COMMIT');
+      console.log('Migration complete: SSY asset_type added.');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('SSY migration failed:', err);
       throw err;
     } finally {
       db.exec('PRAGMA foreign_keys = ON');

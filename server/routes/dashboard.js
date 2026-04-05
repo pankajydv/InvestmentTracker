@@ -25,7 +25,7 @@ module.exports = function (db) {
 
     // Build hide-sold filter
     const soldFilter = hide_sold === 'true'
-      ? ` AND (i.asset_type IN ('PPF','PF') OR COALESCE((SELECT SUM(CASE WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SWITCH_IN','SPLIT') THEN COALESCE(t2.units,0) WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION') THEN -COALESCE(t2.units,0) ELSE 0 END) FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}),0) > 0.001)`
+      ? ` AND (i.asset_type IN ('PPF','SSY','PF') OR COALESCE((SELECT SUM(CASE WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SWITCH_IN','SPLIT','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION') THEN COALESCE(t2.units,0) WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES') THEN -COALESCE(t2.units,0) ELSE 0 END) FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}),0) > 0.001)`
       : '';
     const soldParams = (hide_sold === 'true' && portfolio_id) ? [portfolio_id] : [];
 
@@ -43,12 +43,20 @@ module.exports = function (db) {
       SELECT
         i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency,
         i.isin_code, i.display_name,
-        dv.date, COALESCE(dv.price_per_unit, 0) as price_per_unit,
-        COALESCE(dv.total_units, 0) as total_units,
+        dv.date,
+        COALESCE(dv.price_per_unit,
+          (SELECT price_per_unit FROM transactions WHERE investment_id = i.id AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1),
+          0) as price_per_unit,
+        COALESCE(dv.total_units,
+          (SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','SWITCH_IN','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION') THEN COALESCE(units,0)
+            WHEN transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES') THEN -COALESCE(units,0)
+            ELSE 0 END), 0) FROM transactions WHERE investment_id = i.id),
+          0) as total_units,
         COALESCE(dv.current_value, 0) as current_value,
         COALESCE(dv.invested_amount,
           (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
-           WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS'))) as invested_amount,
+           WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION'))) as invested_amount,
         COALESCE(dv.profit_loss, 0) as profit_loss,
         COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
         COALESCE(dv.day_change, 0) as day_change,

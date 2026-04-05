@@ -1,9 +1,8 @@
 /**
  * NPS Statement Parser
  *
- * Parses NPS transaction statements from:
- * 1. Protean CSV files (two column layouts: with/without charges column)
- * 2. Karvy/Protean PDF files
+ * Parses NPS transaction statements from Protean CSV files
+ * (two column layouts: with/without charges column).
  *
  * Transaction types use standard BUY/SELL/TRANSFER_IN/CHARGES.
  * Employer vs Voluntary distinction is captured in the `broker` field
@@ -13,7 +12,6 @@
  * Each scheme = { name, shortCode } (e.g. "SBI PENSION FUND SCHEME E - TIER I")
  * Each transaction = { date, particulars, type, schemeName, amount, nav, units, charges, broker }
  */
-const { PDFParse } = require('pdf-parse');
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -46,6 +44,19 @@ function toISO(dateStr) {
 }
 
 /**
+ * Detect CRA (Central Recordkeeping Agency) from statement text.
+ * PDF footers contain "Karvy" or "KFintech"; CSV headers identify Protean format.
+ */
+function detectCRA(text) {
+  const lower = text.toLowerCase();
+  if (lower.includes('kfintech')) return 'KFintech';
+  if (lower.includes('karvy')) return 'Karvy';
+  if (lower.includes('protean')) return 'Protean';
+  if (lower.includes('nps transaction statement')) return 'Protean'; // Protean CSV format header
+  return '';
+}
+
+/**
  * Classify NPS transaction from its "Particulars" text.
  * Returns: 'BUY' | 'CHARGES' | 'TRANSFER_IN' | 'SKIP' | 'SIGN_DEPENDENT_REBALANCE' | 'SIGN_DEPENDENT_PFM'
  *
@@ -58,12 +69,19 @@ function classifyTransaction(particulars) {
   const p = particulars.toLowerCase().trim();
 
   if (p.includes('opening balance') || p.includes('closing balance')) return 'SKIP';
+  // Migration entries are consolidation summaries (e.g. registrar change from Karvy);
+  // the underlying individual transactions are what should be imported instead.
+  if (p.includes('migration') || p.includes('units credited on account of migration')) return 'SKIP';
   if (p.includes('billing for')) return 'CHARGES';
   if (p.includes('rebalancing')) return 'SIGN_DEPENDENT_REBALANCE';
-  if (p.includes('migration') || p.includes('units credited on account of migration')) return 'TRANSFER_IN';
-  if (p.includes('pfm change request') || p.includes('t2 to t1') || p.includes('tier ii to tier i')) return 'SIGN_DEPENDENT_PFM';
-  // All contributions (employer and voluntary) → BUY
-  if (p.includes('contribution') || p.includes('by contribution') || p.includes('voluntary contribution')) return 'BUY';
+  if (p.includes('pfm change request') || p.includes('inter pfm switch')
+      || p.includes('t2 to t1') || p.includes('tier ii to tier i')
+      || p.includes('scheme preference change')) return 'SIGN_DEPENDENT_PFM';
+  if (p.includes('persistency switch out')) return 'CHARGES';
+  if (p.includes('one way switch')) return 'SIGN_DEPENDENT_PFM';
+  // Contributions: distinguish employer vs voluntary
+  if (p.includes('voluntary contribution')) return 'VOLUNTARY_CONTRIBUTION';
+  if (p.includes('contribution') || p.includes('by contribution')) return 'EMPLOYER_CONTRIBUTION';
 
   // Default: treat as sign-dependent
   return 'SIGN_DEPENDENT_REBALANCE';
@@ -96,7 +114,7 @@ function extractSchemeNamesFromHeader(headerCells) {
     // Requires the keyword at the end to avoid matching charges column
     const m = trimmed.match(/^(.+?)\s+(?:Amount|NAV|Units)\s*(?:\(Rs\))?\s*$/i);
     if (m) {
-      let name = m[1].trim().replace(/\s*\(Rs\)\s*$/, '').trim();
+      let name = normalizeScheme(m[1].trim().replace(/\s*\(Rs\)\s*$/, '').trim());
       if (!seen.has(name)) {
         seen.add(name);
         const codeMatch = name.match(/SCHEME\s+([A-Z])\s*-/i);
@@ -107,41 +125,9 @@ function extractSchemeNamesFromHeader(headerCells) {
   return schemes;
 }
 
-/**
- * Regex-based scheme name extraction (for PDF where we don't have clean cells).
- * Handles names with hyphens like "ICICI Prudential Pension Fund - Scheme E - TIER I".
- */
-function extractSchemeNamesFromText(text) {
-  const schemes = [];
-  const seen = new Set();
-  const re = /([A-Z][A-Za-z\s.()-]+?SCHEME\s+[A-Z]\s*-\s*TIER\s+[IV]+)/gi;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const name = m[1].trim().replace(/\s+/g, ' ');
-    if (!seen.has(name)) {
-      seen.add(name);
-      const codeMatch = name.match(/SCHEME\s+([A-Z])\s*-/i);
-      schemes.push({ name, shortCode: codeMatch ? codeMatch[1] : '' });
-    }
-  }
-  return schemes;
-}
-
-
-/**
- * Resolve a possibly-truncated scheme to its full name.
- * PDF transaction headers may show "FUND SCHEME E - TIER I" instead of
- * "SBI PENSION FUND SCHEME E - TIER I". Match by short code (E, C, G).
- */
-function resolveScheme(truncated, knownSchemes) {
-  // If already known, return as-is
-  if (knownSchemes.find(x => x.name === truncated.name)) return truncated;
-  // Match by short code
-  if (truncated.shortCode) {
-    const match = knownSchemes.find(x => x.shortCode === truncated.shortCode);
-    if (match) return match;
-  }
-  return truncated;
+/** Normalize NPS scheme name: strip trailing " POP" (Point of Presence indicator) */
+function normalizeScheme(name) {
+  return name.replace(/\s+POP\s*$/i, '').trim();
 }
 
 
@@ -149,6 +135,8 @@ function resolveScheme(truncated, knownSchemes) {
 
 function parseNPSCSV(csvContent) {
   const lines = csvContent.split('\n').map(l => l.replace(/\r$/, ''));
+
+  const broker = detectCRA(csvContent);
 
   let pran = '';
   let subscriberName = '';
@@ -173,12 +161,24 @@ function parseNPSCSV(csvContent) {
       if (m) schemeChoice = m[1].trim();
     }
 
-    // Extract scheme names from "Investment Details" Particulars,References,... header
+    // Extract scheme names from "Investment Details" Particulars,References,... header (old format)
     if (line.startsWith('Particulars,References,')) {
       const cells = parseCSVLine(line);
       const headerSchemes = extractSchemeNamesFromHeader(cells);
       for (const s of headerSchemes) {
+        s.name = normalizeScheme(s.name);
         if (!schemes.find(x => x.name === s.name)) schemes.push(s);
+      }
+    }
+
+    // Extract scheme names from new transposed "Investment Details" format
+    // Lines like: "NPS TRUST- A/C HDFC ... SCHEME E - TIER I POP,1181539.89,23559.3660,50.1516,"
+    if (/SCHEME\s+[A-Z]\s*-\s*TIER/i.test(line) && section === 'header') {
+      const cells = parseCSVLine(line);
+      const schemeName = normalizeScheme(cells[0].trim());
+      if (schemeName && /SCHEME\s+[A-Z]\s*-\s*TIER/i.test(schemeName) && !schemes.find(x => x.name === schemeName)) {
+        const codeMatch = schemeName.match(/SCHEME\s+([A-Z])\s*-/i);
+        schemes.push({ name: schemeName, shortCode: codeMatch ? codeMatch[1] : '' });
       }
     }
 
@@ -209,7 +209,8 @@ function parseNPSCSV(csvContent) {
     }
 
     if (section === 'transaction') {
-      // Detect the Transaction Details header line
+      // ── Format A: Wide table (old) ──
+      // One header: "Date,Particulars,[charges],SchemeE-Amt,SchemeE-NAV,SchemeE-Units,SchemeC-Amt,..."
       if (line.startsWith('Date,Particulars')) {
         const headerCells = parseCSVLine(line);
         const hasChargesCol = headerCells.some(c =>
@@ -246,12 +247,6 @@ function parseNPSCSV(csvContent) {
           const baseType = classifyTransaction(particulars);
           if (baseType === 'SKIP') continue;
 
-          // Determine broker from contribution map (for BUY transactions)
-          let broker = '';
-          if (baseType === 'BUY') {
-            broker = brokerMap.get(date) || '';
-          }
-
           // Column layout:
           // With charges: [date, particulars, charges, E-amt, E-nav, E-units, C-amt, ...]
           // Without:      [date, particulars, E-amt, E-nav, E-units, C-amt, ...]
@@ -286,6 +281,75 @@ function parseNPSCSV(csvContent) {
         }
         break;
       }
+
+      // ── Format B: Vertical per-scheme sections (new Protean format) ──
+      // Each scheme has: scheme name line, then "Date,Description,Amount (in Rs),NAV,Units"
+      // Detect a scheme name line (non-empty, no comma or starts with known scheme patterns)
+      const trimmedLine = line.trim();
+      if (trimmedLine && !trimmedLine.startsWith('Date,') && !toISO(trimmedLine.split(',')[0]?.trim())) {
+        // Check if this looks like a scheme name (contains SCHEME and TIER, or "PENSION FUND")
+        if (/SCHEME\s+[A-Z]\s*-\s*TIER/i.test(trimmedLine) || /PENSION\s+FUND/i.test(trimmedLine)) {
+          const schemeName = normalizeScheme(trimmedLine.replace(/,+$/, '').trim());
+          const codeMatch = schemeName.match(/SCHEME\s+([A-Z])\s*-/i);
+          if (!schemes.find(x => x.name === schemeName)) {
+            schemes.push({ name: schemeName, shortCode: codeMatch ? codeMatch[1] : '' });
+          }
+
+          // Next non-empty line should be the header
+          let j = i + 1;
+          while (j < lines.length && !lines[j].trim()) j++;
+          if (j < lines.length && lines[j].trim().startsWith('Date,')) {
+            j++; // skip header line
+
+            // Build date → uploadedBy lookup from contributions
+            const brokerMap = new Map();
+            for (const c of contributions) {
+              if (c.uploadedBy) brokerMap.set(c.date, c.uploadedBy);
+            }
+
+            // Parse transaction rows until next blank line or scheme name
+            for (; j < lines.length; j++) {
+              const txnLine = lines[j].trim();
+              if (!txnLine) break;
+              // Stop if next scheme section starts
+              if (/SCHEME\s+[A-Z]\s*-\s*TIER/i.test(txnLine) || /PENSION\s+FUND/i.test(txnLine)) break;
+
+              const cells = parseCSVLine(txnLine);
+              if (cells.length < 4) continue;
+
+              const date = toISO(cells[0].trim());
+              if (!date) continue;
+
+              const particulars = cells[1].trim();
+              if (!particulars) continue;
+
+              const baseType = classifyTransaction(particulars);
+              if (baseType === 'SKIP') continue;
+
+              // Columns: Date, Description, Amount, NAV, Units
+              const amount = parseNum(cells[2]);
+              const nav = parseNum(cells[3]);
+              const units = parseNum(cells[4]);
+
+              if (amount === 0 && units === 0) continue;
+
+              const txnType = resolveType(baseType, amount);
+
+              transactions.push({
+                date,
+                particulars,
+                type: txnType,
+                schemeName,
+                amount: Math.abs(amount),
+                nav: Math.abs(nav),
+                units: Math.abs(units),
+                charges: 0,
+                broker,
+              });
+            }
+          }
+        }
+      }
     }
   }
 
@@ -315,299 +379,404 @@ function parseCSVLine(line) {
 }
 
 
-// ─── PDF Parser (Karvy/Protean) ──────────────────────────────────────
+// ─── PDF Parser (Karvy/KFintech NPS statements) ─────────────────────
 
-async function parseNPSPDF(pdfBuffer) {
-  const parser = new PDFParse({ data: pdfBuffer, verbosity: 0 });
-  const result = await parser.getText();
-  const text = result.text;
-  const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+/**
+ * Parse NPS transaction PDF.
+ * Returns same structure as parseNPSCSV:
+ *   { pran, subscriberName, schemeChoice, schemes[], contributions[], transactions[] }
+ */
+async function parseNPSPDF(buffer, password) {
+  const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.mjs');
+  const doc = await pdfjsLib.getDocument({
+    data: new Uint8Array(buffer),
+    password: password || '',
+  }).promise;
 
-  let pran = '';
-  let subscriberName = '';
-  let schemeChoice = '';
+  // Extract positioned text items per page, grouped into rows
+  const pages = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const page = await doc.getPage(p);
+    const viewport = page.getViewport({ scale: 1.0 });
+    const content = await page.getTextContent();
+    const items = content.items
+      .filter(it => it.str.trim())
+      .map(it => ({
+        text: it.str,
+        x: Math.round(it.transform[4]),
+        y: Math.round(viewport.height - it.transform[5]),
+      }))
+      .sort((a, b) => a.y - b.y || a.x - b.x);
+
+    const rows = [];
+    let cur = null;
+    for (const item of items) {
+      if (!cur || Math.abs(item.y - cur.y) > 4) {
+        cur = { y: item.y, items: [] };
+        rows.push(cur);
+      }
+      cur.items.push(item);
+    }
+    pages.push({ pageNum: p, rows });
+  }
+
+  let pran = '', subscriberName = '';
   const schemes = [];
   const contributions = [];
   const transactions = [];
 
-  // Merge lines to reconstruct dates split across lines ("05-Jan-\n2018")
-  const merged = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (/\d{2}-\w{3}-$/.test(line) && i + 1 < lines.length && /^\d{4}\b/.test(lines[i + 1])) {
-      merged.push(line + lines[i + 1]);
-      i++;
-    } else {
-      merged.push(line);
-    }
-  }
-
-  let section = 'header';
-  let currentSchemes = [];
-  const contributionMap = new Map();
-
-  for (let i = 0; i < merged.length; i++) {
-    const line = merged[i];
-
-    // Extract PRAN
-    if (line.startsWith('PRAN') && !pran) {
-      const m = line.match(/PRAN\s+(\d+)/);
-      if (m) pran = m[1];
-    }
-
-    // Extract subscriber name
-    if (line.startsWith('Subscriber Name') && !subscriberName) {
-      const m = line.match(/Subscriber Name\s+(?:Shri|Smt|Ms|Mr)?\s*(.+)/i);
-      if (m) subscriberName = m[1].trim();
-    }
-
-    // Extract scheme choice
-    if (line.includes('Scheme Choice') && !schemeChoice) {
-      const m = line.match(/Scheme Choice\s*-?\s*(.+)/);
-      if (m) schemeChoice = m[1].trim();
-    }
-
-    // Extract clean scheme names from "Scheme 1 SBI PENSION FUND SCHEME E - TIER I 71.00%"
-    const schemeLineMatch = line.match(/^Scheme\s+\d+\s+(.+?SCHEME\s+[A-Z]\s*-\s*TIER\s+[IV]+)/i);
-    if (schemeLineMatch) {
-      const name = schemeLineMatch[1].trim().replace(/\s+/g, ' ');
-      if (!schemes.find(x => x.name === name)) {
-        const codeMatch = name.match(/SCHEME\s+([A-Z])\s*-/i);
-        schemes.push({ name, shortCode: codeMatch ? codeMatch[1] : '' });
+  // Extract metadata from page 1 rows (sorted top-to-bottom)
+  let foundSubscriberSection = false;
+  for (const page of pages) {
+    for (const row of page.rows) {
+      const text = row.items.map(i => i.text).join(' ');
+      if (!pran) {
+        const m = text.match(/PRAN\s+(\d{12})/);
+        if (m) pran = m[1];
       }
-    }
-
-    // Detect schemes from content
-    if (line.includes('Particulars') && (line.includes('SCHEME') || line.includes('FUND') || line.includes('Fund'))) {
-      const schemeNames = extractSchemeNamesFromText(line);
-      for (let k = i + 1; k < Math.min(i + 6, merged.length); k++) {
-        schemeNames.push(...extractSchemeNamesFromText(merged[k]));
-      }
-      for (const s of schemeNames) {
-        if (!schemes.find(x => x.name === s.name)) schemes.push(s);
-      }
-    }
-
-    if (line.includes('Amount') && line.includes('Units') && (line.includes('SCHEME') || line.includes('FUND') || line.includes('Fund'))) {
-      for (const s of extractSchemeNamesFromText(line)) {
-        if (!schemes.find(x => x.name === s.name)) schemes.push(s);
-      }
-    }
-
-    // Section detection
-    if (line.includes('Contribution/Redemption Details')) {
-      section = 'contribution';
-      continue;
-    }
-    if (line.startsWith('Transaction Details')) {
-      section = 'transaction';
-      currentSchemes = [];
-      for (let k = i + 1; k < Math.min(i + 10, merged.length); k++) {
-        for (const s of extractSchemeNamesFromText(merged[k])) {
-          // Try to match truncated name to a clean scheme by short code
-          const resolved = resolveScheme(s, schemes);
-          currentSchemes.push(resolved);
-          if (!schemes.find(x => x.name === resolved.name)) schemes.push(resolved);
-        }
-        if (merged[k].includes('Amount') && merged[k].includes('Units')) break;
-      }
-      continue;
-    }
-
-    if (section === 'transaction' && line.startsWith('Date') && line.includes('Particulars')) {
-      currentSchemes = [];
-      for (let k = i + 1; k < Math.min(i + 10, merged.length); k++) {
-        for (const s of extractSchemeNamesFromText(merged[k])) {
-          const resolved = resolveScheme(s, schemes);
-          currentSchemes.push(resolved);
-          if (!schemes.find(x => x.name === resolved.name)) schemes.push(resolved);
-        }
-        if (merged[k].includes('Amount') && merged[k].includes('Units')) break;
-      }
-      continue;
-    }
-
-    // Parse contribution lines
-    if (section === 'contribution') {
-      const dateMatch = line.match(/^(\d{2}-\w{3}-\d{4})\s+(.+)/);
-      if (dateMatch) {
-        const date = toISO(dateMatch[1]);
-        const rest = dateMatch[2];
-        const nums = rest.match(/([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$/);
-        if (date && nums) {
-          const employee = parseNum(nums[1]);
-          const employer = parseNum(nums[2]);
-          const total = parseNum(nums[3]);
-          const particulars = rest.substring(0, rest.indexOf(nums[0])).trim().replace(/,\s*$/, '');
-          // PDF doesn't have "Uploaded By" cleanly — derive from employer vs employee amounts
-          let broker = '';
-          if (employer > 0 && employee === 0) broker = 'Employer';
-          else if (employee > 0 && employer === 0) broker = 'Voluntary';
-          contributions.push({ date, particulars, uploadedBy: broker, employee, employer, total });
-          contributionMap.set(date, broker);
-        }
-      }
-    }
-
-    // Parse transaction detail lines
-    if (section === 'transaction') {
-      if (line.startsWith('Amount') || line.startsWith('NAV') || line.startsWith('Notes') ||
-          line.startsWith('View More') || line.startsWith('Retired') || line.startsWith('Home') ||
-          /^--\s*\d+\s*of\s*\d+\s*--$/.test(line)) continue;
-
-      // Match date at start — with or without trailing text
-      const dateWithTextMatch = line.match(/^(\d{2}-\w{3}-\d{4})\s+(.+)/);
-      const dateOnlyMatch = !dateWithTextMatch && line.match(/^(\d{2}-\w{3}-\d{4})\s*$/);
-      if (!dateWithTextMatch && !dateOnlyMatch) continue;
-
-      const date = toISO(dateWithTextMatch ? dateWithTextMatch[1] : dateOnlyMatch[1]);
-      if (!date) continue;
-      let rest = dateWithTextMatch ? dateWithTextMatch[2].trim() : '';
-
-      // Collect subsequent non-date lines: text lines (particulars) and number lines (amounts/NAVs)
-      let dataLine = rest;
-      let navLine = '';
-      const collectedNumLines = [];
-      for (let k = i + 1; k < Math.min(i + 12, merged.length); k++) {
-        const nextLine = merged[k].trim();
-        if (!nextLine) continue;
-        // Stop if we hit a new date, section header, or page marker
-        if (/^\d{2}-\w{3}-\d{4}/.test(nextLine)) break;
-        if (nextLine.startsWith('Date') || nextLine.startsWith('Transaction Details') ||
-            nextLine.startsWith('Notes') || nextLine.startsWith('--') ||
-            nextLine.includes('SCHEME') || nextLine.startsWith('Particulars')) break;
-
-        // Check if line is all numbers (amounts/units or NAVs)
-        const cleaned = nextLine.replace(/\s+/g, ' ').trim();
-        if (/^[\d.,\s()-]+$/.test(cleaned)) {
-          collectedNumLines.push(nextLine);
-        } else {
-          // Text line — append to particulars/data
-          dataLine += (dataLine ? ' ' : '') + nextLine;
-        }
-      }
-
-      // Concatenate collected number lines and determine amounts vs NAVs
-      // Pattern: amounts/units come first, then NAVs on a separate line.
-      // Individual numbers per line (rebalancing) need to be joined.
-      // A NAV line typically has exactly schemeCount numbers (one per scheme).
-      if (collectedNumLines.length > 0) {
-        const hasNumbersInData = /[\d.]+/.test(dataLine) && /[a-zA-Z]/.test(dataLine);
-        if (hasNumbersInData) {
-          // dataLine already has text + numbers (same-line format like billing)
-          // First collected num line is NAVs
-          navLine = collectedNumLines[0] || '';
-        } else if (collectedNumLines.length === 2) {
-          // Two number lines: first = amounts/units, second = NAVs
-          dataLine += (dataLine ? ' ' : '') + collectedNumLines[0];
-          navLine = collectedNumLines[1];
-        } else {
-          // Multiple individual number lines — join all into amounts, last line = NAVs
-          // Heuristic: a NAV line has schemeCount-ish numbers (3 for E/C/G),
-          // while amount lines have 2*schemeCount numbers (amount+units per scheme)
-          const schemeCount = currentSchemes.length || 3;
-          const allNums = collectedNumLines.join(' ');
-          const numTokens = allNums.trim().split(/\s+/).filter(t => t);
-          // If total tokens = 2*schemeCount + schemeCount (amounts + NAVs), split
-          if (numTokens.length === 3 * schemeCount) {
-            const amtPart = numTokens.slice(0, 2 * schemeCount).join(' ');
-            const navPart = numTokens.slice(2 * schemeCount).join(' ');
-            dataLine += (dataLine ? ' ' : '') + amtPart;
-            navLine = navPart;
-          } else {
-            // Join all as amounts, no separate NAVs
-            dataLine += (dataLine ? ' ' : '') + allNums;
+      if (!subscriberName) {
+        if (/Subscriber Details/i.test(text)) {
+          foundSubscriberSection = true;
+        } else if (foundSubscriberSection) {
+          // First non-header row after "Subscriber Details" is the name
+          const nameText = row.items.filter(i => i.x < 200).map(i => i.text).join(' ').trim();
+          if (nameText && !/^PRAN/i.test(nameText)) {
+            subscriberName = nameText.replace(/^Shri\s+|^Smt\s+|^Ms\s+|^Mr\s+/i, '').trim();
           }
         }
       }
-
-      // If dataLine has no particulars text, it's a direct contribution ("Investment in NPS")
-      if (!dataLine.match(/[a-zA-Z]/)) {
-        dataLine = 'Investment in NPS ' + dataLine;
-      }
-
-      const parsedTxns = parsePDFTransactionLine(date, dataLine, navLine, currentSchemes.length || 3, contributionMap);
-      if (parsedTxns) {
-        for (const txn of parsedTxns) {
-          const schemeIdx = txn.schemeIndex;
-          if (schemeIdx < currentSchemes.length) {
-            txn.schemeName = currentSchemes[schemeIdx].name;
-          } else if (schemeIdx < schemes.length) {
-            txn.schemeName = schemes[schemeIdx].name;
-          }
-          delete txn.schemeIndex;
-          transactions.push(txn);
-        }
-      }
     }
+    if (pran && subscriberName) break;
   }
 
-  return { pran, subscriberName, schemeChoice, schemes, contributions, transactions };
+  // Detect CRA from page text (footer contains "Karvy" or "KFintech")
+  const allText = pages.map(p => p.rows.map(r => r.items.map(i => i.text).join(' ')).join('\n')).join('\n');
+  const broker = detectCRA(allText);
+
+  // Process each page
+  for (const page of pages) {
+    parsePDFPage(page.rows, schemes, contributions, transactions, broker);
+  }
+
+  return { pran, subscriberName, schemeChoice: '', schemes, contributions, transactions };
 }
 
-/**
- * Parse a PDF transaction data line into per-scheme transactions.
- */
-function parsePDFTransactionLine(date, dataLine, navLine, schemeCount, contributionMap) {
-  const parts = dataLine.match(/^(.*?)\s+([-(\d][\d.,()]+(?:\s+[-(\d][\d.,()]+)*)$/);
-  if (!parts) return null;
+/** Detect if a row's first item (x < 50) is a date string */
+function rowDate(row) {
+  const first = row.items[0];
+  if (!first || first.x > 50) return null;
+  return toISO(first.text.trim());
+}
 
-  const particulars = parts[1].trim();
-  const numbersStr = parts[2].trim();
-  const numTokens = numbersStr.split(/\s+/).map(s => parseNum(s)).filter(n => !isNaN(n));
-  const navNums = navLine ? navLine.trim().split(/\s+/).map(s => parseNum(s)).filter(n => !isNaN(n)) : [];
+/** Parse a single PDF page for contribution + transaction sections */
+function parsePDFPage(rows, schemes, contributions, transactions, broker) {
+  let mode = 'scan'; // scan | contribution | transaction
+  let contribHeaderFound = false;
+  let currentSchemes = []; // Schemes for the current transaction table
+  let columnDef = null;    // Column x-boundary definition
+  let pendingTxn = null;   // Current transaction being assembled (date row)
 
-  const baseType = classifyTransaction(particulars);
-  if (baseType === 'SKIP') return null;
-
-  // For BUY (contribution) transactions, look up the broker from contribution map
-  const broker = baseType === 'BUY' ? (contributionMap.get(date) || '') : '';
-  const results = [];
-  const isBilling = baseType === 'CHARGES';
-
-  let chargesTotal = 0;
-  let schemeNums;
-  if (isBilling && numTokens.length >= 1) {
-    chargesTotal = Math.abs(numTokens[0]);
-    schemeNums = numTokens.slice(1);
-  } else {
-    schemeNums = numTokens;
+  function flushPending() {
+    if (!pendingTxn) return;
+    emitTransactions(pendingTxn, currentSchemes, transactions, contributions, broker);
+    pendingTxn = null;
   }
 
-  for (let s = 0; s < schemeCount; s++) {
-    const amtIdx = s * 2;
-    const unitsIdx = s * 2 + 1;
-    if (amtIdx >= schemeNums.length) break;
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri];
+    const text = row.items.map(i => i.text).join(' ');
 
-    const amount = schemeNums[amtIdx];
-    const units = schemeNums[unitsIdx] || 0;
-    const nav = navNums[s] || (units !== 0 ? Math.abs(amount / units) : 0);
+    // Detect section markers
+    if (/Contribution\s*\/?\s*Redemption\s*Details/i.test(text)) {
+      flushPending();
+      mode = 'contribution';
+      contribHeaderFound = false;
+      continue;
+    }
+    if (/Transaction Details/i.test(text) && !text.includes("'Transaction Details'")) {
+      flushPending();
+      mode = 'transaction';
+      currentSchemes = [];
+      columnDef = null;
+      continue;
+    }
+    // Notes section ends transaction parsing
+    if (text.startsWith('Note:') || /^Page \d+ of/i.test(text)) {
+      flushPending();
+      mode = 'scan';
+      continue;
+    }
+
+    // ── Contribution section ──
+    if (mode === 'contribution') {
+      // Skip contribution header row
+      if (!contribHeaderFound && row.items.some(i => i.text === 'Date' && i.x < 60)) {
+        contribHeaderFound = true;
+        continue;
+      }
+      if (text.startsWith('Total') || text.includes('Transaction Details')) {
+        if (text.includes('Transaction Details')) {
+          // Transaction Details starts on same page after contributions
+          flushPending();
+          mode = 'transaction';
+          currentSchemes = [];
+          columnDef = null;
+        } else {
+          mode = 'scan';
+        }
+        continue;
+      }
+      const date = rowDate(row);
+      if (date && contribHeaderFound) {
+        // Parse contribution row
+        const parts = row.items.filter(i => i.x >= 80);
+        const particulars = parts.filter(i => i.x < 200).map(i => i.text).join(' ').trim();
+        const uploadedBy = parts.filter(i => i.x >= 180 && i.x < 280).map(i => i.text).join(' ').trim();
+        const numItems = parts.filter(i => i.x >= 280).sort((a, b) => a.x - b.x);
+        // Columns: employer, employee, total (but opening balance rows may only have total)
+        let employer = 0, employee = 0, total = 0;
+        if (numItems.length >= 3) {
+          employer = parseNum(numItems[0].text);
+          employee = parseNum(numItems[1].text);
+          total = parseNum(numItems[2].text);
+        } else if (numItems.length === 1) {
+          total = parseNum(numItems[0].text);
+        }
+        if (particulars.toLowerCase().includes('opening balance')) continue;
+        contributions.push({ date, particulars, uploadedBy, employee, employer, total });
+      }
+      continue;
+    }
+
+    // ── Transaction section ──
+    if (mode === 'transaction') {
+      // Phase 1: Parse scheme names (before column header)
+      if (!columnDef) {
+        // Check if this row is the Amount/Units column header
+        if (row.items.some(i => i.text.trim() === 'Amount (₹)' || i.text.trim() === 'Amount')) {
+          // Extract column positions from Amount and Units headers
+          const amtItems = row.items.filter(i => /^Amount/i.test(i.text.trim())).sort((a, b) => a.x - b.x);
+          const unitItems = row.items.filter(i => /^Units$/i.test(i.text.trim())).sort((a, b) => a.x - b.x);
+          if (amtItems.length >= 3 && unitItems.length >= 3) {
+            columnDef = buildColumnDef(amtItems, unitItems);
+          }
+          continue;
+        }
+        // Otherwise, check if it's a scheme name row
+        if (row.items.some(i => /Pension Fund|Scheme [A-Z]|Tier [IV]/i.test(i.text) && i.x > 170)) {
+          // Collect scheme name fragments at x > 170 (exclude charges column header)
+          const nameItems = row.items.filter(i => i.x > 170 && !/Withdrawal|deduction|units|intermediary|charges/i.test(i.text));
+          if (nameItems.length > 0) {
+            // Try to assign to 3 scheme columns
+            assignSchemeNameItems(nameItems, currentSchemes);
+          }
+        }
+        continue;
+      }
+
+      // Phase 2: Parse transaction rows (columnDef established)
+      const lowerText = text.toLowerCase();
+
+      // Opening Balance → skip (just units, no transaction)
+      if (lowerText.includes('opening balance')) continue;
+
+      // Closing Units → end of this table
+      if (lowerText.includes('closing units') || lowerText.includes('closing balance')) {
+        flushPending();
+        // Register discovered schemes
+        for (const s of currentSchemes) {
+          if (s.name && !schemes.find(x => x.name === s.name)) {
+            schemes.push(s);
+          }
+        }
+        // Stay in transaction mode with cleared columnDef so we can pick up
+        // a consecutive table on the same page (e.g. SBI → ICICI in 2020-21)
+        mode = 'transaction';
+        currentSchemes = [];
+        columnDef = null;
+        continue;
+      }
+
+      const date = rowDate(row);
+      if (date) {
+        // New date row → flush previous, start new
+        flushPending();
+        pendingTxn = { date, particularsParts: [], dataItems: [], navItems: [] };
+        // Collect particulars (items with x in [70, 170))
+        const partItems = row.items.filter(i => i.x >= 70 && i.x < 170);
+        pendingTxn.particularsParts.push(partItems.map(i => i.text).join(' '));
+        // Collect data items (x >= 170)
+        const dataItems = row.items.filter(i => i.x >= 170);
+        pendingTxn.dataItems.push(...dataItems);
+      } else if (pendingTxn) {
+        // Non-date row after a date row
+        const numericItems = row.items.filter(i => i.x >= 200 && /^[\d.,()\-]+$/.test(i.text.trim()));
+        const textItems = row.items.filter(i => i.x >= 70 && i.x < 170);
+
+        if (numericItems.length > 0 && textItems.length === 0) {
+          // NAV row (only numbers at scheme amount positions)
+          pendingTxn.navItems.push(...numericItems);
+        } else if (numericItems.length > 0 && textItems.length > 0) {
+          // Mixed row (NAV values + continuation text, e.g. "Switch" at x=111 + NAVs)
+          pendingTxn.navItems.push(...numericItems);
+          pendingTxn.particularsParts.push(textItems.map(i => i.text).join(' '));
+        } else if (textItems.length > 0) {
+          // Continuation of particulars text
+          pendingTxn.particularsParts.push(textItems.map(i => i.text).join(' '));
+        }
+      }
+    }
+  }
+  flushPending();
+  // Register any remaining discovered schemes
+  for (const s of currentSchemes) {
+    if (s.name && !schemes.find(x => x.name === s.name)) {
+      schemes.push(s);
+    }
+  }
+}
+
+/** Build column definition from the Amount/Units header positions */
+function buildColumnDef(amtItems, unitItems) {
+  // amtItems and unitItems each have 3 items (one per scheme), sorted by x
+  const cols = [];
+  for (let i = 0; i < 3; i++) {
+    cols.push({
+      amtX: amtItems[i].x,
+      unitsX: unitItems[i].x,
+    });
+  }
+  // Build boundaries:
+  // Between amount and units of same scheme: midpoint
+  // Between schemes: midpoint of units[i] and amount[i+1]
+  const boundaries = [];
+  for (let i = 0; i < 3; i++) {
+    const amtEnd = (cols[i].amtX + cols[i].unitsX) / 2;
+    const unitsEnd = i < 2 ? (cols[i].unitsX + cols[i + 1].amtX) / 2 : 999;
+    boundaries.push({ amtMin: i === 0 ? 200 : boundaries[i - 1].unitsEnd, amtEnd, unitsEnd });
+  }
+  return { cols, boundaries };
+}
+
+/** Assign a positioned item to a scheme column (returns { schemeIdx, isAmount } or null) */
+function assignColumn(x, columnDef) {
+  for (let i = 0; i < columnDef.boundaries.length; i++) {
+    const b = columnDef.boundaries[i];
+    if (x >= b.amtMin && x < b.amtEnd) return { schemeIdx: i, isAmount: true };
+    if (x >= b.amtEnd && x < b.unitsEnd) return { schemeIdx: i, isAmount: false };
+  }
+  return null;
+}
+
+/** Collect scheme name items into 3 column buckets and build scheme names */
+function assignSchemeNameItems(items, currentSchemes) {
+  // Divide items into 3 columns based on x gaps
+  // Items are sorted by x; find significant gaps to separate columns
+  if (items.length === 0) return;
+
+  // Simple approach: use x thresholds ~310 and ~450 to split into 3 columns
+  const cols = [[], [], []];
+  for (const item of items) {
+    if (item.x < 310) cols[0].push(item.text);
+    else if (item.x < 450) cols[1].push(item.text);
+    else cols[2].push(item.text);
+  }
+
+  for (let i = 0; i < 3; i++) {
+    if (cols[i].length === 0) continue;
+    if (!currentSchemes[i]) {
+      currentSchemes[i] = { name: '', shortCode: '' };
+    }
+    const existing = currentSchemes[i].name;
+    const addition = cols[i].join(' ').trim();
+    currentSchemes[i].name = existing ? (existing + ' ' + addition) : addition;
+    // Extract short code
+    const codeMatch = currentSchemes[i].name.match(/Scheme\s+([A-Z])\s*-/i);
+    if (codeMatch) currentSchemes[i].shortCode = codeMatch[1];
+  }
+}
+
+/** Emit transactions from a completed pendingTxn */
+function emitTransactions(pending, currentSchemes, transactions, contributions, broker) {
+  const { date, particularsParts, dataItems, navItems } = pending;
+  const particulars = particularsParts.join(' ').trim();
+
+  const baseType = classifyTransaction(particulars);
+  if (baseType === 'SKIP') return;
+
+  // Parse charges (items with x < 200)
+  const chargeItems = dataItems.filter(i => i.x < 220);
+  const chargesTotal = chargeItems.length > 0 ? Math.abs(parseNum(chargeItems[0].text)) : 0;
+
+  // Parse per-scheme data items
+  // Data items at x >= 220 → assign to scheme columns
+  const schemeData = [{}, {}, {}]; // { amount, units }
+  const schemeDataItems = dataItems.filter(i => i.x >= 220);
+
+  for (const item of schemeDataItems) {
+    const val = parseNum(item.text);
+    if (val === 0 && item.text.trim() === '-') continue;
+    // Use nearest scheme column based on x position
+    const colIdx = nearestSchemeCol(item.x, currentSchemes.length);
+    if (colIdx < 0) continue;
+    if (!schemeData[colIdx].amount && schemeData[colIdx].amount !== 0) {
+      schemeData[colIdx].amount = val;
+    } else if (!schemeData[colIdx].units && schemeData[colIdx].units !== 0) {
+      schemeData[colIdx].units = val;
+    }
+  }
+
+  // Parse NAV items
+  const schemeNavs = [0, 0, 0];
+  for (const item of navItems) {
+    const val = parseNum(item.text);
+    if (val <= 0) continue;
+    const colIdx = nearestSchemeCol(item.x, currentSchemes.length);
+    if (colIdx >= 0) schemeNavs[colIdx] = Math.abs(val);
+  }
+
+  // Emit one transaction per scheme
+  for (let s = 0; s < currentSchemes.length; s++) {
+    const data = schemeData[s] || {};
+    const amount = data.amount || 0;
+    const units = data.units || 0;
+    const nav = schemeNavs[s] || 0;
 
     if (amount === 0 && units === 0) continue;
 
     const txnType = resolveType(baseType, amount);
 
-    results.push({
+    transactions.push({
       date,
       particulars,
-      type: isBilling ? 'CHARGES' : txnType,
-      schemeIndex: s,
-      schemeName: '',
+      type: txnType,
+      schemeName: currentSchemes[s]?.name || `Unknown Scheme ${s}`,
       amount: Math.abs(amount),
       nav: Math.abs(nav),
       units: Math.abs(units),
       charges: s === 0 ? chargesTotal : 0,
-      broker: isBilling ? '' : broker,
+      broker,
     });
   }
+}
 
-  return results.length > 0 ? results : null;
+/** Find nearest scheme column index for a given x position */
+function nearestSchemeCol(x, numSchemes) {
+  // Approximate column centers for 3-scheme layout (from typical Karvy PDF):
+  // Scheme 0: amt ~248, units ~306 → center ~277
+  // Scheme 1: amt ~370, units ~422 → center ~396
+  // Scheme 2: amt ~485, units ~540 → center ~512
+  // Use boundaries at ~340 and ~455
+  if (numSchemes < 3) return x < 400 ? 0 : 1;
+  if (x < 340) return 0;
+  if (x < 455) return 1;
+  return 2;
 }
 
 
 // ─── Main entry point ────────────────────────────────────────────────
 
-async function parseNPSStatements(files) {
+async function parseNPSStatements(files, password) {
   let pran = '';
   let subscriberName = '';
   let schemeChoice = '';
@@ -615,17 +784,17 @@ async function parseNPSStatements(files) {
   const allTransactions = [];
 
   for (const file of files) {
-    const isCSV = file.originalname.toLowerCase().endsWith('.csv');
-    const isPDF = file.originalname.toLowerCase().endsWith('.pdf');
+    const ext = file.originalname.toLowerCase();
+    const isCSV = ext.endsWith('.csv');
+    const isPDF = ext.endsWith('.pdf');
+    if (!isCSV && !isPDF) continue;
 
     let parsed;
     if (isCSV) {
       const content = file.buffer.toString('utf-8');
       parsed = parseNPSCSV(content);
-    } else if (isPDF) {
-      parsed = await parseNPSPDF(file.buffer);
     } else {
-      continue;
+      parsed = await parseNPSPDF(file.buffer, password);
     }
 
     if (!pran && parsed.pran) pran = parsed.pran;
