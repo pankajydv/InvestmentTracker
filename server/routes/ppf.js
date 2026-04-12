@@ -155,8 +155,8 @@ module.exports = function (db) {
       `);
 
       const insertInvestment = db.prepare(`
-        INSERT INTO investments (name, asset_type, account_number, interest_rate, currency, notes, category, opening_balance)
-        VALUES (?, ?, ?, ?, 'INR', ?, 'Debt', ?)
+        INSERT INTO investments (name, asset_type, account_number, currency, notes, category, opening_balance)
+        VALUES (?, ?, ?, 'INR', ?, 'Debt', ?)
       `);
 
       const insertTransaction = db.prepare(`
@@ -178,7 +178,7 @@ module.exports = function (db) {
           investmentId = existing.id;
           // Update interest rate and maturity if provided
           if (interestRate) {
-            db.prepare('UPDATE investments SET interest_rate = ? WHERE id = ?').run(interestRate, investmentId);
+            // Interest rates are stored in global interest_rates table, not per investment.
           }
           if (maturityDate) {
             db.prepare('UPDATE investments SET maturity_date = ? WHERE id = ?').run(maturityDate, investmentId);
@@ -197,7 +197,6 @@ module.exports = function (db) {
             displayName,
             assetType,
             acctNum,
-            interestRate || null,
             notes || null,
             openingBalance || 0
           );

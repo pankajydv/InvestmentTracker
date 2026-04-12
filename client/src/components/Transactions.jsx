@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom';
 import { Card, Table, Spinner, Form, Modal, Button, Row, Col } from 'react-bootstrap';
-import { getTransactions, getBrokers, getAssetTypes, getTransactionTypes, getInvestmentNames, updateTransaction, deleteTransaction } from '../services/api';
+import { getTransactions, getBrokers, getAssetTypes, getTransactionTypes, getInvestmentNames, getPortfolios, updateTransaction, deleteTransaction } from '../services/api';
 import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 
@@ -71,6 +71,8 @@ export default function Transactions() {
   const isInitialLoad = useRef(true);
   const { selectedId } = usePortfolio();
   const [transactions, setTransactions] = useState([]);
+  const [totalTransactions, setTotalTransactions] = useState(0);
+  const [portfolioMeta, setPortfolioMeta] = useState({});
   const [brokers, setBrokers] = useState([]);
   const [assetTypes, setAssetTypes] = useState([]);
   const [transactionTypes, setTransactionTypes] = useState(TRANSACTION_TYPES_DEFAULT);
@@ -209,6 +211,16 @@ export default function Transactions() {
     getAssetTypes().then(setAssetTypes).catch(() => {});
   }, []);
 
+  useEffect(() => {
+    getPortfolios().then((rows) => {
+      const map = {};
+      for (const p of rows || []) {
+        map[p.id] = { name: p.name, color: p.color };
+      }
+      setPortfolioMeta(map);
+    }).catch(() => {});
+  }, []);
+
   // Load brokers based on selected asset type + portfolio
   useEffect(() => {
     const params = {};
@@ -258,7 +270,7 @@ export default function Transactions() {
 
   useEffect(() => {
     loadTransactions();
-  }, [selectedId, filterType, filterAssetType, filterBroker, filterInvestment, filterStartDate, filterEndDate]);
+  }, [selectedId, filterType, filterAssetType, filterBroker, filterInvestment, filterStartDate, filterEndDate, currentPage, pageSize]);
 
   const loadTransactions = async () => {
     try {
@@ -271,8 +283,16 @@ export default function Transactions() {
       if (filterInvestment) params.investment_name = filterInvestment;
       if (filterStartDate) params.from = filterStartDate;
       if (filterEndDate) params.to = filterEndDate;
+      params.limit = pageSize;
+      params.offset = (currentPage - 1) * pageSize;
       const result = await getTransactions(params);
-      setTransactions(result);
+      if (Array.isArray(result)) {
+        setTransactions(result);
+        setTotalTransactions(result.length);
+      } else {
+        setTransactions(result.items || []);
+        setTotalTransactions(result.total || 0);
+      }
     } catch (e) {
       console.error(e);
     } finally {
@@ -280,12 +300,19 @@ export default function Transactions() {
     }
   };
 
+  useEffect(() => {
+    const pages = Math.max(1, Math.ceil(totalTransactions / pageSize));
+    if (currentPage > pages) {
+      setCurrentPage(pages);
+    }
+  }, [totalTransactions, pageSize, currentPage]);
+
   // Reset to page 1 — call from user-initiated filter changes only
   const resetPage = () => setCurrentPage(1);
 
   // Pagination computed values
-  const totalPages = Math.max(1, Math.ceil(transactions.length / pageSize));
-  const paginatedTransactions = transactions.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const totalPages = Math.max(1, Math.ceil(totalTransactions / pageSize));
+  const paginatedTransactions = transactions;
 
   const typeCounts = transactions.reduce((acc, t) => {
     acc[t.transaction_type] = (acc[t.transaction_type] || 0) + 1;
@@ -319,10 +346,28 @@ export default function Transactions() {
       >
       <div className="d-flex align-items-center justify-content-between">
         <h1 className="h4 fw-bold mb-0">Transactions</h1>
+        <span className="d-flex align-items-center gap-2 small text-muted">
+          {totalTransactions} transaction{totalTransactions !== 1 ? 's' : ''}
+          <button
+            onClick={loadTransactions}
+            disabled={loading}
+            className="btn btn-outline-secondary btn-sm d-inline-flex align-items-center justify-content-center p-0"
+            style={{ width: 28, height: 28 }}
+            title="Refresh transactions"
+          >
+            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+              className={loading ? 'spin' : ''}
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                d="M4 4v5h5M20 20v-5h-5M4.93 9a8 8 0 0113.14-2.07L20 9M19.07 15a8 8 0 01-13.14 2.07L4 15"
+              />
+            </svg>
+          </button>
+        </span>
       </div>
 
       {/* Filter bar */}
-      <div className="d-flex flex-wrap align-items-center gap-3">
+      <div className="d-flex flex-wrap align-items-center gap-2">
         {assetTypes.length > 1 && (
           <div className="d-flex align-items-center gap-2">
             <label className="small fw-semibold text-muted text-uppercase">Asset Type</label>
@@ -422,7 +467,7 @@ export default function Transactions() {
             size="sm"
             value={filterInvestment}
               onChange={(e) => { setFilterInvestment(e.target.value); resetPage(); }}
-            style={{ maxWidth: 220 }}
+            style={{ maxWidth: 190 }}
           >
             <option value="">All Investments</option>
             {investmentNames.map((name) => (
@@ -438,7 +483,7 @@ export default function Transactions() {
               size="sm"
               value={filterBroker}
               onChange={(e) => { setFilterBroker(e.target.value); resetPage(); }}
-              style={{ width: 'auto' }}
+              style={{ width: 130 }}
             >
               <option value="">All Brokers</option>
               {brokers.map((b) => (
@@ -448,14 +493,14 @@ export default function Transactions() {
           </div>
         )}
 
-        <div className="d-flex align-items-center gap-2">
+        <div className="d-flex align-items-center gap-1 flex-nowrap" style={{ whiteSpace: 'nowrap' }}>
           <label className="small fw-semibold text-muted text-uppercase">Date</label>
           <Form.Control
             type="date"
             size="sm"
             value={filterStartDate}
             onChange={(e) => { setFilterStartDate(e.target.value); resetPage(); }}
-            style={{ width: 140 }}
+            style={{ width: 126 }}
             placeholder="From"
           />
           <span className="text-muted small">to</span>
@@ -464,7 +509,7 @@ export default function Transactions() {
             size="sm"
             value={filterEndDate}
             onChange={(e) => { setFilterEndDate(e.target.value); resetPage(); }}
-            style={{ width: 140 }}
+            style={{ width: 126 }}
             placeholder="To"
           />
         </div>
@@ -477,26 +522,8 @@ export default function Transactions() {
             Clear filters
           </button>
         )}
-
-        <span className="ms-auto d-flex align-items-center gap-2 small text-muted">
-          {transactions.length} transaction{transactions.length !== 1 ? 's' : ''}
-          <button
-            onClick={loadTransactions}
-            disabled={loading}
-            className="btn btn-outline-secondary btn-sm d-inline-flex align-items-center justify-content-center p-0"
-            style={{ width: 28, height: 28 }}
-            title="Refresh transactions"
-          >
-            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"
-              className={loading ? 'spin' : ''}
-            >
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                d="M4 4v5h5M20 20v-5h-5M4.93 9a8 8 0 0113.14-2.07L20 9M19.07 15a8 8 0 01-13.14 2.07L4 15"
-              />
-            </svg>
-          </button>
-        </span>
       </div>
+
       </div>
 
       <Card className="shadow-sm">
@@ -504,7 +531,7 @@ export default function Transactions() {
           <div className="d-flex justify-content-center py-5">
             <Spinner animation="border" variant="primary" />
           </div>
-        ) : transactions.length === 0 ? (
+        ) : totalTransactions === 0 ? (
           <div className="p-5 text-center text-muted">
             <p>No transactions found.</p>
             {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment || filterStartDate || filterEndDate) ? (
@@ -547,8 +574,19 @@ export default function Transactions() {
                       <div className="d-flex align-items-center gap-2 mt-1">
                         <span className="text-muted" style={{ fontSize: '0.75rem' }}>{ASSET_TYPE_LABELS[txn.asset_type]}</span>
                         {!selectedId && txn.portfolio_name && (
-                          <span className="badge bg-light text-dark" style={{ fontSize: '0.7rem' }}>
-                            {txn.portfolio_name}
+                          <span
+                            title={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
+                            aria-label={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
+                            style={{
+                              width: 10,
+                              height: 10,
+                              borderRadius: '50%',
+                              display: 'inline-block',
+                              backgroundColor: portfolioMeta[txn.portfolio_id]?.color || txn.portfolio_color || '#6c757d',
+                              border: '1px solid rgba(0,0,0,0.15)',
+                              cursor: 'help'
+                            }}
+                          >
                           </span>
                         )}
                       </div>
@@ -598,7 +636,7 @@ export default function Transactions() {
           </div>
         )}
         {/* Pagination controls */}
-        {transactions.length > 0 && (
+        {totalTransactions > 0 && (
           <div className="d-flex align-items-center justify-content-between px-3 py-2 border-top small">
             <div className="d-flex align-items-center gap-2">
               <span className="text-muted">Rows per page:</span>
@@ -615,7 +653,7 @@ export default function Transactions() {
             </div>
             <div className="d-flex align-items-center gap-2">
               <span className="text-muted">
-                {(currentPage - 1) * pageSize + 1}–{Math.min(currentPage * pageSize, transactions.length)} of {transactions.length}
+                {(currentPage - 1) * pageSize + 1}–{Math.min(currentPage * pageSize, totalTransactions)} of {totalTransactions}
               </span>
               <Button
                 variant="outline-secondary"

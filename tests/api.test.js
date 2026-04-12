@@ -26,6 +26,12 @@ let server;
 let db;
 let testDataDir;
 
+function txnItems(body) {
+  if (Array.isArray(body)) return body;
+  if (body && Array.isArray(body.items)) return body.items;
+  return [];
+}
+
 /** POST/PUT/DELETE helper with JSON body */
 async function api(method, urlPath, body) {
   const opts = { method, headers: {} };
@@ -78,6 +84,8 @@ before(async () => {
   // Use a temp directory so we never touch the production DB
   testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-test-'));
   process.env.DATA_DIR = testDataDir;
+  process.env.NODE_ENV = 'test';
+  process.env.ALLOW_DB_MIGRATIONS = 'true';
 
   // ── Mock external API calls BEFORE requiring route modules ──
   const priceService = require('../server/services/priceService');
@@ -275,13 +283,12 @@ describe('Investments — Bonds', () => {
   it('POST creates a bond', async () => {
     const { status, body } = await api('POST', '/investments', {
       name: 'SGB 2024-25', asset_type: 'BOND',
-      face_value: 5000, interest_rate: 2.5, coupon_frequency: 'SEMI_ANNUAL',
+      face_value: 5000, coupon_frequency: 'SEMI_ANNUAL',
       maturity_date: '2032-06-15',
     });
     assert.equal(status, 201);
     assert.equal(body.asset_type, 'BOND');
     assert.equal(body.face_value, 5000);
-    assert.equal(body.interest_rate, 2.5);
     assert.equal(body.coupon_frequency, 'SEMI_ANNUAL');
   });
 });
@@ -294,7 +301,7 @@ describe('Investments — PPF', () => {
   it('POST creates a PPF account', async () => {
     const { status, body } = await api('POST', '/investments', {
       name: 'PPF Account', asset_type: 'PPF',
-      account_number: 'PPF001', interest_rate: 7.1,
+      account_number: 'PPF001',
     });
     assert.equal(status, 201);
     assert.equal(body.asset_type, 'PPF');
@@ -330,9 +337,10 @@ describe('Transactions — BUY and SELL', () => {
 
   it('GET /transactions returns transactions with correct fields', async () => {
     const { status, body } = await api('GET', '/transactions?portfolio_id=1');
+    const items = txnItems(body);
     assert.equal(status, 200);
-    assert.ok(body.length >= 2, `Expected >= 2, got ${body.length}`);
-    const txn = body[0];
+    assert.ok(items.length >= 2, `Expected >= 2, got ${items.length}`);
+    const txn = items[0];
     assert.ok('id' in txn);
     assert.ok('investment_id' in txn);
     assert.ok('transaction_type' in txn);
@@ -348,13 +356,15 @@ describe('Transactions — BUY and SELL', () => {
 
   it('GET /transactions filters by broker', async () => {
     const { body } = await api('GET', '/transactions?broker=Groww');
-    assert.ok(body.length >= 2);
-    assert.ok(body.every(t => t.broker === 'Groww'));
+    const items = txnItems(body);
+    assert.ok(items.length >= 2);
+    assert.ok(items.every(t => t.broker === 'Groww'));
   });
 
   it('GET /transactions filters by type', async () => {
     const { body } = await api('GET', '/transactions?type=BUY');
-    assert.ok(body.every(t => t.transaction_type === 'BUY'));
+    const items = txnItems(body);
+    assert.ok(items.every(t => t.transaction_type === 'BUY'));
   });
 
   it('PUT /transactions/:id updates transaction', async () => {
@@ -834,7 +844,7 @@ describe('Utils', () => {
   it('GET /utils/interest-rates returns array', async () => {
     const { status, body } = await api('GET', '/utils/interest-rates');
     assert.equal(status, 200);
-    assert.ok(Array.isArray(body));
+    assert.ok(Array.isArray(body.rates));
   });
 
   it('POST /utils/interest-rates creates rate', async () => {
@@ -854,7 +864,7 @@ describe('Transaction Delete', () => {
   it('DELETE /transactions/:id removes a transaction', async () => {
     // Get count before
     const before = await api('GET', '/transactions?portfolio_id=1');
-    const count = before.body.length;
+    const count = txnItems(before.body).length;
 
     // Create a throwaway transaction
     const { body: created } = await api('POST', '/transactions', {
@@ -869,7 +879,7 @@ describe('Transaction Delete', () => {
 
     // Verify count restored
     const after = await api('GET', '/transactions?portfolio_id=1');
-    assert.equal(after.body.length, count);
+    assert.equal(txnItems(after.body).length, count);
   });
 });
 
@@ -919,8 +929,9 @@ describe('Portfolio Delete', () => {
 describe('Broker field — on transactions, not investments', () => {
   it('Transactions always have broker field', async () => {
     const { body } = await api('GET', '/transactions?portfolio_id=1');
-    assert.ok(body.length > 0);
-    for (const t of body) {
+    const items = txnItems(body);
+    assert.ok(items.length > 0);
+    for (const t of items) {
       assert.ok('broker' in t, `Transaction ${t.id} missing broker field`);
     }
   });

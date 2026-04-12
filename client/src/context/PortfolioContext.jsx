@@ -19,10 +19,14 @@ export function PortfolioProvider({ children }) {
   const loadPortfolios = async () => {
     try {
       const res = await fetch('/api/portfolios');
+      if (!res.ok) {
+        throw new Error(`Failed to load portfolios (${res.status})`);
+      }
       const data = await res.json();
-      setPortfolios(data);
+      setPortfolios(Array.isArray(data) ? data : []);
     } catch (e) {
       console.error('Failed to load portfolios:', e);
+      setPortfolios([]);
     } finally {
       setLoading(false);
     }

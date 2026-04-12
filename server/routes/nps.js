@@ -13,6 +13,10 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 
 
 module.exports = function (db) {
 
+  function normalizeNPSType(type) {
+    return type === 'CHARGES' ? 'AMC' : type;
+  }
+
   /**
    * Build a set of existing NPS transaction keys for delta detection.
    * Key = schemeName|date|type|amount|units
@@ -36,7 +40,7 @@ module.exports = function (db) {
     return [
       schemeName.toUpperCase(),
       date,
-      type,
+      normalizeNPSType(type),
       Math.round(Math.abs(amount || 0) * 100),
       Math.round(Math.abs(units || 0) * 1000),
     ].join('|');
@@ -184,17 +188,49 @@ module.exports = function (db) {
         }
       }
 
+      function formatTotalFull(total) {
+        if (!Number.isFinite(total) || total <= 0) return '0';
+        return Math.round(total).toLocaleString('en-IN');
+      }
+
+      function compactYearRange(range) {
+        const m = String(range || '').match(/(\d{4})\s*-\s*(\d{4})/);
+        if (!m) return range;
+        return `${m[1]}-${m[2].slice(2)}`;
+      }
+
+      /** Convert verbose particulars to concise notes. */
+      function compactParticulars(particulars, normalizedType) {
+        const p = String(particulars || '').trim();
+        if (!p) return '';
+
+        // Examples: "Billing for Q2 2020-2021", "Billing for the Quarter 3 2018-2019"
+        const q = p.match(/billing\s+for\s+(?:the\s+)?(?:quarter\s*-?\s*|q\s*)(\d)\s*,?\s*(\d{4}\s*-\s*\d{4})/i);
+        if (q) {
+          return `Billing Q${q[1]}, ${compactYearRange(q[2])}`;
+        }
+
+        if (/persistency switch out/i.test(p)) return 'Persistency Out';
+        if (/inter\s+pfm\s+switch\s+out/i.test(p) || /pfm\s+change\s+request/i.test(p)) return 'Inter PFM Out';
+        if (/inter\s+pfm\s+switch\s+in/i.test(p)) return 'Inter PFM In';
+        if (/tier\s*ii\s*to\s*tier\s*i|t2\s*to\s*t1/i.test(p)) return 'T2->T1';
+        if (/one\s*way\s*switch/i.test(p) && normalizedType === 'TRANSFER_OUT') return 'One-way Out';
+        if (/one\s*way\s*switch/i.test(p) && normalizedType === 'TRANSFER_IN') return 'One-way In';
+        if (/rebalancing/i.test(p)) return 'Rebalancing';
+
+        return p;
+      }
+
       /** Generate notes for a contribution transaction */
       function makeContribNotes(schemeName, date, type, amount) {
-        const tierMatch = schemeName.match(/TIER\s+(I{1,2})/i);
-        const tier = tierMatch ? tierMatch[1].toUpperCase() : 'I';
         const schemeMatch = schemeName.match(/SCHEME\s+([A-Z])\s*-/i);
         const schemeLetter = schemeMatch ? schemeMatch[1] : '?';
+        const tierMatch = schemeName.match(/TIER\s+(I{1,2})/i);
+        const tier = tierMatch ? tierMatch[1].toUpperCase() : 'I';
         const key = `${date}|${type}|${tier}`;
         const total = tierTotals[key] || Math.abs(amount);
         const pct = total > 0 ? Math.round((Math.abs(amount) / total) * 100) : 0;
-        const fmtTotal = total.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-        return `Investment in Tier ${tier} = ${fmtTotal}, Scheme ${schemeLetter} = ${pct}%`;
+        return `Total=${formatTotalFull(total)}, ${schemeLetter}=${pct}%`;
       }
 
       let importedCount = 0;
@@ -221,20 +257,21 @@ module.exports = function (db) {
 
           let schemeImported = 0;
           for (const t of (scheme.transactions || [])) {
-            const key = makeNPSKey(schemeName, t.date, t.type, t.amount, t.units);
+            const normalizedType = normalizeNPSType(t.type);
+            const key = makeNPSKey(schemeName, t.date, normalizedType, t.amount, t.units);
             if (existingKeys.has(key)) { skippedCount++; continue; }
 
-            const notes = (t.type === 'EMPLOYER_CONTRIBUTION' || t.type === 'VOLUNTARY_CONTRIBUTION')
-              ? makeContribNotes(schemeName, t.date, t.type, t.amount)
-              : (t.particulars || '');
+            const notes = (normalizedType === 'EMPLOYER_CONTRIBUTION' || normalizedType === 'VOLUNTARY_CONTRIBUTION')
+              ? makeContribNotes(schemeName, t.date, normalizedType, t.amount)
+              : compactParticulars(t.particulars || '', normalizedType);
 
             insertTransaction.run(
               investmentId, portfolioId,
-              t.type, t.date,
+              normalizedType, t.date,
               Math.abs(t.units || 0),
               Math.abs(t.nav || 0),
               Math.abs(t.amount || 0),
-              t.type === 'CHARGES' ? 0 : Math.abs(t.charges || 0),
+              normalizedType === 'AMC' ? 0 : Math.abs(t.charges || 0),
               t.broker || '',
               notes
             );

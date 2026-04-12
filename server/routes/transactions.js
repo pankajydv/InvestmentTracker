@@ -9,8 +9,8 @@ module.exports = function (db) {
       units, price_per_unit, amount, fees, notes, broker, portfolio_id,
     } = req.body;
 
-    if (!investment_id || !transaction_type || !transaction_date || !amount) {
-      return res.status(400).json({ error: 'investment_id, transaction_type, transaction_date, and amount are required' });
+    if (!investment_id || !portfolio_id || !transaction_type || !transaction_date || !amount) {
+      return res.status(400).json({ error: 'investment_id, portfolio_id, transaction_type, transaction_date, and amount are required' });
     }
 
     const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(investment_id);
@@ -19,7 +19,7 @@ module.exports = function (db) {
     const result = db.prepare(`
       INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(investment_id, portfolio_id || null, transaction_type, transaction_date,
+    `).run(investment_id, portfolio_id, transaction_type, transaction_date,
       units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null);
 
     const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
@@ -104,38 +104,69 @@ module.exports = function (db) {
   });
 
   router.get('/', (req, res) => {
-    const { from, to, type, portfolio_id, broker, investment_id, investment_name } = req.query;
-    let query = `
-      SELECT t.*, COALESCE(i.display_name, i.name) as investment_name, i.asset_type,
-        t.broker as broker, p.name as portfolio_name
-      FROM transactions t
-      JOIN investments i ON t.investment_id = i.id
-      LEFT JOIN portfolios p ON t.portfolio_id = p.id
-      WHERE 1=1
-    `;
-    const params = [];
+    const { from, to, type, portfolio_id, broker, investment_id, investment_name, limit, offset } = req.query;
+    let where = ' WHERE 1=1';
+    const filterParams = [];
 
-    if (portfolio_id) { query += ' AND t.portfolio_id = ?'; params.push(portfolio_id); }
-    if (from) { query += ' AND t.transaction_date >= ?'; params.push(from); }
-    if (to) { query += ' AND t.transaction_date <= ?'; params.push(to); }
+    if (portfolio_id) { where += ' AND t.portfolio_id = ?'; filterParams.push(portfolio_id); }
+    if (from) { where += ' AND t.transaction_date >= ?'; filterParams.push(from); }
+    if (to) { where += ' AND t.transaction_date <= ?'; filterParams.push(to); }
     if (type) {
       const types = type.split(',').map(t => t.trim()).filter(Boolean);
       if (types.length === 1) {
-        query += ' AND t.transaction_type = ?';
-        params.push(types[0]);
+        where += ' AND t.transaction_type = ?';
+        filterParams.push(types[0]);
       } else if (types.length > 1) {
-        query += ` AND t.transaction_type IN (${types.map(() => '?').join(',')})`;
-        params.push(...types);
+        where += ` AND t.transaction_type IN (${types.map(() => '?').join(',')})`;
+        filterParams.push(...types);
       }
     }
-    if (broker) { query += ' AND t.broker = ?'; params.push(broker); }
-    if (investment_id) { query += ' AND t.investment_id = ?'; params.push(investment_id); }
-    if (investment_name) { query += ' AND COALESCE(i.display_name, i.name) = ?'; params.push(investment_name); }
-    if (req.query.asset_type) { query += ' AND i.asset_type = ?'; params.push(req.query.asset_type); }
+    if (broker) { where += ' AND t.broker = ?'; filterParams.push(broker); }
+    if (investment_id) { where += ' AND t.investment_id = ?'; filterParams.push(investment_id); }
+    if (investment_name) { where += ' AND COALESCE(i.display_name, i.name) = ?'; filterParams.push(investment_name); }
+    if (req.query.asset_type) { where += ' AND i.asset_type = ?'; filterParams.push(req.query.asset_type); }
 
-    query += ' ORDER BY t.transaction_date DESC, t.id DESC LIMIT 500';
-    const txns = db.prepare(query).all(...params);
-    res.json(txns);
+    const countQuery = `
+      SELECT COUNT(*) AS total
+      FROM transactions t
+      JOIN investments i ON t.investment_id = i.id
+      ${where}
+    `;
+    const total = db.prepare(countQuery).get(...filterParams).total;
+
+    let dataQuery = `
+      SELECT t.*, COALESCE(i.display_name, i.name) as investment_name, i.asset_type,
+        t.broker as broker, p.name as portfolio_name, p.color as portfolio_color
+      FROM transactions t
+      JOIN investments i ON t.investment_id = i.id
+      LEFT JOIN portfolios p ON t.portfolio_id = p.id
+      ${where}
+      ORDER BY t.transaction_date DESC, t.id DESC
+    `;
+
+    const dataParams = [...filterParams];
+
+    const parsedLimit = Number(limit);
+    const parsedOffset = Number(offset);
+    const hasLimit = Number.isFinite(parsedLimit) && parsedLimit > 0;
+    const hasOffset = Number.isFinite(parsedOffset) && parsedOffset >= 0;
+
+    // Optional server-side pagination controls.
+    let safeLimit = null;
+    let safeOffset = 0;
+    if (hasLimit) {
+      safeLimit = Math.min(Math.floor(parsedLimit), 200);
+      dataQuery += ' LIMIT ?';
+      dataParams.push(safeLimit);
+      if (hasOffset) {
+        safeOffset = Math.floor(parsedOffset);
+        dataQuery += ' OFFSET ?';
+        dataParams.push(safeOffset);
+      }
+    }
+
+    const items = db.prepare(dataQuery).all(...dataParams);
+    res.json({ items, total, limit: safeLimit, offset: safeOffset });
   });
 
   // ─── Update transaction ───────────────────────────────────────────────

@@ -716,6 +716,17 @@ module.exports = function (db) {
     try {
       const { transactions, corrections, deletions } = req.body;
 
+      const inferPortfolioId = (investmentId) => {
+        const row = db.prepare(`
+          SELECT portfolio_id
+          FROM transactions
+          WHERE investment_id = ? AND portfolio_id IS NOT NULL
+          ORDER BY transaction_date DESC, id DESC
+          LIMIT 1
+        `).get(investmentId);
+        return row ? row.portfolio_id : null;
+      };
+
       const insert = db.prepare(`
         INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes, broker, portfolio_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -745,10 +756,15 @@ module.exports = function (db) {
               continue;
             }
 
+            const portfolioId = txn.portfolio_id ?? inferPortfolioId(txn.investment_id);
+            if (portfolioId == null) {
+              throw new Error(`Missing portfolio_id for investment_id ${txn.investment_id}. Provide portfolio_id in import payload.`);
+            }
+
             insert.run(
               txn.investment_id, txn.transaction_type, txn.transaction_date,
               txn.units || null, txn.price_per_unit || null, txn.amount, txn.fees || 0, txn.notes || null,
-              txn.broker || null, txn.portfolio_id || null
+              txn.broker || null, portfolioId
             );
             created++;
           }
@@ -759,7 +775,11 @@ module.exports = function (db) {
           for (const c of corrections) {
             const existing = db.prepare('SELECT id FROM transactions WHERE id = ?').get(c.id);
             if (!existing) continue;
-            update.run(c.transaction_date, c.expected_units, c.expected_price_per_unit, c.expected_amount, c.notes, c.broker || null, c.portfolio_id || null, c.id);
+            const portfolioId = c.portfolio_id ?? inferPortfolioId(c.investment_id);
+            if (portfolioId == null) {
+              throw new Error(`Missing portfolio_id for corrected transaction id ${c.id}. Provide portfolio_id in correction payload.`);
+            }
+            update.run(c.transaction_date, c.expected_units, c.expected_price_per_unit, c.expected_amount, c.notes, c.broker || null, portfolioId, c.id);
             corrected++;
           }
         }

@@ -30,7 +30,6 @@ export default function CorporateActions() {
   const [suggestions, setSuggestions] = useState(null);
   const [corrections, setCorrections] = useState(null);
   const [deletions, setDeletions] = useState(null);
-  const [investmentCorrections, setInvestmentCorrections] = useState(null);
   const [errors, setErrors] = useState([]);
   const [importing, setImporting] = useState(false);
   const [result, setResult] = useState(null);
@@ -41,7 +40,6 @@ export default function CorporateActions() {
   const [checkedAdd, setCheckedAdd] = useState({});
   const [checkedFix, setCheckedFix] = useState({});
   const [checkedDel, setCheckedDel] = useState({});
-  const [checkedInvFix, setCheckedInvFix] = useState({});
 
   const isRateSync = RATE_TYPES.has(assetType);
 
@@ -53,7 +51,6 @@ export default function CorporateActions() {
     setSuggestions(null);
     setCorrections(null);
     setDeletions(null);
-    setInvestmentCorrections(null);
     setErrors([]);
   };
 
@@ -68,17 +65,14 @@ export default function CorporateActions() {
         setSuggestions(data.suggestions || []);
         setCorrections(data.corrections || []);
         setDeletions(data.deletions || []);
-        setInvestmentCorrections(data.investmentCorrections || []);
         setDatasetVersion(data.datasetVersion || '');
         // Init checked states
         const initAdd = {}; (data.suggestions || []).forEach((_, i) => { initAdd[i] = true; });
         const initFix = {}; (data.corrections || []).forEach((_, i) => { initFix[i] = true; });
         const initDel = {}; // destructive — unchecked by default
-        const initInvFix = {}; (data.investmentCorrections || []).forEach((_, i) => { initInvFix[i] = true; });
         setCheckedAdd(initAdd);
         setCheckedFix(initFix);
         setCheckedDel(initDel);
-        setCheckedInvFix(initInvFix);
       } else {
         const data = await previewCorporateActions(selectedId || null, year, assetType);
         setSuggestions(data.suggestions || []);
@@ -107,14 +101,12 @@ export default function CorporateActions() {
         const selAdd = (suggestions || []).filter((_, i) => checkedAdd[i]);
         const selFix = (corrections || []).filter((_, i) => checkedFix[i]);
         const selDel = (deletions || []).filter((_, i) => checkedDel[i]);
-        const selInvFix = (investmentCorrections || []).filter((_, i) => checkedInvFix[i]);
-        const totalSel = selAdd.length + selFix.length + selDel.length + selInvFix.length;
+        const totalSel = selAdd.length + selFix.length + selDel.length;
         if (!totalSel) { setError('No actions selected'); setImporting(false); return; }
         const data = await importInterestRateSync({
           additions: selAdd,
           corrections: selFix,
           deletions: selDel,
-          investmentCorrections: selInvFix,
         });
         setResult(data);
         clearPreview();
@@ -149,11 +141,10 @@ export default function CorporateActions() {
   const addCount = countChecked(suggestions, checkedAdd);
   const fixCount = countChecked(corrections, checkedFix);
   const delCount = countChecked(deletions, checkedDel);
-  const invFixCount = countChecked(investmentCorrections, checkedInvFix);
-  const totalSelected = addCount + fixCount + delCount + invFixCount;
+  const totalSelected = addCount + fixCount + delCount;
 
   const hasData = suggestions !== null;
-  const totalItems = (suggestions?.length || 0) + (corrections?.length || 0) + (deletions?.length || 0) + (investmentCorrections?.length || 0);
+  const totalItems = (suggestions?.length || 0) + (corrections?.length || 0) + (deletions?.length || 0);
 
   const portfolioLabel = selectedId
     ? portfolios.find(p => p.id === selectedId)?.name || 'Selected portfolio'
@@ -168,7 +159,7 @@ export default function CorporateActions() {
         <h1 className="h4 fw-bold">Sync Corporate Actions</h1>
         <p className="text-muted small mb-0">
           {isRateSync
-            ? `Sync ${assetType} interest rates from the reference dataset — add missing, correct wrong, and update investment rates.`
+            ? `Sync ${assetType} interest rates from the reference dataset — add missing and correct wrong.`
             : 'Fetch dividends, splits and bonus issues from Yahoo Finance — add missing, correct wrong, and remove invalid entries.'}
         </p>
       </div>
@@ -371,37 +362,6 @@ export default function CorporateActions() {
         />
       )}
 
-      {/* ── Rate mode: Update Investment Rates ─────────────── */}
-      {isRateSync && investmentCorrections && investmentCorrections.length > 0 && (
-        <SectionCard
-          icon={<Pencil size={14} />}
-          title="Update Investment Rates"
-          variant="info"
-          items={investmentCorrections}
-          checked={checkedInvFix}
-          setChecked={setCheckedInvFix}
-          toggleAll={(val) => toggleAll(investmentCorrections, setCheckedInvFix, val)}
-          selectedCount={invFixCount}
-          columns={['Investment', 'Current Rate', '', 'Latest Rate']}
-          renderRow={(c, i) => (
-            <tr key={i} className={!checkedInvFix[i] ? 'text-muted' : ''}>
-              <td className="px-3 py-2">
-                <Form.Check type="checkbox" checked={!!checkedInvFix[i]}
-                  onChange={(e) => setCheckedInvFix({ ...checkedInvFix, [i]: e.target.checked })} />
-              </td>
-              <td className="px-3 py-2 fw-medium">{c.name}</td>
-              <td className="px-3 py-2 text-end">
-                <span className="text-danger text-decoration-line-through">{c.current_rate ? `${c.current_rate}%` : 'Not set'}</span>
-              </td>
-              <td className="px-3 py-2 text-center text-muted">→</td>
-              <td className="px-3 py-2 text-end">
-                <span className="text-success fw-medium">{c.expected_rate}%</span>
-              </td>
-            </tr>
-          )}
-        />
-      )}
-
       {/* ── Deletions (both modes) ─────────────────────────── */}
       {deletions && deletions.length > 0 && (
         <SectionCard
@@ -457,7 +417,6 @@ export default function CorporateActions() {
             <span className="small text-muted">
               {addCount > 0 && <span className="me-3"><strong>{addCount}</strong> to add</span>}
               {fixCount > 0 && <span className="me-3"><strong>{fixCount}</strong> to correct</span>}
-              {invFixCount > 0 && <span className="me-3"><strong>{invFixCount}</strong> investments to update</span>}
               {delCount > 0 && <span className="me-3 text-danger"><strong>{delCount}</strong> to delete</span>}
             </span>
             <div className="d-flex gap-2">
@@ -480,7 +439,6 @@ export default function CorporateActions() {
           {result.corrected > 0 && `Corrected ${result.corrected}. `}
           {result.deleted > 0 && `Deleted ${result.deleted}. `}
           {result.skipped > 0 && `Skipped ${result.skipped} (duplicates). `}
-          {result.investmentsUpdated > 0 && `Updated ${result.investmentsUpdated} investment(s). `}
           <button className="btn btn-link btn-sm p-0 ms-2" onClick={() => { setResult(null); handleFetch(); }}>
             Check again
           </button>

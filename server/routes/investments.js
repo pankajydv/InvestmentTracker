@@ -2,6 +2,29 @@ const express = require('express');
 const router = express.Router();
 const { INTEREST_RATES, DATASET_VERSION } = require('../data/interest-rates');
 
+/**
+ * Get the effective interest rate for a given asset type and date.
+ * Returns the rate that was active on the given date, or the latest rate if date is after all rates.
+ */
+function getEffectiveRate(assetType, date) {
+  if (!['PPF', 'SSY', 'PF'].includes(assetType)) return null;
+  
+  const rates = INTEREST_RATES.filter(r => r.rate_type === assetType);
+  
+  for (const rate of rates) {
+    const effectiveFrom = new Date(rate.effective_from);
+    const effectiveTo = rate.effective_to ? new Date(rate.effective_to) : new Date('2099-12-31');
+    const compareDate = new Date(date);
+    
+    if (compareDate >= effectiveFrom && compareDate <= effectiveTo) {
+      return rate.rate;
+    }
+  }
+  
+  // Fallback to latest rate if date is before first rate
+  return rates.length > 0 ? rates[rates.length - 1].rate : null;
+}
+
 module.exports = function (db) {
   // ─── Get all investments ──────────────────────────────────────────────
   router.get('/', (req, res) => {
@@ -9,12 +32,12 @@ module.exports = function (db) {
     let query = 'SELECT DISTINCT i.* FROM investments i';
     const params = [];
 
+    query += ' WHERE 1=1';
+
     if (portfolio_id) {
-      query += ' JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?';
+      query += ' AND (EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?) OR NOT EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id))';
       params.push(portfolio_id);
     }
-
-    query += ' WHERE 1=1';
 
     if (type) {
       query += ' AND i.asset_type = ?';
@@ -25,15 +48,20 @@ module.exports = function (db) {
       const portfolioTxnParams = portfolio_id ? [portfolio_id] : [];
       query += ` AND (
         i.asset_type IN ('PPF', 'SSY', 'PF') OR
+        NOT EXISTS (
+          SELECT 1
+          FROM transactions t2
+          WHERE t2.investment_id = i.id${portfolioTxnFilter}
+        ) OR
         COALESCE((
           SELECT SUM(CASE
             WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SWITCH_IN','SPLIT','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION') THEN COALESCE(t2.units, 0)
-            WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES') THEN -COALESCE(t2.units, 0)
+            WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(t2.units, 0)
             ELSE 0 END)
           FROM transactions t2 WHERE t2.investment_id = i.id${portfolioTxnFilter}
         ), 0) > 0.001
       )`;
-      params.push(...portfolioTxnParams);
+      params.push(...portfolioTxnParams, ...portfolioTxnParams);
     }
 
     query += ' ORDER BY i.asset_type, COALESCE(i.display_name, i.name)';
@@ -69,7 +97,7 @@ module.exports = function (db) {
 
     const totals = db.prepare(`
       SELECT
-        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
+        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
         COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN amount + COALESCE(fees, 0) ELSE 0 END), 0) as total_invested,
         COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'WITHDRAWAL') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
       FROM transactions WHERE investment_id = ?${portfolioFilter}
@@ -94,7 +122,7 @@ module.exports = function (db) {
   router.post('/', (req, res) => {
     const {
       name, asset_type, ticker_symbol, amfi_code,
-      account_number, interest_rate, currency, notes,
+      account_number, currency, notes,
       face_value, coupon_frequency, maturity_date,
     } = req.body;
 
@@ -103,10 +131,10 @@ module.exports = function (db) {
     }
 
     const result = db.prepare(`
-      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_frequency, maturity_date, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(name, asset_type, ticker_symbol || null, amfi_code || null,
-      account_number || null, interest_rate || null,
+      account_number || null,
       currency || 'INR', face_value || null,
       coupon_frequency || null, maturity_date || null,
       notes || null);
@@ -119,7 +147,7 @@ module.exports = function (db) {
   router.put('/:id', (req, res) => {
     const {
       name, ticker_symbol, amfi_code,
-      account_number, interest_rate, currency, notes, portfolio_id,
+      account_number, currency, notes, portfolio_id,
       face_value, coupon_frequency, maturity_date,
       display_name, isin_code,
     } = req.body;
@@ -129,7 +157,7 @@ module.exports = function (db) {
     const params = [];
 
     // Legacy fields: only update if provided (COALESCE pattern)
-    const coalesceFields = { name, ticker_symbol, amfi_code, account_number, interest_rate, currency, face_value, coupon_frequency, maturity_date, notes };
+    const coalesceFields = { name, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_frequency, maturity_date, notes };
     for (const [col, val] of Object.entries(coalesceFields)) {
       sets.push(`${col} = COALESCE(?, ${col})`);
       params.push(val !== undefined ? val : null);
@@ -228,36 +256,12 @@ module.exports = function (db) {
         }
       }
 
-      // Check investments with this asset type — is their interest_rate correct?
-      const latestRate = datasetRates.filter(r => !r.effective_to).pop()
-        || datasetRates[datasetRates.length - 1];
-
-      let investmentQuery = 'SELECT i.id, i.name, i.display_name, i.interest_rate FROM investments i WHERE i.asset_type = ?';
-      const investmentParams = [asset_type];
-      if (portfolio_id) {
-        investmentQuery += ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)';
-        investmentParams.push(parseInt(portfolio_id));
-      }
-      const investments = db.prepare(investmentQuery).all(...investmentParams);
-
-      const investmentCorrections = [];
-      for (const inv of investments) {
-        if (!inv.interest_rate || Math.abs(inv.interest_rate - latestRate.rate) >= 0.001) {
-          investmentCorrections.push({
-            id: inv.id,
-            name: inv.display_name || inv.name,
-            current_rate: inv.interest_rate,
-            expected_rate: latestRate.rate,
-          });
-        }
-      }
+      // Rates are now global only, no per-investment rate corrections needed
 
       res.json({
         suggestions,
         corrections,
         deletions,
-        investmentCorrections,
-        latestRate: latestRate.rate,
         datasetVersion: DATASET_VERSION,
         rateType: asset_type,
       });
@@ -273,9 +277,9 @@ module.exports = function (db) {
    */
   router.post('/interest-rate-sync/import', (req, res) => {
     try {
-      const { additions, corrections, deletions, investmentCorrections } = req.body;
+      const { additions, corrections, deletions } = req.body;
 
-      let created = 0, corrected = 0, deleted = 0, investmentsUpdated = 0;
+      let created = 0, corrected = 0, deleted = 0;
 
       const runAll = db.transaction(() => {
         if (additions && additions.length) {
@@ -305,20 +309,10 @@ module.exports = function (db) {
             deleted++;
           }
         }
-
-        if (investmentCorrections && investmentCorrections.length) {
-          const updateInv = db.prepare(
-            "UPDATE investments SET interest_rate = ?, updated_at = datetime('now') WHERE id = ?"
-          );
-          for (const ic of investmentCorrections) {
-            updateInv.run(ic.expected_rate, ic.id);
-            investmentsUpdated++;
-          }
-        }
       });
 
       runAll();
-      res.json({ created, corrected, deleted, investmentsUpdated });
+      res.json({ created, corrected, deleted });
     } catch (e) {
       res.status(500).json({ error: 'Failed to import interest rate changes: ' + e.message });
     }

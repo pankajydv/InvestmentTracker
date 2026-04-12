@@ -3,6 +3,7 @@ const router = express.Router();
 const XLSX = require('xlsx');
 const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = require('../services/priceService');
 const { updateAllPrices, cancelUpdate } = require('../services/updater');
+const { INTEREST_RATES, DATASET_VERSION } = require('../data/interest-rates');
 
 module.exports = function (db) {
 
@@ -10,10 +11,14 @@ module.exports = function (db) {
   router.get('/export', (req, res) => {
     try {
       const portfolios = db.prepare('SELECT id, name, pan_number, color, created_at FROM portfolios ORDER BY id').all();
+      const hasInterestRate = db.prepare("PRAGMA table_info(investments)")
+        .all()
+        .some(col => col.name === 'interest_rate');
+      const interestRateSelect = hasInterestRate ? 'interest_rate' : 'NULL AS interest_rate';
       const investments = db.prepare(`
         SELECT id, name, display_name, asset_type, category,
                ticker_symbol, amfi_code, isin_code, previous_isin_codes,
-               account_number, interest_rate, currency,
+               account_number, ${interestRateSelect}, currency,
                face_value, coupon_frequency, maturity_date,
                notes, created_at, updated_at
         FROM investments ORDER BY id
@@ -156,8 +161,18 @@ module.exports = function (db) {
 
   // ─── Get interest rates ───────────────────────────────────────────────
   router.get('/interest-rates', (req, res) => {
-    const rates = db.prepare('SELECT * FROM interest_rates ORDER BY rate_type, effective_from DESC').all();
-    res.json(rates);
+    const dbRates = db.prepare('SELECT * FROM interest_rates ORDER BY rate_type, effective_from DESC').all();
+    const rates = dbRates.length > 0
+      ? dbRates
+      : [...INTEREST_RATES].sort((a, b) => {
+          if (a.rate_type !== b.rate_type) return a.rate_type.localeCompare(b.rate_type);
+          return b.effective_from.localeCompare(a.effective_from);
+        });
+    res.json({
+      rates,
+      datasetVersion: DATASET_VERSION,
+      source: dbRates.length > 0 ? 'database' : 'reference-dataset',
+    });
   });
 
   router.post('/interest-rates', (req, res) => {

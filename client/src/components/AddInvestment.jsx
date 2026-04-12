@@ -404,10 +404,12 @@ export default function AddInvestment() {
   };
 
   const NPS_TXN_TYPES = [
-    { value: 'BUY', label: 'Buy / Contribution' },
-    { value: 'SELL', label: 'Sell / Redemption' },
+    { value: 'EMPLOYER_CONTRIBUTION', label: 'Employer Contribution' },
+    { value: 'VOLUNTARY_CONTRIBUTION', label: 'Voluntary Contribution' },
     { value: 'TRANSFER_IN', label: 'Transfer In' },
-    { value: 'CHARGES', label: 'Charges' },
+    { value: 'TRANSFER_OUT', label: 'Transfer Out' },
+    { value: 'AMC', label: 'AMC Charges' },
+    { value: 'CHARGES', label: 'Legacy Charges' },
   ];
 
   const NPS_SOURCES = [
@@ -1520,12 +1522,12 @@ export default function AddInvestment() {
                         const hasNew = scheme.newTransactionCount > 0;
                         const NPS_TYPE_COLORS = {
                           EMPLOYER_CONTRIBUTION: 'bg-success', VOLUNTARY_CONTRIBUTION: 'bg-info',
-                          CHARGES: 'bg-warning text-dark', BUY: 'bg-success', SELL: 'bg-danger',
+                          AMC: 'bg-warning text-dark', CHARGES: 'bg-warning text-dark', BUY: 'bg-success', SELL: 'bg-danger',
                           TRANSFER_IN: 'bg-primary', TRANSFER_OUT: 'bg-danger',
                         };
                         const NPS_TYPE_LABELS = {
                           EMPLOYER_CONTRIBUTION: 'Employer', VOLUNTARY_CONTRIBUTION: 'Voluntary',
-                          CHARGES: 'Charges', BUY: 'Buy', SELL: 'Sell',
+                          AMC: 'AMC', CHARGES: 'Legacy Charges', BUY: 'Buy', SELL: 'Sell',
                           TRANSFER_IN: 'Transfer In', TRANSFER_OUT: 'Transfer Out',
                         };
 
@@ -1587,10 +1589,16 @@ export default function AddInvestment() {
                                     <tbody>
                                       {scheme.transactions.map((t, ti) => (
                                         <tr key={ti} style={{ opacity: t.isNew ? 1 : 0.5 }}>
+                                          {(() => {
+                                            const typeKey = String(t.type || '').trim().toUpperCase();
+                                            const typeBadgeClass = NPS_TYPE_COLORS[typeKey] || 'bg-light text-dark border';
+                                            const typeLabel = NPS_TYPE_LABELS[typeKey] || typeKey || 'UNKNOWN';
+                                            return (
+                                              <>
                                           <td className="px-2 py-1 text-nowrap">{t.date}</td>
                                           <td className="px-2 py-1">
-                                            <span className={`badge ${NPS_TYPE_COLORS[t.type] || 'bg-secondary'}`} style={{ fontSize: '0.65rem' }}>
-                                              {NPS_TYPE_LABELS[t.type] || t.type}
+                                            <span className={`badge ${typeBadgeClass}`} style={{ fontSize: '0.65rem' }}>
+                                              {typeLabel}
                                             </span>
                                           </td>
                                           <td className="px-2 py-1 text-end">{formatCurrency(t.amount)}</td>
@@ -1604,6 +1612,9 @@ export default function AddInvestment() {
                                               <span className="badge bg-light text-muted" style={{ fontSize: '0.6rem' }}>In DB</span>
                                             )}
                                           </td>
+                                              </>
+                                            );
+                                          })()}
                                         </tr>
                                       ))}
                                     </tbody>

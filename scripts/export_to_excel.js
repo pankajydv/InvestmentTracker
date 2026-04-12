@@ -60,7 +60,7 @@ console.log(`Portfolios: ${portfolios.length}`);
 const investments = queryAll(`
   SELECT id, name, display_name, asset_type, category,
          ticker_symbol, amfi_code, isin_code, previous_isin_codes,
-         account_number, interest_rate, currency,
+         account_number, currency,
          face_value, coupon_frequency, maturity_date,
          notes, created_at, updated_at
   FROM investments ORDER BY id

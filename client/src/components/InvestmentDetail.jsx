@@ -7,7 +7,7 @@ import { ArrowLeft, Trash2, Plus, X, Settings, Pencil } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
-const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES'];
+const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
 const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
 const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY' };
 
@@ -308,7 +308,7 @@ export default function InvestmentDetail() {
             <Table hover size="sm" className="mb-0 small">
               <thead className="table-light">
                 <tr>
-                  <th className="px-3">Date</th>
+                  <th className="px-3 text-nowrap">Date</th>
                   <th className="px-3">Type</th>
                   {!isPPF && <th className="px-3 text-end">Units</th>}
                   {!isPPF && <th className="px-3 text-end">Price/Unit</th>}
@@ -318,7 +318,7 @@ export default function InvestmentDetail() {
                   {!isPPF && <th className="px-3 text-end">Holding</th>}
                   {!isPPF && data.transactions.some(t => t.folio_number) && <th className="px-3">Folio</th>}
                   {!isNPS && !isPPF && <th className="px-3">Broker</th>}
-                  <th className="px-3" style={isNPS ? {} : { width: 150 }}>Notes</th>
+                  <th className="px-3">Notes</th>
                   <th className="px-3 text-center" style={{ width: 80 }}>Actions</th>
                 </tr>
               </thead>
@@ -346,7 +346,7 @@ export default function InvestmentDetail() {
                   const hasFolio = data.transactions.some(t => t.folio_number);
                   return [...sorted].reverse().map((txn) => (
                   <tr key={txn.id}>
-                    <td className="px-3">{formatDate(txn.transaction_date)}</td>
+                    <td className="px-3 text-nowrap">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3">
                       <span className={`badge rounded-pill badge-${txn.transaction_type.toLowerCase()}`}>
                         {TYPE_LABELS[txn.transaction_type] || txn.transaction_type.replace(/_/g, ' ')}
@@ -360,7 +360,7 @@ export default function InvestmentDetail() {
                     {!isPPF && <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
                     {!isPPF && hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
                     {!isNPS && !isPPF && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.broker || '-'}</td>}
-                    <td className="px-3 text-muted" style={isNPS ? {} : { maxWidth: 150, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
+                    <td className="px-3 text-muted" style={{ maxWidth: 260, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                     <td className="px-3">
                       {EDITABLE_TYPES.includes(txn.transaction_type) && (
                         <div className="d-flex gap-1 row-actions">

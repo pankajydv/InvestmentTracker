@@ -4,7 +4,8 @@
  * Parses NPS transaction statements from Protean CSV files
  * (two column layouts: with/without charges column).
  *
- * Transaction types use standard BUY/SELL/TRANSFER_IN/CHARGES.
+ * Transaction types use standard EMPLOYER_CONTRIBUTION/VOLUNTARY_CONTRIBUTION/
+ * TRANSFER_IN/TRANSFER_OUT/AMC.
  * Employer vs Voluntary distinction is captured in the `broker` field
  * (from the "Uploaded By" column in the Contribution/Redemption section).
  *
@@ -58,12 +59,12 @@ function detectCRA(text) {
 
 /**
  * Classify NPS transaction from its "Particulars" text.
- * Returns: 'BUY' | 'CHARGES' | 'TRANSFER_IN' | 'SKIP' | 'SIGN_DEPENDENT_REBALANCE' | 'SIGN_DEPENDENT_PFM'
+ * Returns: 'EMPLOYER_CONTRIBUTION' | 'VOLUNTARY_CONTRIBUTION' | 'AMC' |
+ * 'TRANSFER_IN' | 'TRANSFER_OUT' | 'SKIP' | 'SIGN_DEPENDENT_REBALANCE' | 'SIGN_DEPENDENT_PFM'
  *
- * Contributions (employer and voluntary) → BUY
- * Billing/charges → CHARGES
- * Rebalancing → depends on sign (positive=BUY, negative=SELL)
- * Migration/PFM change → depends on sign (positive=TRANSFER_IN, negative=SELL)
+ * Contributions (employer and voluntary) keep separate contribution types.
+ * Billing/charges → AMC
+ * Rebalancing and migration/switch entries are sign-dependent transfers.
  */
 function classifyTransaction(particulars) {
   const p = particulars.toLowerCase().trim();
@@ -72,12 +73,12 @@ function classifyTransaction(particulars) {
   // Migration entries are consolidation summaries (e.g. registrar change from Karvy);
   // the underlying individual transactions are what should be imported instead.
   if (p.includes('migration') || p.includes('units credited on account of migration')) return 'SKIP';
-  if (p.includes('billing for')) return 'CHARGES';
+  if (p.includes('billing for')) return 'AMC';
   if (p.includes('rebalancing')) return 'SIGN_DEPENDENT_REBALANCE';
   if (p.includes('pfm change request') || p.includes('inter pfm switch')
       || p.includes('t2 to t1') || p.includes('tier ii to tier i')
       || p.includes('scheme preference change')) return 'SIGN_DEPENDENT_PFM';
-  if (p.includes('persistency switch out')) return 'CHARGES';
+  if (p.includes('persistency switch out')) return 'AMC';
   if (p.includes('one way switch')) return 'SIGN_DEPENDENT_PFM';
   // Contributions: distinguish employer vs voluntary
   if (p.includes('voluntary contribution')) return 'VOLUNTARY_CONTRIBUTION';
@@ -92,10 +93,10 @@ function classifyTransaction(particulars) {
  */
 function resolveType(baseType, amount) {
   if (baseType === 'SIGN_DEPENDENT_REBALANCE') {
-    return amount >= 0 ? 'BUY' : 'SELL';
+    return amount >= 0 ? 'TRANSFER_IN' : 'TRANSFER_OUT';
   }
   if (baseType === 'SIGN_DEPENDENT_PFM') {
-    return amount >= 0 ? 'TRANSFER_IN' : 'SELL';
+    return amount >= 0 ? 'TRANSFER_IN' : 'TRANSFER_OUT';
   }
   return baseType;
 }
