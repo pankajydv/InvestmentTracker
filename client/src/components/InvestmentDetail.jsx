@@ -7,9 +7,70 @@ import { ArrowLeft, Trash2, Plus, X, Settings, Pencil } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
-const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
+const UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
 const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
 const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY' };
+
+const CASH_OUTFLOW_TYPES = new Set([
+  'BUY', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
+]);
+
+const CASH_INFLOW_TYPES = new Set([
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST'
+]);
+
+function xnpv(rate, flows, baseDate) {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return flows.reduce((sum, flow) => {
+    const years = (flow.date - baseDate) / msPerDay / 365;
+    return sum + flow.amount / ((1 + rate) ** years);
+  }, 0);
+}
+
+function calculateXirr(flows) {
+  if (!Array.isArray(flows) || flows.length < 2) return null;
+
+  let hasPositive = false;
+  let hasNegative = false;
+  for (const flow of flows) {
+    if (flow.amount > 0) hasPositive = true;
+    if (flow.amount < 0) hasNegative = true;
+  }
+  if (!hasPositive || !hasNegative) return null;
+
+  const sortedFlows = [...flows].sort((a, b) => a.date - b.date);
+  const baseDate = sortedFlows[0].date;
+
+  let low = -0.9999;
+  let high = 10;
+  let fLow = xnpv(low, sortedFlows, baseDate);
+  let fHigh = xnpv(high, sortedFlows, baseDate);
+
+  // Expand the upper bound if needed to bracket the root.
+  for (let i = 0; i < 25 && fLow * fHigh > 0; i += 1) {
+    high *= 2;
+    fHigh = xnpv(high, sortedFlows, baseDate);
+  }
+
+  if (fLow * fHigh > 0) return null;
+
+  for (let i = 0; i < 100; i += 1) {
+    const mid = (low + high) / 2;
+    const fMid = xnpv(mid, sortedFlows, baseDate);
+
+    if (Math.abs(fMid) < 1e-7) return mid;
+
+    if (fLow * fMid < 0) {
+      high = mid;
+      fHigh = fMid;
+    } else {
+      low = mid;
+      fLow = fMid;
+    }
+  }
+
+  return (low + high) / 2;
+}
 
 export default function InvestmentDetail() {
   const { id } = useParams();
@@ -173,6 +234,41 @@ export default function InvestmentDetail() {
     ? ['BUY', 'SELL', 'INTEREST']
     : ['BUY', 'SELL', 'DIVIDEND'];
 
+  const absoluteReturnPct = data.latestValue?.profit_loss_pct ?? null;
+
+  const xirrCashflows = (data.transactions || []).reduce((acc, txn) => {
+    const txnDate = new Date(txn.transaction_date);
+    if (Number.isNaN(txnDate.getTime())) return acc;
+
+    const amount = Number(txn.amount) || 0;
+    const fees = Number(txn.fees) || 0;
+    let cashflow = 0;
+
+    if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+      cashflow = -(amount + fees);
+    } else if (CASH_INFLOW_TYPES.has(txn.transaction_type)) {
+      cashflow = amount - fees;
+    }
+
+    if (Math.abs(cashflow) > 1e-9) {
+      acc.push({ amount: cashflow, date: txnDate });
+    }
+
+    return acc;
+  }, []);
+
+  const terminalValue = Number(data.latestValue?.current_value) || 0;
+  if (terminalValue > 0 && data.latestValue?.date) {
+    const valuationDate = new Date(data.latestValue.date);
+    if (!Number.isNaN(valuationDate.getTime())) {
+      xirrCashflows.push({ amount: terminalValue, date: valuationDate });
+    }
+  }
+
+  const xirrRate = calculateXirr(xirrCashflows);
+  const xirrPct = xirrRate == null ? null : xirrRate * 100;
+  const cumulativeValue = (Number(data.latestValue?.current_value) || 0) + (Number(data.saleProceeds) || 0);
+
   return (
     <div>
       {/* Header */}
@@ -202,20 +298,27 @@ export default function InvestmentDetail() {
 
       {/* Summary Cards */}
       <Row className="g-3 mb-4">
-        <Col xs={6} md={3}><SummaryCard label="Total Invested" value={formatINR(data.totalInvested)} /></Col>
-        <Col xs={6} md={3}><SummaryCard label="Current Value" value={formatINR(data.latestValue?.current_value)} /></Col>
-        <Col xs={6} md={3}>
+        <Col xs={6} md={4} lg={2}><SummaryCard label="Total Invested" value={formatINR(data.totalInvested)} /></Col>
+        <Col xs={6} md={4} lg={2}><SummaryCard label="Current Value" value={formatINR(data.latestValue?.current_value)} /></Col>
+        <Col xs={6} md={4} lg={2}><SummaryCard label="Cumulative Value" value={formatINR(cumulativeValue)} /></Col>
+        <Col xs={6} md={6} lg={2}>
           <SummaryCard
             label="Profit/Loss"
             value={`${data.latestValue?.profit_loss >= 0 ? '+' : ''}${formatINR(data.latestValue?.profit_loss)}`}
             color={profitColor(data.latestValue?.profit_loss)}
           />
         </Col>
-        <Col xs={6} md={3}>
+        <Col xs={12} md={6} lg={4}>
           <SummaryCard
-            label="Return %"
-            value={formatPct(data.latestValue?.profit_loss_pct)}
-            color={profitColor(data.latestValue?.profit_loss_pct)}
+            label="Returns"
+            value={(
+              <span>
+                <span>Abs: {formatPct(absoluteReturnPct)}</span>
+                <span className="mx-2 text-muted">|</span>
+                <span>XIRR: {xirrPct == null ? 'N/A' : formatPct(xirrPct)}</span>
+              </span>
+            )}
+            color={profitColor(absoluteReturnPct)}
           />
         </Col>
       </Row>

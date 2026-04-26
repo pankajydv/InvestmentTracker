@@ -1,8 +1,8 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { Link, useNavigate, useSearchParams, useLocation } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { Card, Table, Spinner, Form, Modal, Button, Row, Col } from 'react-bootstrap';
-import { getTransactions, getBrokers, getAssetTypes, getTransactionTypes, getInvestmentNames, getPortfolios, updateTransaction, deleteTransaction } from '../services/api';
-import { formatNumber, formatDate, ASSET_TYPE_LABELS } from '../utils/formatters';
+import { getTransactions, getBrokers, getTransactionTypes, getInvestmentNames, getPortfolios, updateTransaction, deleteTransaction } from '../services/api';
+import { formatNumber, formatDate, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const TRANSACTION_TYPES_DEFAULT = [
@@ -14,11 +14,57 @@ const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'T
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
 const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES'];
+const DEBT_LIKE_TYPES = new Set(['PPF', 'SSY', 'PF']);
 
-const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY' };
+const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY', EPS_CONTRIBUTION: 'EPS', PF_CONTRIBUTION: 'CONTRIBUTION' };
 const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
 
 function txnSortKey(t) { return CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1; }
+
+function isDebtLikeAssetType(assetType) {
+  return DEBT_LIKE_TYPES.has(assetType);
+}
+
+function formatYmd(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function getDurationRange(duration) {
+  const today = new Date();
+  const now = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  if (duration === 'ALL' || duration === 'CUSTOM') return { from: '', to: '' };
+
+  if (duration === 'LAST_1_MONTH') {
+    const from = new Date(now);
+    from.setMonth(from.getMonth() - 1);
+    return { from: formatYmd(from), to: formatYmd(now) };
+  }
+
+  if (duration === 'THIS_YEAR') {
+    const from = new Date(now.getFullYear(), 0, 1);
+    return { from: formatYmd(from), to: formatYmd(now) };
+  }
+
+  if (duration === 'LAST_1_YEAR') {
+    const from = new Date(now);
+    from.setFullYear(from.getFullYear() - 1);
+    return { from: formatYmd(from), to: formatYmd(now) };
+  }
+
+  const currentFyStartYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+  if (duration === 'THIS_FINANCIAL_YEAR') {
+    const from = new Date(currentFyStartYear, 3, 1);
+    return { from: formatYmd(from), to: formatYmd(now) };
+  }
+
+  if (duration === 'LAST_FINANCIAL_YEAR') {
+    const from = new Date(currentFyStartYear - 1, 3, 1);
+    const to = new Date(currentFyStartYear, 2, 31);
+    return { from: formatYmd(from), to: formatYmd(to) };
+  }
+
+  return { from: '', to: '' };
+}
 
 function computeHoldingMap(transactions) {
   // Group by investment_id, process oldest-first to build running balance
@@ -62,11 +108,11 @@ const TYPE_BADGE = {
   CHARGES: 'badge-charges',
   EMPLOYER_CONTRIBUTION: 'badge-buy',
   VOLUNTARY_CONTRIBUTION: 'badge-buy',
+  EPS_CONTRIBUTION: 'badge-interest',
+  PF_CONTRIBUTION: 'badge-buy',
 };
 
 export default function Transactions() {
-  const navigate = useNavigate();
-  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const isInitialLoad = useRef(true);
   const { selectedId } = usePortfolio();
@@ -74,7 +120,6 @@ export default function Transactions() {
   const [totalTransactions, setTotalTransactions] = useState(0);
   const [portfolioMeta, setPortfolioMeta] = useState({});
   const [brokers, setBrokers] = useState([]);
-  const [assetTypes, setAssetTypes] = useState([]);
   const [transactionTypes, setTransactionTypes] = useState(TRANSACTION_TYPES_DEFAULT);
   const [investmentNames, setInvestmentNames] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -82,37 +127,31 @@ export default function Transactions() {
     const v = searchParams.get('type');
     return v ? v.split(',') : [];
   });
-  const [filterAssetType, setFilterAssetType] = useState(() => searchParams.get('asset_type') || '');
   const [filterBroker, setFilterBroker] = useState(() => searchParams.get('broker') || '');
   const [filterInvestment, setFilterInvestment] = useState(() => searchParams.get('investment') || '');
+  const [filterDuration, setFilterDuration] = useState(() => {
+    const v = searchParams.get('duration');
+    if (v) return v;
+    return searchParams.get('from') || searchParams.get('to') ? 'CUSTOM' : 'ALL';
+  });
   const [filterStartDate, setFilterStartDate] = useState(() => searchParams.get('from') || '');
   const [filterEndDate, setFilterEndDate] = useState(() => searchParams.get('to') || '');
   const [typeDropdownOpen, setTypeDropdownOpen] = useState(false);
   const typeDropdownRef = useRef(null);
-
-  // Pagination state
-  const [currentPage, setCurrentPage] = useState(() => {
-    const v = parseInt(searchParams.get('page'), 10);
-    return v >= 1 ? v : 1;
-  });
-  const [pageSize, setPageSize] = useState(() => {
-    const v = parseInt(searchParams.get('size'), 10);
-    return [10, 25, 50, 100].includes(v) ? v : 25;
-  });
+  const [pageByType, setPageByType] = useState({});
+  const [pageSizeByType, setPageSizeByType] = useState({});
 
   // Sync filter/pagination state → URL search params
   useEffect(() => {
     const params = new URLSearchParams();
     if (filterType.length) params.set('type', filterType.join(','));
-    if (filterAssetType) params.set('asset_type', filterAssetType);
     if (filterBroker) params.set('broker', filterBroker);
     if (filterInvestment) params.set('investment', filterInvestment);
+    if (filterDuration !== 'ALL') params.set('duration', filterDuration);
     if (filterStartDate) params.set('from', filterStartDate);
     if (filterEndDate) params.set('to', filterEndDate);
-    if (currentPage > 1) params.set('page', String(currentPage));
-    if (pageSize !== 25) params.set('size', String(pageSize));
     setSearchParams(params, { replace: true });
-  }, [filterType, filterAssetType, filterBroker, filterInvestment, filterStartDate, filterEndDate, currentPage, pageSize]);
+  }, [filterType, filterBroker, filterInvestment, filterDuration, filterStartDate, filterEndDate]);
 
   // Save scroll position before unload / navigation
   useEffect(() => {
@@ -208,10 +247,6 @@ export default function Transactions() {
   };
 
   useEffect(() => {
-    getAssetTypes().then(setAssetTypes).catch(() => {});
-  }, []);
-
-  useEffect(() => {
     getPortfolios().then((rows) => {
       const map = {};
       for (const p of rows || []) {
@@ -221,22 +256,24 @@ export default function Transactions() {
     }).catch(() => {});
   }, []);
 
-  // Load brokers based on selected asset type + portfolio
+  // Load brokers based on selected portfolio and active filters
   useEffect(() => {
     const params = {};
     if (selectedId) params.portfolio_id = selectedId;
-    if (filterAssetType) params.asset_type = filterAssetType;
+    if (filterType.length) params.type = filterType.join(',');
+    if (filterInvestment) params.investment_name = filterInvestment;
+    if (filterStartDate) params.from = filterStartDate;
+    if (filterEndDate) params.to = filterEndDate;
     getBrokers(params).then(b => {
       setBrokers(b);
       setFilterBroker(prev => b.includes(prev) ? prev : '');
     }).catch(() => {});
-  }, [selectedId, filterAssetType]);
+  }, [selectedId, filterType, filterInvestment, filterStartDate, filterEndDate]);
 
-  // Load transaction types based on selected asset type + portfolio
+  // Load transaction types based on selected portfolio and active filters
   useEffect(() => {
     const params = {};
     if (selectedId) params.portfolio_id = selectedId;
-    if (filterAssetType) params.asset_type = filterAssetType;
     getTransactionTypes(params).then(types => {
       setTransactionTypes(types.length ? types : TRANSACTION_TYPES_DEFAULT);
       // Clear any selected types that aren't available in the new list
@@ -245,7 +282,7 @@ export default function Transactions() {
         return next.length === prev.length ? prev : next;
       });
     }).catch(() => {});
-  }, [selectedId, filterAssetType]);
+  }, [selectedId]);
 
   // Close type dropdown on outside click
   useEffect(() => {
@@ -261,16 +298,19 @@ export default function Transactions() {
   useEffect(() => {
     const params = {};
     if (selectedId) params.portfolio_id = selectedId;
-    if (filterAssetType) params.asset_type = filterAssetType;
+    if (filterType.length) params.type = filterType.join(',');
+    if (filterBroker) params.broker = filterBroker;
+    if (filterStartDate) params.from = filterStartDate;
+    if (filterEndDate) params.to = filterEndDate;
     getInvestmentNames(params).then(names => {
       setInvestmentNames(names);
       setFilterInvestment(prev => names.includes(prev) ? prev : '');
     }).catch(() => {});
-  }, [selectedId, filterAssetType]);
+  }, [selectedId, filterType, filterBroker, filterStartDate, filterEndDate]);
 
   useEffect(() => {
     loadTransactions();
-  }, [selectedId, filterType, filterAssetType, filterBroker, filterInvestment, filterStartDate, filterEndDate, currentPage, pageSize]);
+  }, [selectedId, filterType, filterBroker, filterInvestment, filterStartDate, filterEndDate]);
 
   const loadTransactions = async () => {
     try {
@@ -278,13 +318,11 @@ export default function Transactions() {
       const params = {};
       if (selectedId) params.portfolio_id = selectedId;
       if (filterType.length) params.type = filterType.join(',');
-      if (filterAssetType) params.asset_type = filterAssetType;
       if (filterBroker) params.broker = filterBroker;
       if (filterInvestment) params.investment_name = filterInvestment;
       if (filterStartDate) params.from = filterStartDate;
       if (filterEndDate) params.to = filterEndDate;
-      params.limit = pageSize;
-      params.offset = (currentPage - 1) * pageSize;
+      params.group_pf = '1';
       const result = await getTransactions(params);
       if (Array.isArray(result)) {
         setTransactions(result);
@@ -300,48 +338,97 @@ export default function Transactions() {
     }
   };
 
-  useEffect(() => {
-    const pages = Math.max(1, Math.ceil(totalTransactions / pageSize));
-    if (currentPage > pages) {
-      setCurrentPage(pages);
-    }
-  }, [totalTransactions, pageSize, currentPage]);
+  const resetPage = () => setPageByType({});
 
-  // Reset to page 1 — call from user-initiated filter changes only
-  const resetPage = () => setCurrentPage(1);
-
-  // Pagination computed values
-  const totalPages = Math.max(1, Math.ceil(totalTransactions / pageSize));
-  const paginatedTransactions = transactions;
-
-  const typeCounts = transactions.reduce((acc, t) => {
-    acc[t.transaction_type] = (acc[t.transaction_type] || 0) + 1;
-    return acc;
-  }, {});
-
-  const isDebtLike = ['PPF', 'SSY', 'PF'].includes(filterAssetType);
   const holdingMap = computeHoldingMap(transactions);
 
   // Compute running balance map for debt-like assets (PPF/SSY/PF)
   const balanceMap = {};
-  if (isDebtLike) {
-    const byInvestment = {};
-    const sorted = [...transactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || a.id - b.id);
-    for (const txn of sorted) {
-      const key = txn.investment_id;
-      if (!(key in byInvestment)) byInvestment[key] = 0;
-      if (['DEPOSIT', 'INTEREST', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'].includes(txn.transaction_type)) {
-        byInvestment[key] += txn.amount || 0;
-      } else if (txn.transaction_type === 'WITHDRAWAL') {
-        byInvestment[key] -= txn.amount || 0;
-      }
-      balanceMap[txn.id] = byInvestment[key];
+  const byInvestment = {};
+  const sorted = [...transactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || a.id - b.id);
+  for (const txn of sorted) {
+    const key = txn.investment_id;
+    if (!(key in byInvestment)) byInvestment[key] = 0;
+    if (txn.transaction_type === 'PF_CONTRIBUTION') {
+      // EPS portion not included — it goes to pension, not the withdrawable PF corpus
+      byInvestment[key] += (txn.employee_amount || 0) + (txn.employer_amount || 0);
+    } else if (['DEPOSIT', 'INTEREST', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'].includes(txn.transaction_type)) {
+      byInvestment[key] += txn.amount || 0;
+    } else if (txn.transaction_type === 'WITHDRAWAL') {
+      byInvestment[key] -= txn.amount || 0;
     }
+    balanceMap[txn.id] = byInvestment[key];
   }
+
+  const groupedTransactions = transactions.reduce((acc, txn) => {
+    const key = txn.asset_type || 'OTHER';
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(txn);
+    return acc;
+  }, {});
+
+  const groupedTotals = transactions.reduce((acc, txn) => {
+    const key = txn.asset_type || 'OTHER';
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+
+  const groupedAssetTypes = Object.keys(groupedTotals).sort((a, b) => {
+    const labelA = ASSET_TYPE_LABELS[a] || a;
+    const labelB = ASSET_TYPE_LABELS[b] || b;
+    return labelA.localeCompare(labelB);
+  });
+
+  const visibleGroupedAssetTypes = Object.keys(groupedTransactions).sort((a, b) => {
+    const labelA = ASSET_TYPE_LABELS[a] || a;
+    const labelB = ASSET_TYPE_LABELS[b] || b;
+    return labelA.localeCompare(labelB);
+  });
+
+  useEffect(() => {
+    // Keep per-type page numbers in valid bounds after filtering/data changes.
+    setPageByType((prev) => {
+      let changed = false;
+      const next = {};
+      for (const type of visibleGroupedAssetTypes) {
+        const size = pageSizeByType[type] || 25;
+        const total = groupedTransactions[type]?.length || 0;
+        const pages = Math.max(1, Math.ceil(total / size));
+        const page = Math.min(prev[type] || 1, pages);
+        next[type] = page;
+        if (page !== (prev[type] || 1)) changed = true;
+      }
+      const prevKeys = Object.keys(prev);
+      if (prevKeys.length !== Object.keys(next).length) changed = true;
+      return changed ? next : prev;
+    });
+  }, [visibleGroupedAssetTypes, groupedTransactions, pageSizeByType]);
+
+  const handleDurationChange = (value) => {
+    setFilterDuration(value);
+    resetPage();
+    if (value === 'CUSTOM') return;
+    const range = getDurationRange(value);
+    setFilterStartDate(range.from);
+    setFilterEndDate(range.to);
+  };
+
+  const jumpToAssetType = (type) => {
+    const el = document.getElementById(`section-txn-${type}`);
+    if (!el) return;
+    const stickyHeader = document.querySelector('[data-txn-sticky-header="1"]');
+    const appNavHeight = 56;
+    const stickyHeight = stickyHeader ? stickyHeader.getBoundingClientRect().height : 120;
+    const stickyOffset = appNavHeight + stickyHeight + 8;
+    const top = el.getBoundingClientRect().top + window.scrollY - stickyOffset;
+    window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+  };
+
+  const isEditingDebtLike = editTxn ? isDebtLikeAssetType(editTxn.asset_type) : false;
 
   return (
     <div className="d-flex flex-column gap-3">
-      <div style={{ position: 'sticky', top: 56, zIndex: 10, backgroundColor: '#f8f9fa', paddingBottom: '0.5rem', marginTop: '-0.5rem', paddingTop: '0.5rem' }}
+      <div data-txn-sticky-header="1" style={{ position: 'sticky', top: 56, zIndex: 10, backgroundColor: '#f8f9fa', paddingBottom: '0.5rem', marginTop: '-0.5rem', paddingTop: '0.5rem' }}
         className="d-flex flex-column gap-3"
       >
       <div className="d-flex align-items-center justify-content-between">
@@ -368,23 +455,6 @@ export default function Transactions() {
 
       {/* Filter bar */}
       <div className="d-flex flex-wrap align-items-center gap-2">
-        {assetTypes.length > 1 && (
-          <div className="d-flex align-items-center gap-2">
-            <label className="small fw-semibold text-muted text-uppercase">Asset Type</label>
-            <Form.Select
-              size="sm"
-              value={filterAssetType}
-              onChange={(e) => { setFilterAssetType(e.target.value); resetPage(); }}
-              style={{ width: 'auto' }}
-            >
-              <option value="">All Asset Types</option>
-              {assetTypes.map((t) => (
-                <option key={t} value={t}>{ASSET_TYPE_LABELS[t] || t}</option>
-              ))}
-            </Form.Select>
-          </div>
-        )}
-
         <div className="d-flex align-items-center gap-2 position-relative" ref={typeDropdownRef}>
           <label className="small fw-semibold text-muted text-uppercase">Type</label>
           <button
@@ -493,30 +563,57 @@ export default function Transactions() {
           </div>
         )}
 
-        <div className="d-flex align-items-center gap-1 flex-nowrap" style={{ whiteSpace: 'nowrap' }}>
-          <label className="small fw-semibold text-muted text-uppercase">Date</label>
-          <Form.Control
-            type="date"
+        <div className="d-flex align-items-center gap-2" style={{ whiteSpace: 'nowrap' }}>
+          <label className="small fw-semibold text-muted text-uppercase">Duration</label>
+          <Form.Select
             size="sm"
-            value={filterStartDate}
-            onChange={(e) => { setFilterStartDate(e.target.value); resetPage(); }}
-            style={{ width: 126 }}
-            placeholder="From"
-          />
-          <span className="text-muted small">to</span>
-          <Form.Control
-            type="date"
-            size="sm"
-            value={filterEndDate}
-            onChange={(e) => { setFilterEndDate(e.target.value); resetPage(); }}
-            style={{ width: 126 }}
-            placeholder="To"
-          />
+            value={filterDuration}
+            onChange={(e) => handleDurationChange(e.target.value)}
+            style={{ width: 180 }}
+          >
+            <option value="ALL">All Time</option>
+            <option value="LAST_1_MONTH">1 Month</option>
+            <option value="LAST_FINANCIAL_YEAR">Last Financial Year</option>
+            <option value="THIS_FINANCIAL_YEAR">This Financial Year</option>
+            <option value="THIS_YEAR">This Year</option>
+            <option value="LAST_1_YEAR">Last 1 Year</option>
+            <option value="CUSTOM">Custom</option>
+          </Form.Select>
+
+          {filterDuration === 'CUSTOM' && (
+            <>
+              <Form.Control
+                type="date"
+                size="sm"
+                value={filterStartDate}
+                onChange={(e) => { setFilterStartDate(e.target.value); resetPage(); }}
+                style={{ width: 126 }}
+                placeholder="From"
+              />
+              <span className="text-muted small">to</span>
+              <Form.Control
+                type="date"
+                size="sm"
+                value={filterEndDate}
+                onChange={(e) => { setFilterEndDate(e.target.value); resetPage(); }}
+                style={{ width: 126 }}
+                placeholder="To"
+              />
+            </>
+          )}
         </div>
 
-        {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment || filterStartDate || filterEndDate) && (
+        {(filterType.length > 0 || filterBroker || filterInvestment || filterDuration !== 'ALL' || filterStartDate || filterEndDate) && (
           <button
-            onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); setFilterStartDate(''); setFilterEndDate(''); resetPage(); }}
+            onClick={() => {
+              setFilterType([]);
+              setFilterBroker('');
+              setFilterInvestment('');
+              setFilterDuration('ALL');
+              setFilterStartDate('');
+              setFilterEndDate('');
+              resetPage();
+            }}
             className="btn btn-link btn-sm text-muted text-decoration-underline p-0"
           >
             Clear filters
@@ -524,18 +621,48 @@ export default function Transactions() {
         )}
       </div>
 
+      {!loading && groupedAssetTypes.length > 1 && (
+        <div className="d-flex align-items-center gap-2 flex-nowrap overflow-auto pb-1">
+          <span className="small fw-semibold text-muted text-uppercase flex-shrink-0">Navigate</span>
+          {groupedAssetTypes.map((type) => (
+            <button
+              key={type}
+              type="button"
+              onClick={() => jumpToAssetType(type)}
+              className="text-decoration-none px-2 py-1 rounded border bg-white small flex-shrink-0"
+              style={{ borderLeft: `4px solid ${ASSET_TYPE_COLORS[type] || '#6c757d'}` }}
+            >
+              <span className="fw-semibold" style={{ color: ASSET_TYPE_COLORS[type] || '#495057' }}>
+                {ASSET_TYPE_LABELS[type] || type}
+              </span>
+              <span className="ms-1 text-muted">{groupedTotals[type] || 0}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
       </div>
 
-      <Card className="shadow-sm">
-        {loading ? (
+      {loading ? (
+        <Card className="shadow-sm">
           <div className="d-flex justify-content-center py-5">
             <Spinner animation="border" variant="primary" />
           </div>
-        ) : totalTransactions === 0 ? (
+        </Card>
+      ) : totalTransactions === 0 ? (
+        <Card className="shadow-sm">
           <div className="p-5 text-center text-muted">
             <p>No transactions found.</p>
-            {(filterType.length > 0 || filterAssetType || filterBroker || filterInvestment || filterStartDate || filterEndDate) ? (
-              <button onClick={() => { setFilterType([]); setFilterAssetType(''); setFilterBroker(''); setFilterInvestment(''); setFilterStartDate(''); setFilterEndDate(''); resetPage(); }}
+            {(filterType.length > 0 || filterBroker || filterInvestment || filterDuration !== 'ALL' || filterStartDate || filterEndDate) ? (
+              <button onClick={() => {
+                setFilterType([]);
+                setFilterBroker('');
+                setFilterInvestment('');
+                setFilterDuration('ALL');
+                setFilterStartDate('');
+                setFilterEndDate('');
+                resetPage();
+              }}
                 className="btn btn-link text-primary mt-2">
                 Clear filters
               </button>
@@ -545,152 +672,195 @@ export default function Transactions() {
               </Link>
             )}
           </div>
-        ) : (
-          <div className="responsive-table">
-            <Table hover size="sm" className="mb-0 small">
-              <thead className="table-light">
-                <tr>
-                  <th className="px-3 py-2">Date</th>
-                  <th className="px-3 py-2">Investment</th>
-                  <th className="px-3 py-2">Type</th>
-                  {!isDebtLike && <th className="px-3 py-2 text-end">Units</th>}
-                  {!isDebtLike && <th className="px-3 py-2 text-end">Price/Unit</th>}
-                  <th className="px-3 py-2 text-end">Amount</th>
-                  {!isDebtLike && <th className="px-3 py-2 text-end">Fees</th>}
-                  {isDebtLike ? <th className="px-3 py-2 text-end">Balance</th> : <th className="px-3 py-2 text-end">Holding</th>}
-                  {!isDebtLike && <th className="px-3 py-2">Broker</th>}
-                  <th className="px-3 py-2">Notes</th>
-                  <th className="px-3 py-2 text-center" style={{ width: 80 }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {paginatedTransactions.map((txn) => (
-                  <tr key={txn.id}>
-                    <td className="px-3 py-2 text-nowrap">{formatDate(txn.transaction_date)}</td>
-                    <td className="px-3 py-2">
-                      <Link to={`/investments/${txn.investment_id}`} state={{ from: 'transactions', transactionsSearch: window.location.search }} className="text-primary fw-medium text-decoration-none">
-                        {txn.investment_name}
-                      </Link>
-                      <div className="d-flex align-items-center gap-2 mt-1">
-                        <span className="text-muted" style={{ fontSize: '0.75rem' }}>{ASSET_TYPE_LABELS[txn.asset_type]}</span>
-                        {!selectedId && txn.portfolio_name && (
-                          <span
-                            title={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
-                            aria-label={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
-                            style={{
-                              width: 10,
-                              height: 10,
-                              borderRadius: '50%',
-                              display: 'inline-block',
-                              backgroundColor: portfolioMeta[txn.portfolio_id]?.color || txn.portfolio_color || '#6c757d',
-                              border: '1px solid rgba(0,0,0,0.15)',
-                              cursor: 'help'
-                            }}
-                          >
-                          </span>
+        </Card>
+      ) : (
+        <>
+          {visibleGroupedAssetTypes.map((type) => {
+            const allTxns = groupedTransactions[type] || [];
+            const isDebtLike = isDebtLikeAssetType(type);
+            const isPf = type === 'PF';
+            const totalForType = groupedTotals[type] || allTxns.length;
+            const sectionPageSize = pageSizeByType[type] || 25;
+            const sectionTotalPages = Math.max(1, Math.ceil(allTxns.length / sectionPageSize));
+            const sectionCurrentPage = Math.min(pageByType[type] || 1, sectionTotalPages);
+            const sectionStart = (sectionCurrentPage - 1) * sectionPageSize;
+            const sectionEnd = sectionStart + sectionPageSize;
+            const txns = allTxns.slice(sectionStart, sectionEnd);
+            return (
+              <Card key={type} id={`section-txn-${type}`} className="shadow-sm">
+                <Card.Header className="bg-white d-flex justify-content-between align-items-center">
+                  <h2 className="h6 fw-semibold mb-0">{ASSET_TYPE_LABELS[type] || type}</h2>
+                  <span className="small text-muted">
+                    {txns.length}
+                    {totalForType !== txns.length ? ` / ${totalForType}` : ''}
+                    {' '}transaction{totalForType !== 1 ? 's' : ''}
+                  </span>
+                </Card.Header>
+                <div className="responsive-table">
+                  <Table hover size="sm" className="mb-0 small">
+                    <thead className="table-light">
+                      <tr>
+                        <th className="px-3 py-2">Date</th>
+                        <th className="px-3 py-2">Investment</th>
+                        <th className="px-3 py-2">Type</th>
+                        {!isDebtLike && <th className="px-3 py-2 text-end">Units</th>}
+                        {!isDebtLike && <th className="px-3 py-2 text-end">Price/Unit</th>}
+                        {isPf ? (
+                          <><th className="px-3 py-2 text-end">Employee</th><th className="px-3 py-2 text-end">Employer</th><th className="px-3 py-2 text-end">EPS</th><th className="px-3 py-2 text-end">Total</th></>
+                        ) : (
+                          <th className="px-3 py-2 text-end">Amount</th>
                         )}
-                      </div>
-                    </td>
-                    <td className="px-3 py-2">
-                      <span className={`badge ${TYPE_BADGE[txn.transaction_type] || 'bg-secondary text-white'}`}>
-                        {TYPE_LABELS[txn.transaction_type] || txn.transaction_type.replace(/_/g, ' ')}
-                      </span>
-                    </td>
-                    {!isDebtLike && <td className="px-3 py-2 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>}
-                    {!isDebtLike && <td className="px-3 py-2 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>}
-                    <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
-                    {!isDebtLike && <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
-                    {isDebtLike
-                      ? <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>
-                      : <td className="px-3 py-2 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
-                    {!isDebtLike && <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>}
-                    <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }} title={txn.notes || ''}>{txn.notes || '-'}</td>
-                    <td className="px-3 py-2 text-center">
-                      {EDITABLE_TYPES.includes(txn.transaction_type) && (
-                        <div className="d-flex justify-content-center gap-1 row-actions">
-                          <button
-                            className="btn btn-link btn-sm p-0 text-primary"
-                            title="Edit"
-                            onClick={() => handleEdit(txn)}
-                          >
-                            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                            </svg>
-                          </button>
-                          <button
-                            className="btn btn-link btn-sm p-0 text-danger"
-                            title="Delete"
-                            onClick={() => { setDeleteConfirm(txn); setDeleteText(''); }}
-                          >
-                            <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                            </svg>
-                          </button>
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </Table>
-          </div>
-        )}
-        {/* Pagination controls */}
-        {totalTransactions > 0 && (
-          <div className="d-flex align-items-center justify-content-between px-3 py-2 border-top small">
-            <div className="d-flex align-items-center gap-2">
-              <span className="text-muted">Rows per page:</span>
-              <Form.Select
-                size="sm"
-                value={pageSize}
-                onChange={(e) => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
-                style={{ width: 'auto' }}
-              >
-                {[10, 25, 50, 100].map(n => (
-                  <option key={n} value={n}>{n}</option>
-                ))}
-              </Form.Select>
-            </div>
-            <div className="d-flex align-items-center gap-2">
-              <span className="text-muted">
-                {(currentPage - 1) * pageSize + 1}–{Math.min(currentPage * pageSize, totalTransactions)} of {totalTransactions}
-              </span>
-              <Button
-                variant="outline-secondary"
-                size="sm"
-                disabled={currentPage <= 1}
-                onClick={() => setCurrentPage(p => p - 1)}
-              >
-                ‹ Prev
-              </Button>
-              <span className="d-flex align-items-center gap-1 text-muted">
-                Page
-                <Form.Control
-                  type="number"
-                  size="sm"
-                  min={1}
-                  max={totalPages}
-                  value={currentPage}
-                  onChange={(e) => {
-                    const val = parseInt(e.target.value, 10);
-                    if (val >= 1 && val <= totalPages) setCurrentPage(val);
-                  }}
-                  style={{ width: 54, textAlign: 'center' }}
-                />
-                of {totalPages}
-              </span>
-              <Button
-                variant="outline-secondary"
-                size="sm"
-                disabled={currentPage >= totalPages}
-                onClick={() => setCurrentPage(p => p + 1)}
-              >
-                Next ›
-              </Button>
-            </div>
-          </div>
-        )}
-      </Card>
+                        {!isDebtLike && <th className="px-3 py-2 text-end">Fees</th>}
+                        {isDebtLike ? <th className="px-3 py-2 text-end">Balance</th> : <th className="px-3 py-2 text-end">Holding</th>}
+                        {!isDebtLike && <th className="px-3 py-2">Broker</th>}
+                        <th className="px-3 py-2">Notes</th>
+                        <th className="px-3 py-2 text-center" style={{ width: 80 }}>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {txns.map((txn) => (
+                        <tr key={txn.id}>
+                          <td className="px-3 py-2 text-nowrap">{formatDate(txn.transaction_date)}</td>
+                          <td className="px-3 py-2">
+                            <div className="d-flex align-items-center gap-2">
+                              <Link to={`/investments/${txn.investment_id}`} state={{ from: 'transactions', transactionsSearch: window.location.search }} className="text-primary fw-medium text-decoration-none">
+                                {txn.investment_name}
+                              </Link>
+                              {!selectedId && txn.portfolio_name && (
+                                <span
+                                  title={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
+                                  aria-label={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
+                                  style={{
+                                    width: 10,
+                                    height: 10,
+                                    borderRadius: '50%',
+                                    display: 'inline-block',
+                                    backgroundColor: portfolioMeta[txn.portfolio_id]?.color || txn.portfolio_color || '#6c757d',
+                                    border: '1px solid rgba(0,0,0,0.15)',
+                                    cursor: 'help',
+                                    flexShrink: 0
+                                  }}
+                                >
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2">
+                            <span className={`badge ${TYPE_BADGE[txn.transaction_type] || 'bg-secondary text-white'}`}>
+                              {TYPE_LABELS[txn.transaction_type] || txn.transaction_type.replace(/_/g, ' ')}
+                            </span>
+                          </td>
+                          {!isDebtLike && <td className="px-3 py-2 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>}
+                          {!isDebtLike && <td className="px-3 py-2 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>}
+                          {isPf ? (
+                            <>
+                              <td className="px-3 py-2 text-end">{txn.employee_amount != null ? `₹${formatNumber(txn.employee_amount, 2)}` : '-'}</td>
+                              <td className="px-3 py-2 text-end">{txn.employer_amount != null ? `₹${formatNumber(txn.employer_amount, 2)}` : '-'}</td>
+                              <td className="px-3 py-2 text-end text-muted">{txn.eps_amount > 0 ? `₹${formatNumber(txn.eps_amount, 2)}` : '-'}</td>
+                              <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
+                            </>
+                          ) : (
+                            <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
+                          )}
+                          {!isDebtLike && <td className="px-3 py-2 text-end text-muted">{txn.fees ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
+                          {isDebtLike
+                            ? <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>
+                            : <td className="px-3 py-2 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
+                          {!isDebtLike && <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>}
+                          <td className="px-3 py-2 text-muted text-truncate" style={{ maxWidth: 150 }} title={txn.notes || ''}>{txn.notes || '-'}</td>
+                          <td className="px-3 py-2 text-center">
+                            {EDITABLE_TYPES.includes(txn.transaction_type) && (
+                              <div className="d-flex justify-content-center gap-1 row-actions">
+                                <button
+                                  className="btn btn-link btn-sm p-0 text-primary"
+                                  title="Edit"
+                                  onClick={() => handleEdit(txn)}
+                                >
+                                  <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                                  </svg>
+                                </button>
+                                <button
+                                  className="btn btn-link btn-sm p-0 text-danger"
+                                  title="Delete"
+                                  onClick={() => { setDeleteConfirm(txn); setDeleteText(''); }}
+                                >
+                                  <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                  </svg>
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </Table>
+                </div>
+                <div className="d-flex align-items-center justify-content-between px-3 py-2 border-top small">
+                  <div className="d-flex align-items-center gap-2">
+                    <span className="text-muted">Rows per page:</span>
+                    <Form.Select
+                      size="sm"
+                      value={sectionPageSize}
+                      onChange={(e) => {
+                        const nextSize = Number(e.target.value);
+                        setPageSizeByType((prev) => ({ ...prev, [type]: nextSize }));
+                        setPageByType((prev) => ({ ...prev, [type]: 1 }));
+                      }}
+                      style={{ width: 'auto' }}
+                    >
+                      {[10, 25, 50, 100].map(n => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </Form.Select>
+                  </div>
+                  <div className="d-flex align-items-center gap-2">
+                    <span className="text-muted">
+                      {sectionStart + 1}–{Math.min(sectionEnd, totalForType)} of {totalForType}
+                    </span>
+                    <Button
+                      variant="outline-secondary"
+                      size="sm"
+                      disabled={sectionCurrentPage <= 1}
+                      onClick={() => setPageByType((prev) => ({ ...prev, [type]: Math.max(1, (prev[type] || 1) - 1) }))}
+                    >
+                      ‹ Prev
+                    </Button>
+                    <span className="d-flex align-items-center gap-1 text-muted">
+                      Page
+                      <Form.Control
+                        type="number"
+                        size="sm"
+                        min={1}
+                        max={sectionTotalPages}
+                        value={sectionCurrentPage}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value, 10);
+                          if (val >= 1 && val <= sectionTotalPages) {
+                            setPageByType((prev) => ({ ...prev, [type]: val }));
+                          }
+                        }}
+                        style={{ width: 54, textAlign: 'center' }}
+                      />
+                      of {sectionTotalPages}
+                    </span>
+                    <Button
+                      variant="outline-secondary"
+                      size="sm"
+                      disabled={sectionCurrentPage >= sectionTotalPages}
+                      onClick={() => setPageByType((prev) => ({ ...prev, [type]: Math.min(sectionTotalPages, (prev[type] || 1) + 1) }))}
+                    >
+                      Next ›
+                    </Button>
+                  </div>
+                </div>
+              </Card>
+            );
+          })}
+        </>
+      )}
+
 
       {/* Edit Modal */}
       <Modal show={!!editTxn} onHide={() => setEditTxn(null)} centered size="lg">
@@ -703,7 +873,7 @@ export default function Transactions() {
           {editTxn && (
             <div className="d-flex flex-column gap-3">
               <Row className="g-3">
-                {!isDebtLike && <Col sm={6}>
+                {!isEditingDebtLike && <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Folio</Form.Label>
                     <Form.Control
@@ -726,7 +896,7 @@ export default function Transactions() {
                   </Form.Group>
                 </Col>
               </Row>
-              {editTxn.transaction_type !== 'AMC' && !isDebtLike && (
+              {editTxn.transaction_type !== 'AMC' && !isEditingDebtLike && (
                 <Row className="g-3">
                   <Col sm={6}>
                     <Form.Group>
@@ -767,7 +937,7 @@ export default function Transactions() {
                     />
                   </Form.Group>
                 </Col>
-                {!isDebtLike && <Col sm={6}>
+                {!isEditingDebtLike && <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Charges</Form.Label>
                     <Form.Control
@@ -780,7 +950,7 @@ export default function Transactions() {
                   </Form.Group>
                 </Col>}
               </Row>
-              {!isDebtLike && <Row className="g-3">
+              {!isEditingDebtLike && <Row className="g-3">
                 <Col sm={6}>
                   <Form.Group>
                     <Form.Label className="small fw-semibold">Broker</Form.Label>

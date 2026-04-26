@@ -822,6 +822,134 @@ function initializeDb(db) {
   } else if (!hasMigrationRecord(db, '20260412-add-portfolio-daily-day-change') && pdCols.includes('day_change')) {
     recordMigration(db, '20260412-add-portfolio-daily-day-change', 'skipped', 'already present');
   }
+
+  // ── Migration: add EPS_CONTRIBUTION transaction_type + merge EPS investments ──────
+    // EPS (Employee Pension Scheme) contributions are always tied to a PF account, not a
+    // separate investment. This migration:
+    //   1. Adds EPS_CONTRIBUTION to the transactions CHECK constraint.
+    //   2. For every PF investment whose name contains "EPS", locates the paired non-EPS
+    //      PF investment in the same portfolio, moves all EMPLOYER_CONTRIBUTION rows to it
+    //      with type EPS_CONTRIBUTION, then marks the EPS investment as inactive.
+    const hasEPSContributionType = (() => {
+      const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'").get();
+      return row && row.sql && row.sql.includes("'EPS_CONTRIBUTION'");
+    })();
+    const epsMigrationId = '20260413-add-eps-contribution-type';
+
+    if (!hasEPSContributionType && !hasMigrationRecord(db, epsMigrationId)) {
+      if (!migrationsEnabled) {
+        throw new Error(`Pending migration ${epsMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+      }
+
+      console.log('Migrating: adding EPS_CONTRIBUTION transaction_type and merging EPS investments...');
+      const beforeTransactions = getTableCount(db, 'transactions');
+      const backupPath = createPreMigrationBackup(db, 'add-eps-contribution-type');
+      if (backupPath) console.log(`Created migration backup: ${backupPath}`);
+
+      db.exec('PRAGMA foreign_keys = OFF');
+      db.exec('BEGIN');
+      try {
+        // Step 1: recreate transactions with EPS_CONTRIBUTION in CHECK
+        db.exec(`
+          CREATE TABLE transactions_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            investment_id INTEGER NOT NULL,
+            portfolio_id INTEGER NOT NULL,
+            transaction_type TEXT NOT NULL CHECK(transaction_type IN (
+              'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST',
+              'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
+              'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
+              'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
+              'REDEMPTION', 'EPS_CONTRIBUTION'
+            )),
+            transaction_date TEXT NOT NULL,
+            units REAL,
+            price_per_unit REAL,
+            amount REAL NOT NULL,
+            fees REAL DEFAULT 0,
+            broker TEXT,
+            notes TEXT,
+            locked INTEGER DEFAULT 0,
+            folio_number TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+          )
+        `);
+        db.exec(`INSERT INTO transactions_new
+          SELECT id, investment_id, portfolio_id, transaction_type, transaction_date,
+                 units, price_per_unit, amount, fees, broker, notes,
+                 locked, folio_number, created_at
+          FROM transactions`);
+
+        const copiedTransactions = getTableCount(db, 'transactions_new');
+        ensureRowCountPreserved({ before: beforeTransactions, after: copiedTransactions, table: 'transactions', migrationName: 'add-eps-contribution-type' });
+
+        db.exec('DROP TABLE transactions');
+        db.exec('ALTER TABLE transactions_new RENAME TO transactions');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)');
+        db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id)');
+
+        // Step 2: for each EPS investment, find its paired PF and migrate transactions
+      // To find the paired PF, we look at transactions to get portfolio_id (not stored on investments)
+      const epsInvestments = db.prepare(`
+        SELECT DISTINCT i.id, i.name, i.display_name
+        FROM investments i
+        WHERE i.asset_type = 'PF'
+          AND (i.name LIKE '%EPS%' OR COALESCE(i.display_name, '') LIKE '%EPS%')
+      `).all();
+
+      const findPortfolioForInvestment = db.prepare(`
+        SELECT DISTINCT t.portfolio_id FROM transactions t
+        WHERE t.investment_id = ? LIMIT 1
+      `);
+      const findPairedPF = db.prepare(`
+        SELECT DISTINCT i.id FROM investments i
+        INNER JOIN transactions t ON t.investment_id = i.id
+        WHERE i.asset_type = 'PF' AND i.id != ?
+          AND t.portfolio_id = ?
+          AND i.name NOT LIKE '%EPS%'
+          AND COALESCE(i.display_name, '') NOT LIKE '%EPS%'
+        LIMIT 1
+      `);
+      const moveTxns = db.prepare(`
+        UPDATE transactions
+        SET investment_id = ?, transaction_type = 'EPS_CONTRIBUTION'
+        WHERE investment_id = ? AND transaction_type = 'EMPLOYER_CONTRIBUTION'
+      `);
+      const markInactive = db.prepare('UPDATE investments SET is_active = 0 WHERE id = ?');
+
+      let totalMoved = 0;
+      for (const eps of epsInvestments) {
+        const portRow = findPortfolioForInvestment.get(eps.id);
+        if (!portRow) {
+          console.log(`EPS migration: investment ${eps.id} (${eps.name || eps.display_name}) has no transactions, skipping`);
+          continue;
+        }
+        const paired = findPairedPF.get(eps.id, portRow.portfolio_id);
+        if (!paired) {
+          console.log(`EPS migration: no paired PF found for investment ${eps.id} in portfolio ${portRow.portfolio_id}, skipping`);
+          }
+          const { changes } = moveTxns.run(paired.id, eps.id);
+          totalMoved += changes;
+          markInactive.run(eps.id);
+          console.log(`EPS migration: moved ${changes} EPS_CONTRIBUTION rows from investment ${eps.id} → ${paired.id}`);
+        }
+
+        db.exec('COMMIT');
+        assertDbIntegrity(db, epsMigrationId);
+        recordMigration(db, epsMigrationId, 'applied', `Migrated ${totalMoved} EPS transactions`);
+        console.log(`Migration complete: EPS_CONTRIBUTION added, ${totalMoved} transactions merged.`);
+      } catch (err) {
+        db.exec('ROLLBACK');
+        console.error('EPS migration failed:', err);
+        throw err;
+      } finally {
+        db.exec('PRAGMA foreign_keys = ON');
+      }
+    } else if (!hasMigrationRecord(db, epsMigrationId) && hasEPSContributionType) {
+      recordMigration(db, epsMigrationId, 'skipped', 'EPS_CONTRIBUTION already present');
+  }
 }
 
 /**

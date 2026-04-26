@@ -1,8 +1,84 @@
 const express = require('express');
 const router = express.Router();
 
+// PF transaction types that get merged into a single contribution row per date
+const PF_GROUPABLE_TYPES = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'EPS_CONTRIBUTION']);
+
+/**
+ * For PF asset type transactions, group DEPOSIT / EMPLOYER_CONTRIBUTION /
+ * VOLUNTARY_CONTRIBUTION / EPS_CONTRIBUTION entries that share the same
+ * investment_id + date into a single synthetic PF_CONTRIBUTION row.
+ * Non-groupable types (INTEREST, WITHDRAWAL, etc.) pass through unchanged.
+ */
+function groupPfTransactions(rows) {
+  const keyFor = (r) => `${r.portfolio_id || ''}|${r.investment_id}|${r.transaction_date}`;
+  const isGroupable = (r) => r.asset_type === 'PF' && PF_GROUPABLE_TYPES.has(r.transaction_type);
+
+  const groupedBuckets = new Map();
+  for (const row of rows) {
+    if (!isGroupable(row)) continue;
+    const key = keyFor(row);
+    if (!groupedBuckets.has(key)) groupedBuckets.set(key, []);
+    groupedBuckets.get(key).push(row);
+  }
+
+  const emitted = new Set();
+  const transformed = [];
+
+  for (const row of rows) {
+    if (!isGroupable(row)) {
+      transformed.push(row);
+      continue;
+    }
+    const key = keyFor(row);
+    if (emitted.has(key)) continue;
+    emitted.add(key);
+
+    const bucket = groupedBuckets.get(key) || [row];
+
+    // Single rows pass through unchanged
+    if (bucket.length === 1) {
+      transformed.push(bucket[0]);
+      continue;
+    }
+
+    let employeeAmount = 0;
+    let employerAmount = 0;
+    let epsAmount = 0;
+    const notes = [];
+    const seenNotes = new Set();
+    let base = bucket[0];
+
+    for (const b of bucket) {
+      if (b.id > base.id) base = b;
+      if (b.transaction_type === 'EMPLOYER_CONTRIBUTION') {
+        employerAmount += Number(b.amount || 0);
+      } else if (b.transaction_type === 'EPS_CONTRIBUTION') {
+        epsAmount += Number(b.amount || 0);
+      } else {
+        // DEPOSIT or VOLUNTARY_CONTRIBUTION -> employee side
+        employeeAmount += Number(b.amount || 0);
+      }
+      const note = (b.notes || '').trim();
+      if (note && !seenNotes.has(note)) { seenNotes.add(note); notes.push(note); }
+    }
+
+    transformed.push({
+      ...base,
+      transaction_type: 'PF_CONTRIBUTION',
+      amount: employeeAmount + employerAmount + epsAmount,
+      employee_amount: employeeAmount,
+      employer_amount: employerAmount,
+      eps_amount: epsAmount,
+      notes: notes.join(' | ') || null,
+      is_pf_grouped: 1,
+    });
+  }
+  return transformed;
+}
+
 module.exports = function (db) {
-  // ─── Add transaction ──────────────────────────────────────────────────
+  // --- Add transaction ---
   router.post('/', (req, res) => {
     const {
       investment_id, transaction_type, transaction_date,
@@ -26,7 +102,7 @@ module.exports = function (db) {
     res.status(201).json(txn);
   });
 
-  // ─── Get transactions for an investment ───────────────────────────────
+  // --- Get transactions for an investment ---
   router.get('/investment/:investmentId', (req, res) => {
     const txns = db.prepare(
       'SELECT * FROM transactions WHERE investment_id = ? ORDER BY transaction_date DESC, id DESC'
@@ -34,8 +110,7 @@ module.exports = function (db) {
     res.json(txns);
   });
 
-  // ─── Get all transactions ─────────────────────────────────────────────
-  // ─── Get distinct asset types that have transactions ──────────────────
+  // --- Get distinct asset types that have transactions ---
   router.get('/asset-types', (req, res) => {
     const types = db.prepare(
       `SELECT DISTINCT i.asset_type FROM investments i
@@ -45,60 +120,42 @@ module.exports = function (db) {
     res.json(types);
   });
 
-  // ─── Get distinct transaction types (optionally filtered by asset type / portfolio) ───
+  // --- Get distinct transaction types ---
   router.get('/transaction-types', (req, res) => {
     const { asset_type, portfolio_id } = req.query;
     let sql = `SELECT DISTINCT t.transaction_type FROM transactions t
        JOIN investments i ON t.investment_id = i.id WHERE 1=1`;
     const params = [];
-    if (asset_type) {
-      sql += ` AND i.asset_type = ?`;
-      params.push(asset_type);
-    }
-    if (portfolio_id) {
-      sql += ` AND t.portfolio_id = ?`;
-      params.push(portfolio_id);
-    }
-    sql += ` ORDER BY t.transaction_type`;
+    if (asset_type) { sql += ' AND i.asset_type = ?'; params.push(asset_type); }
+    if (portfolio_id) { sql += ' AND t.portfolio_id = ?'; params.push(portfolio_id); }
+    sql += ' ORDER BY t.transaction_type';
     const types = db.prepare(sql).all(...params).map(r => r.transaction_type);
     res.json(types);
   });
 
-  // ─── Get distinct brokers ─────────────────────────────────────────────
+  // --- Get distinct brokers ---
   router.get('/brokers', (req, res) => {
     const { asset_type, portfolio_id } = req.query;
     let sql = `SELECT DISTINCT t.broker FROM transactions t
        INNER JOIN investments i ON t.investment_id = i.id
        WHERE t.broker IS NOT NULL AND t.broker != ''`;
     const params = [];
-    if (asset_type) {
-      sql += ` AND i.asset_type = ?`;
-      params.push(asset_type);
-    }
-    if (portfolio_id) {
-      sql += ` AND t.portfolio_id = ?`;
-      params.push(portfolio_id);
-    }
-    sql += ` ORDER BY t.broker`;
+    if (asset_type) { sql += ' AND i.asset_type = ?'; params.push(asset_type); }
+    if (portfolio_id) { sql += ' AND t.portfolio_id = ?'; params.push(portfolio_id); }
+    sql += ' ORDER BY t.broker';
     const brokers = db.prepare(sql).all(...params).map(r => r.broker);
     res.json(brokers);
   });
 
-  // ─── Get investment names that have transactions ──────────────────────
+  // --- Get investment names that have transactions ---
   router.get('/investment-names', (req, res) => {
     const { portfolio_id, asset_type } = req.query;
     let sql = `SELECT DISTINCT COALESCE(i.display_name, i.name) as name FROM investments i
        INNER JOIN transactions t ON t.investment_id = i.id WHERE 1=1`;
     const params = [];
-    if (portfolio_id) {
-      sql += ` AND t.portfolio_id = ?`;
-      params.push(portfolio_id);
-    }
-    if (asset_type) {
-      sql += ` AND i.asset_type = ?`;
-      params.push(asset_type);
-    }
-    sql += ` ORDER BY name`;
+    if (portfolio_id) { sql += ' AND t.portfolio_id = ?'; params.push(portfolio_id); }
+    if (asset_type) { sql += ' AND i.asset_type = ?'; params.push(asset_type); }
+    sql += ' ORDER BY name';
     const names = db.prepare(sql).all(...params).map(r => r.name);
     res.json(names);
   });
@@ -151,7 +208,6 @@ module.exports = function (db) {
     const hasLimit = Number.isFinite(parsedLimit) && parsedLimit > 0;
     const hasOffset = Number.isFinite(parsedOffset) && parsedOffset >= 0;
 
-    // Optional server-side pagination controls.
     let safeLimit = null;
     let safeOffset = 0;
     if (hasLimit) {
@@ -165,11 +221,14 @@ module.exports = function (db) {
       }
     }
 
-    const items = db.prepare(dataQuery).all(...dataParams);
-    res.json({ items, total, limit: safeLimit, offset: safeOffset });
+    const rawItems = db.prepare(dataQuery).all(...dataParams);
+    const shouldGroupPf = req.query.group_pf === '1' || req.query.group_pf === 'true';
+    const items = shouldGroupPf ? groupPfTransactions(rawItems) : rawItems;
+    const effectiveTotal = (shouldGroupPf && !hasLimit) ? items.length : total;
+    res.json({ items, total: effectiveTotal, limit: safeLimit, offset: safeOffset });
   });
 
-  // ─── Update transaction ───────────────────────────────────────────────
+  // --- Update transaction ---
   router.put('/:id', (req, res) => {
     const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Transaction not found' });
@@ -195,7 +254,7 @@ module.exports = function (db) {
     res.json(txn);
   });
 
-  // ─── Delete transaction ───────────────────────────────────────────────
+  // --- Delete transaction ---
   router.delete('/:id', (req, res) => {
     db.prepare('DELETE FROM transactions WHERE id = ?').run(req.params.id);
     res.json({ success: true });

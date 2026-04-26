@@ -2,6 +2,66 @@ const express = require('express');
 const router = express.Router();
 const { INTEREST_RATES, DATASET_VERSION } = require('../data/interest-rates');
 
+const CASH_OUTFLOW_TYPES = new Set([
+  'BUY', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
+]);
+
+const CASH_INFLOW_TYPES = new Set([
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST'
+]);
+
+function xnpv(rate, flows, baseDate) {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return flows.reduce((sum, flow) => {
+    const years = (flow.date - baseDate) / msPerDay / 365;
+    return sum + flow.amount / ((1 + rate) ** years);
+  }, 0);
+}
+
+function calculateXirr(flows) {
+  if (!Array.isArray(flows) || flows.length < 2) return null;
+
+  let hasPositive = false;
+  let hasNegative = false;
+  for (const flow of flows) {
+    if (flow.amount > 0) hasPositive = true;
+    if (flow.amount < 0) hasNegative = true;
+  }
+  if (!hasPositive || !hasNegative) return null;
+
+  const sortedFlows = [...flows].sort((a, b) => a.date - b.date);
+  const baseDate = sortedFlows[0].date;
+
+  let low = -0.9999;
+  let high = 10;
+  let fLow = xnpv(low, sortedFlows, baseDate);
+  let fHigh = xnpv(high, sortedFlows, baseDate);
+
+  for (let i = 0; i < 25 && fLow * fHigh > 0; i += 1) {
+    high *= 2;
+    fHigh = xnpv(high, sortedFlows, baseDate);
+  }
+
+  if (fLow * fHigh > 0) return null;
+
+  for (let i = 0; i < 100; i += 1) {
+    const mid = (low + high) / 2;
+    const fMid = xnpv(mid, sortedFlows, baseDate);
+
+    if (Math.abs(fMid) < 1e-7) return mid;
+
+    if (fLow * fMid < 0) {
+      high = mid;
+      fHigh = fMid;
+    } else {
+      low = mid;
+      fLow = fMid;
+    }
+  }
+
+  return (low + high) / 2;
+}
+
 /**
  * Get the effective interest rate for a given asset type and date.
  * Returns the rate that was active on the given date, or the latest rate if date is after all rates.
@@ -56,7 +116,7 @@ module.exports = function (db) {
         COALESCE((
           SELECT SUM(CASE
             WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SWITCH_IN','SPLIT','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION') THEN COALESCE(t2.units, 0)
-            WHEN t2.transaction_type IN ('SELL','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(t2.units, 0)
+            WHEN t2.transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(t2.units, 0)
             ELSE 0 END)
           FROM transactions t2 WHERE t2.investment_id = i.id${portfolioTxnFilter}
         ), 0) > 0.001
@@ -66,7 +126,69 @@ module.exports = function (db) {
 
     query += ' ORDER BY i.asset_type, COALESCE(i.display_name, i.name)';
     const investments = db.prepare(query).all(...params);
-    res.json(investments);
+
+    const portfolioIdNum = portfolio_id ? parseInt(portfolio_id, 10) : null;
+
+    const latestValueByPortfolioStmt = db.prepare('SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1');
+    const latestValueGlobalStmt = db.prepare('SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1');
+
+    const txnsByPortfolioStmt = db.prepare('SELECT transaction_type, transaction_date, amount, fees FROM transactions WHERE investment_id = ? AND portfolio_id = ?');
+    const txnsGlobalStmt = db.prepare('SELECT transaction_type, transaction_date, amount, fees FROM transactions WHERE investment_id = ? AND portfolio_id IS NULL');
+
+    const enriched = investments.map((inv) => {
+      let latestValue;
+      if (portfolioIdNum) {
+        latestValue = latestValueByPortfolioStmt.get(inv.id, portfolioIdNum) || latestValueGlobalStmt.get(inv.id);
+      } else {
+        latestValue = latestValueGlobalStmt.get(inv.id);
+      }
+
+      let txns;
+      if (portfolioIdNum) {
+        txns = txnsByPortfolioStmt.all(inv.id, portfolioIdNum);
+        if (txns.length === 0) txns = txnsGlobalStmt.all(inv.id);
+      } else {
+        txns = txnsGlobalStmt.all(inv.id);
+      }
+      const xirrCashflows = [];
+
+      for (const txn of txns) {
+        const txnDate = new Date(txn.transaction_date);
+        if (Number.isNaN(txnDate.getTime())) continue;
+
+        const amount = Number(txn.amount) || 0;
+        const fees = Number(txn.fees) || 0;
+        let cashflow = 0;
+
+        if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+          cashflow = -(amount + fees);
+        } else if (CASH_INFLOW_TYPES.has(txn.transaction_type)) {
+          cashflow = amount - fees;
+        }
+
+        if (Math.abs(cashflow) > 1e-9) {
+          xirrCashflows.push({ amount: cashflow, date: txnDate });
+        }
+      }
+
+      const terminalValue = Number(latestValue?.current_value) || 0;
+      if (terminalValue > 0 && latestValue?.date) {
+        const valuationDate = new Date(latestValue.date);
+        if (!Number.isNaN(valuationDate.getTime())) {
+          xirrCashflows.push({ amount: terminalValue, date: valuationDate });
+        }
+      }
+
+      const xirrRate = calculateXirr(xirrCashflows);
+
+      return {
+        ...inv,
+        absolute_return_pct: latestValue?.profit_loss_pct ?? null,
+        xirr_pct: xirrRate == null ? null : xirrRate * 100,
+      };
+    });
+
+    res.json(enriched);
   });
 
   // ─── Get single investment with details ───────────────────────────────
@@ -97,9 +219,9 @@ module.exports = function (db) {
 
     const totals = db.prepare(`
       SELECT
-        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
+        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
         COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN amount + COALESCE(fees, 0) ELSE 0 END), 0) as total_invested,
-        COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'WITHDRAWAL') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
+        COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
       FROM transactions WHERE investment_id = ?${portfolioFilter}
     `).get(inv.id, ...portfolioParams);
 

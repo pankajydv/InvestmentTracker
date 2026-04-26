@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Row, Col, Card, Spinner, Form, Button } from 'react-bootstrap';
 import { getInvestments } from '../services/api';
-import { formatINR, ASSET_TYPE_LABELS } from '../utils/formatters';
+import { formatINR, formatPct, ASSET_TYPE_LABELS } from '../utils/formatters';
 import { PlusCircle, Filter, EyeOff, Eye, RefreshCw, Percent } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
@@ -97,19 +97,19 @@ export default function Investments() {
           {investments.map((inv) => (
             <Col key={inv.id} md={6} lg={4}>
               <Card as={Link} to={`/investments/${inv.id}`} state={{ investmentsSearch: searchParams.toString() }} className="shadow-sm h-100 text-decoration-none" style={{ transition: 'box-shadow 0.2s' }}>
-                <Card.Body>
-                  <div className="d-flex justify-content-between align-items-start mb-2">
+                <Card.Body className="p-3">
+                  <div className="d-flex justify-content-between align-items-start mb-1">
                     <div>
-                      <h6 className="fw-semibold mb-1">{inv.display_name || inv.name}</h6>
+                      <h6 className="fw-semibold mb-1 text-truncate" style={{ maxWidth: '24rem' }}>{inv.display_name || inv.name}</h6>
                       <span className="badge bg-primary bg-opacity-10 text-primary">{ASSET_TYPE_LABELS[inv.asset_type]}</span>
                       {inv.is_active === 0 && <span className="badge bg-secondary ms-1">Inactive</span>}
                     </div>
                   </div>
-                  <div className="small text-muted">
-                    {inv.ticker_symbol && <div>Symbol: <span className="text-body">{inv.ticker_symbol.replace(/\.(NS|BO)$/, '')}</span></div>}
-                    {inv.isin_code && <div>ISIN: <span className="text-body">{inv.isin_code}</span></div>}
-                    {inv.amfi_code && <div>AMFI: <span className="text-body">{inv.amfi_code}</span></div>}
-                    {inv.category && <div>Category: <span className="text-body">{inv.category}</span></div>}
+                  <div className="small text-muted d-flex flex-wrap gap-2 mb-1" style={{ lineHeight: 1.2 }}>
+                    {inv.ticker_symbol && <span>Symbol: <span className="text-body">{inv.ticker_symbol.replace(/\.(NS|BO)$/, '')}</span></span>}
+                    {inv.isin_code && <span>ISIN: <span className="text-body">{inv.isin_code}</span></span>}
+                    {inv.amfi_code && <span>AMFI: <span className="text-body">{inv.amfi_code}</span></span>}
+                    {inv.category && <span>Category: <span className="text-body">{inv.category}</span></span>}
                   </div>
                 </Card.Body>
               </Card>

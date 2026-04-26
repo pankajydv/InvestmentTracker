@@ -242,6 +242,28 @@ function parseSchemeBlock(lines, startIdx, amc) {
   let closingBalance = 0;
   let totalCostValue = 0;
   let pendingTxn = null; // For multi-line transactions
+  let pendingFeeLine = null; // For split fee lines like: "09-Apr-2026 2.37" then "*** STT Paid ***"
+
+  const applyChargeToLatestTxn = (chargeType, value) => {
+    if (!value) return;
+
+    const isStamp = chargeType === 'STAMP';
+    const validTypes = isStamp ? ['BUY', 'SWITCH_IN'] : ['SELL', 'SWITCH_OUT'];
+
+    if (pendingTxn && validTypes.includes(pendingTxn.type)) {
+      if (isStamp) pendingTxn.stampDuty = (pendingTxn.stampDuty || 0) + value;
+      else pendingTxn.stt = (pendingTxn.stt || 0) + value;
+      return;
+    }
+
+    if (transactions.length > 0) {
+      const last = transactions[transactions.length - 1];
+      if (validTypes.includes(last.type)) {
+        if (isStamp) last.stampDuty = (last.stampDuty || 0) + value;
+        else last.stt = (last.stt || 0) + value;
+      }
+    }
+  };
 
   const flushPending = () => {
     if (pendingTxn) {
@@ -316,7 +338,24 @@ function parseSchemeBlock(lines, startIdx, amc) {
     if (/^CAMSCASWS-/.test(line)) { i++; continue; }
 
     // Info lines (not transactions): *** text ***
-    if (/^\*{2,3}.*\*{2,3}$/.test(line)) { i++; continue; }
+    // Handle split fee pattern where amount is on previous date line, e.g.
+    // "09-Apr-2026 2.37" then "*** STT Paid ***"
+    if (/^\*{2,3}.*\*{2,3}$/.test(line)) {
+      if (pendingFeeLine && /\*{3}\s*Stamp Duty\s*\*{3}/i.test(line)) {
+        applyChargeToLatestTxn('STAMP', pendingFeeLine.amount);
+        pendingFeeLine = null;
+        i++;
+        continue;
+      }
+      if (pendingFeeLine && /\*{3}\s*STT Paid\s*\*{3}/i.test(line)) {
+        applyChargeToLatestTxn('STT', pendingFeeLine.amount);
+        pendingFeeLine = null;
+        i++;
+        continue;
+      }
+      i++;
+      continue;
+    }
 
     // Check for AMC name (new section = end of scheme)
     if (AMC_NAMES.some(a => line === a || line.toUpperCase() === a.toUpperCase())) {
@@ -340,13 +379,8 @@ function parseSchemeBlock(lines, startIdx, amc) {
       const stampMatch = rest.match(/^([\d,.]+)\s+\*{3}\s*Stamp Duty\s*\*{3}/i);
       if (stampMatch) {
         const stampDuty = parseNum(stampMatch[1]);
-        // Attach to most recent BUY/SWITCH_IN transaction
-        if (pendingTxn && (pendingTxn.type === 'BUY' || pendingTxn.type === 'SWITCH_IN')) {
-          pendingTxn.stampDuty = (pendingTxn.stampDuty || 0) + stampDuty;
-        } else if (transactions.length > 0) {
-          const last = transactions[transactions.length - 1];
-          if (last.type === 'BUY' || last.type === 'SWITCH_IN') last.stampDuty = (last.stampDuty || 0) + stampDuty;
-        }
+        applyChargeToLatestTxn('STAMP', stampDuty);
+        pendingFeeLine = null;
         i++;
         continue;
       }
@@ -355,13 +389,19 @@ function parseSchemeBlock(lines, startIdx, amc) {
       const sttMatch = rest.match(/^([\d,.]+)\s+\*{3}\s*STT Paid\s*\*{3}/i);
       if (sttMatch) {
         const stt = parseNum(sttMatch[1]);
-        // Attach to most recent SELL/SWITCH_OUT transaction
-        if (pendingTxn && (pendingTxn.type === 'SELL' || pendingTxn.type === 'SWITCH_OUT')) {
-          pendingTxn.stt = (pendingTxn.stt || 0) + stt;
-        } else if (transactions.length > 0) {
-          const last = transactions[transactions.length - 1];
-          if (last.type === 'SELL' || last.type === 'SWITCH_OUT') last.stt = (last.stt || 0) + stt;
-        }
+        applyChargeToLatestTxn('STT', stt);
+        pendingFeeLine = null;
+        i++;
+        continue;
+      }
+
+      // Split fee line with date + amount only, marker comes on next line.
+      const feeLineMatch = rest.match(/^([\d,.]+)$/);
+      if (feeLineMatch) {
+        pendingFeeLine = {
+          date: toISO(dateStr),
+          amount: parseNum(feeLineMatch[1]),
+        };
         i++;
         continue;
       }
@@ -376,6 +416,7 @@ function parseSchemeBlock(lines, startIdx, amc) {
       );
       if (txnMatch) {
         flushPending();
+        pendingFeeLine = null;
 
         const amount = parseNum(txnMatch[1]);
         const price = parseNum(txnMatch[2]);
