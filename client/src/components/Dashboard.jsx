@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardSummary, triggerPriceUpdate, cancelPriceUpdate } from '../services/api';
@@ -15,6 +15,21 @@ export default function Dashboard() {
   const [hideSold, setHideSold] = useState(() => localStorage.getItem('hideSoldInvestments') !== 'false');
   const [sortConfigs, setSortConfigs] = useState({});
   const [updatingType, setUpdatingType] = useState(null);
+
+  const scrollToSection = useCallback((sectionId, { smooth = true, updateHash = true } = {}) => {
+    const el = document.getElementById(sectionId);
+    if (!el) return;
+
+    const appNavbar = document.querySelector('.navbar.sticky-top');
+    const appNavHeight = appNavbar ? appNavbar.getBoundingClientRect().height : 56;
+    const top = el.getBoundingClientRect().top + window.scrollY - appNavHeight - 12;
+
+    window.scrollTo({ top: Math.max(0, top), behavior: smooth ? 'smooth' : 'auto' });
+
+    if (updateHash && window.location.hash !== `#${sectionId}`) {
+      window.history.replaceState(null, '', `#${sectionId}`);
+    }
+  }, []);
 
   const handleUpdateType = async (assetType) => {
     setUpdatingType(assetType);
@@ -43,6 +58,16 @@ export default function Dashboard() {
   useEffect(() => {
     loadData();
   }, [selectedId, hideSold]);
+
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (!hash || !hash.startsWith('#section-')) return;
+    const sectionId = hash.slice(1);
+    const raf = window.requestAnimationFrame(() => {
+      scrollToSection(sectionId, { smooth: false, updateHash: false });
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [data, scrollToSection]);
 
   const loadData = async () => {
     try {
@@ -105,6 +130,11 @@ export default function Dashboard() {
     { key: 'portfolioPct', label: '% Portfolio', end: true },
     { key: 'totalReturn', label: 'Total Return', end: true },
   ];
+
+  const handleAllocationClick = (event, type) => {
+    event.preventDefault();
+    scrollToSection(`section-${type}`);
+  };
 
   return (
     <div>
@@ -207,7 +237,14 @@ export default function Dashboard() {
                   className="rounded p-3 border"
                   style={{ borderLeftColor: ASSET_TYPE_COLORS[type], borderLeftWidth: '4px', borderLeftStyle: 'solid' }}
                 >
-                  <a href={`#section-${type}`} className="text-decoration-underline fw-semibold" style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}>{ASSET_TYPE_LABELS[type]} ↓</a>
+                  <a
+                    href={`#section-${type}`}
+                    className="text-decoration-underline fw-semibold"
+                    style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}
+                    onClick={(event) => handleAllocationClick(event, type)}
+                  >
+                    {ASSET_TYPE_LABELS[type]} ↓
+                  </a>
                   <div className="fs-6 fw-semibold">{formatINR(info.totalValue)}</div>
                   <div className={profitColor(info.totalProfitLoss)} style={{ fontSize: '0.75rem' }}>
                     {info.totalProfitLoss >= 0 ? '+' : ''}{formatINR(info.totalProfitLoss)}
@@ -288,7 +325,11 @@ export default function Dashboard() {
                         {inv.name}
                       </Link>
                       <div className="d-flex align-items-center gap-2 mt-1">
-                        {inv.amfi_code && <span className="text-muted" style={{ fontSize: '0.7rem' }}>{inv.amfi_code}</span>}
+                        {inv.asset_type === 'MUTUAL_FUND' && inv.open_folios_count !== undefined ? (
+                          <span className="text-muted" style={{ fontSize: '0.7rem' }}>Folios: {inv.open_folios_count}</span>
+                        ) : inv.amfi_code ? (
+                          <span className="text-muted" style={{ fontSize: '0.7rem' }}>{inv.amfi_code}</span>
+                        ) : null}
                       </div>
                     </td>
                     <td className="px-3 text-end">

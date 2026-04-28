@@ -148,6 +148,9 @@ export default function InvestmentDetail() {
   const [editForm, setEditForm] = useState({});
   const [saving, setSaving] = useState(false);
 
+  // Folio filter state
+  const [selectedFolio, setSelectedFolio] = useState('ALL');
+
   // Delete confirmation modal state
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [deleteText, setDeleteText] = useState('');
@@ -268,6 +271,30 @@ export default function InvestmentDetail() {
   const xirrRate = calculateXirr(xirrCashflows);
   const xirrPct = xirrRate == null ? null : xirrRate * 100;
   const cumulativeValue = (Number(data.latestValue?.current_value) || 0) + (Number(data.saleProceeds) || 0);
+  const hasFolioColumn = !isPPF && data.transactions.some((t) => t.folio_number);
+  const folioOptions = (data.folio_options || []).map((f) => f.folio_number).filter(Boolean);
+  const detailItems = [
+    data.isin_code ? { label: 'ISIN', value: data.isin_code } : null,
+    data.amfi_code ? { label: 'AMFI', value: data.amfi_code } : null,
+    data.asset_type === 'MUTUAL_FUND' && data.folio_summary
+      ? { label: 'Folios', value: `Open: ${data.folio_summary.open} | Closed: ${data.folio_summary.closed}` }
+      : null,
+    !isPPF ? { label: 'Total Units', value: formatNumber(data.totalUnits, 4) } : null,
+    isPPF && data.account_number ? { label: 'Account', value: data.account_number } : null,
+    !isPPF && data.latestValue ? { label: 'Last Price', value: `₹${formatNumber(data.latestValue.price_per_unit, 2)}` } : null,
+    data.ticker_symbol ? { label: 'Ticker', value: data.ticker_symbol } : null,
+    data.category ? { label: 'Category', value: data.category } : null,
+    isPPF && data.interest_rate ? { label: 'Interest', value: `${data.interest_rate}% p.a.` } : null,
+    isPPF && data.maturity_date ? { label: 'Maturity', value: formatDate(data.maturity_date) } : null,
+    isPPF && data.opening_balance > 0 ? { label: 'Opening Balance', value: `₹${formatNumber(data.opening_balance, 2)}` } : null,
+    !isPPF && data.latestValue
+      ? {
+          label: '1D Change',
+          value: formatNumber(data.latestValue.day_change, 0),
+          color: profitColor(data.latestValue.day_change),
+        }
+      : null,
+  ].filter(Boolean);
 
   return (
     <div>
@@ -326,21 +353,19 @@ export default function InvestmentDetail() {
       {/* Details */}
       <Card className="shadow-sm mb-4">
         <Card.Body>
-          <h2 className="h6 fw-semibold mb-3">Details</h2>
-          <Row className="g-3 small">
-            {data.ticker_symbol && <Col xs={6} md={3}><Detail label="Ticker" value={data.ticker_symbol} /></Col>}
-            {data.isin_code && <Col xs={6} md={3}><Detail label="ISIN" value={data.isin_code} /></Col>}
-            {data.amfi_code && <Col xs={6} md={3}><Detail label="AMFI Code" value={data.amfi_code} /></Col>}
-            {data.category && <Col xs={6} md={3}><Detail label="Category" value={data.category} /></Col>}
-            {!isPPF && <Col xs={6} md={3}><Detail label="Total Units" value={formatNumber(data.totalUnits, 4)} /></Col>}
-            {isPPF && data.account_number && <Col xs={6} md={3}><Detail label="Account Number" value={data.account_number} /></Col>}
-            {isPPF && data.interest_rate && <Col xs={6} md={3}><Detail label="Interest Rate" value={`${data.interest_rate}% p.a.`} /></Col>}
-            {isPPF && data.maturity_date && <Col xs={6} md={3}><Detail label="Maturity Date" value={formatDate(data.maturity_date)} /></Col>}
-            {isPPF && data.opening_balance > 0 && <Col xs={6} md={3}><Detail label="Opening Balance" value={`₹${formatNumber(data.opening_balance, 2)}`} /></Col>}
-            {!isPPF && data.latestValue && <Col xs={6} md={3}><Detail label="Last Price" value={`₹${formatNumber(data.latestValue.price_per_unit, 2)}`} /></Col>}
-            {!isPPF && data.latestValue && <Col xs={6} md={3}><Detail label="1 Day Change" value={formatNumber(data.latestValue.day_change, 0)} color={profitColor(data.latestValue.day_change)} /></Col>}
-            <Col xs={6} md={3}><Detail label="Currency" value={data.currency} /></Col>
-          </Row>
+          <h2 className="h6 fw-semibold mb-2">Details</h2>
+          <div className="d-flex flex-wrap gap-3 small">
+            {detailItems.map((item) => (
+              <span
+                key={item.label}
+                className="rounded-3 px-3 py-2 bg-light"
+                style={{ whiteSpace: 'nowrap', cursor: 'default', lineHeight: 1.2 }}
+              >
+                <span className="text-muted" style={{ fontSize: '0.72rem', letterSpacing: '0.02em' }}>{item.label}:</span>{' '}
+                <span className={item.color || ''}>{item.value}</span>
+              </span>
+            ))}
+          </div>
         </Card.Body>
       </Card>
 
@@ -400,7 +425,7 @@ export default function InvestmentDetail() {
       {/* Transactions Table */}
       <Card className="shadow-sm">
         <Card.Header className="bg-white">
-          <h2 className="h6 fw-semibold mb-0">Transactions ({data.transactions.length})</h2>
+          <h2 className="h6 fw-semibold mb-0">Transactions</h2>
         </Card.Header>
         {data.transactions.length === 0 ? (
           <Card.Body className="text-center text-muted py-4">
@@ -419,7 +444,20 @@ export default function InvestmentDetail() {
                   {!isPPF && <th className="px-3 text-end">Charges</th>}
                   {isPPF && <th className="px-3 text-end">Balance</th>}
                   {!isPPF && <th className="px-3 text-end">Holding</th>}
-                  {!isPPF && data.transactions.some(t => t.folio_number) && <th className="px-3">Folio</th>}
+                  {hasFolioColumn && (
+                    <th className="px-3" style={{ minWidth: '180px' }}>
+                      <Form.Select
+                        size="sm"
+                        value={selectedFolio}
+                        onChange={(e) => setSelectedFolio(e.target.value)}
+                      >
+                        <option value="ALL">All folios</option>
+                        {folioOptions.map((folio) => (
+                          <option key={folio} value={folio}>{folio}</option>
+                        ))}
+                      </Form.Select>
+                    </th>
+                  )}
                   {!isNPS && !isPPF && <th className="px-3">Broker</th>}
                   <th className="px-3">Notes</th>
                   <th className="px-3 text-center" style={{ width: 80 }}>Actions</th>
@@ -447,7 +485,10 @@ export default function InvestmentDetail() {
                     balanceMap[txn.id] = amtBal;
                   }
                   const hasFolio = data.transactions.some(t => t.folio_number);
-                  return [...sorted].reverse().map((txn) => (
+                  const filteredSorted = selectedFolio === 'ALL'
+                    ? [...sorted].reverse()
+                    : [...sorted].filter((t) => t.folio_number === selectedFolio).reverse();
+                  return filteredSorted.map((txn) => (
                   <tr key={txn.id}>
                     <td className="px-3 text-nowrap">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3">

@@ -67,6 +67,27 @@ module.exports = function (db) {
       ORDER BY i.asset_type, i.name
     `).all(...dvParams, ...dvParams, ...portfolioParams, ...soldParams);
 
+    // Add folio information for MF investments
+    for (const inv of investments) {
+      if (inv.asset_type === 'MUTUAL_FUND') {
+        const folios = db.prepare(`
+          SELECT 
+            folio_number,
+            COALESCE(SUM(CASE 
+              WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
+              WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+              ELSE 0 END), 0) as net_units
+          FROM transactions 
+          WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : ''}
+          AND folio_number IS NOT NULL
+          GROUP BY folio_number
+        `).all(portfolio_id ? [inv.id, portfolio_id] : [inv.id]);
+        
+        inv.open_folios_count = folios.filter(f => f.net_units > 0.0001).length;
+        inv.total_folios_count = folios.length;
+      }
+    }
+
     // Group by asset type
     const byType = {};
     for (const inv of investments) {

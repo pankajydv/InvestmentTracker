@@ -230,6 +230,43 @@ module.exports = function (db) {
       `SELECT * FROM transactions WHERE investment_id = ?${portfolioFilter} ORDER BY transaction_date DESC`
     ).all(inv.id, ...portfolioParams);
 
+    // Get folio summary and options (for MF)
+    let folio_summary = null;
+    let folio_options = [];
+    
+    if (inv.asset_type === 'MUTUAL_FUND') {
+      // Get all unique folios for this investment with their net units
+      const folios = db.prepare(`
+        SELECT 
+          folio_number,
+          COALESCE(SUM(CASE 
+            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
+            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+            ELSE 0 END), 0) as net_units
+        FROM transactions 
+        WHERE investment_id = ?${portfolioFilter}
+        AND folio_number IS NOT NULL
+        GROUP BY folio_number
+        ORDER BY folio_number
+      `).all(inv.id, ...portfolioParams);
+
+      folio_options = folios.map(f => ({
+        folio_number: f.folio_number,
+        net_units: f.net_units,
+        is_open: f.net_units > 0.0001
+      }));
+
+      const totalFolios = folio_options.length;
+      const openFolios = folio_options.filter(f => f.is_open).length;
+      const closedFolios = totalFolios - openFolios;
+
+      folio_summary = {
+        total: totalFolios,
+        open: openFolios,
+        closed: closedFolios
+      };
+    }
+
     res.json({
       ...inv,
       latestValue,
@@ -237,6 +274,8 @@ module.exports = function (db) {
       totalInvested: totals.total_invested,
       saleProceeds: totals.sale_proceeds,
       transactions,
+      folio_summary,
+      folio_options,
     });
   });
 
