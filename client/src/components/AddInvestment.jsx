@@ -6,7 +6,7 @@ import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp, Plus } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND'];
+const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND', 'SGB'];
 const STOCK_TXN_TYPES = ['BUY', 'SELL'];
 
 export default function AddInvestment() {
@@ -773,6 +773,7 @@ export default function AddInvestment() {
   const isForeignStock = assetType === 'FOREIGN_STOCK';
   const isStock = isIndianStock || isForeignStock;
   const isBond = assetType === 'BOND';
+  const isSGB = assetType === 'SGB';
   const isNPS = assetType === 'NPS';
 
   // Bond-specific form state
@@ -802,13 +803,17 @@ export default function AddInvestment() {
     setSubmitting(true);
     try {
       if (!bondForm.name) { setError('Name is required'); setSubmitting(false); return; }
+      if (!portfolioId) { setError('Please select a portfolio first (from the top navbar)'); setSubmitting(false); return; }
       if (!bondForm.coupon_rate) { setError('Coupon rate is required'); setSubmitting(false); return; }
       if (!bondForm.maturity_date) { setError('Maturity date is required'); setSubmitting(false); return; }
       if (!bondTxn.units || !bondTxn.price_per_unit) { setError('Units and price are required'); setSubmitting(false); return; }
 
+      const computedAmount = parseFloat(bondTxn.units) * parseFloat(bondTxn.price_per_unit);
+      if (!computedAmount || isNaN(computedAmount)) { setError('Invalid units or price'); setSubmitting(false); return; }
+
       const inv = await createInvestment({
         name: bondForm.name,
-        asset_type: 'BOND',
+        asset_type: assetType,
         interest_rate: parseFloat(bondForm.coupon_rate),
         face_value: parseFloat(bondForm.face_value) || 1000,
         coupon_frequency: bondForm.coupon_frequency,
@@ -824,7 +829,7 @@ export default function AddInvestment() {
         transaction_date: bondTxn.transaction_date,
         units: parseFloat(bondTxn.units),
         price_per_unit: parseFloat(bondTxn.price_per_unit),
-        amount: parseFloat(bondAmount),
+        amount: computedAmount,
         fees: parseFloat(bondTxn.fees) || 0,
         broker: bondForm.broker || null,
         notes: bondTxn.notes || null,
@@ -1339,21 +1344,21 @@ export default function AddInvestment() {
         </>
       )}
 
-      {/* Bond form */}
-      {isBond && (
+      {/* Bond/SGB form */}
+      {(isBond || isSGB) && (
         <>
           <Card className="shadow-sm">
             <Card.Body>
-              <h2 className="h6 fw-semibold mb-3">2. Bond Details</h2>
+              <h2 className="h6 fw-semibold mb-3">2. {isSGB ? 'SGB' : 'Bond'} Details</h2>
               <Row className="g-3">
                 <Col md={8}>
-                  <Form.Label className="small">Name</Form.Label>
+                  <Form.Label className="small">Name {isSGB && <span className="text-muted" style={{fontSize: '0.75rem'}}>(Format: SGB 2.50 05/01/2029 Series-IX)</span>}</Form.Label>
                   <Form.Control
                     size="sm"
                     type="text"
                     value={bondForm.name}
                     onChange={(e) => setBondForm({ ...bondForm, name: e.target.value })}
-                    placeholder="e.g., Shriram Finance NCD 9.05%"
+                    placeholder={isSGB ? 'e.g., SGB 2.50 05/01/2029 Series-IX' : 'e.g., Shriram Finance NCD 9.05%'}
                     required
                   />
                 </Col>
@@ -2917,8 +2922,8 @@ export default function AddInvestment() {
         </>
       )}
 
-      {/* Non-Indian-Stock / Non-Bond / Non-MF / Non-NPS / Non-PPF / Non-SSY / Non-PF: original flow */}
-      {!isIndianStock && !isBond && !isMF && !isNPS && assetType !== 'PPF' && assetType !== 'SSY' && assetType !== 'PF' && (
+      {/* Non-Indian-Stock / Non-Bond / Non-SGB / Non-MF / Non-NPS / Non-PPF / Non-SSY / Non-PF: original flow */}
+      {!isIndianStock && !isBond && !isSGB && !isMF && !isNPS && assetType !== 'PPF' && assetType !== 'SSY' && assetType !== 'PF' && (
         <>
           {/* Step 2: Investment Details */}
           <Card className="shadow-sm">

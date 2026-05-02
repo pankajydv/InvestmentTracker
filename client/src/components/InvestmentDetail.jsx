@@ -2,7 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal } from 'react-bootstrap';
 import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate } from '../services/api';
-import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS } from '../utils/formatters';
+import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
+import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
@@ -280,9 +281,11 @@ export default function InvestmentDetail() {
   const isEpsInvestment = isPPF && /eps/i.test(String(data.name || ''));
   const isBond = data.asset_type === 'BOND';
   const isNPS = data.asset_type === 'NPS';
+  const isSGB = data.asset_type === 'SGB';
+  
   const txnTypes = isPPF
     ? ['DEPOSIT', 'WITHDRAWAL', 'INTEREST']
-    : isBond
+    : isBond || isSGB
     ? ['BUY', 'SELL', 'INTEREST']
     : ['BUY', 'SELL', 'DIVIDEND'];
 
@@ -322,6 +325,44 @@ export default function InvestmentDetail() {
   const cumulativeValue = (Number(data.latestValue?.current_value) || 0) + (Number(data.saleProceeds) || 0);
   const hasFolioColumn = !isPPF && data.transactions.some((t) => t.folio_number);
   const folioOptions = (data.folio_options || []).map((f) => f.folio_number).filter(Boolean);
+
+  // SGB calculations
+  let sgbDetails = null;
+  if (isSGB) {
+    const parsed = parseSGBName(data.name);
+    if (parsed) {
+      const maturityDate = convertDateFormat(parsed.maturity_date); // DD/MM/YYYY to YYYY-MM-DD
+      const buyTransactions = (data.transactions || []).filter(t => t.transaction_type === 'BUY').sort((a, b) => new Date(a.transaction_date) - new Date(b.transaction_date));
+      const issueDate = buyTransactions.length > 0 ? buyTransactions[0].transaction_date : null;
+      
+      let couponDates = [];
+      let totalInterestPaid = 0;
+      let accruedInterest = 0;
+      
+      if (issueDate && maturityDate) {
+        couponDates = calculateCouponDates(issueDate, maturityDate);
+        const paidCoupons = getPaidCouponDates(couponDates);
+        totalInterestPaid = calculateInterestPaid(data.totalUnits, parsed.coupon_rate, 1, paidCoupons);
+        
+        // Get accrued interest
+        const lastCoupon = getLastCouponDate(paidCoupons);
+        const nextCoupon = lastCoupon ? getNextCouponDate(lastCoupon) : couponDates.length > 0 ? couponDates[0] : null;
+        if (lastCoupon && nextCoupon) {
+          accruedInterest = calculateAccruedInterest(data.totalUnits, parsed.coupon_rate, 1, lastCoupon, nextCoupon);
+        }
+      }
+      
+      sgbDetails = {
+        coupon_rate: parsed.coupon_rate,
+        maturity_date: maturityDate,
+        series: parsed.series,
+        total_interest_paid: totalInterestPaid,
+        accrued_interest: accruedInterest,
+        issue_date: issueDate,
+      };
+    }
+  }
+
   const detailItems = [
     data.isin_code ? { label: 'ISIN', value: data.isin_code } : null,
     data.amfi_code ? { label: 'AMFI', value: data.amfi_code } : null,
@@ -336,6 +377,11 @@ export default function InvestmentDetail() {
     isPPF && data.interest_rate ? { label: 'Interest', value: `${data.interest_rate}% p.a.` } : null,
     isPPF && data.maturity_date ? { label: 'Maturity', value: formatDate(data.maturity_date) } : null,
     isPPF && data.opening_balance > 0 ? { label: 'Opening Balance', value: `₹${formatNumber(data.opening_balance, 2)}` } : null,
+    isSGB && sgbDetails && sgbDetails.coupon_rate ? { label: 'Coupon Rate', value: `${sgbDetails.coupon_rate}% p.a.` } : null,
+    isSGB && sgbDetails && sgbDetails.maturity_date ? { label: 'Maturity', value: formatDate(sgbDetails.maturity_date) } : null,
+    isSGB && sgbDetails && sgbDetails.series ? { label: 'Series', value: sgbDetails.series } : null,
+    isSGB && sgbDetails && sgbDetails.total_interest_paid > 0 ? { label: 'Interest Paid', value: `₹${formatNumber(sgbDetails.total_interest_paid, 2)}` } : null,
+    isSGB && sgbDetails && sgbDetails.accrued_interest > 0 ? { label: 'Accrued Interest', value: `₹${formatNumber(sgbDetails.accrued_interest, 2)}` } : null,
     !isPPF && data.latestValue
       ? {
           label: '1D Change',
@@ -360,7 +406,7 @@ export default function InvestmentDetail() {
           </Link>
           <h1 className="h4 fw-bold mb-1">{data.display_name || data.name}</h1>
           <div className="d-flex align-items-center gap-2">
-            <Badge bg="primary" className="bg-opacity-10 text-primary">{ASSET_TYPE_LABELS[data.asset_type]}</Badge>
+            <Badge bg="primary" className="bg-opacity-10 text-primary" title={ASSET_TYPE_FULL_NAMES[data.asset_type]}>{ASSET_TYPE_LABELS[data.asset_type]}</Badge>
             {data.is_active === 0 && <Badge bg="secondary">Inactive</Badge>}
           </div>
         </div>

@@ -10,6 +10,7 @@ const {
   calculatePPFValue,
   toNSETicker,
   resolveAmfiCodeByISIN,
+  fetchSGBPrice,
 } = require('./priceService');
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -211,6 +212,32 @@ async function updateAllPrices(db, options = {}) {
 
         case 'BOND': {
           pricePerUnit = inv.face_value || 1000;
+          break;
+        }
+
+        case 'SGB': {
+          // SGBs trade on NSE - fetch live price via NSE quote-equity API using ticker_symbol
+          if (inv.ticker_symbol) {
+            try {
+              const sgbData = await fetchSGBPrice(inv.ticker_symbol);
+              pricePerUnit = sgbData.price;
+              apiChange = sgbData.change;
+              apiChangePct = sgbData.changePercent;
+            } catch (e) {
+              console.warn(`  ${inv.name}: NSE price fetch failed (${e.message}), falling back to last known price`);
+            }
+          }
+          // Fallback: use last known price from daily_values
+          if (!pricePerUnit) {
+            const lastKnown = db.prepare(
+              'SELECT price_per_unit FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+            ).get(inv.id);
+            if (lastKnown) pricePerUnit = lastKnown.price_per_unit;
+          }
+          // Final fallback: use face_value
+          if (!pricePerUnit) {
+            pricePerUnit = inv.face_value || 5000;
+          }
           break;
         }
 

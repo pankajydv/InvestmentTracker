@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardSummary, triggerPriceUpdate, cancelPriceUpdate } from '../services/api';
-import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
+import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
 import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, Receipt, RefreshCw, EyeOff, Eye } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
@@ -242,6 +242,7 @@ export default function Dashboard() {
                     className="text-decoration-underline fw-semibold"
                     style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}
                     onClick={(event) => handleAllocationClick(event, type)}
+                    title={ASSET_TYPE_FULL_NAMES[type]}
                   >
                     {ASSET_TYPE_LABELS[type]} ↓
                   </a>
@@ -260,7 +261,7 @@ export default function Dashboard() {
       {Object.entries(byType).map(([type, info]) => (
         <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
           <Card.Header className="bg-white d-flex justify-content-between align-items-center">
-            <h2 className="h6 fw-semibold mb-0">
+            <h2 className="h6 fw-semibold mb-0" title={ASSET_TYPE_FULL_NAMES[type]}>
               {ASSET_TYPE_LABELS[type]} ({info.investments.length})
             </h2>
             <div className="d-flex align-items-center gap-2">

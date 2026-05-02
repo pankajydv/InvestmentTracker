@@ -548,6 +548,81 @@ function resolveAmfiCodeByISIN(isins) {
   });
 }
 
+// ─── SGB Price from NSE quote-equity API ─────────────────────────────────────
+
+// Reusable NSE session: cache the cookie for 30 minutes
+let _nseCookie = null;
+let _nseCookieExpiry = 0;
+
+async function getNSECookie() {
+  if (_nseCookie && Date.now() < _nseCookieExpiry) return _nseCookie;
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'www.nseindia.com',
+      path: '/api/marketStatus',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124',
+        'Accept': 'application/json',
+      }
+    }, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        _nseCookie = (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+        _nseCookieExpiry = Date.now() + 30 * 60 * 1000;
+        resolve(_nseCookie);
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/**
+ * Fetch SGB price from NSE quote-equity API.
+ * @param {string} symbol - NSE symbol e.g. 'SGBSEP28VI' or 'SGBJAN29IX'
+ * @returns {Promise<{price: number, change: number, changePercent: number, previousClose: number}>}
+ */
+async function fetchSGBPrice(symbol) {
+  const cookie = await getNSECookie();
+  // Small delay to avoid hammering NSE
+  await new Promise(r => setTimeout(r, 500));
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'www.nseindia.com',
+      path: '/api/quote-equity?symbol=' + encodeURIComponent(symbol),
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://www.nseindia.com/get-quotes/bonds?symbol=' + symbol,
+        'Cookie': cookie,
+      }
+    }, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const pi = json.priceInfo;
+          if (!pi || !pi.lastPrice) {
+            return reject(new Error(`No price data from NSE for ${symbol}`));
+          }
+          resolve({
+            price: pi.lastPrice,
+            change: pi.change || 0,
+            changePercent: pi.pChange || 0,
+            previousClose: pi.previousClose || pi.close || pi.lastPrice,
+          });
+        } catch (e) {
+          reject(new Error(`Failed to parse NSE response for ${symbol}: ${e.message}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 module.exports = {
   fetchMutualFundNAV,
   searchMutualFunds,
@@ -561,4 +636,5 @@ module.exports = {
   lookupTickerByISIN,
   searchStocks,
   resolveAmfiCodeByISIN,
+  fetchSGBPrice,
 };

@@ -88,11 +88,11 @@ function initializeDb(db) {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
-    -- Asset types: INDIAN_STOCK, MUTUAL_FUND, FOREIGN_STOCK, PPF, SSY, PF, BOND
+    -- Asset types: INDIAN_STOCK, MUTUAL_FUND, FOREIGN_STOCK, PPF, SSY, PF, BOND, SGB
     CREATE TABLE IF NOT EXISTS investments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
-      asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS')),
+      asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS', 'SGB')),
       ticker_symbol TEXT,          -- NSE symbol for Indian stocks, Yahoo ticker for foreign stocks
       amfi_code TEXT,              -- AMFI scheme code for mutual funds
       account_number TEXT,         -- For PPF/SSY/PF accounts
@@ -251,7 +251,7 @@ function initializeDb(db) {
         CREATE TABLE investments (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           name TEXT NOT NULL,
-          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS')),
+          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS', 'SGB')),
           ticker_symbol TEXT,
           amfi_code TEXT,
           account_number TEXT,
@@ -524,7 +524,7 @@ function initializeDb(db) {
         CREATE TABLE investments_new (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           name TEXT NOT NULL,
-          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS')),
+          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS', 'SGB')),
           ticker_symbol TEXT,
           amfi_code TEXT,
           account_number TEXT,
@@ -705,7 +705,7 @@ function initializeDb(db) {
         CREATE TABLE investments_new (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           name TEXT NOT NULL,
-          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS')),
+          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS', 'SGB')),
           ticker_symbol TEXT,
           amfi_code TEXT,
           account_number TEXT,
@@ -949,6 +949,99 @@ function initializeDb(db) {
       }
     } else if (!hasMigrationRecord(db, epsMigrationId) && hasEPSContributionType) {
       recordMigration(db, epsMigrationId, 'skipped', 'EPS_CONTRIBUTION already present');
+  }
+
+  // ── Migration: add SGB asset_type ──────────────────────────────────
+  const hasSGBType = (() => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='investments'").get();
+    return row && row.sql && row.sql.includes("'SGB'");
+  })();
+  const sgbMigrationId = '20260502-add-sgb-asset-type';
+
+  if (!hasSGBType && !hasMigrationRecord(db, sgbMigrationId)) {
+    if (!migrationsEnabled) {
+      throw new Error(`Pending migration ${sgbMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+    }
+
+    console.log('Migrating: adding SGB asset_type...');
+    const beforeInvestments = getTableCount(db, 'investments');
+    const backupPath = createPreMigrationBackup(db, 'add-sgb-asset-type');
+    if (backupPath) console.log(`Created migration backup: ${backupPath}`);
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      // Get current table structure to build safe INSERT statement
+      const currentCols = db.prepare("PRAGMA table_info(investments)").all().map(c => c.name);
+      console.log('Current investments columns:', currentCols.join(', '));
+      
+      // Map of all possible columns in order
+      const allCols = [
+        'id', 'name', 'asset_type', 'ticker_symbol', 'amfi_code', 'account_number',
+        'interest_rate', 'currency', 'face_value', 'coupon_frequency', 'maturity_date',
+        'notes', 'display_name', 'isin_code', 'previous_isin_codes', 'is_active',
+        'category', 'created_at', 'updated_at'
+      ];
+      
+      // Build INSERT statement with only existing columns
+      const colsToUse = allCols.filter(c => currentCols.includes(c));
+      const selectParts = colsToUse.map(c => c === 'is_active' ? 'COALESCE(is_active, 1)' : c);
+      const insertStmt = `INSERT INTO investments_new (${colsToUse.join(', ')}) SELECT ${selectParts.join(', ')} FROM investments`;
+      
+      console.log('Using columns:', colsToUse.join(', '));
+      
+      // Recreate investments table with SGB
+      db.exec(`
+        CREATE TABLE investments_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          asset_type TEXT NOT NULL CHECK(asset_type IN ('INDIAN_STOCK', 'MUTUAL_FUND', 'FOREIGN_STOCK', 'PPF', 'SSY', 'PF', 'BOND', 'NPS', 'SGB')),
+          ticker_symbol TEXT,
+          amfi_code TEXT,
+          account_number TEXT,
+          interest_rate REAL,
+          currency TEXT DEFAULT 'INR',
+          face_value REAL,
+          coupon_frequency TEXT,
+          maturity_date TEXT,
+          notes TEXT,
+          display_name TEXT,
+          isin_code TEXT,
+          previous_isin_codes TEXT,
+          is_active INTEGER DEFAULT 1,
+          category TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now'))
+        )
+      `);
+      
+      db.exec(insertStmt);
+
+      const copiedInvestments = getTableCount(db, 'investments_new');
+      ensureRowCountPreserved({
+        before: beforeInvestments,
+        after: copiedInvestments,
+        table: 'investments',
+        migrationName: 'add-sgb-asset-type',
+      });
+
+      db.exec("DROP TABLE investments");
+      db.exec("ALTER TABLE investments_new RENAME TO investments");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_investments_asset_type ON investments(asset_type)");
+
+      db.exec('COMMIT');
+      assertDbIntegrity(db, sgbMigrationId);
+      recordMigration(db, sgbMigrationId, 'applied');
+      console.log('Migration complete: SGB asset_type added.');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('SGB migration failed:', err);
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+  } else if (!hasMigrationRecord(db, sgbMigrationId) && hasSGBType) {
+    recordMigration(db, sgbMigrationId, 'skipped', 'SGB already present');
   }
 }
 

@@ -2,11 +2,11 @@ import React, { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Row, Col, Card, Spinner, Form, Button } from 'react-bootstrap';
 import { getInvestments } from '../services/api';
-import { formatINR, formatPct, ASSET_TYPE_LABELS } from '../utils/formatters';
+import { formatINR, formatPct, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
 import { PlusCircle, Filter, EyeOff, Eye, RefreshCw, Percent } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const ASSET_TYPES = ['', 'MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND'];
+const ASSET_TYPES = ['', 'MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND', 'SGB'];
 
 export default function Investments() {
   const { selectedId } = usePortfolio();
@@ -101,7 +101,7 @@ export default function Investments() {
                   <div className="d-flex justify-content-between align-items-start mb-1">
                     <div>
                       <h6 className="fw-semibold mb-1 text-truncate" style={{ maxWidth: '24rem' }}>{inv.display_name || inv.name}</h6>
-                      <span className="badge bg-primary bg-opacity-10 text-primary">{ASSET_TYPE_LABELS[inv.asset_type]}</span>
+                      <span className="badge bg-primary bg-opacity-10 text-primary" title={ASSET_TYPE_FULL_NAMES[inv.asset_type]}>{ASSET_TYPE_LABELS[inv.asset_type]}</span>
                       {inv.is_active === 0 && <span className="badge bg-secondary ms-1">Inactive</span>}
                     </div>
                   </div>

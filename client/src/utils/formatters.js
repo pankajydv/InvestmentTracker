@@ -81,6 +81,22 @@ export const ASSET_TYPE_LABELS = {
   PF: 'PF',
   BOND: 'Bonds',
   NPS: 'NPS',
+  SGB: 'SGB',
+};
+
+/**
+ * Asset type full names for tooltips
+ */
+export const ASSET_TYPE_FULL_NAMES = {
+  MUTUAL_FUND: 'Mutual Fund',
+  INDIAN_STOCK: 'Indian Stock',
+  FOREIGN_STOCK: 'Foreign Stock',
+  PPF: 'Public Provident Fund',
+  SSY: 'Sukanya Samriddhi Yojana',
+  PF: 'Provident Fund',
+  BOND: 'Bonds',
+  NPS: 'National Pension Scheme',
+  SGB: 'Sovereign Gold Bond',
 };
 
 /**
@@ -95,6 +111,7 @@ export const ASSET_TYPE_COLORS = {
   PF: '#ef4444',
   BOND: '#f97316',
   NPS: '#06b6d4',
+  SGB: '#fbbf24',
 };
 
 /**
