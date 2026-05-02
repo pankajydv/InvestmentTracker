@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { INTEREST_RATES, DATASET_VERSION } = require('../data/interest-rates');
-const { calculatePfInterestPreview } = require('../services/pfInterestCalculator');
+const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = require('../services/pfInterestCalculator');
 
 const CASH_OUTFLOW_TYPES = new Set([
   'BUY', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
@@ -417,7 +417,11 @@ module.exports = function (db) {
 
     const rateRows = getRateRowsForType(inv.asset_type);
 
-    const preview = calculatePfInterestPreview({
+    const calculator = inv.asset_type === 'PF'
+      ? calculatePfInterestPreview
+      : calculateSmallSavingsInterestPreview;
+
+    const preview = calculator({
       openingBalance: inv.opening_balance || 0,
       transactions: txns,
       rateRows,
