@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse, Table } from 'react-bootstrap';
-import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions } from '../services/api';
+import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
-import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp } from 'lucide-react';
+import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp, Plus } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND'];
@@ -114,6 +114,26 @@ export default function AddInvestment() {
   const [ppfResult, setPpfResult] = useState(null);
   const [ppfPassword, setPpfPassword] = useState('');
   const [ppfShowTxns, setPpfShowTxns] = useState(false);
+
+  // PF/EPS upload state
+  const pfFileRef = useRef(null);
+  const [pfFiles, setPfFiles] = useState([]);
+  const [pfUploading, setPfUploading] = useState(false);
+  const [pfImporting, setPfImporting] = useState(false);
+  const [pfError, setPfError] = useState('');
+  const [pfPreview, setPfPreview] = useState(null);
+  const [pfResult, setPfResult] = useState(null);
+  const [pfShowTxns, setPfShowTxns] = useState(false);
+  const [pfSelectedTxns, setPfSelectedTxns] = useState(new Set()); // For select/deselect individual transactions
+
+  // PF manual entry form
+  const [pfManualForm, setPfManualForm] = useState({
+    date: new Date().toISOString().split('T')[0],
+    type: 'DEPOSIT',
+    eeAmount: '',
+    erAmount: '',
+    notes: '',
+  });
 
   // Sync local portfolioId when navbar portfolio changes
   useEffect(() => {
@@ -517,6 +537,113 @@ export default function AddInvestment() {
 
   const PPF_TYPE_COLORS = {
     DEPOSIT: 'bg-success', INTEREST: 'bg-info', WITHDRAWAL: 'bg-danger',
+  };
+
+  // PF Handlers
+  const handlePFUpload = async () => {
+    setPfError('');
+    if (!portfolioId) return setPfError('Please select a portfolio first');
+    if (!pfFiles.length) return setPfError('Please select PF statement PDF files');
+    setPfUploading(true);
+    try {
+      const data = await previewPFStatements(pfFiles, portfolioId);
+      setPfPreview(data);
+    } catch (e) {
+      setPfError(e.message);
+    } finally {
+      setPfUploading(false);
+    }
+  };
+
+  const handlePFImport = async () => {
+    setPfError('');
+    if (!pfPreview) return;
+    const selectedTxns = Array.from(pfSelectedTxns).map(idx => pfPreview.transactions[idx]);
+    if (selectedTxns.length === 0) return setPfError('Please select transactions to import');
+    setPfImporting(true);
+    try {
+      const res = await importPFTransactions(portfolioId, {
+        pfInvestmentId: pfPreview.pfInvestmentId,
+        uan: pfPreview.uan,
+        transactions: selectedTxns,
+      });
+      setPfResult(res);
+      setPfPreview(null);
+      setPfSelectedTxns(new Set());
+      await refreshPortfolios();
+    } catch (e) {
+      setPfError(e.message);
+    } finally {
+      setPfImporting(false);
+    }
+  };
+
+  const handlePFReset = () => {
+    setPfPreview(null);
+    setPfResult(null);
+    setPfFiles([]);
+    setPfError('');
+    setPfShowTxns(false);
+    setPfSelectedTxns(new Set());
+    if (pfFileRef.current) pfFileRef.current.value = '';
+  };
+
+  const togglePFTransaction = (idx) => {
+    const newSet = new Set(pfSelectedTxns);
+    if (newSet.has(idx)) {
+      newSet.delete(idx);
+    } else {
+      newSet.add(idx);
+    }
+    setPfSelectedTxns(newSet);
+  };
+
+  const handlePFManualSubmit = async () => {
+    setPfError('');
+    if (!portfolioId) return setPfError('Please select a portfolio first');
+    if (!pfManualForm.date) return setPfError('Please select a date');
+    if ((!pfManualForm.eeAmount || pfManualForm.eeAmount === '0') && 
+        (!pfManualForm.erAmount || pfManualForm.erAmount === '0')) {
+      return setPfError('Please enter at least Employee or Employer contribution amount');
+    }
+
+    setPfImporting(true);
+    try {
+      const eeAmt = parseFloat(pfManualForm.eeAmount) || 0;
+      const erAmt = parseFloat(pfManualForm.erAmount) || 0;
+      const epsAmt = erAmt - eeAmt; // EPS = ER - EE
+
+      const res = await addManualPFTransaction(portfolioId, {
+        date: pfManualForm.date,
+        type: pfManualForm.type,
+        eeAmount: eeAmt,
+        erAmount: erAmt,
+        epsAmount: epsAmt > 0 ? epsAmt : 0,
+        notes: (pfManualForm.notes || '').trim(),
+      });
+
+      setPfResult(res);
+      setPfManualForm({
+        date: new Date().toISOString().split('T')[0],
+        type: 'DEPOSIT',
+        eeAmount: '',
+        erAmount: '',
+        notes: '',
+      });
+      await refreshPortfolios();
+    } catch (e) {
+      setPfError(e.message);
+    } finally {
+      setPfImporting(false);
+    }
+  };
+
+  const PF_TYPE_COLORS = {
+    DEPOSIT: 'bg-success',
+    EMPLOYER_CONTRIBUTION: 'bg-info',
+    EPS_CONTRIBUTION: 'bg-warning',
+    INTEREST: 'bg-primary',
+    WITHDRAWAL: 'bg-danger',
   };
 
   const handlePnlUpload = async () => {
@@ -2490,8 +2617,308 @@ export default function AddInvestment() {
         </>
       )}
 
-      {/* Non-Indian-Stock / Non-Bond / Non-MF / Non-NPS / Non-PPF / Non-SSY: original flow (PF) */}
-      {!isIndianStock && !isBond && !isMF && !isNPS && assetType !== 'PPF' && assetType !== 'SSY' && (
+      {/* PF: Upload + Manual sections */}
+      {assetType === 'PF' && (
+        <>
+          {/* Upload PF Statements */}
+          <Card className="shadow-sm">
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('pf-upload')}
+            >
+              <Upload size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Upload PF Statements</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'pf-upload' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'pf-upload'}>
+              <div>
+                <Card.Body className="pt-2">
+                  <p className="small text-muted mb-3">
+                    Upload EPFO Member Passbook PDFs (FY 2020-21 onwards). Multiple year statements can be uploaded together.
+                  </p>
+
+                  {pfError && (
+                    <Alert variant="danger" className="small py-2 d-flex align-items-center gap-2">
+                      <AlertCircle size={14} className="flex-shrink-0" />
+                      {pfError}
+                    </Alert>
+                  )}
+
+                  {pfResult && (
+                    <Alert variant="success" className="small py-2">
+                      <CheckCircle size={14} className="me-1" />
+                      Imported {pfResult.imported} transaction{pfResult.imported !== 1 ? 's' : ''}.
+                      {pfResult.skipped > 0 && <span className="text-muted ms-1">({pfResult.skipped} duplicates skipped)</span>}
+                      <button className="btn btn-link btn-sm p-0 ms-2" onClick={handlePFReset}>Upload more</button>
+                    </Alert>
+                  )}
+
+                  {!pfPreview && !pfResult && (
+                    <>
+                      <Row className="g-3 align-items-end">
+                        <Col md={12}>
+                          <Form.Label className="small">Statement Files (PDF)</Form.Label>
+                          <Form.Control
+                            ref={pfFileRef}
+                            size="sm"
+                            type="file"
+                            accept=".pdf"
+                            multiple
+                            onChange={(e) => setPfFiles(Array.from(e.target.files))}
+                          />
+                        </Col>
+                      </Row>
+                      {pfFiles.length > 0 && (
+                        <div className="mt-2 small text-muted">
+                          {pfFiles.length} file{pfFiles.length > 1 ? 's' : ''} selected
+                        </div>
+                      )}
+                      <div className="mt-3">
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          onClick={handlePFUpload}
+                          disabled={pfUploading || !pfFiles.length}
+                        >
+                          {pfUploading ? <><Spinner size="sm" className="me-1" /> Parsing...</> : <><Upload size={14} className="me-1" /> Parse & Preview</>}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+
+                  {/* PF Preview */}
+                  {pfPreview && (
+                    <div className="mt-3">
+                      <div className="d-flex align-items-center gap-2 mb-2 flex-wrap">
+                        <span className="badge bg-info">PF</span>
+                        {pfPreview.uan && <span className="badge bg-secondary">UAN: {pfPreview.uan}</span>}
+                        {pfPreview.memberName && <span className="badge bg-secondary">{pfPreview.memberName}</span>}
+                        {pfPreview.pfInvestmentId && <span className="badge" style={{ fontSize: '0.6rem', backgroundColor: '#dbeafe', color: '#1d4ed8' }}>Existing Investment</span>}
+                      </div>
+
+                      <div className="small mb-2">
+                        <span className="text-success fw-medium">{pfPreview.summary.newTransactions} new</span>
+                        {pfPreview.summary.existingTransactions > 0 && <span className="text-muted"> · {pfPreview.summary.existingTransactions} already in DB</span>}
+                        <span className="text-muted"> · {pfPreview.summary.totalTransactions} total</span>
+                      </div>
+
+                      {/* Transaction Table with Select/Deselect */}
+                      <div className="border rounded overflow-hidden">
+                        <button
+                          onClick={() => setPfShowTxns(!pfShowTxns)}
+                          className="w-100 bg-transparent border-0 text-start px-3 py-2 d-flex align-items-center"
+                          style={{ cursor: 'pointer' }}
+                        >
+                          <span className="small fw-medium flex-grow-1">Transactions ({pfPreview.transactions.length})</span>
+                          <ChevronDown size={14} className="text-muted" style={{ transition: 'transform 0.2s', transform: pfShowTxns ? 'rotate(180deg)' : 'rotate(0deg)' }} />
+                        </button>
+                        {pfShowTxns && (
+                          <div className="border-top">
+                            <div className="table-responsive" style={{ maxHeight: 350, overflowY: 'auto' }}>
+                              <Table size="sm" className="mb-0" style={{ fontSize: '0.75rem' }}>
+                                <thead className="table-light">
+                                  <tr>
+                                    <th className="px-2 py-1 text-center" style={{ width: '30px' }}>Select</th>
+                                    <th className="px-2 py-1">Date</th>
+                                    <th className="px-2 py-1">Type</th>
+                                    <th className="px-2 py-1 text-end">Amount</th>
+                                    <th className="px-2 py-1">Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {pfPreview.transactions.map((t, ti) => (
+                                    <tr key={ti} style={{ opacity: t.isNew ? 1 : 0.5, backgroundColor: pfSelectedTxns.has(ti) ? '#f0f7ff' : 'transparent' }}>
+                                      <td className="px-2 py-1 text-center">
+                                        <Form.Check
+                                          type="checkbox"
+                                          checked={pfSelectedTxns.has(ti)}
+                                          onChange={() => togglePFTransaction(ti)}
+                                          disabled={!t.isNew}
+                                        />
+                                      </td>
+                                      <td className="px-2 py-1 text-nowrap">{t.date}</td>
+                                      <td className="px-2 py-1">
+                                        <span className={`badge ${PF_TYPE_COLORS[t.type] || 'bg-secondary'}`} style={{ fontSize: '0.65rem' }}>
+                                          {t.type}
+                                        </span>
+                                      </td>
+                                      <td className="px-2 py-1 text-end">{formatCurrency(t.amount)}</td>
+                                      <td className="px-2 py-1">
+                                        {t.isNew ? (
+                                          <span className="badge" style={{ fontSize: '0.6rem', backgroundColor: '#dcfce7', color: '#15803d' }}>New</span>
+                                        ) : (
+                                          <span className="badge bg-light text-muted" style={{ fontSize: '0.6rem' }}>In DB</span>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </Table>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Import Bar */}
+                      <div className="bg-light border rounded p-2 mt-3 d-flex align-items-center justify-content-between">
+                        <div className="small text-muted">
+                          <strong>{pfSelectedTxns.size}</strong> transaction{pfSelectedTxns.size !== 1 ? 's' : ''} selected to import
+                        </div>
+                        <div className="d-flex gap-2">
+                          <Button size="sm" variant="outline-secondary" onClick={handlePFReset}>Cancel</Button>
+                          <Button
+                            size="sm" variant="success"
+                            onClick={handlePFImport}
+                            disabled={pfImporting || pfSelectedTxns.size === 0}
+                          >
+                            {pfImporting ? <><Spinner size="sm" className="me-1" /> Importing...</> : <><CheckCircle size={14} className="me-1" /> Approve & Import</>}
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </Card.Body>
+              </div>
+            </Collapse>
+          </Card>
+
+          {/* Add PF Manually */}
+          <Card className="shadow-sm">
+            <Card.Header
+              className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+              style={{ cursor: 'pointer' }}
+              onClick={() => toggleSection('pf-manual')}
+            >
+              <Plus size={20} className="text-primary" />
+              <span className="h6 fw-semibold mb-0 flex-grow-1">Add PF Manually</span>
+              <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style={{ transition: 'transform 0.2s', transform: expandedSection === 'pf-manual' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </Card.Header>
+            <Collapse in={expandedSection === 'pf-manual'}>
+              <div>
+                <Card.Body className="pt-2">
+                  <p className="small text-muted mb-3">Add a PF transaction manually. EPS will be calculated automatically as the difference between Employer and Employee contributions.</p>
+
+                  {pfError && (
+                    <Alert variant="danger" className="small py-2 d-flex align-items-center gap-2 mb-3">
+                      <AlertCircle size={14} className="flex-shrink-0" />
+                      {pfError}
+                    </Alert>
+                  )}
+
+                  {pfResult && (
+                    <Alert variant="success" className="small py-2 mb-3">
+                      <CheckCircle size={14} className="me-1" />
+                      Added {pfResult.inserted} transaction{pfResult.inserted !== 1 ? 's' : ''}
+                      <button className="btn btn-link btn-sm p-0 ms-2" onClick={() => {
+                        setPfResult(null);
+                        setPfManualForm({
+                          date: new Date().toISOString().split('T')[0],
+                          type: 'DEPOSIT',
+                          eeAmount: '',
+                          erAmount: '',
+                          notes: '',
+                        });
+                      }}>Add another</button>
+                    </Alert>
+                  )}
+
+                  {!pfResult && (
+                    <>
+                      <Row className="g-3">
+                        <Col md={6}>
+                          <Form.Label className="small">Date</Form.Label>
+                          <Form.Control
+                            size="sm"
+                            type="date"
+                            value={pfManualForm.date}
+                            onChange={(e) => setPfManualForm({ ...pfManualForm, date: e.target.value })}
+                          />
+                        </Col>
+                        <Col md={6}>
+                          <Form.Label className="small">Transaction Type</Form.Label>
+                          <Form.Select
+                            size="sm"
+                            value={pfManualForm.type}
+                            onChange={(e) => setPfManualForm({ ...pfManualForm, type: e.target.value })}
+                          >
+                            <option value="DEPOSIT">Employee Contribution</option>
+                            <option value="EMPLOYER_CONTRIBUTION">Employer Contribution</option>
+                          </Form.Select>
+                        </Col>
+                        <Col md={6}>
+                          <Form.Label className="small">Employee Contribution (₹)</Form.Label>
+                          <Form.Control
+                            size="sm"
+                            type="number"
+                            step="0.01"
+                            value={pfManualForm.eeAmount}
+                            onChange={(e) => setPfManualForm({ ...pfManualForm, eeAmount: e.target.value })}
+                            placeholder="Employee amount"
+                          />
+                        </Col>
+                        <Col md={6}>
+                          <Form.Label className="small">Employer Contribution (₹)</Form.Label>
+                          <Form.Control
+                            size="sm"
+                            type="number"
+                            step="0.01"
+                            value={pfManualForm.erAmount}
+                            onChange={(e) => setPfManualForm({ ...pfManualForm, erAmount: e.target.value })}
+                            placeholder="Employer amount"
+                          />
+                        </Col>
+                        <Col md={12}>
+                          <Form.Label className="small">Notes</Form.Label>
+                          <Form.Control
+                            size="sm"
+                            type="text"
+                            value={pfManualForm.notes || ''}
+                            onChange={(e) => setPfManualForm({ ...pfManualForm, notes: e.target.value })}
+                            placeholder="Optional notes"
+                          />
+                        </Col>
+                        <Col md={12}>
+                          <Form.Label className="small text-info">EPS (Auto-calculated)</Form.Label>
+                          <Form.Control
+                            size="sm"
+                            type="text"
+                            disabled
+                            value={`₹ ${Math.max(0, (parseFloat(pfManualForm.erAmount) || 0) - (parseFloat(pfManualForm.eeAmount) || 0)).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`}
+                          />
+                          <div className="small text-muted mt-1">EPS = Employer - Employee contribution</div>
+                        </Col>
+                      </Row>
+
+                      <div className="mt-3 d-flex justify-content-center gap-3">
+                        <Button
+                          variant="primary"
+                          onClick={handlePFManualSubmit}
+                          disabled={pfImporting}
+                        >
+                          {pfImporting ? <><Spinner size="sm" className="me-1" /> Adding...</> : <><Plus size={14} className="me-1" /> Add Transaction</>}
+                        </Button>
+                        <Button variant="link" className="text-muted" onClick={() => navigate(-1)}>
+                          Close
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </Card.Body>
+              </div>
+            </Collapse>
+          </Card>
+        </>
+      )}
+
+      {/* Non-Indian-Stock / Non-Bond / Non-MF / Non-NPS / Non-PPF / Non-SSY / Non-PF: original flow */}
+      {!isIndianStock && !isBond && !isMF && !isNPS && assetType !== 'PPF' && assetType !== 'SSY' && assetType !== 'PF' && (
         <>
           {/* Step 2: Investment Details */}
           <Card className="shadow-sm">

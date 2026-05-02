@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal } from 'react-bootstrap';
-import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction } from '../services/api';
+import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -9,7 +9,14 @@ import { usePortfolio } from '../context/PortfolioContext';
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
 const UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
 const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
-const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY' };
+const TYPE_LABELS = {
+  DEPOSIT: 'Deposit',
+  EMPLOYER_CONTRIBUTION: 'Employer',
+  VOLUNTARY_CONTRIBUTION: 'Voluntary',
+  EPS_CONTRIBUTION: 'EPS',
+  INTEREST: 'Interest',
+  WITHDRAWAL: 'Withdrawal'
+};
 
 const CASH_OUTFLOW_TYPES = new Set([
   'BUY', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
@@ -154,6 +161,7 @@ export default function InvestmentDetail() {
   // Delete confirmation modal state
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [deleteText, setDeleteText] = useState('');
+  const [interestUpdating, setInterestUpdating] = useState(false);
 
   const getChanges = () => {
     if (!editTxn) return [];
@@ -217,6 +225,46 @@ export default function InvestmentDetail() {
     }
   };
 
+  const handleInterestUpdate = async () => {
+    try {
+      setInterestUpdating(true);
+      const preview = await previewInvestmentInterestUpdate(id, {
+        portfolio_id: selectedId || undefined,
+      });
+
+      const entries = preview.proposed_entries || [];
+      const inserts = entries.filter(e => e.action === 'insert').length;
+      const updates = entries.filter(e => e.action === 'update').length;
+
+      if (!entries.length) {
+        alert('No interest entries to post for the selected period.');
+        return;
+      }
+
+      const proceed = window.confirm(
+        `Interest preview complete. ${inserts} new and ${updates} existing FY entries found.\n\n` +
+        'Click OK to continue with interest update.'
+      );
+      if (!proceed) return;
+
+      const replaceExisting = updates > 0
+        ? window.confirm('Replace existing INTEREST transactions on FY-end dates? Click Cancel to keep existing rows and only insert missing ones.')
+        : false;
+
+      const applied = await applyInvestmentInterestUpdate(id, {
+        portfolio_id: selectedId || undefined,
+        replace_existing: replaceExisting,
+      });
+
+      alert(`Interest update completed. Inserted: ${applied.summary.inserted}, Updated: ${applied.summary.updated}, Skipped: ${applied.summary.skipped}`);
+      await loadData();
+    } catch (e) {
+      alert('Interest update failed: ' + e.message);
+    } finally {
+      setInterestUpdating(false);
+    }
+  };
+
   const updateTxnField = (field, value) => {
     const updated = { ...txnForm, [field]: value };
     if ((field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
@@ -229,6 +277,7 @@ export default function InvestmentDetail() {
   if (!data) return <div className="text-danger">Investment not found</div>;
 
   const isPPF = data.asset_type === 'PPF' || data.asset_type === 'SSY' || data.asset_type === 'PF';
+  const isEpsInvestment = isPPF && /eps/i.test(String(data.name || ''));
   const isBond = data.asset_type === 'BOND';
   const isNPS = data.asset_type === 'NPS';
   const txnTypes = isPPF
@@ -296,6 +345,11 @@ export default function InvestmentDetail() {
       : null,
   ].filter(Boolean);
 
+  const getTxnTypeLabel = (type) => {
+    if (type === 'DEPOSIT' && Number(data.id) === 199) return 'Employee';
+    return TYPE_LABELS[type] || type.replace(/_/g, ' ');
+  };
+
   return (
     <div>
       {/* Header */}
@@ -314,6 +368,11 @@ export default function InvestmentDetail() {
           <Button variant="primary" size="sm" onClick={() => setShowAddTxn(true)} className="d-flex align-items-center gap-1">
             <Plus size={16} /> Add Transaction
           </Button>
+          {isPPF && (
+            <Button variant="outline-primary" size="sm" onClick={handleInterestUpdate} disabled={interestUpdating} className="d-flex align-items-center gap-1">
+              {interestUpdating ? 'Updating...' : 'Update Interest'}
+            </Button>
+          )}
           <Link to={`/investments/${id}/settings`} state={{ from: cameFrom, transactionsSearch, investmentsSearch }} className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
             <Settings size={16} /> Settings
           </Link>
@@ -472,6 +531,9 @@ export default function InvestmentDetail() {
                   const sorted = [...data.transactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || txnSortKey(a) - txnSortKey(b) || a.id - b.id);
                   const holdingMap = {};
                   const balanceMap = {};
+                  const creditTypes = isEpsInvestment
+                    ? ['EPS_CONTRIBUTION', 'INTEREST', 'TRANSFER_IN']
+                    : ['DEPOSIT', 'INTEREST', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'TRANSFER_IN'];
                   let unitBal = 0;
                   let amtBal = data.opening_balance || 0;
                   for (const txn of sorted) {
@@ -479,9 +541,12 @@ export default function InvestmentDetail() {
                     else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) unitBal -= txn.units || 0;
                     if (Math.abs(unitBal) < 1e-6) unitBal = 0;
                     holdingMap[txn.id] = unitBal;
-                    // PPF/SSY balance: deposits & interest add, withdrawals subtract
-                    if (['DEPOSIT', 'INTEREST'].includes(txn.transaction_type)) amtBal += txn.amount || 0;
-                    else if (txn.transaction_type === 'WITHDRAWAL') amtBal -= txn.amount || 0;
+                    // EPS-only ledgers should accumulate EPS rows; EPF-ledgers should exclude EPS rows.
+                    if (creditTypes.includes(txn.transaction_type)) {
+                      amtBal += txn.amount || 0;
+                    } else if (['WITHDRAWAL', 'TRANSFER_OUT'].includes(txn.transaction_type)) {
+                      amtBal -= txn.amount || 0;
+                    }
                     balanceMap[txn.id] = amtBal;
                   }
                   const hasFolio = data.transactions.some(t => t.folio_number);
@@ -493,7 +558,7 @@ export default function InvestmentDetail() {
                     <td className="px-3 text-nowrap">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3">
                       <span className={`badge rounded-pill badge-${txn.transaction_type.toLowerCase()}`}>
-                        {TYPE_LABELS[txn.transaction_type] || txn.transaction_type.replace(/_/g, ' ')}
+                        {getTxnTypeLabel(txn.transaction_type)}
                       </span>
                     </td>
                     {!isPPF && <td className="px-3 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>}

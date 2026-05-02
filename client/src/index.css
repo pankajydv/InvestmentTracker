@@ -1,5 +1,5 @@
 body {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-family: 'Roboto', system-ui, -apple-system, sans-serif;
   background-color: #f8f9fa;
 }
 
@@ -45,7 +45,7 @@ tr:hover .row-actions {
 .badge-dividend { background-color: #dbeafe !important; color: #1d4ed8 !important; }
 .badge-bonus { background-color: #d1fae5 !important; color: #047857 !important; }
 .badge-ipo { background-color: #dcfce7 !important; color: #15803d !important; }
-.badge-deposit { background-color: #dcfce7 !important; color: #15803d !important; }
+.badge-deposit { background-color: #fed7aa !important; color: #92400e !important; }
 .badge-withdrawal { background-color: #fee2e2 !important; color: #b91c1c !important; }
 .badge-split { background-color: #dbeafe !important; color: #1d4ed8 !important; }
 .badge-interest { background-color: #dbeafe !important; color: #1d4ed8 !important; }
@@ -53,6 +53,12 @@ tr:hover .row-actions {
 .badge-amc { background-color: #fef3c7 !important; color: #b45309 !important; }
 .badge-charges { background-color: #fef3c7 !important; color: #b45309 !important; }
 .badge-employer_contribution { background-color: #dcfce7 !important; color: #15803d !important; }
+.badge-deposit,
+.badge-employer_contribution {
+  font-weight: 700 !important;
+  letter-spacing: 0.01em;
+}
+.badge-eps_contribution { background-color: #fef9c3 !important; color: #854d0e !important; }
 .badge-voluntary_contribution { background-color: #dbeafe !important; color: #1d4ed8 !important; }
 .badge-transfer_in { background-color: #d1fae5 !important; color: #047857 !important; }
 .badge-transfer_out { background-color: #fef3c7 !important; color: #b45309 !important; }

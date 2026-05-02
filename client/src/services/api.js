@@ -199,6 +199,25 @@ export const previewPPFStatements = async (files, portfolioId, password) => {
 export const importPPFTransactions = (portfolioId, data) =>
   fetchJSON('/ppf/import', { method: 'POST', body: JSON.stringify({ portfolio_id: portfolioId, ...data }) });
 
+// PF Statement Upload
+export const previewPFStatements = async (files, portfolioId) => {
+  const formData = new FormData();
+  files.forEach(f => formData.append('files', f));
+  formData.append('portfolio_id', portfolioId);
+  const res = await fetch(`${API_BASE}/pf/preview`, { method: 'POST', body: formData });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Upload failed');
+  }
+  return res.json();
+};
+
+export const importPFTransactions = (portfolioId, data) =>
+  fetchJSON('/pf/import', { method: 'POST', body: JSON.stringify({ portfolio_id: portfolioId, ...data }) });
+
+export const addManualPFTransaction = (portfolioId, data) =>
+  fetchJSON('/pf/manual', { method: 'POST', body: JSON.stringify({ portfolio_id: portfolioId, ...data }) });
+
 // Portfolio Expenses
 export const getExpenses = (params = {}) => {
   const qs = new URLSearchParams(params);
@@ -230,6 +249,21 @@ export const previewInterestRateSync = (assetType, portfolioId) => {
 };
 export const importInterestRateSync = (data) =>
   fetchJSON('/investments/interest-rate-sync/import', { method: 'POST', body: JSON.stringify(data) });
+
+// Interest Update (PF/PPF/SSY)
+export const previewInvestmentInterestUpdate = (investmentId, params = {}) => {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+  });
+  return fetchJSON(`/investments/${investmentId}/interest/preview${qs.toString() ? `?${qs}` : ''}`);
+};
+
+export const applyInvestmentInterestUpdate = (investmentId, data = {}) =>
+  fetchJSON(`/investments/${investmentId}/interest/apply`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
 
 // Export all data as XLSX download
 export const exportData = async () => {

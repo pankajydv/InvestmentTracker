@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { INTEREST_RATES, DATASET_VERSION } = require('../data/interest-rates');
+const { calculatePfInterestPreview } = require('../services/pfInterestCalculator');
 
 const CASH_OUTFLOW_TYPES = new Set([
   'BUY', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
@@ -342,6 +343,320 @@ module.exports = function (db) {
   router.delete('/:id', (req, res) => {
     db.prepare('DELETE FROM investments WHERE id = ?').run(req.params.id);
     res.json({ success: true });
+  });
+
+  function parseBool(v, defaultVal = false) {
+    if (v == null) return defaultVal;
+    const s = String(v).toLowerCase();
+    return s === '1' || s === 'true' || s === 'yes';
+  }
+
+  function fyEndDateFromLabel(fyLabel) {
+    const m = String(fyLabel || '').match(/^FY(\d{4})-(\d{2})$/);
+    if (!m) return null;
+    const startYear = parseInt(m[1], 10);
+    const endYear = startYear + 1;
+    return `${endYear}-03-31`;
+  }
+
+  function getRateRowsForType(assetType) {
+    const dbRates = db.prepare(
+      'SELECT rate, effective_from, effective_to FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
+    ).all(assetType);
+    if (dbRates.length) return dbRates;
+
+    return INTEREST_RATES
+      .filter(r => r.rate_type === assetType)
+      .map(r => ({ rate: r.rate, effective_from: r.effective_from, effective_to: r.effective_to || null }));
+  }
+
+  function getInterestPreview(inv, queryParams) {
+    const requestedPortfolioId = queryParams.portfolio_id != null
+      ? parseInt(queryParams.portfolio_id, 10)
+      : null;
+
+    const portfolioFilter = Number.isFinite(requestedPortfolioId) ? ' AND portfolio_id = ?' : '';
+    const portfolioArgs = Number.isFinite(requestedPortfolioId) ? [requestedPortfolioId] : [];
+
+    const minDateRow = db.prepare(`
+      SELECT MIN(transaction_date) AS d
+      FROM transactions
+      WHERE investment_id = ?${portfolioFilter}
+    `).get(inv.id, ...portfolioArgs);
+    const maxDateRow = db.prepare(`
+      SELECT MAX(transaction_date) AS d
+      FROM transactions
+      WHERE investment_id = ?${portfolioFilter}
+    `).get(inv.id, ...portfolioArgs);
+
+    if (!minDateRow?.d || !maxDateRow?.d) {
+      throw new Error('No transactions found for this investment.');
+    }
+
+    const fromDate = queryParams.from_date || minDateRow.d;
+    const toDate = queryParams.to_date || maxDateRow.d;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+      throw new Error('from_date and to_date must be YYYY-MM-DD');
+    }
+
+    const contributionMonthShift = queryParams.contribution_month_shift != null
+      ? parseInt(queryParams.contribution_month_shift, 10)
+      : 0;
+    const monthlyRoundingDecimals = queryParams.monthly_rounding_decimals != null
+      ? parseInt(queryParams.monthly_rounding_decimals, 10)
+      : 2;
+    const ignoreExistingInterest = queryParams.ignore_existing_interest !== 'false';
+    const includeTransferTransactions = parseBool(queryParams.include_transfer_transactions, false);
+
+    const txns = db.prepare(`
+      SELECT id, transaction_date, transaction_type, amount, portfolio_id
+      FROM transactions
+      WHERE investment_id = ?${portfolioFilter}
+      ORDER BY transaction_date, id
+    `).all(inv.id, ...portfolioArgs);
+
+    const rateRows = getRateRowsForType(inv.asset_type);
+
+    const preview = calculatePfInterestPreview({
+      openingBalance: inv.opening_balance || 0,
+      transactions: txns,
+      rateRows,
+      fromDate,
+      toDate,
+      contributionMonthShift,
+      monthlyRoundingDecimals,
+      ignoreExistingInterest,
+      includeTransferTransactions,
+    });
+
+    const existingInterestRows = db.prepare(`
+      SELECT id, transaction_date, amount, notes, portfolio_id
+      FROM transactions
+      WHERE investment_id = ?
+        AND transaction_type = 'INTEREST'
+        AND transaction_date >= ?
+        AND transaction_date <= ?${portfolioFilter}
+      ORDER BY transaction_date ASC, id ASC
+    `).all(inv.id, fromDate, toDate, ...portfolioArgs);
+
+    const existingByDate = new Map();
+    for (const r of existingInterestRows) {
+      if (!existingByDate.has(r.transaction_date)) existingByDate.set(r.transaction_date, r);
+    }
+
+    const proposedEntries = preview.annualRows
+      .map((row) => {
+        const creditDate = fyEndDateFromLabel(row.fy);
+        if (!creditDate || creditDate < fromDate || creditDate > toDate) return null;
+
+        const existing = existingByDate.get(creditDate) || null;
+        const amount = Math.round(Number(row.interest || 0) * 100) / 100;
+        if (amount <= 0) return null;
+
+        const sameAmount = existing && Math.abs(Number(existing.amount || 0) - amount) < 0.005;
+        const action = existing ? (sameAmount ? 'unchanged' : 'update') : 'insert';
+
+        return {
+          fy: row.fy,
+          date: creditDate,
+          amount,
+          existing_id: existing?.id || null,
+          existing_amount: existing ? Number(existing.amount) : null,
+          existing_notes: existing?.notes || null,
+          portfolio_id: existing?.portfolio_id || requestedPortfolioId || null,
+          action,
+        };
+      })
+      .filter(Boolean);
+
+    const distinctPortfolios = db.prepare(
+      'SELECT DISTINCT portfolio_id FROM transactions WHERE investment_id = ? ORDER BY portfolio_id'
+    ).all(inv.id).map(r => r.portfolio_id).filter(v => v != null);
+
+    return {
+      investment: { id: inv.id, name: inv.name, asset_type: inv.asset_type },
+      window: { from_date: fromDate, to_date: toDate },
+      options: {
+        contribution_month_shift: contributionMonthShift,
+        monthly_rounding_decimals: monthlyRoundingDecimals,
+        ignore_existing_interest: ignoreExistingInterest,
+        include_transfer_transactions: includeTransferTransactions,
+        portfolio_id: Number.isFinite(requestedPortfolioId) ? requestedPortfolioId : null,
+      },
+      preview,
+      proposed_entries: proposedEntries,
+      portfolio_context: {
+        requested_portfolio_id: Number.isFinite(requestedPortfolioId) ? requestedPortfolioId : null,
+        inferred_portfolio_ids: distinctPortfolios,
+      },
+    };
+  }
+
+  // ─── Interest Preview (PF/PPF/SSY) ───────────────────────────────────
+  router.get('/:id/interest/preview', (req, res) => {
+    try {
+      const invId = parseInt(req.params.id, 10);
+      if (!Number.isFinite(invId)) {
+        return res.status(400).json({ error: 'Invalid investment id' });
+      }
+
+      const inv = db.prepare('SELECT id, name, asset_type, opening_balance FROM investments WHERE id = ?').get(invId);
+      if (!inv) return res.status(404).json({ error: 'Investment not found' });
+      if (!['PF', 'PPF', 'SSY'].includes(inv.asset_type)) {
+        return res.status(400).json({ error: 'Interest preview is supported only for PF, PPF, and SSY investments.' });
+      }
+
+      const result = getInterestPreview(inv, req.query || {});
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: 'Failed interest preview: ' + e.message });
+    }
+  });
+
+  // Legacy alias: keep existing PF endpoint for compatibility
+  router.get('/:id/pf-interest/epfo-preview', (req, res) => {
+    try {
+      const invId = parseInt(req.params.id, 10);
+      if (!Number.isFinite(invId)) {
+        return res.status(400).json({ error: 'Invalid investment id' });
+      }
+
+      const inv = db.prepare('SELECT id, name, asset_type, opening_balance FROM investments WHERE id = ?').get(invId);
+      if (!inv) return res.status(404).json({ error: 'Investment not found' });
+      if (inv.asset_type !== 'PF') {
+        return res.status(400).json({ error: 'EPFO preview is supported only for PF investments.' });
+      }
+
+      const result = getInterestPreview(inv, req.query || {});
+
+      const fromDate = result.window.from_date;
+      const toDate = result.window.to_date;
+      const contributionTotal = db.prepare(
+        "SELECT ROUND(COALESCE(SUM(amount),0),2) AS amt FROM transactions " +
+        "WHERE investment_id = ? AND transaction_date >= ? AND transaction_date <= ? " +
+        "AND transaction_type IN ('DEPOSIT','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION')"
+      ).get(invId, fromDate, toDate).amt;
+
+      const checkpointTransferIn = db.prepare(
+        "SELECT ROUND(COALESCE(SUM(amount),0),2) AS amt FROM transactions " +
+        "WHERE investment_id = ? AND transaction_type = 'TRANSFER_IN' AND transaction_date = ?"
+      ).get(invId, toDate).amt;
+
+      const opening = Number(inv.opening_balance || 0);
+      const checkpointImpliedBalance = Math.round((opening + contributionTotal + checkpointTransferIn) * 100) / 100;
+      const checkpointGap = Math.round((checkpointImpliedBalance - result.preview.closingBalance) * 100) / 100;
+
+      res.json({
+        investment: result.investment,
+        window: result.window,
+        preview: result.preview,
+        checkpoint: {
+          transfer_in_on_to_date: checkpointTransferIn,
+          implied_balance_using_transfer_checkpoint: checkpointImpliedBalance,
+          gap_implied_minus_modeled: checkpointGap,
+        },
+        proposed_entries: result.proposed_entries,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed EPFO PF interest preview: ' + e.message });
+    }
+  });
+
+  // ─── Interest Apply (PF/PPF/SSY) ─────────────────────────────────────
+  router.post('/:id/interest/apply', express.json(), (req, res) => {
+    try {
+      const invId = parseInt(req.params.id, 10);
+      if (!Number.isFinite(invId)) {
+        return res.status(400).json({ error: 'Invalid investment id' });
+      }
+
+      const inv = db.prepare('SELECT id, name, asset_type, opening_balance FROM investments WHERE id = ?').get(invId);
+      if (!inv) return res.status(404).json({ error: 'Investment not found' });
+      if (!['PF', 'PPF', 'SSY'].includes(inv.asset_type)) {
+        return res.status(400).json({ error: 'Interest apply is supported only for PF, PPF, and SSY investments.' });
+      }
+
+      const queryLikeParams = {
+        ...req.body,
+        portfolio_id: req.body?.portfolio_id ?? null,
+      };
+      const previewResult = getInterestPreview(inv, queryLikeParams);
+
+      const replaceExisting = parseBool(req.body?.replace_existing, false);
+      const dryRun = parseBool(req.body?.dry_run, false);
+
+      const explicitPortfolioId = req.body?.portfolio_id != null
+        ? parseInt(req.body.portfolio_id, 10)
+        : null;
+      const inferredPortfolioIds = previewResult.portfolio_context.inferred_portfolio_ids || [];
+
+      let targetPortfolioId = Number.isFinite(explicitPortfolioId) ? explicitPortfolioId : null;
+      if (targetPortfolioId == null) {
+        if (inferredPortfolioIds.length === 1) {
+          targetPortfolioId = inferredPortfolioIds[0];
+        } else {
+          return res.status(400).json({
+            error: 'portfolio_id is required when the investment has transactions in multiple portfolios.',
+            inferred_portfolio_ids: inferredPortfolioIds,
+          });
+        }
+      }
+
+      const insertStmt = db.prepare(
+        "INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, amount, fees, notes) " +
+        "VALUES (?, ?, 'INTEREST', ?, ?, 0, ?)"
+      );
+      const updateStmt = db.prepare(
+        "UPDATE transactions SET amount = ?, notes = ? WHERE id = ?"
+      );
+
+      let inserted = 0;
+      let updated = 0;
+      let skipped = 0;
+      const appliedEntries = [];
+
+      const runApply = db.transaction(() => {
+        for (const entry of previewResult.proposed_entries) {
+          const note = `Auto interest update (${inv.asset_type} model) ${entry.fy}`;
+
+          if (entry.action === 'unchanged') {
+            skipped += 1;
+            appliedEntries.push({ ...entry, result: 'skipped_unchanged' });
+            continue;
+          }
+
+          if (entry.existing_id) {
+            if (!replaceExisting) {
+              skipped += 1;
+              appliedEntries.push({ ...entry, result: 'skipped_existing' });
+              continue;
+            }
+            if (!dryRun) updateStmt.run(entry.amount, note, entry.existing_id);
+            updated += 1;
+            appliedEntries.push({ ...entry, result: dryRun ? 'would_update' : 'updated' });
+            continue;
+          }
+
+          if (!dryRun) insertStmt.run(inv.id, targetPortfolioId, entry.date, entry.amount, note);
+          inserted += 1;
+          appliedEntries.push({ ...entry, result: dryRun ? 'would_insert' : 'inserted' });
+        }
+      });
+
+      runApply();
+
+      res.json({
+        success: true,
+        dry_run: dryRun,
+        replace_existing: replaceExisting,
+        investment: previewResult.investment,
+        target_portfolio_id: targetPortfolioId,
+        summary: { inserted, updated, skipped },
+        applied_entries: appliedEntries,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed interest apply: ' + e.message });
+    }
   });
 
   // ─── Interest Rate Sync: Preview ──────────────────────────────────────
