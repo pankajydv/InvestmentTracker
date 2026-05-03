@@ -27,6 +27,7 @@ app.use('/api/nps', require('./routes/nps')(db));
 app.use('/api/ppf', require('./routes/ppf')(db));
 app.use('/api/pf', require('./routes/pf')(db));
 app.use('/api/expenses', require('./routes/expenses')(db));
+app.use('/api/tax', require('./routes/tax')(db));
 
 // Serve static files in production
 if (process.env.NODE_ENV === 'production') {

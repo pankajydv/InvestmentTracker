@@ -1,15 +1,15 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal } from 'react-bootstrap';
-import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate } from '../services/api';
+import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewRsuGrantSchedule, importRsuGrantSchedule } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
+const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
 const UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
-const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
 const TYPE_LABELS = {
   DEPOSIT: 'Deposit',
   EMPLOYER_CONTRIBUTION: 'Employer',
@@ -20,7 +20,7 @@ const TYPE_LABELS = {
 };
 
 const CASH_OUTFLOW_TYPES = new Set([
-  'BUY', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
+  'BUY', 'VEST', 'ESPP_PURCHASE', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
 ]);
 
 const CASH_INFLOW_TYPES = new Set([
@@ -99,9 +99,32 @@ export default function InvestmentDetail() {
     amount: '',
     fees: '0',
     notes: '',
+    exchange_rate_used: '',
+    usd_amount: '',
+    fmv_per_unit: '',
   });
+  const [rateLoading, setRateLoading] = useState(false);
 
   useEffect(() => { loadData(); }, [id, selectedId]);
+
+  // Auto-fetch RBI rate when date or type changes for USD investments
+  const fetchRBIRate = useCallback(async (date) => {
+    if (!data || data.currency !== 'USD') return;
+    if (!date) return;
+    try {
+      setRateLoading(true);
+      const result = await getUSDINRRate(date);
+      setTxnForm(prev => ({ ...prev, exchange_rate_used: result.rate ? String(result.rate) : prev.exchange_rate_used }));
+    } catch (_) { /* silently ignore */ } finally {
+      setRateLoading(false);
+    }
+  }, [data]);
+
+  useEffect(() => {
+    if (showAddTxn && data?.asset_type === 'FOREIGN_STOCK' && data?.currency === 'USD' && txnForm.transaction_date) {
+      fetchRBIRate(txnForm.transaction_date);
+    }
+  }, [showAddTxn, data, txnForm.transaction_date, fetchRBIRate]);
 
   const loadData = async () => {
     try {
@@ -125,8 +148,14 @@ export default function InvestmentDetail() {
     e.preventDefault();
     try {
       let amount = parseFloat(txnForm.amount);
-      if (!amount && txnForm.units && txnForm.price_per_unit) {
-        amount = parseFloat(txnForm.units) * parseFloat(txnForm.price_per_unit);
+      // For USD investments: auto-compute INR amount from USD × rate if not set
+      const rate = txnForm.exchange_rate_used ? parseFloat(txnForm.exchange_rate_used) : null;
+      const usdUnits = txnForm.units ? parseFloat(txnForm.units) : null;
+      const priceUSD = txnForm.price_per_unit ? parseFloat(txnForm.price_per_unit) : null;
+      if (!amount && usdUnits && priceUSD && rate) {
+        amount = usdUnits * priceUSD * rate;
+      } else if (!amount && usdUnits && priceUSD) {
+        amount = usdUnits * priceUSD;
       }
 
       await addTransaction({
@@ -134,16 +163,20 @@ export default function InvestmentDetail() {
         portfolio_id: selectedId || null,
         transaction_type: txnForm.transaction_type,
         transaction_date: txnForm.transaction_date,
-        units: txnForm.units ? parseFloat(txnForm.units) : null,
-        price_per_unit: txnForm.price_per_unit ? parseFloat(txnForm.price_per_unit) : null,
+        units: usdUnits,
+        price_per_unit: priceUSD,
         amount,
         fees: parseFloat(txnForm.fees) || 0,
         notes: txnForm.notes || null,
+        exchange_rate_used: rate,
+        usd_amount: txnForm.usd_amount ? parseFloat(txnForm.usd_amount) : (usdUnits && priceUSD ? usdUnits * priceUSD : null),
+        fmv_per_unit: txnForm.fmv_per_unit ? parseFloat(txnForm.fmv_per_unit) : null,
       });
       setShowAddTxn(false);
       setTxnForm({
         transaction_type: 'BUY', transaction_date: new Date().toISOString().split('T')[0],
         units: '', price_per_unit: '', amount: '', fees: '0', notes: '',
+        exchange_rate_used: '', usd_amount: '', fmv_per_unit: '',
       });
       loadData();
     } catch (e) {
@@ -158,11 +191,18 @@ export default function InvestmentDetail() {
 
   // Folio filter state
   const [selectedFolio, setSelectedFolio] = useState('ALL');
+  const [selectedGrant, setSelectedGrant] = useState('ALL');
 
   // Delete confirmation modal state
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [deleteText, setDeleteText] = useState('');
   const [interestUpdating, setInterestUpdating] = useState(false);
+  const [showRsuModal, setShowRsuModal] = useState(false);
+  const [rsuLoading, setRsuLoading] = useState(false);
+  const [rsuImporting, setRsuImporting] = useState(false);
+  const [rsuPreview, setRsuPreview] = useState(null);
+  const [rsuIncludeFuture, setRsuIncludeFuture] = useState(false);
+  const [rsuOverwriteExisting, setRsuOverwriteExisting] = useState(false);
 
   const getChanges = () => {
     if (!editTxn) return [];
@@ -175,6 +215,8 @@ export default function InvestmentDetail() {
     if (String(editForm.fees || '') !== String(editTxn.fees || '')) changes.push('Charges');
     if ((editForm.broker || '') !== (editTxn.broker || '')) changes.push('Broker');
     if ((editForm.notes || '') !== (editTxn.notes || '')) changes.push('Notes');
+    if (String(editForm.exchange_rate_used || '') !== String(editTxn.exchange_rate_used || '')) changes.push('Exchange Rate');
+    if (String(editForm.fmv_per_unit || '') !== String(editTxn.fmv_per_unit || '')) changes.push('FMV/Unit');
     return changes;
   };
   const editChanges = getChanges();
@@ -191,6 +233,8 @@ export default function InvestmentDetail() {
       fees: txn.fees || '',
       broker: txn.broker || '',
       notes: txn.notes || '',
+      exchange_rate_used: txn.exchange_rate_used || '',
+      fmv_per_unit: txn.fmv_per_unit || '',
     });
   };
 
@@ -206,6 +250,8 @@ export default function InvestmentDetail() {
         fees: editForm.fees ? Number(editForm.fees) : 0,
         broker: editForm.broker || null,
         notes: editForm.notes || null,
+        exchange_rate_used: editForm.exchange_rate_used ? Number(editForm.exchange_rate_used) : null,
+        fmv_per_unit: editForm.fmv_per_unit ? Number(editForm.fmv_per_unit) : null,
       });
       setEditTxn(null);
       loadData();
@@ -266,9 +312,74 @@ export default function InvestmentDetail() {
     }
   };
 
+  const loadRsuPreview = async (includeFuture) => {
+    if (!selectedId) {
+      alert('Select a portfolio first to preview RSU imports.');
+      return;
+    }
+
+    try {
+      setRsuLoading(true);
+      const result = await previewRsuGrantSchedule({
+        investment_id: id,
+        portfolio_id: selectedId,
+        include_future: includeFuture,
+      });
+      setRsuPreview(result);
+    } catch (e) {
+      alert('RSU preview failed: ' + e.message);
+    } finally {
+      setRsuLoading(false);
+    }
+  };
+
+  const openRsuModal = async () => {
+    setShowRsuModal(true);
+    await loadRsuPreview(rsuIncludeFuture);
+  };
+
+  const handleImportRsu = async () => {
+    if (!selectedId) {
+      alert('Select a portfolio first to import RSU grants.');
+      return;
+    }
+
+    if (!window.confirm('Import RSU vest rows into transactions for this investment?')) return;
+
+    try {
+      setRsuImporting(true);
+      const result = await importRsuGrantSchedule({
+        investment_id: Number(id),
+        portfolio_id: Number(selectedId),
+        include_future: rsuIncludeFuture,
+        overwrite_existing: rsuOverwriteExisting,
+      });
+      alert(`RSU import complete. Created: ${result.created}, Skipped: ${result.skipped}, Replaced: ${result.removed_existing}.`);
+      await loadRsuPreview(rsuIncludeFuture);
+      await loadData();
+    } catch (e) {
+      alert('RSU import failed: ' + e.message);
+    } finally {
+      setRsuImporting(false);
+    }
+  };
+
   const updateTxnField = (field, value) => {
     const updated = { ...txnForm, [field]: value };
-    if ((field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
+    // Date change: auto-fetch RBI rate for USD investments
+    if (field === 'transaction_date' && isForeignUSD && value) {
+      fetchRBIRate(value);
+    }
+    // Auto-calc INR amount for USD investments
+    if (isForeignUSD) {
+      const u = parseFloat(updated.units) || 0;
+      const p = parseFloat(updated.price_per_unit) || 0;
+      const r = parseFloat(updated.exchange_rate_used) || 0;
+      if (u > 0 && p > 0 && r > 0 && (field === 'units' || field === 'price_per_unit' || field === 'exchange_rate_used')) {
+        updated.usd_amount = String(Math.round(u * p * 100) / 100);
+        updated.amount = String(Math.round(u * p * r * 100) / 100);
+      }
+    } else if ((field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
       updated.amount = (parseFloat(updated.units) * parseFloat(updated.price_per_unit)).toFixed(2);
     }
     setTxnForm(updated);
@@ -282,11 +393,16 @@ export default function InvestmentDetail() {
   const isBond = data.asset_type === 'BOND';
   const isNPS = data.asset_type === 'NPS';
   const isSGB = data.asset_type === 'SGB';
-  
+  const isForeignUSD = data.asset_type === 'FOREIGN_STOCK' && data.currency === 'USD';
+  const isMSFTStock = /MSFT/i.test(String(data.ticker_symbol || '')) || /microsoft/i.test(String(data.name || ''));
+  const canImportRsu = isForeignUSD && isMSFTStock;
+
   const txnTypes = isPPF
     ? ['DEPOSIT', 'WITHDRAWAL', 'INTEREST']
     : isBond || isSGB
     ? ['BUY', 'SELL', 'INTEREST']
+    : isForeignUSD
+    ? ['VEST', 'ESPP_PURCHASE', 'BUY', 'SELL', 'DIVIDEND']
     : ['BUY', 'SELL', 'DIVIDEND'];
 
   const absoluteReturnPct = data.latestValue?.profit_loss_pct ?? null;
@@ -323,8 +439,72 @@ export default function InvestmentDetail() {
   const xirrRate = calculateXirr(xirrCashflows);
   const xirrPct = xirrRate == null ? null : xirrRate * 100;
   const cumulativeValue = (Number(data.latestValue?.current_value) || 0) + (Number(data.saleProceeds) || 0);
-  const hasFolioColumn = !isPPF && data.transactions.some((t) => t.folio_number);
+  const visibleTransactions = isForeignUSD
+    ? (data.transactions || []).filter((txn) => {
+        const isPlaceholderVest = txn.transaction_type === 'VEST'
+          && (Number(txn.amount) || 0) === 0
+          && txn.price_per_unit == null
+          && txn.gross_units == null
+          && txn.tax_withheld_units == null;
+        return !isPlaceholderVest;
+      })
+    : (data.transactions || []);
+  const hiddenPlaceholderCount = (data.transactions || []).length - visibleTransactions.length;
+  const hasFolioColumn = !isPPF && visibleTransactions.some((t) => t.folio_number);
   const folioOptions = (data.folio_options || []).map((f) => f.folio_number).filter(Boolean);
+
+  const parseGrantMeta = (notes) => {
+    const text = String(notes || '');
+    const grantMatch = text.match(/^RSU Vest\s*\|\s*([^|]+?)\s*\|/i);
+    const awardMatch = text.match(/Award\s+(\d+)/i);
+    const trancheMatch = text.match(/Tranche\s+(\d+\/\d+)/i);
+    return {
+      grantLabel: grantMatch ? grantMatch[1].trim() : null,
+      awardNumber: awardMatch ? awardMatch[1] : null,
+      tranche: trancheMatch ? trancheMatch[1] : null,
+    };
+  };
+
+  const formatGrantUnits = (value) => {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '-';
+    return Math.abs(num - Math.round(num)) < 1e-6
+      ? String(Math.round(num))
+      : formatNumber(num, 3);
+  };
+
+  const awardTotalToVest = (data.transactions || []).reduce((acc, txn) => {
+    if (txn.transaction_type !== 'VEST') return acc;
+    if (txn.gross_units == null) return acc;
+    const meta = parseGrantMeta(txn.notes);
+    if (!meta.awardNumber) return acc;
+    acc[meta.awardNumber] = (acc[meta.awardNumber] || 0) + Number(txn.gross_units || 0);
+    return acc;
+  }, {});
+
+  const cumulativeAwardGrossByTxnId = (() => {
+    const byTxn = {};
+    const runningByAward = {};
+    const vestRows = (data.transactions || [])
+      .filter((txn) => txn.transaction_type === 'VEST' && txn.gross_units != null)
+      .slice()
+      .sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || a.id - b.id);
+
+    for (const txn of vestRows) {
+      const meta = parseGrantMeta(txn.notes);
+      if (!meta.awardNumber) continue;
+      runningByAward[meta.awardNumber] = (runningByAward[meta.awardNumber] || 0) + Number(txn.gross_units || 0);
+      byTxn[txn.id] = runningByAward[meta.awardNumber];
+    }
+
+    return byTxn;
+  })();
+
+  const grantOptions = Array.from(new Set(
+    visibleTransactions
+      .map((t) => parseGrantMeta(t.notes).grantLabel)
+      .filter(Boolean)
+  )).sort((a, b) => a.localeCompare(b));
 
   // SGB calculations
   let sgbDetails = null;
@@ -419,6 +599,11 @@ export default function InvestmentDetail() {
               {interestUpdating ? 'Updating...' : 'Update Interest'}
             </Button>
           )}
+          {canImportRsu && (
+            <Button variant="outline-primary" size="sm" onClick={openRsuModal} className="d-flex align-items-center gap-1">
+              RSU Grants
+            </Button>
+          )}
           <Link to={`/investments/${id}/settings`} state={{ from: cameFrom, transactionsSearch, investmentsSearch }} className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
             <Settings size={16} /> Settings
           </Link>
@@ -487,36 +672,58 @@ export default function InvestmentDetail() {
                 <Col md={4}>
                   <Form.Label className="small">Type</Form.Label>
                   <Form.Select size="sm" value={txnForm.transaction_type} onChange={(e) => updateTxnField('transaction_type', e.target.value)}>
-                    {txnTypes.map((t) => <option key={t} value={t}>{t}</option>)}
+                    {txnTypes.map((t) => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
                   </Form.Select>
                 </Col>
                 <Col md={4}>
                   <Form.Label className="small">Date</Form.Label>
-                  <Form.Control size="sm" type="date" value={txnForm.transaction_date} onChange={(e) => updateTxnField('transaction_date', e.target.value)} required />
+                  <Form.Control size="sm" type="date" value={txnForm.transaction_date}
+                    onChange={(e) => updateTxnField('transaction_date', e.target.value)} required />
                 </Col>
                 {!isPPF && (
                   <>
                     <Col md={4}>
                       <Form.Label className="small">Units</Form.Label>
-                      <Form.Control size="sm" type="number" step="0.001" value={txnForm.units} onChange={(e) => updateTxnField('units', e.target.value)} placeholder="Number of units" />
+                      <Form.Control size="sm" type="number" step="0.001" value={txnForm.units}
+                        onChange={(e) => updateTxnField('units', e.target.value)} placeholder="Number of units" />
                     </Col>
                     <Col md={4}>
-                      <Form.Label className="small">Price per Unit</Form.Label>
-                      <Form.Control size="sm" type="number" step="0.01" value={txnForm.price_per_unit} onChange={(e) => updateTxnField('price_per_unit', e.target.value)} placeholder="Price per unit" />
+                      <Form.Label className="small">{isForeignUSD ? 'Price/Unit (USD)' : 'Price per Unit'}</Form.Label>
+                      <Form.Control size="sm" type="number" step="0.0001" value={txnForm.price_per_unit}
+                        onChange={(e) => updateTxnField('price_per_unit', e.target.value)} placeholder={isForeignUSD ? 'FMV in USD' : 'Price per unit'} />
                     </Col>
+                    {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                      <Col md={4}>
+                        <Form.Label className="small">FMV/Unit on Purchase Date (USD)</Form.Label>
+                        <Form.Control size="sm" type="number" step="0.0001" value={txnForm.fmv_per_unit}
+                          onChange={(e) => updateTxnField('fmv_per_unit', e.target.value)} placeholder="Market price (USD)" />
+                      </Col>
+                    )}
+                    {isForeignUSD && (
+                      <Col md={4}>
+                        <Form.Label className="small d-flex align-items-center gap-1">
+                          RBI Rate (₹/USD) {rateLoading && <Spinner animation="border" size="sm" />}
+                        </Form.Label>
+                        <Form.Control size="sm" type="number" step="0.0001" value={txnForm.exchange_rate_used}
+                          onChange={(e) => updateTxnField('exchange_rate_used', e.target.value)} placeholder="Auto-fetched from RBI" />
+                      </Col>
+                    )}
                   </>
                 )}
                 <Col md={4}>
-                  <Form.Label className="small">Amount (₹)</Form.Label>
-                  <Form.Control size="sm" type="number" step="0.01" value={txnForm.amount} onChange={(e) => updateTxnField('amount', e.target.value)} placeholder="Total amount" required />
+                  <Form.Label className="small">Amount (₹){isForeignUSD && txnForm.usd_amount ? ` — USD ${txnForm.usd_amount}` : ''}</Form.Label>
+                  <Form.Control size="sm" type="number" step="0.01" value={txnForm.amount}
+                    onChange={(e) => updateTxnField('amount', e.target.value)} placeholder="Total amount in ₹" required />
                 </Col>
                 <Col md={4}>
                   <Form.Label className="small">Charges (₹)</Form.Label>
-                  <Form.Control size="sm" type="number" step="0.01" value={txnForm.fees} onChange={(e) => updateTxnField('fees', e.target.value)} />
+                  <Form.Control size="sm" type="number" step="0.01" value={txnForm.fees}
+                    onChange={(e) => updateTxnField('fees', e.target.value)} />
                 </Col>
                 <Col md={4}>
                   <Form.Label className="small">Notes</Form.Label>
-                  <Form.Control size="sm" type="text" value={txnForm.notes} onChange={(e) => updateTxnField('notes', e.target.value)} placeholder="Optional" />
+                  <Form.Control size="sm" type="text" value={txnForm.notes}
+                    onChange={(e) => updateTxnField('notes', e.target.value)} placeholder="Optional" />
                 </Col>
                 <Col xs={12}>
                   <Button type="submit" variant="primary" size="sm">Add Transaction</Button>
@@ -532,18 +739,25 @@ export default function InvestmentDetail() {
         <Card.Header className="bg-white">
           <h2 className="h6 fw-semibold mb-0">Transactions</h2>
         </Card.Header>
-        {data.transactions.length === 0 ? (
+        {visibleTransactions.length === 0 ? (
           <Card.Body className="text-center text-muted py-4">
             No transactions recorded yet. Add your first transaction above.
           </Card.Body>
         ) : (
           <div className="responsive-table">
+            {hiddenPlaceholderCount > 0 && (
+              <div className="px-3 py-2 small text-muted border-bottom">
+                Hidden {hiddenPlaceholderCount} placeholder RSU rows with no amount/price/withholding data.
+              </div>
+            )}
             <Table hover size="sm" className="mb-0 small">
               <thead className="table-light">
                 <tr>
                   <th className="px-3 text-nowrap">Date</th>
                   <th className="px-3">Type</th>
                   {!isPPF && <th className="px-3 text-end">Units</th>}
+                  {isForeignUSD && <th className="px-3 text-end">Gross</th>}
+                  {isForeignUSD && <th className="px-3 text-end">Withheld</th>}
                   {!isPPF && <th className="px-3 text-end">Price/Unit</th>}
                   <th className="px-3 text-end">Amount</th>
                   {!isPPF && <th className="px-3 text-end">Charges</th>}
@@ -563,6 +777,20 @@ export default function InvestmentDetail() {
                       </Form.Select>
                     </th>
                   )}
+                  {isForeignUSD && (
+                    <th className="px-3" style={{ minWidth: '220px' }}>
+                      <Form.Select
+                        size="sm"
+                        value={selectedGrant}
+                        onChange={(e) => setSelectedGrant(e.target.value)}
+                      >
+                        <option value="ALL">All grants</option>
+                        {grantOptions.map((grant) => (
+                          <option key={grant} value={grant}>{grant}</option>
+                        ))}
+                      </Form.Select>
+                    </th>
+                  )}
                   {!isNPS && !isPPF && <th className="px-3">Broker</th>}
                   <th className="px-3">Notes</th>
                   <th className="px-3 text-center" style={{ width: 80 }}>Actions</th>
@@ -574,7 +802,7 @@ export default function InvestmentDetail() {
                   // Corporate actions come before regular trades on the same date
                   const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
                   const txnSortKey = (t) => CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1;
-                  const sorted = [...data.transactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || txnSortKey(a) - txnSortKey(b) || a.id - b.id);
+                  const sorted = [...visibleTransactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || txnSortKey(a) - txnSortKey(b) || a.id - b.id);
                   const holdingMap = {};
                   const balanceMap = {};
                   const creditTypes = isEpsInvestment
@@ -595,11 +823,22 @@ export default function InvestmentDetail() {
                     }
                     balanceMap[txn.id] = amtBal;
                   }
-                  const hasFolio = data.transactions.some(t => t.folio_number);
-                  const filteredSorted = selectedFolio === 'ALL'
-                    ? [...sorted].reverse()
-                    : [...sorted].filter((t) => t.folio_number === selectedFolio).reverse();
-                  return filteredSorted.map((txn) => (
+                  const hasFolio = visibleTransactions.some(t => t.folio_number);
+                  const filteredByFolio = selectedFolio === 'ALL'
+                    ? [...sorted]
+                    : [...sorted].filter((t) => t.folio_number === selectedFolio);
+                  const filteredByGrant = isForeignUSD && selectedGrant !== 'ALL'
+                    ? filteredByFolio.filter((t) => parseGrantMeta(t.notes).grantLabel === selectedGrant)
+                    : filteredByFolio;
+                  const filteredSorted = filteredByGrant.reverse();
+                  return filteredSorted.map((txn) => {
+                    const grantMeta = parseGrantMeta(txn.notes);
+                    const totalToVest = grantMeta.awardNumber ? awardTotalToVest[grantMeta.awardNumber] : null;
+                    const cumulativeVested = cumulativeAwardGrossByTxnId[txn.id];
+                    const grantProgress = cumulativeVested != null && totalToVest != null
+                      ? `${formatGrantUnits(cumulativeVested)}/${formatGrantUnits(totalToVest)}`
+                      : null;
+                    return (
                   <tr key={txn.id}>
                     <td className="px-3 text-nowrap">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3">
@@ -608,12 +847,23 @@ export default function InvestmentDetail() {
                       </span>
                     </td>
                     {!isPPF && <td className="px-3 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>}
-                    {!isPPF && <td className="px-3 text-end">{txn.price_per_unit ? `₹${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>}
-                    <td className="px-3 text-end fw-medium">₹{formatNumber(txn.amount, 2)}</td>
+                    {isForeignUSD && <td className="px-3 text-end">{txn.gross_units != null ? formatNumber(txn.gross_units, 4) : '-'}</td>}
+                    {isForeignUSD && <td className="px-3 text-end">{txn.tax_withheld_units != null ? formatNumber(txn.tax_withheld_units, 4) : '-'}</td>}
+                    {!isPPF && <td className="px-3 text-end">{txn.price_per_unit ? `${isForeignUSD ? '$' : '₹'}${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>}
+                    <td className="px-3 text-end fw-medium">
+                      ₹{formatNumber(txn.amount, 2)}
+                      {isForeignUSD && txn.usd_amount ? <div className="text-muted" style={{fontSize:'0.75rem'}}>${formatNumber(txn.usd_amount, 2)}</div> : null}
+                    </td>
                     {!isPPF && <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
                     {isPPF && <td className="px-3 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>}
                     {!isPPF && <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
                     {!isPPF && hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
+                    {isForeignUSD && (
+                      <td className="px-3">
+                        <div className="fw-medium text-body">{grantMeta.grantLabel || '-'}</div>
+                        {grantProgress ? <div className="text-muted" style={{ fontSize: '0.75rem', lineHeight: 1.1 }}>{grantProgress}</div> : null}
+                      </td>
+                    )}
                     {!isNPS && !isPPF && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.broker || '-'}</td>}
                     <td className="px-3 text-muted" style={{ maxWidth: 260, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                     <td className="px-3">
@@ -629,7 +879,8 @@ export default function InvestmentDetail() {
                       )}
                     </td>
                   </tr>
-                  ));
+                    );
+                  });
                 })()}
               </tbody>
             </Table>
@@ -725,6 +976,38 @@ export default function InvestmentDetail() {
                   </Form.Group>
                 </Col>
               </Row>
+              {isForeignUSD && (
+                <Row className="g-3">
+                  <Col sm={6}>
+                    <Form.Group>
+                      <Form.Label className="small fw-semibold">RBI Rate (₹/USD)</Form.Label>
+                      <Form.Control
+                        type="number"
+                        size="sm"
+                        step="any"
+                        value={editForm.exchange_rate_used}
+                        onChange={(e) => setEditForm({ ...editForm, exchange_rate_used: e.target.value })}
+                        placeholder="Exchange rate used"
+                      />
+                    </Form.Group>
+                  </Col>
+                  {editTxn?.transaction_type === 'ESPP_PURCHASE' && (
+                    <Col sm={6}>
+                      <Form.Group>
+                        <Form.Label className="small fw-semibold">FMV/Unit (USD)</Form.Label>
+                        <Form.Control
+                          type="number"
+                          size="sm"
+                          step="any"
+                          value={editForm.fmv_per_unit}
+                          onChange={(e) => setEditForm({ ...editForm, fmv_per_unit: e.target.value })}
+                          placeholder="Fair market value per share"
+                        />
+                      </Form.Group>
+                    </Col>
+                  )}
+                </Row>
+              )}
               <Row className="g-3">
                 {!isPPF && <Col sm={6}>
                   <Form.Group>
@@ -762,6 +1045,92 @@ export default function InvestmentDetail() {
           <Button variant="secondary" size="sm" onClick={() => setEditTxn(null)}>Cancel</Button>
           <Button variant="primary" size="sm" onClick={handleEditSave} disabled={saving || !hasChanges}>
             {saving ? 'Saving...' : hasChanges ? 'Save Changes' : 'No Changes'}
+          </Button>
+        </Modal.Footer>
+      </Modal>
+
+      <Modal show={showRsuModal} onHide={() => setShowRsuModal(false)} centered size="xl">
+        <Modal.Header closeButton>
+          <Modal.Title className="h6">RSU Grant Schedule Import</Modal.Title>
+        </Modal.Header>
+        <Modal.Body>
+          <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+            <div className="small text-muted">
+              Annual + on-hire + special SA grants mapped to VEST transactions.
+            </div>
+            <div className="d-flex flex-wrap align-items-center gap-3">
+              <Form.Check
+                type="switch"
+                id="rsu-include-future"
+                label="Include future vest dates"
+                checked={rsuIncludeFuture}
+                onChange={async (e) => {
+                  const checked = e.target.checked;
+                  setRsuIncludeFuture(checked);
+                  await loadRsuPreview(checked);
+                }}
+              />
+              <Form.Check
+                type="switch"
+                id="rsu-overwrite-existing"
+                label="Replace existing imported rows"
+                checked={rsuOverwriteExisting}
+                onChange={(e) => setRsuOverwriteExisting(e.target.checked)}
+              />
+            </div>
+          </div>
+
+          {rsuLoading ? (
+            <div className="text-center py-4"><Spinner animation="border" /></div>
+          ) : !rsuPreview ? (
+            <div className="small text-muted">No preview loaded.</div>
+          ) : (
+            <>
+              <div className="small mb-2">
+                <strong>As of:</strong> {formatDate(rsuPreview.as_of_date)} |{' '}
+                <strong>Rows:</strong> {rsuPreview.totals?.rows || 0} |{' '}
+                <strong>Units:</strong> {formatNumber(rsuPreview.totals?.units || 0, 0)} |{' '}
+                <strong>Already Imported:</strong> {rsuPreview.imported_rows || 0}
+              </div>
+              <div className="responsive-table" style={{ maxHeight: 420, overflowY: 'auto' }}>
+                <Table size="sm" hover className="mb-0 small">
+                  <thead className="table-light">
+                    <tr>
+                      <th>Date</th>
+                      <th>Grant</th>
+                      <th>Award</th>
+                      <th className="text-end">Tranche</th>
+                      <th className="text-end">% </th>
+                      <th className="text-end">Units</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rsuPreview.rows.map((row) => (
+                      <tr key={row.import_key}>
+                        <td>{formatDate(row.vest_date)}</td>
+                        <td>{row.grant_label}</td>
+                        <td>{row.award_number}</td>
+                        <td className="text-end">{row.vest_sequence}/{row.vest_total_tranches}</td>
+                        <td className="text-end">{formatNumber(row.vest_percent, 2)}</td>
+                        <td className="text-end">{formatNumber(row.units, 0)}</td>
+                        <td>
+                          {row.already_imported
+                            ? <Badge bg="secondary">Existing</Badge>
+                            : <Badge bg="success">New</Badge>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </Table>
+              </div>
+            </>
+          )}
+        </Modal.Body>
+        <Modal.Footer>
+          <Button variant="secondary" size="sm" onClick={() => setShowRsuModal(false)}>Close</Button>
+          <Button variant="primary" size="sm" onClick={handleImportRsu} disabled={rsuImporting || rsuLoading || !rsuPreview?.rows?.length}>
+            {rsuImporting ? 'Importing...' : 'Import VEST Rows'}
           </Button>
         </Modal.Footer>
       </Modal>

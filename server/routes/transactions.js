@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { fetchHistoricalUSDToINR, fetchUSDToINR } = require('../services/priceService');
 
 // PF transaction types that get merged into a single contribution row per date
 const PF_GROUPABLE_TYPES = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'EPS_CONTRIBUTION']);
@@ -78,11 +79,23 @@ function groupPfTransactions(rows) {
 }
 
 module.exports = function (db) {
+  // --- Get RBI USD/INR rate for a date (used by UI to auto-fill exchange_rate_used) ---
+  router.get('/usd-inr-rate', async (req, res) => {
+    try {
+      const { date } = req.query;
+      const rate = date ? await fetchHistoricalUSDToINR(date) : await fetchUSDToINR();
+      res.json({ rate, date: date || new Date().toISOString().split('T')[0] });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // --- Add transaction ---
-  router.post('/', (req, res) => {
+  router.post('/', async (req, res) => {
     const {
       investment_id, transaction_type, transaction_date,
       units, price_per_unit, amount, fees, notes, broker, portfolio_id,
+      exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units,
     } = req.body;
 
     if (!investment_id || !portfolio_id || !transaction_type || !transaction_date || !amount) {
@@ -92,11 +105,22 @@ module.exports = function (db) {
     const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(investment_id);
     if (!inv) return res.status(404).json({ error: 'Investment not found' });
 
+    // Auto-fetch RBI rate for USD investments if not provided
+    let resolvedRate = exchange_rate_used || null;
+    if (inv.currency === 'USD' && !resolvedRate) {
+      try {
+        resolvedRate = await fetchHistoricalUSDToINR(transaction_date);
+      } catch (_) {
+        resolvedRate = null;
+      }
+    }
+
     const result = db.prepare(`
-      INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(investment_id, portfolio_id, transaction_type, transaction_date,
-      units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null);
+      units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null,
+      resolvedRate, usd_amount || null, fmv_per_unit || null, gross_units || null, tax_withheld_units || null);
 
     const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json(txn);
@@ -233,10 +257,15 @@ module.exports = function (db) {
     const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Transaction not found' });
 
-    const { transaction_date, units, price_per_unit, amount, fees, notes, broker, folio_number } = req.body;
+    const {
+      transaction_date, units, price_per_unit, amount, fees, notes, broker,
+      folio_number, exchange_rate_used, usd_amount, fmv_per_unit,
+      gross_units, tax_withheld_units,
+    } = req.body;
     db.prepare(`
       UPDATE transactions
-      SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?, broker = ?, folio_number = ?
+      SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?, broker = ?, folio_number = ?,
+          exchange_rate_used = ?, usd_amount = ?, fmv_per_unit = ?, gross_units = ?, tax_withheld_units = ?
       WHERE id = ?
     `).run(
       transaction_date || existing.transaction_date,
@@ -247,6 +276,11 @@ module.exports = function (db) {
       notes !== undefined ? notes : existing.notes,
       broker !== undefined ? broker : existing.broker,
       folio_number !== undefined ? folio_number : existing.folio_number,
+      exchange_rate_used !== undefined ? exchange_rate_used : existing.exchange_rate_used,
+      usd_amount !== undefined ? usd_amount : existing.usd_amount,
+      fmv_per_unit !== undefined ? fmv_per_unit : existing.fmv_per_unit,
+      gross_units !== undefined ? gross_units : existing.gross_units,
+      tax_withheld_units !== undefined ? tax_withheld_units : existing.tax_withheld_units,
       req.params.id
     );
 

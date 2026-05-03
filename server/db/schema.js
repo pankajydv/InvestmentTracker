@@ -1043,6 +1043,191 @@ function initializeDb(db) {
   } else if (!hasMigrationRecord(db, sgbMigrationId) && hasSGBType) {
     recordMigration(db, sgbMigrationId, 'skipped', 'SGB already present');
   }
+
+  // ── Migration: add VEST / ESPP_PURCHASE transaction types + RSU/ESPP columns ──
+  // Adds:
+  //   - VEST and ESPP_PURCHASE to the transactions CHECK constraint
+  //   - exchange_rate_used REAL  (USD/INR RBI rate on the transaction date)
+  //   - usd_amount REAL          (raw USD value)
+  //   - fmv_per_unit REAL        (FMV per share on date; ESPP only)
+  const hasVESTType = (() => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'").get();
+    return row && row.sql && row.sql.includes("'VEST'");
+  })();
+  const rsuMigrationId = '20260502-add-rsu-espp-transaction-types';
+
+  if (!hasVESTType && !hasMigrationRecord(db, rsuMigrationId)) {
+    if (!migrationsEnabled) {
+      throw new Error(`Pending migration ${rsuMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+    }
+
+    console.log('Migrating: adding VEST, ESPP_PURCHASE types and RSU columns...');
+    const beforeTransactions = getTableCount(db, 'transactions');
+    const backupPath = createPreMigrationBackup(db, 'add-rsu-espp-transaction-types');
+    if (backupPath) console.log(`Created migration backup: ${backupPath}`);
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE transactions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          portfolio_id INTEGER NOT NULL,
+          transaction_type TEXT NOT NULL CHECK(transaction_type IN (
+            'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST',
+            'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
+            'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
+            'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
+            'REDEMPTION', 'EPS_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'
+          )),
+          transaction_date TEXT NOT NULL,
+          units REAL,
+          price_per_unit REAL,
+          amount REAL NOT NULL,
+          fees REAL DEFAULT 0,
+          broker TEXT,
+          notes TEXT,
+          locked INTEGER DEFAULT 0,
+          folio_number TEXT,
+          exchange_rate_used REAL,
+          usd_amount REAL,
+          fmv_per_unit REAL,
+          created_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+        )
+      `);
+
+      // Copy existing rows; new columns default to NULL
+      const existingCols = db.prepare("PRAGMA table_info(transactions)").all().map(c => c.name);
+      const knownCols = [
+        'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
+        'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
+        'locked', 'folio_number', 'created_at',
+      ];
+      const colsToCopy = knownCols.filter(c => existingCols.includes(c));
+      db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
+
+      const copiedTransactions = getTableCount(db, 'transactions_new');
+      ensureRowCountPreserved({
+        before: beforeTransactions,
+        after: copiedTransactions,
+        table: 'transactions',
+        migrationName: 'add-rsu-espp-transaction-types',
+      });
+
+      db.exec('DROP TABLE transactions');
+      db.exec('ALTER TABLE transactions_new RENAME TO transactions');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id)');
+
+      db.exec('COMMIT');
+      assertDbIntegrity(db, rsuMigrationId);
+      recordMigration(db, rsuMigrationId, 'applied');
+      console.log('Migration complete: VEST/ESPP_PURCHASE types and RSU columns added.');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('RSU/ESPP migration failed:', err);
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+  } else if (!hasMigrationRecord(db, rsuMigrationId) && hasVESTType) {
+    recordMigration(db, rsuMigrationId, 'skipped', 'VEST type already present');
+  }
+
+  // ── Migration: add vest withholding columns on transactions ────────────────
+  // Adds:
+  //   - gross_units REAL        (pre-tax vested shares; mainly for VEST)
+  //   - tax_withheld_units REAL (shares withheld/sold for tax at vest)
+  const txnColsWithholding = db.prepare('PRAGMA table_info(transactions)').all().map((c) => c.name);
+  const hasGrossUnits = txnColsWithholding.includes('gross_units');
+  const hasTaxWithheldUnits = txnColsWithholding.includes('tax_withheld_units');
+  const vestWithholdingMigrationId = '20260503-add-vest-withholding-columns';
+
+  if ((!hasGrossUnits || !hasTaxWithheldUnits) && !hasMigrationRecord(db, vestWithholdingMigrationId)) {
+    if (!migrationsEnabled) {
+      throw new Error(`Pending migration ${vestWithholdingMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+    }
+
+    console.log('Migrating: adding gross_units and tax_withheld_units columns...');
+    const beforeTransactions = getTableCount(db, 'transactions');
+    const backupPath = createPreMigrationBackup(db, 'add-vest-withholding-columns');
+    if (backupPath) console.log(`Created migration backup: ${backupPath}`);
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE transactions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          portfolio_id INTEGER NOT NULL,
+          transaction_type TEXT NOT NULL CHECK(transaction_type IN (
+            'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST',
+            'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
+            'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
+            'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
+            'REDEMPTION', 'EPS_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'
+          )),
+          transaction_date TEXT NOT NULL,
+          units REAL,
+          price_per_unit REAL,
+          amount REAL NOT NULL,
+          fees REAL DEFAULT 0,
+          broker TEXT,
+          notes TEXT,
+          locked INTEGER DEFAULT 0,
+          folio_number TEXT,
+          exchange_rate_used REAL,
+          usd_amount REAL,
+          fmv_per_unit REAL,
+          gross_units REAL,
+          tax_withheld_units REAL,
+          created_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+        )
+      `);
+
+      const existingCols = db.prepare('PRAGMA table_info(transactions)').all().map((c) => c.name);
+      const knownCols = [
+        'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
+        'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
+        'locked', 'folio_number', 'exchange_rate_used', 'usd_amount', 'fmv_per_unit',
+        'created_at',
+      ];
+      const colsToCopy = knownCols.filter((c) => existingCols.includes(c));
+      db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
+
+      const copiedTransactions = getTableCount(db, 'transactions_new');
+      ensureRowCountPreserved({
+        before: beforeTransactions,
+        after: copiedTransactions,
+        table: 'transactions',
+        migrationName: 'add-vest-withholding-columns',
+      });
+
+      db.exec('DROP TABLE transactions');
+      db.exec('ALTER TABLE transactions_new RENAME TO transactions');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id)');
+
+      db.exec('COMMIT');
+      assertDbIntegrity(db, vestWithholdingMigrationId);
+      recordMigration(db, vestWithholdingMigrationId, 'applied');
+      console.log('Migration complete: gross_units and tax_withheld_units added.');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('Vest withholding migration failed:', err);
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+  } else if (!hasMigrationRecord(db, vestWithholdingMigrationId) && hasGrossUnits && hasTaxWithheldUnits) {
+    recordMigration(db, vestWithholdingMigrationId, 'skipped', 'vesting withholding columns already present');
+  }
 }
 
 /**

@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download } from 'lucide-react';
+import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText } from 'lucide-react';
 import { triggerPriceUpdate, cancelPriceUpdate, exportData } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 
@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { path: '/investments', label: 'Investments', icon: List },
   { path: '/performance', label: 'Performance', icon: TrendingUp },
   { path: '/transactions', label: 'Transactions', icon: List },
+  { path: '/tax', label: 'Tax Report', icon: FileText },
 
   { path: '/investments/add', label: 'Add Investment', icon: PlusCircle },
 ];

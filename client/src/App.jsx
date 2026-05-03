@@ -13,6 +13,7 @@ import Transactions from './components/Transactions';
 import CorporateActions from './components/CorporateActions';
 import InvestmentSettings from './components/InvestmentSettings';
 import InterestRates from './components/InterestRates';
+import TaxReport from './components/TaxReport';
 
 import Portfolios from './components/Portfolios';
 
@@ -33,6 +34,7 @@ export default function App() {
               <Route path="/investments/:id/settings" element={<InvestmentSettings />} />
               <Route path="/performance" element={<Performance />} />
               <Route path="/transactions" element={<Transactions />} />
+              <Route path="/tax" element={<TaxReport />} />
               <Route path="/interest-rates" element={<InterestRates />} />
   
               <Route path="/portfolios" element={<Portfolios />} />

@@ -1,8 +1,10 @@
 const express = require('express');
 const multer = require('multer');
-const { lookupTickerByISIN, fetchCorporateActions, toNSETicker } = require('../services/priceService');
+const { lookupTickerByISIN, fetchCorporateActions, toNSETicker, fetchHistoricalStockPrice, fetchHistoricalUSDToINR } = require('../services/priceService');
 const { parseContractNotes } = require('../services/contractNoteParser');
 const { parsePnLStatement } = require('../services/pnlParser');
+const { GRANTS, generateRsuSchedule } = require('../services/rsuGrantService');
+const { parseOpenLots, parseClosedLots, reconcileVestTransactions } = require('../services/fidelityVestReconciler');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -408,6 +410,433 @@ module.exports = function (db) {
     } catch (e) {
       console.error('AMC charge error:', e);
       res.status(500).json({ error: 'Failed to record charge: ' + e.message });
+    }
+  });
+
+  // RSU Grants (MSFT annual, on-hire, special)
+  // Preview schedule rows and optionally mark already imported rows.
+  router.get('/rsu-grants/preview', (req, res) => {
+    try {
+      const investmentId = req.query.investment_id ? parseInt(req.query.investment_id, 10) : null;
+      const portfolioId = req.query.portfolio_id ? parseInt(req.query.portfolio_id, 10) : null;
+      const includeFuture = String(req.query.include_future || '').toLowerCase() === 'true';
+      const asOfDate = req.query.as_of_date || null;
+      const grantKeys = req.query.grant_keys
+        ? String(req.query.grant_keys).split(',').map((s) => s.trim()).filter(Boolean)
+        : null;
+
+      const schedule = generateRsuSchedule({ includeFuture, asOfDate, grantKeys });
+
+      if (!investmentId || !portfolioId) {
+        return res.json({
+          ...schedule,
+          imported_rows: 0,
+          rows: schedule.rows.map((row) => ({ ...row, already_imported: false })),
+        });
+      }
+
+      const existing = db.prepare(`
+        SELECT id, transaction_date, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'VEST'
+          AND notes LIKE 'RSU Vest | %'
+      `).all(investmentId, portfolioId);
+
+      const importedKeys = new Set();
+      for (const txn of existing) {
+        const notes = String(txn.notes || '');
+        const awardMatch = notes.match(/Award\s+(\d+)/i);
+        const trancheMatch = notes.match(/Tranche\s+(\d+)\//i);
+        if (!awardMatch || !trancheMatch) continue;
+        importedKeys.add(`${awardMatch[1]}|${txn.transaction_date}|${parseInt(trancheMatch[1], 10)}`);
+      }
+
+      const rows = schedule.rows.map((row) => ({
+        ...row,
+        already_imported: importedKeys.has(row.import_key),
+      }));
+
+      res.json({
+        ...schedule,
+        imported_rows: rows.filter((r) => r.already_imported).length,
+        rows,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to preview RSU grants: ' + e.message });
+    }
+  });
+
+  // Upload stock grant documents and map them to known RSU awards.
+  router.post('/rsu-grants/documents/preview', upload.array('files', 20), (req, res) => {
+    try {
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No files uploaded' });
+      }
+
+      const grantByAward = new Map(GRANTS.map((g) => [String(g.awardNumber), g]));
+      const grantKeys = new Set();
+      const fileSummaries = [];
+
+      const parseText = (buffer) => {
+        const utf8 = buffer.toString('utf8');
+        const latin1 = buffer.toString('latin1');
+        const utf16 = buffer.toString('utf16le');
+        return [utf8, latin1, utf16].join('\n');
+      };
+
+      const extractMatch = (text, regex) => {
+        const match = text.match(regex);
+        return match ? String(match[1]).trim() : null;
+      };
+
+      const detectAwardNumber = (text) => {
+        const cleaned = String(text || '');
+
+        const labeled = extractMatch(cleaned, /award\s+number\s*[:\-]?\s*([0-9]{7,})/i);
+        if (labeled && grantByAward.has(labeled)) return labeled;
+
+        // Fast path: exact known award number appears anywhere in the extracted text.
+        for (const award of grantByAward.keys()) {
+          if (cleaned.includes(award)) return award;
+        }
+
+        // Fallback: normalize potentially split digits (e.g. "0 0 0 0 ...") and try matching.
+        const candidates = cleaned.match(/[0-9][0-9\s\-]{8,}[0-9]/g) || [];
+        for (const raw of candidates) {
+          const digits = raw.replace(/\D/g, '');
+          if (grantByAward.has(digits)) return digits;
+        }
+
+        return null;
+      };
+
+      for (const file of req.files) {
+        const text = parseText(file.buffer);
+        const awardNumber = detectAwardNumber(text);
+        const awardDate = extractMatch(text, /award\s+date\s*[:\-]?\s*([0-9]{2}[\/\-][0-9]{2}[\/\-][0-9]{4})/i);
+        const sharesMatchA = text.match(/total\s+(?:number\s+of\s+)?shares(?:\s+subject\s+to\s+the\s+award)?\s*[:\-]?\s*([0-9,]+)/i);
+        const sharesMatchB = text.match(/([0-9,]+)\s+shares\s+subject\s+to\s+the\s+award/i);
+        const sharesRaw = sharesMatchA?.[1] || sharesMatchB?.[1] || null;
+        const shares = sharesRaw ? Number(String(sharesRaw).replace(/,/g, '')) : null;
+
+        const grant = awardNumber ? grantByAward.get(awardNumber) : null;
+        if (grant) grantKeys.add(grant.key);
+
+        fileSummaries.push({
+          file_name: file.originalname,
+          award_number: awardNumber,
+          award_date: awardDate,
+          extracted_shares: shares,
+          matched_grant_key: grant ? grant.key : null,
+          matched_grant_label: grant ? grant.label : null,
+        });
+      }
+
+      const matchedGrants = GRANTS
+        .filter((g) => grantKeys.has(g.key))
+        .map((g) => ({
+          key: g.key,
+          label: g.label,
+          award_number: g.awardNumber,
+          award_date: g.awardDate,
+          total_shares: g.totalShares,
+        }));
+
+      res.json({
+        files_processed: req.files.length,
+        matched_count: matchedGrants.length,
+        grant_keys: Array.from(grantKeys),
+        matched_grants: matchedGrants,
+        file_summaries: fileSummaries,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to parse stock grant documents: ' + e.message });
+    }
+  });
+
+  // Import RSU VEST transactions in idempotent mode.
+  router.post('/rsu-grants/import', async (req, res) => {
+    try {
+      const {
+        investment_id,
+        portfolio_id,
+        include_future,
+        as_of_date,
+        grant_keys,
+        overwrite_existing,
+      } = req.body || {};
+
+      const investmentId = parseInt(investment_id, 10);
+      const portfolioId = parseInt(portfolio_id, 10);
+      if (!investmentId || !portfolioId) {
+        return res.status(400).json({ error: 'investment_id and portfolio_id are required' });
+      }
+
+      const investment = db.prepare('SELECT id, ticker_symbol, currency FROM investments WHERE id = ?').get(investmentId);
+      if (!investment) return res.status(404).json({ error: 'Investment not found' });
+
+      const schedule = generateRsuSchedule({
+        includeFuture: include_future === true,
+        asOfDate: as_of_date || null,
+        grantKeys: Array.isArray(grant_keys) ? grant_keys : null,
+      });
+
+      const rows = schedule.rows;
+      if (!rows.length) {
+        return res.json({ created: 0, skipped: 0, removed_existing: 0, total_rows: 0 });
+      }
+
+      const existing = db.prepare(`
+        SELECT id, transaction_date, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'VEST'
+          AND notes LIKE 'RSU Vest | %'
+      `).all(investmentId, portfolioId);
+
+      const existingByKey = new Map();
+      for (const txn of existing) {
+        const notes = String(txn.notes || '');
+        const awardMatch = notes.match(/Award\s+(\d+)/i);
+        const trancheMatch = notes.match(/Tranche\s+(\d+)\//i);
+        if (!awardMatch || !trancheMatch) continue;
+        const key = `${awardMatch[1]}|${txn.transaction_date}|${parseInt(trancheMatch[1], 10)}`;
+        existingByKey.set(key, txn.id);
+      }
+
+      const insertTxn = db.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees, broker, notes,
+          exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units
+        ) VALUES (?, ?, 'VEST', ?, NULL, ?, ?, 0, 'Fidelity', ?, ?, ?, NULL, ?, ?)
+      `);
+      const deleteTxn = db.prepare('DELETE FROM transactions WHERE id = ?');
+
+      let removedExisting = 0;
+      let created = 0;
+      let skipped = 0;
+
+      const today = new Date().toISOString().slice(0, 10);
+      const pricingByDate = new Map();
+
+      for (const row of rows) {
+        if (row.vest_date > today) continue;
+        if (!investment.ticker_symbol) continue;
+        try {
+          const [pricePerUnit, fxRate] = await Promise.all([
+            fetchHistoricalStockPrice(investment.ticker_symbol, row.vest_date),
+            investment.currency === 'USD' ? fetchHistoricalUSDToINR(row.vest_date) : Promise.resolve(null),
+          ]);
+          pricingByDate.set(row.vest_date, {
+            price_per_unit: pricePerUnit != null ? Number(pricePerUnit) : null,
+            exchange_rate_used: fxRate != null ? Number(fxRate) : null,
+          });
+        } catch (_) {
+          pricingByDate.set(row.vest_date, { price_per_unit: null, exchange_rate_used: null });
+        }
+      }
+
+      const runAll = db.transaction(() => {
+        for (const row of rows) {
+          const existingId = existingByKey.get(row.import_key);
+          if (existingId && overwrite_existing === true) {
+            deleteTxn.run(existingId);
+            removedExisting += 1;
+          } else if (existingId) {
+            skipped += 1;
+            continue;
+          }
+
+          const pricing = pricingByDate.get(row.vest_date) || { price_per_unit: null, exchange_rate_used: null };
+          const usdAmount = pricing.price_per_unit != null ? Number((row.units * pricing.price_per_unit).toFixed(4)) : null;
+          const amount = pricing.price_per_unit != null && pricing.exchange_rate_used != null
+            ? Number((usdAmount * pricing.exchange_rate_used).toFixed(2))
+            : 0;
+
+          insertTxn.run(
+            investmentId,                       // investment_id
+            portfolioId,                        // portfolio_id
+            row.vest_date,                      // transaction_date (position 4 in VALUES)
+            pricing.price_per_unit,             // price_per_unit (position 6 in VALUES)
+            amount,                             // amount (position 7 in VALUES)
+            row.notes,                          // notes (position 10 in VALUES)
+            pricing.exchange_rate_used,         // exchange_rate_used (position 11 in VALUES)
+            usdAmount,                          // usd_amount (position 12 in VALUES)
+            row.units,                          // gross_units (position 14 in VALUES)
+            null,                               // tax_withheld_units (position 15 in VALUES)
+          );
+          created += 1;
+        }
+      });
+
+      runAll();
+
+      res.json({
+        created,
+        skipped,
+        removed_existing: removedExisting,
+        total_rows: rows.length,
+        as_of_date: schedule.as_of_date,
+        include_future: schedule.include_future,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to import RSU grants: ' + e.message });
+    }
+  });
+
+  // Reconcile imported RSU VEST rows using Fidelity open/closed lot exports.
+  // This infers net vested shares and tax-withheld shares, and aligns vest FMV.
+  router.post('/rsu-grants/reconcile-fidelity', upload.fields([
+    { name: 'open_lots', maxCount: 1 },
+    { name: 'closed_lots', maxCount: 1 },
+  ]), async (req, res) => {
+    try {
+      const investmentId = parseInt(req.body?.investment_id, 10);
+      const portfolioId = req.body?.portfolio_id ? parseInt(req.body.portfolio_id, 10) : null;
+      const dryRun = String(req.body?.dry_run || '').toLowerCase() === 'true';
+      const overwritePrice = String(req.body?.overwrite_price || 'true').toLowerCase() !== 'false';
+      const notesContains = req.body?.notes_contains ? String(req.body.notes_contains).toLowerCase() : null;
+
+      if (!investmentId) {
+        return res.status(400).json({ error: 'investment_id is required' });
+      }
+
+      const investment = db.prepare('SELECT id, ticker_symbol, currency FROM investments WHERE id = ?').get(investmentId);
+      if (!investment) {
+        return res.status(404).json({ error: 'Investment not found' });
+      }
+
+      const openFile = req.files?.open_lots?.[0] || null;
+      const closedFile = req.files?.closed_lots?.[0] || null;
+      if (!openFile && !closedFile) {
+        return res.status(400).json({ error: 'At least one file is required: open_lots or closed_lots' });
+      }
+
+      let vestTxns = db.prepare(`
+        SELECT id, transaction_date, units, gross_units, price_per_unit, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND transaction_type = 'VEST'
+          ${portfolioId ? 'AND portfolio_id = ?' : ''}
+        ORDER BY transaction_date ASC, id ASC
+      `).all(...(portfolioId ? [investmentId, portfolioId] : [investmentId]));
+
+      if (notesContains) {
+        vestTxns = vestTxns.filter((t) => String(t.notes || '').toLowerCase().includes(notesContains));
+      }
+
+      if (!vestTxns.length) {
+        return res.json({
+          updated: 0,
+          matched_txns: 0,
+          matched_dates: 0,
+          skipped_dates: [],
+          skipped_rows: [],
+          notes_filter: notesContains || null,
+          message: 'No VEST transactions found for the given investment.',
+        });
+      }
+
+      const openRows = openFile ? parseOpenLots(openFile.buffer) : [];
+      const closedRows = closedFile ? parseClosedLots(closedFile.buffer) : [];
+
+      const reconciliation = reconcileVestTransactions({
+        vestTransactions: vestTxns,
+        openLotsRows: openRows,
+        closedLotsRows: closedRows,
+      });
+
+      const updates = reconciliation.updates;
+      if (!updates.length || dryRun) {
+        return res.json({
+          updated: 0,
+          matched_txns: reconciliation.matched_txns,
+          matched_dates: reconciliation.matched_dates,
+          skipped_dates: reconciliation.skipped_dates,
+          skipped_rows: reconciliation.skipped_rows,
+          notes_filter: notesContains || null,
+          preview: updates,
+          dry_run: dryRun,
+        });
+      }
+
+      const dates = Array.from(new Set(updates.map((u) => u.matched_lot_date || u.date)));
+      const fxByDate = new Map();
+      for (const date of dates) {
+        let fx = null;
+        if (investment.currency === 'USD') {
+          try {
+            fx = await fetchHistoricalUSDToINR(date);
+          } catch (_) {
+            fx = null;
+          }
+        }
+        fxByDate.set(date, fx != null ? Number(fx) : null);
+      }
+
+      const updateTxn = db.prepare(`
+        UPDATE transactions
+        SET transaction_date = ?,
+            units = ?,
+            gross_units = ?,
+            tax_withheld_units = ?,
+            price_per_unit = ?,
+            exchange_rate_used = ?,
+            usd_amount = ?,
+            amount = ?
+        WHERE id = ?
+      `);
+
+      let updated = 0;
+      const runAll = db.transaction(() => {
+        for (const u of updates) {
+          const row = db.prepare('SELECT price_per_unit, exchange_rate_used FROM transactions WHERE id = ?').get(u.id);
+          if (!row) continue;
+
+          const effectiveDate = u.matched_lot_date || u.date;
+
+          const price = overwritePrice && u.vest_price_usd != null
+            ? Number(u.vest_price_usd)
+            : (row.price_per_unit != null ? Number(row.price_per_unit) : null);
+          const fx = fxByDate.get(effectiveDate) != null
+            ? Number(fxByDate.get(effectiveDate))
+            : (row.exchange_rate_used != null ? Number(row.exchange_rate_used) : null);
+          const usdAmount = price != null ? Number((u.gross_units * price).toFixed(4)) : null;
+          const amount = usdAmount != null && fx != null ? Number((usdAmount * fx).toFixed(2)) : 0;
+
+          updateTxn.run(
+            effectiveDate,
+            u.net_units,
+            u.gross_units,
+            u.tax_withheld_units,
+            price,
+            fx,
+            usdAmount,
+            amount,
+            u.id,
+          );
+          updated += 1;
+        }
+      });
+
+      runAll();
+
+      res.json({
+        updated,
+        matched_txns: reconciliation.matched_txns,
+        matched_dates: reconciliation.matched_dates,
+        skipped_dates: reconciliation.skipped_dates,
+        skipped_rows: reconciliation.skipped_rows,
+        notes_filter: notesContains || null,
+        preview: updates,
+        dry_run: false,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to reconcile RSU fidelity lots: ' + e.message });
     }
   });
 

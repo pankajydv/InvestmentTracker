@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse, Table } from 'react-bootstrap';
-import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction } from '../services/api';
+import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction, previewRsuGrantDocuments, importRsuGrantSchedule } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp, Plus } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
-const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND', 'SGB'];
+const ASSET_TYPES = ['MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND', 'SGB'];
 const STOCK_TXN_TYPES = ['BUY', 'SELL'];
 
 export default function AddInvestment() {
@@ -46,6 +46,13 @@ export default function AddInvestment() {
   const [stockQuery, setStockQuery] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const rsuGrantFileRef = useRef(null);
+  const [rsuGrantFiles, setRsuGrantFiles] = useState([]);
+  const [rsuGrantPreview, setRsuGrantPreview] = useState(null);
+  const [rsuParsing, setRsuParsing] = useState(false);
+  const [rsuCreating, setRsuCreating] = useState(false);
+  const [rsuIncludeFuture, setRsuIncludeFuture] = useState(false);
+  const [rsuOverwriteExisting, setRsuOverwriteExisting] = useState(false);
 
   // Contract notes upload state
   const contractFileRef = useRef(null);
@@ -213,6 +220,89 @@ export default function AddInvestment() {
     } finally {
       setSearching(false);
     }
+  };
+
+  const handleRsuGrantPreview = async () => {
+    setError('');
+    if (!rsuGrantFiles.length) {
+      setError('Please upload stock grant document files first');
+      return;
+    }
+
+    setRsuParsing(true);
+    try {
+      const preview = await previewRsuGrantDocuments(rsuGrantFiles);
+      if (!preview.grant_keys || preview.grant_keys.length === 0) {
+        setError('Could not map uploaded files to known grants. Check document format or file selection.');
+      }
+      setRsuGrantPreview(preview);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setRsuParsing(false);
+    }
+  };
+
+  const handleCreateFromRsuDocs = async () => {
+    setError('');
+    if (!portfolioId) {
+      setError('Please select a portfolio first (top navbar selector)');
+      return;
+    }
+    if (!rsuGrantPreview?.grant_keys?.length) {
+      setError('Preview grant documents first to detect grant awards');
+      return;
+    }
+
+    setRsuCreating(true);
+    try {
+      const investmentName = (form.name || stockInfo?.name || stockQuery || 'Microsoft Corp').trim();
+      const ticker = (form.ticker_symbol || 'MSFT').trim().toUpperCase();
+      const notesFromDocs = `Created from RSU grant docs (${rsuGrantPreview.grant_keys.length} awards)`;
+
+      // Safety: reuse an existing matching FOREIGN_STOCK investment when possible
+      // to avoid unintentionally creating a duplicate and splitting RSU history.
+      const existingMatches = (await getInvestments())
+        .filter((inv) => String(inv.asset_type || '').toUpperCase() === 'FOREIGN_STOCK')
+        .filter((inv) => String(inv.ticker_symbol || '').toUpperCase() === ticker);
+
+      if (existingMatches.length > 1) {
+        setError(`Found ${existingMatches.length} existing ${ticker} investments. To avoid importing into the wrong one, open the target investment and use the "RSU Grants" button there.`);
+        return;
+      }
+
+      const inv = existingMatches.length === 1
+        ? existingMatches[0]
+        : await createInvestment({
+          name: investmentName,
+          asset_type: 'FOREIGN_STOCK',
+          ticker_symbol: ticker,
+          currency: 'USD',
+          notes: form.notes || notesFromDocs,
+        });
+
+      await importRsuGrantSchedule({
+        investment_id: inv.id,
+        portfolio_id: Number(portfolioId),
+        grant_keys: rsuGrantPreview.grant_keys,
+        include_future: rsuIncludeFuture,
+        overwrite_existing: rsuOverwriteExisting,
+      });
+
+      navigate(`/investments/${inv.id}`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setRsuCreating(false);
+    }
+  };
+
+  const handleRsuGrantReset = () => {
+    setRsuGrantFiles([]);
+    setRsuGrantPreview(null);
+    setRsuIncludeFuture(false);
+    setRsuOverwriteExisting(false);
+    if (rsuGrantFileRef.current) rsuGrantFileRef.current.value = '';
   };
 
   const handleContractUpload = async () => {
@@ -889,6 +979,7 @@ export default function AddInvestment() {
                     setError('');
                     setExpandedSection(null);
                     handleCASReset();
+                    handleRsuGrantReset();
                   }}
                   className={`btn w-100 btn-sm border-2 ${
                     assetType === type
@@ -2925,6 +3016,91 @@ export default function AddInvestment() {
       {/* Non-Indian-Stock / Non-Bond / Non-SGB / Non-MF / Non-NPS / Non-PPF / Non-SSY / Non-PF: original flow */}
       {!isIndianStock && !isBond && !isSGB && !isMF && !isNPS && assetType !== 'PPF' && assetType !== 'SSY' && assetType !== 'PF' && (
         <>
+          {isForeignStock && (
+            <Card className="shadow-sm">
+              <Card.Body>
+                <h2 className="h6 fw-semibold mb-2">2. Upload Stock Grant Documents (RSU)</h2>
+                <p className="small text-muted mb-3">
+                  Upload annual/on-hire/special grant files. The app maps award numbers, creates the Foreign Stock investment,
+                  and imports VEST transactions automatically.
+                </p>
+
+                <Form.Label className="small">Grant Document Files</Form.Label>
+                <Form.Control
+                  ref={rsuGrantFileRef}
+                  size="sm"
+                  type="file"
+                  accept=".doc,.docx,.htm,.html,.txt"
+                  multiple
+                  onChange={(e) => {
+                    setRsuGrantFiles(Array.from(e.target.files || []));
+                    setRsuGrantPreview(null);
+                  }}
+                />
+                {rsuGrantFiles.length > 0 && (
+                  <div className="small text-muted mt-2">
+                    Selected {rsuGrantFiles.length} file(s)
+                  </div>
+                )}
+
+                <div className="d-flex flex-wrap gap-2 mt-3">
+                  <Button size="sm" variant="outline-primary" onClick={handleRsuGrantPreview} disabled={rsuParsing || rsuCreating || !rsuGrantFiles.length}>
+                    {rsuParsing ? <><Spinner size="sm" className="me-1" /> Parsing...</> : 'Preview Grants from Docs'}
+                  </Button>
+                  <Button size="sm" variant="outline-secondary" onClick={handleRsuGrantReset} disabled={rsuParsing || rsuCreating}>
+                    Reset
+                  </Button>
+                </div>
+
+                {rsuGrantPreview && (
+                  <div className="mt-3 border rounded p-2 bg-light">
+                    <div className="small mb-2">
+                      <strong>Matched Grants:</strong> {rsuGrantPreview.matched_count || 0}
+                    </div>
+                    {!!rsuGrantPreview.matched_grants?.length && (
+                      <div className="small mb-2">
+                        {rsuGrantPreview.matched_grants.map((g) => (
+                          <div key={g.key}>• {g.label} | Award {g.award_number} | Shares {g.total_shares}</div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="d-flex flex-wrap gap-3 mt-2">
+                      <Form.Check
+                        type="switch"
+                        id="rsu-include-future-add"
+                        label="Include future vest dates"
+                        checked={rsuIncludeFuture}
+                        onChange={(e) => setRsuIncludeFuture(e.target.checked)}
+                      />
+                      <Form.Check
+                        type="switch"
+                        id="rsu-overwrite-add"
+                        label="Replace existing imported rows (selected grants only)"
+                        checked={rsuOverwriteExisting}
+                        onChange={(e) => setRsuOverwriteExisting(e.target.checked)}
+                      />
+                    </div>
+
+                    <div className="small text-muted mt-2">
+                      If a matching stock investment already exists, this will import into that investment instead of creating a duplicate.
+                    </div>
+
+                    <Button
+                      size="sm"
+                      className="mt-3"
+                      variant="primary"
+                      onClick={handleCreateFromRsuDocs}
+                      disabled={rsuCreating || rsuParsing || !rsuGrantPreview.grant_keys?.length}
+                    >
+                      {rsuCreating ? <><Spinner size="sm" className="me-1" /> Importing RSU Grants...</> : 'Import RSU Grants'}
+                    </Button>
+                  </div>
+                )}
+              </Card.Body>
+            </Card>
+          )}
+
           {/* Step 2: Investment Details */}
           <Card className="shadow-sm">
             <Card.Body>

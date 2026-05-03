@@ -88,6 +88,15 @@ export const updateTransaction = (id, data) =>
   fetchJSON(`/transactions/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteTransaction = (id) =>
   fetchJSON(`/transactions/${id}`, { method: 'DELETE' });
+export const getUSDINRRate = (date) =>
+  fetchJSON(`/transactions/usd-inr-rate${date ? `?date=${encodeURIComponent(date)}` : ''}`);
+
+// Tax Reports
+export const getTaxReport = (fy, portfolioId) => {
+  const params = new URLSearchParams({ fy });
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/tax/us-stocks?${params.toString()}`);
+};
 
 // Utils
 export const searchMutualFunds = (q) => fetchJSON(`/utils/search-mf?q=${encodeURIComponent(q)}`);
@@ -145,6 +154,55 @@ export const importContractNotes = async (portfolioId, broker, trades) => {
     method: 'POST',
     body: JSON.stringify({ portfolio_id: portfolioId, broker, trades }),
   });
+};
+
+// RSU Grants (annual, on-hire, special)
+export const previewRsuGrantSchedule = (params = {}) => {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+  });
+  return fetchJSON(`/stocks/rsu-grants/preview${qs.toString() ? `?${qs}` : ''}`);
+};
+
+export const importRsuGrantSchedule = (data = {}) =>
+  fetchJSON('/stocks/rsu-grants/import', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+
+export const previewRsuGrantDocuments = async (files) => {
+  const formData = new FormData();
+  files.forEach((f) => formData.append('files', f));
+  const res = await fetch(`${API_BASE}/stocks/rsu-grants/documents/preview`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'RSU document preview failed');
+  }
+  return res.json();
+};
+
+export const reconcileRsuWithFidelityLots = async ({ investment_id, portfolio_id, openLotsFile, closedLotsFile, dry_run = true, overwrite_price = true }) => {
+  const formData = new FormData();
+  if (investment_id) formData.append('investment_id', String(investment_id));
+  if (portfolio_id) formData.append('portfolio_id', String(portfolio_id));
+  formData.append('dry_run', String(Boolean(dry_run)));
+  formData.append('overwrite_price', String(Boolean(overwrite_price)));
+  if (openLotsFile) formData.append('open_lots', openLotsFile);
+  if (closedLotsFile) formData.append('closed_lots', closedLotsFile);
+
+  const res = await fetch(`${API_BASE}/stocks/rsu-grants/reconcile-fidelity`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'RSU fidelity reconciliation failed');
+  }
+  return res.json();
 };
 
 // P&L Statement Upload

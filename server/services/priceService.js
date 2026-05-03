@@ -217,7 +217,67 @@ async function fetchStockHistory(symbol, period = '1y') {
 }
 
 /**
- * Fetch USD to INR exchange rate
+ * Fetch historical stock close for a specific date.
+ * Uses Yahoo chart API over a narrow window and returns the nearest close on or before target date.
+ * @param {string} symbol
+ * @param {string} date - ISO date YYYY-MM-DD
+ * @returns {Promise<number>}
+ */
+async function fetchHistoricalStockPrice(symbol, date) {
+  if (!symbol || !date) throw new Error('symbol and date are required');
+
+  const target = new Date(date);
+  const from = new Date(target);
+  from.setDate(from.getDate() - 7);
+  const to = new Date(target);
+  to.setDate(to.getDate() + 1);
+
+  const p1 = Math.floor(from.getTime() / 1000);
+  const p2 = Math.floor(to.getTime() / 1000);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${p1}&period2=${p2}&interval=1d`;
+
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const result = json.chart?.result?.[0];
+          if (!result) {
+            reject(new Error(`No Yahoo data for ${symbol}`));
+            return;
+          }
+
+          const timestamps = result.timestamp || [];
+          const closes = result.indicators?.quote?.[0]?.close || [];
+          const isoTarget = date.split('T')[0];
+
+          let bestPrice = null;
+          let bestDate = null;
+          for (let i = 0; i < timestamps.length; i += 1) {
+            const close = closes[i];
+            if (close == null) continue;
+            const pointDate = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            if (pointDate <= isoTarget && (!bestDate || pointDate > bestDate)) {
+              bestDate = pointDate;
+              bestPrice = close;
+            }
+          }
+
+          if (bestPrice != null) resolve(bestPrice);
+          else reject(new Error(`No historical close found for ${symbol} on or before ${date}`));
+        } catch (e) {
+          reject(new Error(`Failed to parse historical chart for ${symbol}: ${e.message}`));
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+/**
+ * Fetch USD to INR exchange rate (current)
  */
 async function fetchUSDToINR() {
   try {
@@ -234,6 +294,172 @@ async function fetchUSDToINR() {
       return 83.5; // fallback
     }
   }
+}
+
+/**
+ * Fetch historical USD/INR exchange rate for a specific date.
+ *
+ * Strategy:
+ *   1. Try FBIL (Financial Benchmarks India Ltd) — publishes the official RBI
+ *      reference rate. The public CSV endpoint returns the rate for a given date.
+ *   2. Fall back to Yahoo Finance historical chart for USDINR=X.
+ *   3. Fall back to the cached/live rate as a last resort.
+ *
+ * @param {string} date - ISO date string e.g. '2024-03-15'
+ * @returns {Promise<number>} INR per USD
+ */
+async function fetchHistoricalUSDToINR(date) {
+  if (!date) return fetchUSDToINR();
+
+  // ── 1. FBIL reference rate ────────────────────────────────────────────────
+  try {
+    const rate = await _fetchFBILRate(date);
+    if (rate && rate > 0) return rate;
+  } catch (_) { /* fall through */ }
+
+  // ── 2. Yahoo Finance historical USDINR=X ──────────────────────────────────
+  try {
+    const rate = await _fetchYahooHistoricalUSDINR(date);
+    if (rate && rate > 0) return rate;
+  } catch (_) { /* fall through */ }
+
+  // ── 3. Current rate as fallback ───────────────────────────────────────────
+  console.warn(`fetchHistoricalUSDToINR: could not get rate for ${date}, using current rate`);
+  return fetchUSDToINR();
+}
+
+/**
+ * Fetch FBIL USD/INR reference rate for a given date.
+ * FBIL publishes rates at: https://fbil.org.in/FBIL_Data/upload/ReferenceRatesFBIL.csv
+ * The CSV format: Date,USD/INR,...
+ * Date format in the file: DD-Mmm-YYYY (e.g. 15-Mar-2024)
+ */
+function _fetchFBILRate(date) {
+  const targetDate = new Date(date);
+  // FBIL CSV: we fetch the "archive" endpoint which serves a monthly CSV
+  const year = targetDate.getFullYear();
+  const month = String(targetDate.getMonth() + 1).padStart(2, '0');
+  const url = `https://fbil.org.in/FBIL_Data/upload/Historical_Data/FBIL-USD-INR-${year}-${month}.csv`;
+
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`FBIL returned ${res.statusCode}`));
+        return;
+      }
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          // Lines: Date,USD/INR,... — skip header
+          const lines = data.trim().split('\n').slice(1);
+          const isoTarget = date.split('T')[0]; // YYYY-MM-DD
+
+          for (const line of lines) {
+            const parts = line.split(',');
+            if (parts.length < 2) continue;
+            // FBIL date format is DD-Mon-YYYY (e.g. 15-Mar-2024) or DD/MM/YYYY
+            const rawDate = parts[0].trim();
+            const parsed = _parseFBILDate(rawDate);
+            if (parsed === isoTarget) {
+              const rate = parseFloat(parts[1].trim());
+              if (!isNaN(rate) && rate > 0) {
+                resolve(rate);
+                return;
+              }
+            }
+          }
+          // If exact date not found (weekend/holiday), try nearest earlier date
+          const sortedRates = [];
+          for (const line of lines) {
+            const parts = line.split(',');
+            if (parts.length < 2) continue;
+            const parsed = _parseFBILDate(parts[0].trim());
+            const rate = parseFloat(parts[1].trim());
+            if (parsed && !isNaN(rate) && rate > 0 && parsed <= isoTarget) {
+              sortedRates.push({ date: parsed, rate });
+            }
+          }
+          if (sortedRates.length > 0) {
+            sortedRates.sort((a, b) => b.date.localeCompare(a.date));
+            resolve(sortedRates[0].rate);
+          } else {
+            reject(new Error('No matching rate in FBIL CSV'));
+          }
+        } catch (e) {
+          reject(e);
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+function _parseFBILDate(raw) {
+  // Try DD-Mon-YYYY (15-Mar-2024) → YYYY-MM-DD
+  const m1 = raw.match(/^(\d{2})-([A-Za-z]{3})-(\d{4})$/);
+  if (m1) {
+    const months = { Jan:'01', Feb:'02', Mar:'03', Apr:'04', May:'05', Jun:'06', Jul:'07', Aug:'08', Sep:'09', Oct:'10', Nov:'11', Dec:'12' };
+    const mon = months[m1[2]];
+    if (mon) return `${m1[3]}-${mon}-${m1[1]}`;
+  }
+  // Try DD/MM/YYYY
+  const m2 = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m2) return `${m2[3]}-${m2[2]}-${m2[1]}`;
+  return null;
+}
+
+/**
+ * Fetch historical USDINR rate from Yahoo Finance for a specific date.
+ * Uses the v8 chart API with a narrow period around the target date.
+ */
+async function _fetchYahooHistoricalUSDINR(date) {
+  const target = new Date(date);
+  // Fetch a ±5 day window to account for weekends/holidays
+  const from = new Date(target);
+  from.setDate(from.getDate() - 5);
+  const to = new Date(target);
+  to.setDate(to.getDate() + 1);
+
+  const p1 = Math.floor(from.getTime() / 1000);
+  const p2 = Math.floor(to.getTime() / 1000);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X?period1=${p1}&period2=${p2}&interval=1d`;
+
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const result = json.chart?.result?.[0];
+          if (!result) { reject(new Error('No Yahoo data')); return; }
+
+          const timestamps = result.timestamp || [];
+          const closes = result.indicators?.quote?.[0]?.close || [];
+          const isoTarget = date.split('T')[0];
+
+          // Find the closest date ≤ target
+          let bestRate = null;
+          let bestDate = null;
+          for (let i = 0; i < timestamps.length; i++) {
+            const d = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            if (d <= isoTarget && closes[i] != null) {
+              if (!bestDate || d > bestDate) {
+                bestDate = d;
+                bestRate = closes[i];
+              }
+            }
+          }
+          if (bestRate) resolve(bestRate);
+          else reject(new Error('No rate found in Yahoo data'));
+        } catch (e) {
+          reject(e);
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
 }
 
 // ─── PPF/PF Calculation ───────────────────────────────────────────────────────
@@ -629,8 +855,10 @@ module.exports = {
   fetchMutualFundHistory,
   fetchStockPrice,
   fetchStockHistory,
+  fetchHistoricalStockPrice,
   fetchCorporateActions,
   fetchUSDToINR,
+  fetchHistoricalUSDToINR,
   calculatePPFValue,
   toNSETicker,
   lookupTickerByISIN,
