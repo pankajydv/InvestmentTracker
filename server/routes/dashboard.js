@@ -54,7 +54,7 @@ module.exports = function (db) {
         COALESCE(dv.current_value, 0) as current_value,
         COALESCE(dv.invested_amount,
           (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
-           WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_PURCHASE'))) as invested_amount,
+           WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_CONTRIBUTION'))) as invested_amount,
         COALESCE(dv.profit_loss, 0) as profit_loss,
         COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
         COALESCE(dv.day_change, 0) as day_change,

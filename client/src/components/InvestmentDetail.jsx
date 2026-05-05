@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
-import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal } from 'react-bootstrap';
-import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewRsuGrantSchedule, importRsuGrantSchedule } from '../services/api';
+import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal, Dropdown } from 'react-bootstrap';
+import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil } from 'lucide-react';
@@ -9,23 +9,38 @@ import { usePortfolio } from '../context/PortfolioContext';
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
 const UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
-const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE', 'ESPP_CONTRIBUTION', 'DIVIDEND'];
 const TYPE_LABELS = {
   DEPOSIT: 'Deposit',
   EMPLOYER_CONTRIBUTION: 'Employer',
   VOLUNTARY_CONTRIBUTION: 'Voluntary',
+  ESPP_CONTRIBUTION: 'ESPP Contribution',
   EPS_CONTRIBUTION: 'EPS',
   INTEREST: 'Interest',
   WITHDRAWAL: 'Withdrawal'
 };
 
 const CASH_OUTFLOW_TYPES = new Set([
-  'BUY', 'VEST', 'ESPP_PURCHASE', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
+  'BUY', 'VEST', 'ESPP_CONTRIBUTION', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
 ]);
 
 const CASH_INFLOW_TYPES = new Set([
   'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST'
 ]);
+
+function getTxnTypesForInvestment(investment) {
+  if (!investment) return ['BUY', 'SELL', 'DIVIDEND'];
+
+  const isPPFType = investment.asset_type === 'PPF' || investment.asset_type === 'SSY' || investment.asset_type === 'PF';
+  const isBondType = investment.asset_type === 'BOND';
+  const isSGBType = investment.asset_type === 'SGB';
+  const isForeignUsdType = investment.asset_type === 'FOREIGN_STOCK' && investment.currency === 'USD';
+
+  if (isPPFType) return ['DEPOSIT', 'WITHDRAWAL', 'INTEREST'];
+  if (isBondType || isSGBType) return ['BUY', 'SELL', 'INTEREST'];
+  if (isForeignUsdType) return ['VEST', 'ESPP_CONTRIBUTION', 'ESPP_PURCHASE', 'BUY', 'SELL', 'DIVIDEND'];
+  return ['BUY', 'SELL', 'DIVIDEND'];
+}
 
 function xnpv(rate, flows, baseDate) {
   const msPerDay = 24 * 60 * 60 * 1000;
@@ -105,6 +120,15 @@ export default function InvestmentDetail() {
   });
   const [rateLoading, setRateLoading] = useState(false);
 
+  const txnTypes = getTxnTypesForInvestment(data);
+
+  useEffect(() => {
+    if (!showAddTxn) return;
+    if (!txnTypes.includes(txnForm.transaction_type)) {
+      setTxnForm((prev) => ({ ...prev, transaction_type: txnTypes[0] }));
+    }
+  }, [showAddTxn, txnTypes, txnForm.transaction_type]);
+
   useEffect(() => { loadData(); }, [id, selectedId]);
 
   // Auto-fetch RBI rate when date or type changes for USD investments
@@ -174,7 +198,7 @@ export default function InvestmentDetail() {
       });
       setShowAddTxn(false);
       setTxnForm({
-        transaction_type: 'BUY', transaction_date: new Date().toISOString().split('T')[0],
+        transaction_type: txnTypes[0], transaction_date: new Date().toISOString().split('T')[0],
         units: '', price_per_unit: '', amount: '', fees: '0', notes: '',
         exchange_rate_used: '', usd_amount: '', fmv_per_unit: '',
       });
@@ -191,18 +215,23 @@ export default function InvestmentDetail() {
 
   // Folio filter state
   const [selectedFolio, setSelectedFolio] = useState('ALL');
-  const [selectedGrant, setSelectedGrant] = useState('ALL');
+  const [selectedGrants, setSelectedGrants] = useState([]);
+  const [selectedTypes, setSelectedTypes] = useState([]);
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [hideFutureVestings, setHideFutureVestings] = useState(false);
 
   // Delete confirmation modal state
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [deleteText, setDeleteText] = useState('');
   const [interestUpdating, setInterestUpdating] = useState(false);
-  const [showRsuModal, setShowRsuModal] = useState(false);
-  const [rsuLoading, setRsuLoading] = useState(false);
-  const [rsuImporting, setRsuImporting] = useState(false);
-  const [rsuPreview, setRsuPreview] = useState(null);
-  const [rsuIncludeFuture, setRsuIncludeFuture] = useState(false);
-  const [rsuOverwriteExisting, setRsuOverwriteExisting] = useState(false);
+  const [showEsppModal, setShowEsppModal] = useState(false);
+  const [esppPayslipFiles, setEsppPayslipFiles] = useState([]);
+  const [esppContributionLoading, setEsppContributionLoading] = useState(false);
+  const [esppContributionImporting, setEsppContributionImporting] = useState(false);
+  const [esppContributionPreview, setEsppContributionPreview] = useState(null);
+  const [esppContributionOverwrite, setEsppContributionOverwrite] = useState(false);
+  const [esppContributionStatus, setEsppContributionStatus] = useState(null);
 
   const getChanges = () => {
     if (!editTxn) return [];
@@ -312,55 +341,57 @@ export default function InvestmentDetail() {
     }
   };
 
-  const loadRsuPreview = async (includeFuture) => {
+  const handlePreviewEsppContributions = async () => {
+    setEsppContributionStatus(null);
     if (!selectedId) {
-      alert('Select a portfolio first to preview RSU imports.');
+      alert('Select a portfolio first to preview ESPP contributions.');
+      return;
+    }
+    if (!esppPayslipFiles.length) {
+      alert('Select one or more payslip PDF files first.');
       return;
     }
 
     try {
-      setRsuLoading(true);
-      const result = await previewRsuGrantSchedule({
-        investment_id: id,
-        portfolio_id: selectedId,
-        include_future: includeFuture,
-      });
-      setRsuPreview(result);
+      setEsppContributionLoading(true);
+      const result = await previewEsppContributionsFromPayslips(esppPayslipFiles, Number(id), Number(selectedId));
+      setEsppContributionPreview(result);
     } catch (e) {
-      alert('RSU preview failed: ' + e.message);
+      alert('ESPP contribution preview failed: ' + e.message);
     } finally {
-      setRsuLoading(false);
+      setEsppContributionLoading(false);
     }
   };
 
-  const openRsuModal = async () => {
-    setShowRsuModal(true);
-    await loadRsuPreview(rsuIncludeFuture);
-  };
-
-  const handleImportRsu = async () => {
+  const handleImportEsppContributions = async () => {
+    setEsppContributionStatus(null);
     if (!selectedId) {
-      alert('Select a portfolio first to import RSU grants.');
+      setEsppContributionStatus({ type: 'danger', text: 'Select a portfolio first to import ESPP contributions.' });
+      return;
+    }
+    if (!esppContributionPreview?.rows?.length) {
+      setEsppContributionStatus({ type: 'danger', text: 'Preview contributions first.' });
       return;
     }
 
-    if (!window.confirm('Import RSU vest rows into transactions for this investment?')) return;
-
     try {
-      setRsuImporting(true);
-      const result = await importRsuGrantSchedule({
+      setEsppContributionImporting(true);
+      const result = await importEsppContributions({
         investment_id: Number(id),
         portfolio_id: Number(selectedId),
-        include_future: rsuIncludeFuture,
-        overwrite_existing: rsuOverwriteExisting,
+        overwrite_existing: esppContributionOverwrite,
+        rows: esppContributionPreview.rows,
       });
-      alert(`RSU import complete. Created: ${result.created}, Skipped: ${result.skipped}, Replaced: ${result.removed_existing}.`);
-      await loadRsuPreview(rsuIncludeFuture);
       await loadData();
+      await handlePreviewEsppContributions();
+      setEsppContributionStatus({
+        type: 'success',
+        text: `Import complete. Created: ${result.created}, Skipped: ${result.skipped}, Replaced: ${result.removed_existing}.`,
+      });
     } catch (e) {
-      alert('RSU import failed: ' + e.message);
+      setEsppContributionStatus({ type: 'danger', text: 'Import failed: ' + e.message });
     } finally {
-      setRsuImporting(false);
+      setEsppContributionImporting(false);
     }
   };
 
@@ -395,15 +426,7 @@ export default function InvestmentDetail() {
   const isSGB = data.asset_type === 'SGB';
   const isForeignUSD = data.asset_type === 'FOREIGN_STOCK' && data.currency === 'USD';
   const isMSFTStock = /MSFT/i.test(String(data.ticker_symbol || '')) || /microsoft/i.test(String(data.name || ''));
-  const canImportRsu = isForeignUSD && isMSFTStock;
-
-  const txnTypes = isPPF
-    ? ['DEPOSIT', 'WITHDRAWAL', 'INTEREST']
-    : isBond || isSGB
-    ? ['BUY', 'SELL', 'INTEREST']
-    : isForeignUSD
-    ? ['VEST', 'ESPP_PURCHASE', 'BUY', 'SELL', 'DIVIDEND']
-    : ['BUY', 'SELL', 'DIVIDEND'];
+  const canImportEspp = isForeignUSD && isMSFTStock;
 
   const absoluteReturnPct = data.latestValue?.profit_loss_pct ?? null;
 
@@ -439,6 +462,14 @@ export default function InvestmentDetail() {
   const xirrRate = calculateXirr(xirrCashflows);
   const xirrPct = xirrRate == null ? null : xirrRate * 100;
   const cumulativeValue = (Number(data.latestValue?.current_value) || 0) + (Number(data.saleProceeds) || 0);
+  const todayIso = new Date().toISOString().split('T')[0];
+  const placeholderVestCount = isForeignUSD
+    ? (data.transactions || []).filter((txn) => txn.transaction_type === 'VEST'
+      && (Number(txn.amount) || 0) === 0
+      && txn.price_per_unit == null
+      && txn.gross_units == null
+      && txn.tax_withheld_units == null).length
+    : 0;
   const visibleTransactions = isForeignUSD
     ? (data.transactions || []).filter((txn) => {
         const isPlaceholderVest = txn.transaction_type === 'VEST'
@@ -446,16 +477,36 @@ export default function InvestmentDetail() {
           && txn.price_per_unit == null
           && txn.gross_units == null
           && txn.tax_withheld_units == null;
-        return !isPlaceholderVest;
+        const isFutureVest = hideFutureVestings
+          && txn.transaction_type === 'VEST'
+          && String(txn.transaction_date || '') > todayIso;
+        return !isPlaceholderVest && !isFutureVest;
       })
     : (data.transactions || []);
-  const hiddenPlaceholderCount = (data.transactions || []).length - visibleTransactions.length;
+  const hiddenPlaceholderCount = placeholderVestCount;
   const hasFolioColumn = !isPPF && visibleTransactions.some((t) => t.folio_number);
   const folioOptions = (data.folio_options || []).map((f) => f.folio_number).filter(Boolean);
 
-  const parseGrantMeta = (notes) => {
-    const text = String(notes || '');
-    const grantMatch = text.match(/^RSU Vest\s*\|\s*([^|]+?)\s*\|/i);
+  const parseGrantMeta = (txnOrNotes) => {
+    const txn = txnOrNotes && typeof txnOrNotes === 'object' && !Array.isArray(txnOrNotes)
+      ? txnOrNotes
+      : null;
+    const text = String(txn ? txn.notes : txnOrNotes || '');
+    const transactionType = String(txn?.transaction_type || '').toUpperCase();
+
+    if (transactionType === 'ESPP_CONTRIBUTION' || transactionType === 'ESPP_PURCHASE') {
+      return {
+        grantLabel: 'ESPP',
+        awardNumber: null,
+        tranche: null,
+      };
+    }
+
+    const rsuGrantMatch = text.match(/^RSU Vest\s*\|\s*([^|]+?)\s*\|/i);
+    const esppGrantMatch = text.match(/^ESPP Purchase\s*\|\s*([^|]+?)\s*\|/i);
+    const rsuSaleMatch = text.match(/^RSU Sale\s*\|\s*([^|]+?)\s*\|/i);
+    const esppSaleMatch = text.match(/^ESPP Sale\s*\|\s*([^|]+?)\s*\|/i);
+    const grantMatch = rsuGrantMatch || esppGrantMatch || rsuSaleMatch || esppSaleMatch;
     const awardMatch = text.match(/Award\s+(\d+)/i);
     const trancheMatch = text.match(/Tranche\s+(\d+\/\d+)/i);
     return {
@@ -476,7 +527,7 @@ export default function InvestmentDetail() {
   const awardTotalToVest = (data.transactions || []).reduce((acc, txn) => {
     if (txn.transaction_type !== 'VEST') return acc;
     if (txn.gross_units == null) return acc;
-    const meta = parseGrantMeta(txn.notes);
+    const meta = parseGrantMeta(txn);
     if (!meta.awardNumber) return acc;
     acc[meta.awardNumber] = (acc[meta.awardNumber] || 0) + Number(txn.gross_units || 0);
     return acc;
@@ -491,7 +542,7 @@ export default function InvestmentDetail() {
       .sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || a.id - b.id);
 
     for (const txn of vestRows) {
-      const meta = parseGrantMeta(txn.notes);
+      const meta = parseGrantMeta(txn);
       if (!meta.awardNumber) continue;
       runningByAward[meta.awardNumber] = (runningByAward[meta.awardNumber] || 0) + Number(txn.gross_units || 0);
       byTxn[txn.id] = runningByAward[meta.awardNumber];
@@ -502,9 +553,60 @@ export default function InvestmentDetail() {
 
   const grantOptions = Array.from(new Set(
     visibleTransactions
-      .map((t) => parseGrantMeta(t.notes).grantLabel)
+      .map((t) => parseGrantMeta(t).grantLabel)
       .filter(Boolean)
   )).sort((a, b) => a.localeCompare(b));
+
+  const typeOptions = Array.from(new Set(
+    visibleTransactions
+      .map((t) => t.transaction_type)
+      .filter(Boolean)
+  )).sort((a, b) => a.localeCompare(b));
+
+  const toggleSelection = (currentValues, value, setter) => {
+    if (currentValues.includes(value)) {
+      setter(currentValues.filter((v) => v !== value));
+    } else {
+      setter([...currentValues, value]);
+    }
+  };
+
+  const soldUnitsByVestLotKey = (data.transactions || []).reduce((acc, txn) => {
+    if (txn.transaction_type !== 'SELL') return acc;
+    const text = String(txn.notes || '');
+    const acqDate = text.match(/Acquired\s+(\d{4}-\d{2}-\d{2})/i)?.[1];
+    const award = text.match(/Award\s+(\d+)/i)?.[1] || null;
+    const tranche = text.match(/Tranche\s+(\d+\/\d+)/i)?.[1] || null;
+    if (!acqDate || !award || !tranche) return acc;
+    const key = `${acqDate}|${award}|${tranche}`;
+    acc[key] = (acc[key] || 0) + Number(txn.units || 0);
+    return acc;
+  }, {});
+
+  const soldUnitsByEsppDate = (data.transactions || []).reduce((acc, txn) => {
+    if (txn.transaction_type !== 'SELL') return acc;
+    const text = String(txn.notes || '');
+    if (!/^ESPP Sale\s*\|/i.test(text)) return acc;
+    const acqDate = text.match(/Acquired\s+(\d{4}-\d{2}-\d{2})/i)?.[1];
+    if (!acqDate) return acc;
+    acc[acqDate] = (acc[acqDate] || 0) + Number(txn.units || 0);
+    return acc;
+  }, {});
+
+  const isFullySoldLot = (txn) => {
+    if (!txn || (txn.transaction_type !== 'VEST' && txn.transaction_type !== 'ESPP_PURCHASE')) return false;
+
+    if (txn.transaction_type === 'ESPP_PURCHASE') {
+      const soldUnits = Number(soldUnitsByEsppDate[txn.transaction_date] || 0);
+      return soldUnits > 0 && soldUnits >= (Number(txn.units || 0) - 0.0001);
+    }
+
+    const meta = parseGrantMeta(txn);
+    if (!meta.awardNumber || !meta.tranche) return false;
+    const key = `${txn.transaction_date}|${meta.awardNumber}|${meta.tranche}`;
+    const soldUnits = Number(soldUnitsByVestLotKey[key] || 0);
+    return soldUnits > 0 && soldUnits >= (Number(txn.units || 0) - 0.0001);
+  };
 
   // SGB calculations
   let sgbDetails = null;
@@ -599,9 +701,9 @@ export default function InvestmentDetail() {
               {interestUpdating ? 'Updating...' : 'Update Interest'}
             </Button>
           )}
-          {canImportRsu && (
-            <Button variant="outline-primary" size="sm" onClick={openRsuModal} className="d-flex align-items-center gap-1">
-              RSU Grants
+          {canImportEspp && (
+            <Button variant="outline-primary" size="sm" onClick={() => setShowEsppModal(true)} className="d-flex align-items-center gap-1">
+              Import ESPP Contributions
             </Button>
           )}
           <Link to={`/investments/${id}/settings`} state={{ from: cameFrom, transactionsSearch, investmentsSearch }} className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
@@ -682,31 +784,35 @@ export default function InvestmentDetail() {
                 </Col>
                 {!isPPF && (
                   <>
-                    <Col md={4}>
-                      <Form.Label className="small">Units</Form.Label>
-                      <Form.Control size="sm" type="number" step="0.001" value={txnForm.units}
-                        onChange={(e) => updateTxnField('units', e.target.value)} placeholder="Number of units" />
-                    </Col>
-                    <Col md={4}>
-                      <Form.Label className="small">{isForeignUSD ? 'Price/Unit (USD)' : 'Price per Unit'}</Form.Label>
-                      <Form.Control size="sm" type="number" step="0.0001" value={txnForm.price_per_unit}
-                        onChange={(e) => updateTxnField('price_per_unit', e.target.value)} placeholder={isForeignUSD ? 'FMV in USD' : 'Price per unit'} />
-                    </Col>
-                    {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
-                      <Col md={4}>
-                        <Form.Label className="small">FMV/Unit on Purchase Date (USD)</Form.Label>
-                        <Form.Control size="sm" type="number" step="0.0001" value={txnForm.fmv_per_unit}
-                          onChange={(e) => updateTxnField('fmv_per_unit', e.target.value)} placeholder="Market price (USD)" />
-                      </Col>
-                    )}
-                    {isForeignUSD && (
-                      <Col md={4}>
-                        <Form.Label className="small d-flex align-items-center gap-1">
-                          RBI Rate (₹/USD) {rateLoading && <Spinner animation="border" size="sm" />}
-                        </Form.Label>
-                        <Form.Control size="sm" type="number" step="0.0001" value={txnForm.exchange_rate_used}
-                          onChange={(e) => updateTxnField('exchange_rate_used', e.target.value)} placeholder="Auto-fetched from RBI" />
-                      </Col>
+                    {txnForm.transaction_type !== 'ESPP_CONTRIBUTION' && (
+                      <>
+                        <Col md={4}>
+                          <Form.Label className="small">Units</Form.Label>
+                          <Form.Control size="sm" type="number" step="0.001" value={txnForm.units}
+                            onChange={(e) => updateTxnField('units', e.target.value)} placeholder="Number of units" />
+                        </Col>
+                        <Col md={4}>
+                          <Form.Label className="small">{isForeignUSD ? 'Price/Unit (USD)' : 'Price per Unit'}</Form.Label>
+                          <Form.Control size="sm" type="number" step="0.0001" value={txnForm.price_per_unit}
+                            onChange={(e) => updateTxnField('price_per_unit', e.target.value)} placeholder={isForeignUSD ? 'FMV in USD' : 'Price per unit'} />
+                        </Col>
+                        {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                          <Col md={4}>
+                            <Form.Label className="small">FMV/Unit on Purchase Date (USD)</Form.Label>
+                            <Form.Control size="sm" type="number" step="0.0001" value={txnForm.fmv_per_unit}
+                              onChange={(e) => updateTxnField('fmv_per_unit', e.target.value)} placeholder="Market price (USD)" />
+                          </Col>
+                        )}
+                        {isForeignUSD && (
+                          <Col md={4}>
+                            <Form.Label className="small d-flex align-items-center gap-1">
+                              RBI Rate (₹/USD) {rateLoading && <Spinner animation="border" size="sm" />}
+                            </Form.Label>
+                            <Form.Control size="sm" type="number" step="0.0001" value={txnForm.exchange_rate_used}
+                              onChange={(e) => updateTxnField('exchange_rate_used', e.target.value)} placeholder="Auto-fetched from RBI" />
+                          </Col>
+                        )}
+                      </>
                     )}
                   </>
                 )}
@@ -737,7 +843,110 @@ export default function InvestmentDetail() {
       {/* Transactions Table */}
       <Card className="shadow-sm">
         <Card.Header className="bg-white">
-          <h2 className="h6 fw-semibold mb-0">Transactions</h2>
+          <div className="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2">
+            <h2 className="h6 fw-semibold mb-0">Transactions</h2>
+            <div className="d-flex flex-wrap align-items-center gap-2 ms-md-auto">
+              {isForeignUSD && (
+                <Dropdown autoClose="outside">
+                  <Dropdown.Toggle variant="outline-secondary" size="sm">
+                    {selectedGrants.length === 0 ? 'All grants' : `${selectedGrants.length} grant(s)`}
+                  </Dropdown.Toggle>
+                  <Dropdown.Menu style={{ minWidth: 240, maxHeight: 260, overflowY: 'auto' }}>
+                    {grantOptions.length === 0 ? (
+                      <div className="px-3 py-2 text-muted small">No grants</div>
+                    ) : grantOptions.map((grant) => (
+                      <div key={grant} className="px-3 py-1">
+                        <Form.Check
+                          type="checkbox"
+                          className="small mb-0"
+                          label={grant}
+                          checked={selectedGrants.includes(grant)}
+                          onChange={() => toggleSelection(selectedGrants, grant, setSelectedGrants)}
+                        />
+                      </div>
+                    ))}
+                  </Dropdown.Menu>
+                </Dropdown>
+              )}
+
+              <Dropdown autoClose="outside">
+                <Dropdown.Toggle variant="outline-secondary" size="sm">
+                  {selectedTypes.length === 0 ? 'All types' : `${selectedTypes.length} type(s)`}
+                </Dropdown.Toggle>
+                <Dropdown.Menu style={{ minWidth: 220, maxHeight: 260, overflowY: 'auto' }}>
+                  {typeOptions.map((type) => (
+                    <div key={type} className="px-3 py-1">
+                      <Form.Check
+                        type="checkbox"
+                        className="small mb-0"
+                        label={getTxnTypeLabel(type)}
+                        checked={selectedTypes.includes(type)}
+                        onChange={() => toggleSelection(selectedTypes, type, setSelectedTypes)}
+                      />
+                    </div>
+                  ))}
+                </Dropdown.Menu>
+              </Dropdown>
+
+              <Form.Control
+                size="sm"
+                type="date"
+                value={dateFrom}
+                onChange={(e) => setDateFrom(e.target.value)}
+                style={{ width: 145 }}
+                aria-label="Date from"
+              />
+              <Form.Control
+                size="sm"
+                type="date"
+                value={dateTo}
+                onChange={(e) => setDateTo(e.target.value)}
+                style={{ width: 145 }}
+                aria-label="Date to"
+              />
+
+              {hasFolioColumn && (
+                <Form.Select
+                  size="sm"
+                  value={selectedFolio}
+                  onChange={(e) => setSelectedFolio(e.target.value)}
+                  style={{ width: 170 }}
+                >
+                  <option value="ALL">All folios</option>
+                  {folioOptions.map((folio) => (
+                    <option key={folio} value={folio}>{folio}</option>
+                  ))}
+                </Form.Select>
+              )}
+
+              {(selectedGrants.length > 0 || selectedTypes.length > 0 || dateFrom || dateTo || selectedFolio !== 'ALL') && (
+                <Button
+                  size="sm"
+                  variant="outline-secondary"
+                  onClick={() => {
+                    setSelectedGrants([]);
+                    setSelectedTypes([]);
+                    setDateFrom('');
+                    setDateTo('');
+                    setSelectedFolio('ALL');
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
+
+              {isForeignUSD && (
+                <Form.Check
+                  type="switch"
+                  id="hide-future-vestings"
+                  label="Hide future vestings"
+                  checked={hideFutureVestings}
+                  onChange={(e) => setHideFutureVestings(e.target.checked)}
+                  className="small"
+                />
+              )}
+            </div>
+          </div>
         </Card.Header>
         {visibleTransactions.length === 0 ? (
           <Card.Body className="text-center text-muted py-4">
@@ -756,41 +965,15 @@ export default function InvestmentDetail() {
                   <th className="px-3 text-nowrap">Date</th>
                   <th className="px-3">Type</th>
                   {!isPPF && <th className="px-3 text-end">Units</th>}
-                  {isForeignUSD && <th className="px-3 text-end">Gross</th>}
                   {isForeignUSD && <th className="px-3 text-end">Withheld</th>}
+                  {isForeignUSD && <th className="px-3 text-end">FX</th>}
                   {!isPPF && <th className="px-3 text-end">Price/Unit</th>}
                   <th className="px-3 text-end">Amount</th>
                   {!isPPF && <th className="px-3 text-end">Charges</th>}
                   {isPPF && <th className="px-3 text-end">Balance</th>}
                   {!isPPF && <th className="px-3 text-end">Holding</th>}
-                  {hasFolioColumn && (
-                    <th className="px-3" style={{ minWidth: '180px' }}>
-                      <Form.Select
-                        size="sm"
-                        value={selectedFolio}
-                        onChange={(e) => setSelectedFolio(e.target.value)}
-                      >
-                        <option value="ALL">All folios</option>
-                        {folioOptions.map((folio) => (
-                          <option key={folio} value={folio}>{folio}</option>
-                        ))}
-                      </Form.Select>
-                    </th>
-                  )}
-                  {isForeignUSD && (
-                    <th className="px-3" style={{ minWidth: '220px' }}>
-                      <Form.Select
-                        size="sm"
-                        value={selectedGrant}
-                        onChange={(e) => setSelectedGrant(e.target.value)}
-                      >
-                        <option value="ALL">All grants</option>
-                        {grantOptions.map((grant) => (
-                          <option key={grant} value={grant}>{grant}</option>
-                        ))}
-                      </Form.Select>
-                    </th>
-                  )}
+                  {hasFolioColumn && <th className="px-3">Folio</th>}
+                  {isForeignUSD && <th className="px-3">Grant</th>}
                   {!isNPS && !isPPF && <th className="px-3">Broker</th>}
                   <th className="px-3">Notes</th>
                   <th className="px-3 text-center" style={{ width: 80 }}>Actions</th>
@@ -827,32 +1010,69 @@ export default function InvestmentDetail() {
                   const filteredByFolio = selectedFolio === 'ALL'
                     ? [...sorted]
                     : [...sorted].filter((t) => t.folio_number === selectedFolio);
-                  const filteredByGrant = isForeignUSD && selectedGrant !== 'ALL'
-                    ? filteredByFolio.filter((t) => parseGrantMeta(t.notes).grantLabel === selectedGrant)
+                  const filteredByGrant = isForeignUSD && selectedGrants.length > 0
+                    ? filteredByFolio.filter((t) => selectedGrants.includes(parseGrantMeta(t).grantLabel))
                     : filteredByFolio;
-                  const filteredSorted = filteredByGrant.reverse();
+                  const filteredByType = selectedTypes.length > 0
+                    ? filteredByGrant.filter((t) => selectedTypes.includes(t.transaction_type))
+                    : filteredByGrant;
+                  const filteredByDate = filteredByType.filter((t) => {
+                    if (dateFrom && String(t.transaction_date || '') < dateFrom) return false;
+                    if (dateTo && String(t.transaction_date || '') > dateTo) return false;
+                    return true;
+                  });
+                  const filteredSorted = filteredByDate.reverse();
                   return filteredSorted.map((txn) => {
-                    const grantMeta = parseGrantMeta(txn.notes);
+                    const grantMeta = parseGrantMeta(txn);
                     const totalToVest = grantMeta.awardNumber ? awardTotalToVest[grantMeta.awardNumber] : null;
                     const cumulativeVested = cumulativeAwardGrossByTxnId[txn.id];
                     const grantProgress = cumulativeVested != null && totalToVest != null
                       ? `${formatGrantUnits(cumulativeVested)}/${formatGrantUnits(totalToVest)}`
                       : null;
                     return (
-                  <tr key={txn.id}>
+                  <tr
+                    key={txn.id}
+                    style={(() => {
+                      if (txn.transaction_type === 'SELL') return { opacity: 0.68, backgroundColor: '#f8f9fa' };
+                      if (isFullySoldLot(txn)) return { opacity: 0.62, backgroundColor: '#f3f4f6' };
+                      return undefined;
+                    })()}
+                  >
                     <td className="px-3 text-nowrap">{formatDate(txn.transaction_date)}</td>
                     <td className="px-3">
                       <span className={`badge rounded-pill badge-${txn.transaction_type.toLowerCase()}`}>
                         {getTxnTypeLabel(txn.transaction_type)}
                       </span>
                     </td>
-                    {!isPPF && <td className="px-3 text-end">{txn.units ? formatNumber(txn.units, 4) : '-'}</td>}
-                    {isForeignUSD && <td className="px-3 text-end">{txn.gross_units != null ? formatNumber(txn.gross_units, 4) : '-'}</td>}
+                    {!isPPF && (
+                      <td className="px-3 text-end">
+                        {txn.units ? formatNumber(txn.units, 4) : '-'}
+                        {isForeignUSD && txn.gross_units != null && txn.tax_withheld_units != null && Math.abs(Number(txn.gross_units || 0) - Number(txn.units || 0)) > 0.000001 ? (
+                          <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                            Gross {formatNumber(txn.gross_units, 4)}
+                          </div>
+                        ) : null}
+                      </td>
+                    )}
                     {isForeignUSD && <td className="px-3 text-end">{txn.tax_withheld_units != null ? formatNumber(txn.tax_withheld_units, 4) : '-'}</td>}
-                    {!isPPF && <td className="px-3 text-end">{txn.price_per_unit ? `${isForeignUSD ? '$' : '₹'}${formatNumber(txn.price_per_unit, 2)}` : '-'}</td>}
+                    {isForeignUSD && <td className="px-3 text-end">{txn.exchange_rate_used != null ? `₹${formatNumber(txn.exchange_rate_used, 4)}/$` : '-'}</td>}
+                    {!isPPF && (
+                      <td className="px-3 text-end">
+                        {txn.price_per_unit ? `${isForeignUSD ? '$' : '₹'}${formatNumber(txn.price_per_unit, 2)}` : '-'}
+                        {isForeignUSD && txn.fmv_per_unit != null ? (
+                          <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                            FMV ${formatNumber(txn.fmv_per_unit, 2)}
+                          </div>
+                        ) : null}
+                      </td>
+                    )}
                     <td className="px-3 text-end fw-medium">
                       ₹{formatNumber(txn.amount, 2)}
-                      {isForeignUSD && txn.usd_amount ? <div className="text-muted" style={{fontSize:'0.75rem'}}>${formatNumber(txn.usd_amount, 2)}</div> : null}
+                      {isForeignUSD && txn.usd_amount ? (
+                        <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                          ${formatNumber(txn.usd_amount, 2)}
+                        </div>
+                      ) : null}
                     </td>
                     {!isPPF && <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
                     {isPPF && <td className="px-3 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>}
@@ -860,7 +1080,9 @@ export default function InvestmentDetail() {
                     {!isPPF && hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
                     {isForeignUSD && (
                       <td className="px-3">
-                        <div className="fw-medium text-body">{grantMeta.grantLabel || '-'}</div>
+                        <div className="fw-medium text-body" style={{ whiteSpace: 'nowrap' }}>
+                          {grantMeta.grantLabel || '-'}
+                        </div>
                         {grantProgress ? <div className="text-muted" style={{ fontSize: '0.75rem', lineHeight: 1.1 }}>{grantProgress}</div> : null}
                       </td>
                     )}
@@ -922,7 +1144,7 @@ export default function InvestmentDetail() {
                   </Form.Group>
                 </Col>
               </Row>
-              {editTxn.transaction_type !== 'AMC' && !isPPF && (
+              {editTxn.transaction_type !== 'AMC' && editTxn.transaction_type !== 'ESPP_CONTRIBUTION' && !isPPF && (
                 <Row className="g-3">
                   <Col sm={6}>
                     <Form.Group>
@@ -976,7 +1198,7 @@ export default function InvestmentDetail() {
                   </Form.Group>
                 </Col>
               </Row>
-              {isForeignUSD && (
+              {isForeignUSD && editTxn?.transaction_type !== 'ESPP_CONTRIBUTION' && (
                 <Row className="g-3">
                   <Col sm={6}>
                     <Form.Group>
@@ -1049,71 +1271,71 @@ export default function InvestmentDetail() {
         </Modal.Footer>
       </Modal>
 
-      <Modal show={showRsuModal} onHide={() => setShowRsuModal(false)} centered size="xl">
+      <Modal show={showEsppModal} onHide={() => setShowEsppModal(false)} centered size="lg">
         <Modal.Header closeButton>
-          <Modal.Title className="h6">RSU Grant Schedule Import</Modal.Title>
+          <Modal.Title className="h6">Import ESPP Contributions</Modal.Title>
         </Modal.Header>
         <Modal.Body>
-          <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
-            <div className="small text-muted">
-              Annual + on-hire + special SA grants mapped to VEST transactions.
-            </div>
-            <div className="d-flex flex-wrap align-items-center gap-3">
-              <Form.Check
-                type="switch"
-                id="rsu-include-future"
-                label="Include future vest dates"
-                checked={rsuIncludeFuture}
-                onChange={async (e) => {
-                  const checked = e.target.checked;
-                  setRsuIncludeFuture(checked);
-                  await loadRsuPreview(checked);
+          <div className="small fw-semibold mb-2">Monthly ESPP Contributions (from payslips)</div>
+          <div className="small text-muted mb-2">
+            Upload yearly/monthly payslip PDFs to create monthly <strong>ESPP Contribution</strong> cash outflow entries for XIRR timing.
+            Contribution date is derived from payslip pay date when available; otherwise defaults to 28th (preponed to previous working day on weekends).
+          </div>
+          <Row className="g-2 align-items-end mb-2">
+            <Col md={7}>
+              <Form.Label className="small mb-1">Payslip PDF files</Form.Label>
+              <Form.Control
+                type="file"
+                size="sm"
+                multiple
+                accept=".pdf"
+                onChange={(e) => {
+                  const files = Array.from(e.target.files || []);
+                  setEsppPayslipFiles(files);
+                  setEsppContributionStatus(null);
                 }}
               />
-              <Form.Check
-                type="switch"
-                id="rsu-overwrite-existing"
-                label="Replace existing imported rows"
-                checked={rsuOverwriteExisting}
-                onChange={(e) => setRsuOverwriteExisting(e.target.checked)}
-              />
-            </div>
-          </div>
+            </Col>
+            <Col md={5}>
+              <div className="d-flex gap-2">
+                <Button size="sm" variant="outline-primary" onClick={handlePreviewEsppContributions} disabled={esppContributionLoading || !esppPayslipFiles.length}>
+                  {esppContributionLoading ? 'Previewing...' : 'Preview Contributions'}
+                </Button>
+                <Form.Check
+                  type="switch"
+                  id="espp-contrib-overwrite"
+                  label="Replace existing"
+                  checked={esppContributionOverwrite}
+                  onChange={(e) => setEsppContributionOverwrite(e.target.checked)}
+                />
+              </div>
+            </Col>
+          </Row>
 
-          {rsuLoading ? (
-            <div className="text-center py-4"><Spinner animation="border" /></div>
-          ) : !rsuPreview ? (
-            <div className="small text-muted">No preview loaded.</div>
-          ) : (
+          {esppContributionPreview?.rows?.length ? (
             <>
               <div className="small mb-2">
-                <strong>As of:</strong> {formatDate(rsuPreview.as_of_date)} |{' '}
-                <strong>Rows:</strong> {rsuPreview.totals?.rows || 0} |{' '}
-                <strong>Units:</strong> {formatNumber(rsuPreview.totals?.units || 0, 0)} |{' '}
-                <strong>Already Imported:</strong> {rsuPreview.imported_rows || 0}
+                <strong>Rows:</strong> {esppContributionPreview.rows_found || esppContributionPreview.rows.length} |{' '}
+                <strong>Already Imported:</strong> {esppContributionPreview.imported_rows || 0}
               </div>
-              <div className="responsive-table" style={{ maxHeight: 420, overflowY: 'auto' }}>
+              <div className="responsive-table" style={{ maxHeight: 220, overflowY: 'auto' }}>
                 <Table size="sm" hover className="mb-0 small">
                   <thead className="table-light">
                     <tr>
+                      <th>Month</th>
                       <th>Date</th>
-                      <th>Grant</th>
-                      <th>Award</th>
-                      <th className="text-end">Tranche</th>
-                      <th className="text-end">% </th>
-                      <th className="text-end">Units</th>
+                      <th className="text-end">Amount</th>
+                      <th>Source</th>
                       <th>Status</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {rsuPreview.rows.map((row) => (
+                    {esppContributionPreview.rows.map((row) => (
                       <tr key={row.import_key}>
-                        <td>{formatDate(row.vest_date)}</td>
-                        <td>{row.grant_label}</td>
-                        <td>{row.award_number}</td>
-                        <td className="text-end">{row.vest_sequence}/{row.vest_total_tranches}</td>
-                        <td className="text-end">{formatNumber(row.vest_percent, 2)}</td>
-                        <td className="text-end">{formatNumber(row.units, 0)}</td>
+                        <td>{row.month_key}</td>
+                        <td>{formatDate(row.contribution_date)}</td>
+                        <td className="text-end">₹{formatNumber(row.amount, 2)}</td>
+                        <td>{row.source_file}</td>
                         <td>
                           {row.already_imported
                             ? <Badge bg="secondary">Existing</Badge>
@@ -1125,12 +1347,17 @@ export default function InvestmentDetail() {
                 </Table>
               </div>
             </>
-          )}
+          ) : null}
+          {esppContributionStatus?.text ? (
+            <div className={`small mt-2 ${esppContributionStatus.type === 'danger' ? 'text-danger' : 'text-success'}`}>
+              {esppContributionStatus.text}
+            </div>
+          ) : null}
         </Modal.Body>
         <Modal.Footer>
-          <Button variant="secondary" size="sm" onClick={() => setShowRsuModal(false)}>Close</Button>
-          <Button variant="primary" size="sm" onClick={handleImportRsu} disabled={rsuImporting || rsuLoading || !rsuPreview?.rows?.length}>
-            {rsuImporting ? 'Importing...' : 'Import VEST Rows'}
+          <Button variant="secondary" size="sm" onClick={() => setShowEsppModal(false)}>Close</Button>
+          <Button variant="outline-primary" size="sm" onClick={handleImportEsppContributions} disabled={esppContributionImporting || !esppContributionPreview?.rows?.length}>
+            {esppContributionImporting ? 'Importing Contributions...' : 'Import Contributions'}
           </Button>
         </Modal.Footer>
       </Modal>

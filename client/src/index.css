@@ -62,6 +62,7 @@ tr:hover .row-actions {
 .badge-voluntary_contribution { background-color: #dbeafe !important; color: #1d4ed8 !important; }
 .badge-vest { background-color: #e0f2fe !important; color: #075985 !important; }
 .badge-espp_purchase { background-color: #ede9fe !important; color: #6d28d9 !important; }
+.badge-espp_contribution { background-color: #fae8ff !important; color: #86198f !important; }
 .badge-transfer_in { background-color: #d1fae5 !important; color: #047857 !important; }
 .badge-transfer_out { background-color: #fef3c7 !important; color: #b45309 !important; }
 .badge-switch_in { background-color: #d1fae5 !important; color: #047857 !important; }

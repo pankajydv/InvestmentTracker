@@ -1,13 +1,230 @@
 const express = require('express');
 const multer = require('multer');
+const { PDFParse } = require('pdf-parse');
 const { lookupTickerByISIN, fetchCorporateActions, toNSETicker, fetchHistoricalStockPrice, fetchHistoricalUSDToINR } = require('../services/priceService');
 const { parseContractNotes } = require('../services/contractNoteParser');
 const { parsePnLStatement } = require('../services/pnlParser');
 const { GRANTS, generateRsuSchedule } = require('../services/rsuGrantService');
+const { OFFERINGS, generateEsppSchedule } = require('../services/esppGrantService');
 const { parseOpenLots, parseClosedLots, reconcileVestTransactions } = require('../services/fidelityVestReconciler');
+const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisitionImportService');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+const CORPORATE_ACTION_UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'VEST', 'ESPP_PURCHASE'];
+const CORPORATE_ACTION_UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
+
+const MONTH_INDEX = {
+  january: 0,
+  february: 1,
+  march: 2,
+  april: 3,
+  may: 4,
+  june: 5,
+  july: 6,
+  august: 7,
+  september: 8,
+  october: 9,
+  november: 10,
+  december: 11,
+};
+
+function toMonthEndIso(monthName, yearValue) {
+  const monthIdx = MONTH_INDEX[String(monthName || '').toLowerCase()];
+  const year = Number(yearValue);
+  if (!Number.isInteger(monthIdx) || !Number.isInteger(year)) return null;
+  const d = new Date(Date.UTC(year, monthIdx + 1, 0));
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function toIsoDateUTC(year, monthIndex, day) {
+  const y = Number(year);
+  const m = Number(monthIndex);
+  const d = Number(day);
+  if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return null;
+  const dt = new Date(Date.UTC(y, m, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m || dt.getUTCDate() !== d) return null;
+  const yyyy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function parseDateTokenToIso(value) {
+  const input = String(value || '').trim().replace(/,/g, '');
+  if (!input) return null;
+
+  let match = input.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})$/);
+  if (match) {
+    const day = Number(match[1]);
+    const month = Number(match[2]) - 1;
+    let year = Number(match[3]);
+    if (year < 100) year += 2000;
+    return toIsoDateUTC(year, month, day);
+  }
+
+  match = input.match(/^(\d{1,2})[\/-]([A-Za-z]{3,9})[\/-](\d{2,4})$/);
+  if (match) {
+    const day = Number(match[1]);
+    const month = MONTH_INDEX[String(match[2]).toLowerCase().slice(0, 3)
+      .replace('jan', 'january')
+      .replace('feb', 'february')
+      .replace('mar', 'march')
+      .replace('apr', 'april')
+      .replace('jun', 'june')
+      .replace('jul', 'july')
+      .replace('aug', 'august')
+      .replace('sep', 'september')
+      .replace('oct', 'october')
+      .replace('nov', 'november')
+      .replace('dec', 'december')];
+    let year = Number(match[3]);
+    if (year < 100) year += 2000;
+    if (!Number.isInteger(month)) return null;
+    return toIsoDateUTC(year, month, day);
+  }
+
+  match = input.match(/^([A-Za-z]{3,9})\s+(\d{1,2})\s+(\d{2,4})$/);
+  if (match) {
+    const month = MONTH_INDEX[String(match[1]).toLowerCase().slice(0, 3)
+      .replace('jan', 'january')
+      .replace('feb', 'february')
+      .replace('mar', 'march')
+      .replace('apr', 'april')
+      .replace('jun', 'june')
+      .replace('jul', 'july')
+      .replace('aug', 'august')
+      .replace('sep', 'september')
+      .replace('oct', 'october')
+      .replace('nov', 'november')
+      .replace('dec', 'december')];
+    const day = Number(match[2]);
+    let year = Number(match[3]);
+    if (year < 100) year += 2000;
+    if (!Number.isInteger(month)) return null;
+    return toIsoDateUTC(year, month, day);
+  }
+
+  return null;
+}
+
+function toDefaultSalaryDateIso(monthName, yearValue) {
+  const monthIdx = MONTH_INDEX[String(monthName || '').toLowerCase()];
+  const year = Number(yearValue);
+  if (!Number.isInteger(monthIdx) || !Number.isInteger(year)) return null;
+
+  const salaryDate = new Date(Date.UTC(year, monthIdx, 28));
+  while (salaryDate.getUTCDay() === 0 || salaryDate.getUTCDay() === 6) {
+    salaryDate.setUTCDate(salaryDate.getUTCDate() - 1);
+  }
+
+  const yyyy = salaryDate.getUTCFullYear();
+  const mm = String(salaryDate.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(salaryDate.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function extractSalaryPaymentDateIso(text, monthName, yearValue) {
+  const lines = String(text || '').split(/\r?\n+/).map((s) => s.trim()).filter(Boolean);
+  const payDateLine = lines.find((line) => /\bpay\s*date\b|\bsalary\s*(paid|credited)\b/i.test(line));
+
+  if (payDateLine) {
+    const tokenPatterns = [
+      /(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/,
+      /(\d{1,2}[\/-][A-Za-z]{3,9}[\/-]\d{2,4})/,
+      /([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4})/,
+    ];
+
+    for (const pattern of tokenPatterns) {
+      const match = payDateLine.match(pattern);
+      if (!match) continue;
+      const parsed = parseDateTokenToIso(match[1]);
+      if (parsed) return parsed;
+    }
+  }
+
+  return toDefaultSalaryDateIso(monthName, yearValue);
+}
+
+function parseNumber(value) {
+  if (value == null) return null;
+  const clean = String(value).replace(/,/g, '').trim();
+  if (!clean) return null;
+  const num = Number(clean);
+  return Number.isFinite(num) ? num : null;
+}
+
+function parseEsppContributionRowsFromPayslipText(pageText, sourceFileName, pageNo) {
+  const text = String(pageText || '');
+  const monthMatch = text.match(/Payslip\s+for\s+the\s+month\s+of\s+([A-Za-z]+)\s+(\d{4})/i);
+  if (!monthMatch) return [];
+
+  const monthName = monthMatch[1];
+  const year = Number(monthMatch[2]);
+  const monthIdx = MONTH_INDEX[String(monthName || '').toLowerCase()];
+  if (!Number.isInteger(monthIdx) || !Number.isInteger(year)) return [];
+  const contributionDate = extractSalaryPaymentDateIso(text, monthName, year);
+  if (!contributionDate) return [];
+
+  const monthKey = `${year}-${String(monthIdx + 1).padStart(2, '0')}`;
+  const lines = text.split(/\r?\n+/).map((s) => s.trim()).filter(Boolean);
+  const esppLine = lines.find((line) => /\bESPP\b/i.test(line) && !/TCS\s+on\s+ESPP/i.test(line));
+  if (!esppLine) return [];
+
+  const compactText = text.replace(/\s+/g, ' ');
+  const deductionFirstLayout = /YTD\*\s+Earnings\s+Current\s+Month\s+Deductions\s+Current\s+Month\s+YTD\*/i.test(compactText);
+  const esppParts = esppLine.split(/\bESPP\b/i);
+  const afterEspp = esppParts.length > 1 ? esppParts.slice(1).join(' ') : '';
+  const afterNumbers = (afterEspp.match(/-?\d[\d,]*(?:\.\d+)?/g) || [])
+    .map(parseNumber)
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  if (!afterNumbers.length) return [];
+
+  // PDF extraction alternates between two layouts:
+  // 1) Earnings-first pages: ESPP current month amount is the first numeric token after ESPP.
+  // 2) Deductions-first pages: ESPP current month amount is the last numeric token after ESPP.
+  const selectedAmount = deductionFirstLayout
+    ? afterNumbers[afterNumbers.length - 1]
+    : afterNumbers.find((n) => n > 0) ?? afterNumbers[afterNumbers.length - 1];
+  const monthlyContribution = Number(selectedAmount);
+  if (!(monthlyContribution > 0)) return [];
+
+  return [{
+    import_key: `ESPP_CONTRIB|${monthKey}`,
+    month_key: monthKey,
+    contribution_date: contributionDate,
+    amount: Number(monthlyContribution.toFixed(2)),
+    source_file: sourceFileName,
+    source_page: pageNo,
+    raw_line: esppLine,
+  }];
+}
+
+async function extractEsppContributionsFromPayslipFiles(files) {
+  const byMonthKey = new Map();
+
+  for (const file of files || []) {
+    const parser = new PDFParse({ data: file.buffer });
+    const parsed = await parser.getText();
+    await parser.destroy();
+    const pages = Array.isArray(parsed.pages) ? parsed.pages : [];
+
+    for (let i = 0; i < pages.length; i += 1) {
+      const page = pages[i] || {};
+      const rows = parseEsppContributionRowsFromPayslipText(page.text, file.originalname, page.page || (i + 1));
+      for (const row of rows) {
+        if (!byMonthKey.has(row.month_key)) {
+          byMonthKey.set(row.month_key, row);
+        }
+      }
+    }
+  }
+
+  return Array.from(byMonthKey.values()).sort((a, b) => a.month_key.localeCompare(b.month_key));
+}
 
 module.exports = function (db) {
   /**
@@ -410,6 +627,470 @@ module.exports = function (db) {
     } catch (e) {
       console.error('AMC charge error:', e);
       res.status(500).json({ error: 'Failed to record charge: ' + e.message });
+    }
+  });
+
+  // ESPP Grants (offering-based purchases)
+  // Preview ESPP offering rows and mark already imported rows.
+  router.get('/espp-grants/preview', (req, res) => {
+    try {
+      const investmentId = req.query.investment_id ? parseInt(req.query.investment_id, 10) : null;
+      const portfolioId = req.query.portfolio_id ? parseInt(req.query.portfolio_id, 10) : null;
+      const includeFuture = String(req.query.include_future || '').toLowerCase() === 'true';
+      const asOfDate = req.query.as_of_date || null;
+      const offeringKeys = req.query.offering_keys
+        ? String(req.query.offering_keys).split(',').map((s) => s.trim()).filter(Boolean)
+        : null;
+
+      const schedule = generateEsppSchedule({ includeFuture, asOfDate, offeringKeys });
+
+      if (!investmentId || !portfolioId) {
+        return res.json({
+          ...schedule,
+          known_offerings: OFFERINGS.length,
+          imported_rows: 0,
+          rows: schedule.rows.map((row) => ({ ...row, already_imported: false })),
+        });
+      }
+
+      const existing = db.prepare(`
+        SELECT id, transaction_date, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'ESPP_PURCHASE'
+          AND notes LIKE 'ESPP Purchase | %'
+      `).all(investmentId, portfolioId);
+
+      const importedKeys = new Set();
+      for (const txn of existing) {
+        const keyMatch = String(txn.notes || '').match(/Key\s+([A-Z0-9_]+)/i);
+        if (!keyMatch) continue;
+        importedKeys.add(`${keyMatch[1]}|${txn.transaction_date}`);
+      }
+
+      const rows = schedule.rows.map((row) => ({
+        ...row,
+        already_imported: importedKeys.has(row.import_key),
+      }));
+
+      res.json({
+        ...schedule,
+        known_offerings: OFFERINGS.length,
+        imported_rows: rows.filter((r) => r.already_imported).length,
+        rows,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to preview ESPP grants: ' + e.message });
+    }
+  });
+
+  // Import ESPP purchase placeholders in idempotent mode.
+  router.post('/espp-grants/import', async (req, res) => {
+    try {
+      const {
+        investment_id,
+        portfolio_id,
+        include_future,
+        as_of_date,
+        offering_keys,
+        overwrite_existing,
+      } = req.body || {};
+
+      const investmentId = parseInt(investment_id, 10);
+      const portfolioId = parseInt(portfolio_id, 10);
+      if (!investmentId || !portfolioId) {
+        return res.status(400).json({ error: 'investment_id and portfolio_id are required' });
+      }
+
+      const investment = db.prepare('SELECT id, ticker_symbol, currency FROM investments WHERE id = ?').get(investmentId);
+      if (!investment) return res.status(404).json({ error: 'Investment not found' });
+
+      const schedule = generateEsppSchedule({
+        includeFuture: include_future === true,
+        asOfDate: as_of_date || null,
+        offeringKeys: Array.isArray(offering_keys) ? offering_keys : null,
+      });
+
+      const rows = schedule.rows;
+      if (!rows.length) {
+        return res.json({ created: 0, skipped: 0, removed_existing: 0, total_rows: 0 });
+      }
+
+      const existing = db.prepare(`
+        SELECT id, transaction_date, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'ESPP_PURCHASE'
+          AND notes LIKE 'ESPP Purchase | %'
+      `).all(investmentId, portfolioId);
+
+      const existingByKey = new Map();
+      for (const txn of existing) {
+        const keyMatch = String(txn.notes || '').match(/Key\s+([A-Z0-9_]+)/i);
+        if (!keyMatch) continue;
+        const key = `${keyMatch[1]}|${txn.transaction_date}`;
+        existingByKey.set(key, txn.id);
+      }
+
+      const insertTxn = db.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees, broker, notes,
+          exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units
+        ) VALUES (?, ?, 'ESPP_PURCHASE', ?, NULL, ?, 0, 0, 'Fidelity', ?, ?, NULL, ?, NULL, NULL)
+      `);
+      const deleteTxn = db.prepare('DELETE FROM transactions WHERE id = ?');
+
+      let removedExisting = 0;
+      let created = 0;
+      let skipped = 0;
+
+      const pricingByDate = new Map();
+      for (const row of rows) {
+        if (!investment.ticker_symbol) {
+          pricingByDate.set(row.purchase_date, { fmv_per_unit: null, exchange_rate_used: null });
+          continue;
+        }
+
+        try {
+          const [fmvPerUnit, fxRate] = await Promise.all([
+            fetchHistoricalStockPrice(investment.ticker_symbol, row.purchase_date),
+            investment.currency === 'USD' ? fetchHistoricalUSDToINR(row.purchase_date) : Promise.resolve(null),
+          ]);
+          pricingByDate.set(row.purchase_date, {
+            fmv_per_unit: fmvPerUnit != null ? Number(fmvPerUnit) : null,
+            exchange_rate_used: fxRate != null ? Number(fxRate) : null,
+          });
+        } catch (_) {
+          pricingByDate.set(row.purchase_date, { fmv_per_unit: null, exchange_rate_used: null });
+        }
+      }
+
+      const runAll = db.transaction(() => {
+        for (const row of rows) {
+          const existingId = existingByKey.get(row.import_key);
+          if (existingId && overwrite_existing === true) {
+            deleteTxn.run(existingId);
+            removedExisting += 1;
+          } else if (existingId) {
+            skipped += 1;
+            continue;
+          }
+
+          const pricing = pricingByDate.get(row.purchase_date) || { fmv_per_unit: null, exchange_rate_used: null };
+          const purchasePrice = pricing.fmv_per_unit != null
+            ? Number((pricing.fmv_per_unit * (1 - row.discount_pct / 100)).toFixed(4))
+            : null;
+
+          insertTxn.run(
+            investmentId,
+            portfolioId,
+            row.purchase_date,
+            purchasePrice,
+            row.notes,
+            pricing.exchange_rate_used,
+            pricing.fmv_per_unit,
+          );
+          created += 1;
+        }
+      });
+
+      runAll();
+
+      res.json({
+        created,
+        skipped,
+        removed_existing: removedExisting,
+        total_rows: rows.length,
+        as_of_date: schedule.as_of_date,
+        include_future: schedule.include_future,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to import ESPP grants: ' + e.message });
+    }
+  });
+
+  // Parse payslip PDFs and preview monthly ESPP payroll contributions.
+  router.post('/espp-contributions/preview', upload.array('files', 20), async (req, res) => {
+    try {
+      const investmentId = req.body?.investment_id ? parseInt(req.body.investment_id, 10) : null;
+      const portfolioId = req.body?.portfolio_id ? parseInt(req.body.portfolio_id, 10) : null;
+      if (!investmentId || !portfolioId) {
+        return res.status(400).json({ error: 'investment_id and portfolio_id are required' });
+      }
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No payslip files uploaded' });
+      }
+
+      const rows = await extractEsppContributionsFromPayslipFiles(req.files);
+
+      const existing = db.prepare(`
+        SELECT id, transaction_date, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'ESPP_CONTRIBUTION'
+      `).all(investmentId, portfolioId);
+
+      const existingKeys = new Set();
+      for (const txn of existing) {
+        const keyMatch = String(txn.notes || '').match(/Key\s+(ESPP_CONTRIB\|\d{4}-\d{2})/i);
+        if (keyMatch) {
+          existingKeys.add(keyMatch[1].toUpperCase());
+          continue;
+        }
+        existingKeys.add(`ESPP_CONTRIB|${String(txn.transaction_date || '').slice(0, 7)}`.toUpperCase());
+      }
+
+      const previewRows = rows.map((r) => ({
+        ...r,
+        already_imported: existingKeys.has(String(r.import_key).toUpperCase()),
+      }));
+
+      res.json({
+        files_processed: req.files.length,
+        rows_found: previewRows.length,
+        imported_rows: previewRows.filter((r) => r.already_imported).length,
+        rows: previewRows,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to preview ESPP contributions: ' + e.message });
+    }
+  });
+
+  // Import monthly ESPP contribution rows from preview payload.
+  router.post('/espp-contributions/import', express.json(), (req, res) => {
+    try {
+      const {
+        investment_id,
+        portfolio_id,
+        overwrite_existing,
+        rows,
+      } = req.body || {};
+
+      const investmentId = parseInt(investment_id, 10);
+      const portfolioId = parseInt(portfolio_id, 10);
+      if (!investmentId || !portfolioId) {
+        return res.status(400).json({ error: 'investment_id and portfolio_id are required' });
+      }
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return res.status(400).json({ error: 'rows is required and must be a non-empty array' });
+      }
+
+      const investment = db.prepare('SELECT id FROM investments WHERE id = ?').get(investmentId);
+      if (!investment) return res.status(404).json({ error: 'Investment not found' });
+
+      const existing = db.prepare(`
+        SELECT id, transaction_date, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'ESPP_CONTRIBUTION'
+      `).all(investmentId, portfolioId);
+
+      const existingByKey = new Map();
+      for (const txn of existing) {
+        const keyMatch = String(txn.notes || '').match(/Key\s+(ESPP_CONTRIB\|\d{4}-\d{2})/i);
+        if (keyMatch) {
+          existingByKey.set(keyMatch[1].toUpperCase(), txn.id);
+        } else {
+          existingByKey.set(`ESPP_CONTRIB|${String(txn.transaction_date || '').slice(0, 7)}`.toUpperCase(), txn.id);
+        }
+      }
+
+      const insertTxn = db.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees, broker, notes,
+          exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units
+        ) VALUES (?, ?, 'ESPP_CONTRIBUTION', ?, NULL, NULL, ?, 0, 'Payroll', ?, NULL, NULL, NULL, NULL, NULL)
+      `);
+      const deleteTxn = db.prepare('DELETE FROM transactions WHERE id = ?');
+
+      let created = 0;
+      let skipped = 0;
+      let removedExisting = 0;
+
+      const runAll = db.transaction(() => {
+        for (const row of rows) {
+          const importKey = String(row.import_key || '').toUpperCase();
+          const amount = Number(row.amount || 0);
+          const contributionDate = String(row.contribution_date || '');
+          const monthKey = String(row.month_key || contributionDate.slice(0, 7));
+          if (!importKey || !contributionDate || !(amount > 0)) {
+            skipped += 1;
+            continue;
+          }
+
+          const existingId = existingByKey.get(importKey);
+          if (existingId && overwrite_existing === true) {
+            deleteTxn.run(existingId);
+            removedExisting += 1;
+          } else if (existingId) {
+            skipped += 1;
+            continue;
+          }
+
+          const noteParts = [
+            `ESPP Contribution | Month ${monthKey}`,
+            row.source_file ? `Source ${row.source_file}` : null,
+            `Key ${importKey}`,
+          ].filter(Boolean);
+
+          insertTxn.run(
+            investmentId,
+            portfolioId,
+            contributionDate,
+            Number(amount.toFixed(2)),
+            noteParts.join(' | '),
+          );
+          created += 1;
+        }
+      });
+
+      runAll();
+
+      res.json({
+        created,
+        skipped,
+        removed_existing: removedExisting,
+        total_rows: rows.length,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to import ESPP contributions: ' + e.message });
+    }
+  });
+
+  // Preview quarterly ESPP acquisition rows (prepared from OCR/UI extraction).
+  router.post('/espp-acquisitions/preview', express.json(), (req, res) => {
+    try {
+      const investmentId = req.body?.investment_id ? parseInt(req.body.investment_id, 10) : null;
+      const portfolioId = req.body?.portfolio_id ? parseInt(req.body.portfolio_id, 10) : null;
+      const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+      const sourceLabel = req.body?.source ? String(req.body.source).trim() : '';
+
+      if (!investmentId || !portfolioId) {
+        return res.status(400).json({ error: 'investment_id and portfolio_id are required' });
+      }
+      if (!rows.length) {
+        return res.status(400).json({ error: 'rows is required and must be a non-empty array' });
+      }
+
+      const investment = db.prepare('SELECT id FROM investments WHERE id = ?').get(investmentId);
+      if (!investment) return res.status(404).json({ error: 'Investment not found' });
+
+      const normalized = normalizeRows(rows, sourceLabel);
+
+      const existing = db.prepare(`
+        SELECT id, transaction_date, units, price_per_unit, usd_amount, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'ESPP_PURCHASE'
+      `).all(investmentId, portfolioId);
+
+      const previewRows = annotatePreviewRows(normalized, existing);
+
+      res.json({
+        rows_found: previewRows.length,
+        imported_rows: previewRows.filter((r) => r.already_imported).length,
+        rows: previewRows,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to preview ESPP acquisitions: ' + e.message });
+    }
+  });
+
+  // Import quarterly ESPP acquisition rows as ESPP_PURCHASE (share acquisition only, amount=0).
+  router.post('/espp-acquisitions/import', express.json(), async (req, res) => {
+    try {
+      const investmentId = req.body?.investment_id ? parseInt(req.body.investment_id, 10) : null;
+      const portfolioId = req.body?.portfolio_id ? parseInt(req.body.portfolio_id, 10) : null;
+      const overwriteExisting = req.body?.overwrite_existing === true;
+      const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+      const sourceLabel = req.body?.source ? String(req.body.source).trim() : '';
+
+      if (!investmentId || !portfolioId) {
+        return res.status(400).json({ error: 'investment_id and portfolio_id are required' });
+      }
+      if (!rows.length) {
+        return res.status(400).json({ error: 'rows is required and must be a non-empty array' });
+      }
+
+      const investment = db.prepare('SELECT id FROM investments WHERE id = ?').get(investmentId);
+      if (!investment) return res.status(404).json({ error: 'Investment not found' });
+
+      const normalized = normalizeRows(rows, sourceLabel);
+
+      const existing = db.prepare(`
+        SELECT id, transaction_date, units, price_per_unit, usd_amount, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'ESPP_PURCHASE'
+      `).all(investmentId, portfolioId);
+
+      const previewRows = annotatePreviewRows(normalized, existing);
+
+      const rateByDate = new Map();
+      for (const row of previewRows) {
+        if (!rateByDate.has(row.purchase_date)) {
+          const rate = await fetchHistoricalUSDToINR(row.purchase_date);
+          rateByDate.set(row.purchase_date, Number(rate));
+        }
+      }
+
+      const insertTxn = db.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees, broker, notes,
+          exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units
+        ) VALUES (?, ?, 'ESPP_PURCHASE', ?, ?, ?, 0, 0, 'Fidelity', ?, ?, ?, ?, NULL, NULL)
+      `);
+
+      const deleteTxn = db.prepare('DELETE FROM transactions WHERE id = ?');
+
+      let created = 0;
+      let skipped = 0;
+      let removedExisting = 0;
+
+      const runAll = db.transaction(() => {
+        for (const row of previewRows) {
+          if (row.already_imported && overwriteExisting && row.existing_transaction_id) {
+            deleteTxn.run(row.existing_transaction_id);
+            removedExisting += 1;
+          } else if (row.already_imported) {
+            skipped += 1;
+            continue;
+          }
+
+          insertTxn.run(
+            investmentId,
+            portfolioId,
+            row.purchase_date,
+            row.purchase_quantity,
+            row.purchase_price,
+            row.notes,
+            rateByDate.get(row.purchase_date) || null,
+            row.purchase_value,
+            row.fmv_purchase_date,
+          );
+          created += 1;
+        }
+      });
+
+      runAll();
+
+      res.json({
+        created,
+        skipped,
+        removed_existing: removedExisting,
+        total_rows: previewRows.length,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to import ESPP acquisitions: ' + e.message });
     }
   });
 
@@ -848,13 +1529,15 @@ module.exports = function (db) {
    */
   router.get('/corporate-actions/preview', async (req, res) => {
     try {
-      const { portfolio_id, year } = req.query;
+      const { portfolio_id, year, asset_type } = req.query;
       if (!year) return res.status(400).json({ error: 'year is required' });
 
       const yearNum = parseInt(year);
       const portfolioId = portfolio_id ? parseInt(portfolio_id) : null;
+      const assetType = asset_type === 'FOREIGN_STOCK' ? 'FOREIGN_STOCK' : 'INDIAN_STOCK';
+      const currencySymbol = assetType === 'FOREIGN_STOCK' ? '$' : '₹';
 
-      // Get all Indian stock investments (optionally scoped to portfolio) that have a ticker
+      // Get all stock investments of the requested type (optionally scoped to portfolio) that have a ticker
       let investmentQuery;
       let investmentParams;
       if (portfolioId) {
@@ -862,15 +1545,15 @@ module.exports = function (db) {
           SELECT DISTINCT i.id, i.name, i.ticker_symbol
           FROM investments i
           JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
-          WHERE i.asset_type = 'INDIAN_STOCK' AND i.ticker_symbol IS NOT NULL`;
-        investmentParams = [portfolioId];
+          WHERE i.asset_type = ? AND i.ticker_symbol IS NOT NULL`;
+        investmentParams = [portfolioId, assetType];
       } else {
         investmentQuery = `
           SELECT DISTINCT i.id, i.name, i.ticker_symbol
           FROM investments i
-          WHERE i.asset_type = 'INDIAN_STOCK' AND i.ticker_symbol IS NOT NULL
+          WHERE i.asset_type = ? AND i.ticker_symbol IS NOT NULL
             AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id)`;
-        investmentParams = [];
+        investmentParams = [assetType];
       }
       const investments = db.prepare(investmentQuery).all(...investmentParams);
 
@@ -878,6 +1561,15 @@ module.exports = function (db) {
       const corrections = [];
       const deletions = [];
       const errors = [];
+      const fxByDate = new Map();
+
+      async function getFxForDate(date) {
+        if (fxByDate.has(date)) return fxByDate.get(date);
+        const fx = await fetchHistoricalUSDToINR(date);
+        const normalized = Number.isFinite(fx) ? fx : null;
+        fxByDate.set(date, normalized);
+        return normalized;
+      }
 
       for (const inv of investments) {
         // Get all transactions for this investment, ordered by date
@@ -888,7 +1580,9 @@ module.exports = function (db) {
         `).all(inv.id);
 
         // Fetch from Yahoo Finance (once per investment, outside portfolio loop)
-        const ticker = inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol);
+        const ticker = assetType === 'FOREIGN_STOCK'
+          ? inv.ticker_symbol
+          : (inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol));
         let actions;
         try {
           actions = await fetchCorporateActions(ticker, yearNum);
@@ -918,9 +1612,9 @@ module.exports = function (db) {
             if (scopeByPortfolio && t.portfolio_id !== pid) continue;
             if (excludeIds && excludeIds.has(t.id)) continue;
             if (excludeSameDayTrading && t.transaction_date === date && !CORPORATE_TYPES.includes(t.transaction_type)) continue;
-            if (['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT'].includes(t.transaction_type)) {
+            if (CORPORATE_ACTION_UNIT_ADD_TYPES.includes(t.transaction_type)) {
               units += t.units || 0;
-            } else if (['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION'].includes(t.transaction_type)) {
+            } else if (CORPORATE_ACTION_UNIT_SUB_TYPES.includes(t.transaction_type)) {
               units -= t.units || 0;
             }
           }
@@ -946,11 +1640,11 @@ module.exports = function (db) {
 
         // Get existing corporate action transactions for this investment/portfolio in this year
         const existingActionsQuery = scopeByPortfolio
-          ? `SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes, locked
+          ? `SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes, locked, exchange_rate_used, usd_amount
              FROM transactions
              WHERE investment_id = ? AND portfolio_id = ? AND transaction_date BETWEEN ? AND ?
                AND transaction_type IN ('DIVIDEND', 'SPLIT', 'BONUS')`
-          : `SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes, locked
+          : `SELECT id, transaction_type, transaction_date, units, amount, price_per_unit, notes, locked, exchange_rate_used, usd_amount
              FROM transactions
              WHERE investment_id = ? AND transaction_date BETWEEN ? AND ?
                AND transaction_type IN ('DIVIDEND', 'SPLIT', 'BONUS')`;
@@ -971,8 +1665,19 @@ module.exports = function (db) {
         for (const div of actions.dividends) {
           const holdingUnits = holdingAt(div.date, null, true);
           if (holdingUnits <= 0) continue;
-
-          const dividendAmount = Math.round(holdingUnits * div.amount * 100) / 100;
+          const isForeignDividend = assetType === 'FOREIGN_STOCK';
+          const usdDividendAmount = Math.round(holdingUnits * div.amount * 100) / 100;
+          const fxRate = isForeignDividend ? await getFxForDate(div.date) : null;
+          if (isForeignDividend && !(fxRate > 0)) {
+            errors.push({
+              investment: inv.name,
+              error: `Missing USD/INR FX for ${div.date}; cannot compute INR dividend amount`,
+            });
+            continue;
+          }
+          const dividendAmount = isForeignDividend
+            ? Math.round(usdDividendAmount * fxRate * 100) / 100
+            : usdDividendAmount;
 
           // Find any existing dividend within the date window
           const existing = existingActions.find(e =>
@@ -991,8 +1696,10 @@ module.exports = function (db) {
             const amountMatch = Math.abs(existing.amount - dividendAmount) < 1;
             const unitsMatch = existing.units === holdingUnits;
             const priceMatch = existing.price_per_unit != null && Math.abs(existing.price_per_unit - div.amount) < 0.01;
+            const usdMatch = !isForeignDividend || (existing.usd_amount != null && Math.abs(existing.usd_amount - usdDividendAmount) < 0.01);
+            const fxMatch = !isForeignDividend || (existing.exchange_rate_used != null && Math.abs(existing.exchange_rate_used - fxRate) < 0.01);
 
-            if (dateMatch && amountMatch && unitsMatch && priceMatch) {
+            if (dateMatch && amountMatch && unitsMatch && priceMatch && usdMatch && fxMatch) {
               continue; // Perfect match, skip
             }
 
@@ -1009,9 +1716,14 @@ module.exports = function (db) {
               expected_units: holdingUnits,
               expected_amount: dividendAmount,
               expected_price_per_unit: div.amount,
+              expected_exchange_rate_used: fxRate,
+              expected_usd_amount: isForeignDividend ? usdDividendAmount : null,
               broker: brokerAt(div.date),
               portfolio_id: pid,
-              notes: `Dividend \u20B9${div.amount}/share \u00D7 ${holdingUnits} shares`,
+              currency_symbol: currencySymbol,
+              notes: isForeignDividend
+                ? `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares (FX \u20B9${fxRate}/$)`
+                : `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares`,
             });
             continue;
           }
@@ -1024,10 +1736,15 @@ module.exports = function (db) {
             units: holdingUnits,
             price_per_unit: div.amount,
             amount: dividendAmount,
+            exchange_rate_used: fxRate,
+            usd_amount: isForeignDividend ? usdDividendAmount : null,
             fees: 0,
             broker: brokerAt(div.date),
             portfolio_id: pid,
-            notes: `Dividend \u20B9${div.amount}/share \u00D7 ${holdingUnits} shares`,
+            currency_symbol: currencySymbol,
+            notes: isForeignDividend
+              ? `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares (FX \u20B9${fxRate}/$)`
+              : `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares`,
           });
         }
 
@@ -1157,12 +1874,14 @@ module.exports = function (db) {
       };
 
       const insert = db.prepare(`
-        INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes, broker, portfolio_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes, broker, portfolio_id, exchange_rate_used, usd_amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       const update = db.prepare(`
-        UPDATE transactions SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, notes = ?, broker = ?, portfolio_id = ? WHERE id = ?
+        UPDATE transactions
+        SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, notes = ?, broker = ?, portfolio_id = ?, exchange_rate_used = ?, usd_amount = ?
+        WHERE id = ?
       `);
 
       const remove = db.prepare(`DELETE FROM transactions WHERE id = ?`);
@@ -1193,7 +1912,7 @@ module.exports = function (db) {
             insert.run(
               txn.investment_id, txn.transaction_type, txn.transaction_date,
               txn.units || null, txn.price_per_unit || null, txn.amount, txn.fees || 0, txn.notes || null,
-              txn.broker || null, portfolioId
+              txn.broker || null, portfolioId, txn.exchange_rate_used || null, txn.usd_amount || null
             );
             created++;
           }
@@ -1208,7 +1927,18 @@ module.exports = function (db) {
             if (portfolioId == null) {
               throw new Error(`Missing portfolio_id for corrected transaction id ${c.id}. Provide portfolio_id in correction payload.`);
             }
-            update.run(c.transaction_date, c.expected_units, c.expected_price_per_unit, c.expected_amount, c.notes, c.broker || null, portfolioId, c.id);
+            update.run(
+              c.transaction_date,
+              c.expected_units,
+              c.expected_price_per_unit,
+              c.expected_amount,
+              c.notes,
+              c.broker || null,
+              portfolioId,
+              c.expected_exchange_rate_used || null,
+              c.expected_usd_amount || null,
+              c.id
+            );
             corrected++;
           }
         }

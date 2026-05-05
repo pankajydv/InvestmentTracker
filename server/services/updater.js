@@ -100,11 +100,11 @@ async function updateAllPrices(db, options = {}) {
 
   const getInvestedAmount = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION')
+    FROM transactions WHERE investment_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION')
   `);
   const getInvestedAmountPortfolio = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION')
+    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION')
   `);
 
   const getSaleProceeds = db.prepare(`

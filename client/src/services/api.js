@@ -171,6 +171,56 @@ export const importRsuGrantSchedule = (data = {}) =>
     body: JSON.stringify(data),
   });
 
+// ESPP Grants (offering-based purchase placeholders)
+export const previewEsppGrantSchedule = (params = {}) => {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+  });
+  return fetchJSON(`/stocks/espp-grants/preview${qs.toString() ? `?${qs}` : ''}`);
+};
+
+export const importEsppGrantSchedule = (data = {}) =>
+  fetchJSON('/stocks/espp-grants/import', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+
+export const previewEsppContributionsFromPayslips = async (files, investmentId, portfolioId) => {
+  const formData = new FormData();
+  files.forEach((f) => formData.append('files', f));
+  formData.append('investment_id', String(investmentId));
+  formData.append('portfolio_id', String(portfolioId));
+  const res = await fetch(`${API_BASE}/stocks/espp-contributions/preview`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'ESPP contribution preview failed');
+  }
+  return res.json();
+};
+
+export const importEsppContributions = (data = {}) =>
+  fetchJSON('/stocks/espp-contributions/import', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+
+// ESPP share acquisitions (quarterly purchase history), prepared from OCR/UI extraction rows.
+export const previewEsppAcquisitions = (data = {}) =>
+  fetchJSON('/stocks/espp-acquisitions/preview', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+
+export const importEsppAcquisitions = (data = {}) =>
+  fetchJSON('/stocks/espp-acquisitions/import', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+
 export const previewRsuGrantDocuments = async (files) => {
   const formData = new FormData();
   files.forEach((f) => formData.append('files', f));

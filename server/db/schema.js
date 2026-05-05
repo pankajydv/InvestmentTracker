@@ -115,7 +115,7 @@ function initializeDb(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       investment_id INTEGER NOT NULL,
       portfolio_id INTEGER NOT NULL, -- Owner (family member) portfolio
-      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC', 'REDEMPTION')),
+      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC', 'REDEMPTION', 'ESPP_CONTRIBUTION')),
       transaction_date TEXT NOT NULL,
       units REAL,                  -- Number of units/shares bought or sold
       price_per_unit REAL,         -- Price at which transaction happened
@@ -1079,7 +1079,7 @@ function initializeDb(db) {
             'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
             'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
             'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
-            'REDEMPTION', 'EPS_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'
+            'REDEMPTION', 'EPS_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE', 'ESPP_CONTRIBUTION'
           )),
           transaction_date TEXT NOT NULL,
           units REAL,
@@ -1169,7 +1169,7 @@ function initializeDb(db) {
             'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
             'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
             'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
-            'REDEMPTION', 'EPS_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'
+            'REDEMPTION', 'EPS_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE', 'ESPP_CONTRIBUTION'
           )),
           transaction_date TEXT NOT NULL,
           units REAL,
@@ -1227,6 +1227,96 @@ function initializeDb(db) {
     }
   } else if (!hasMigrationRecord(db, vestWithholdingMigrationId) && hasGrossUnits && hasTaxWithheldUnits) {
     recordMigration(db, vestWithholdingMigrationId, 'skipped', 'vesting withholding columns already present');
+  }
+
+  // ── Migration: add ESPP_CONTRIBUTION transaction type ────────────────
+  const hasEsppContributionType = (() => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'").get();
+    return row && row.sql && row.sql.includes("'ESPP_CONTRIBUTION'");
+  })();
+  const esppContributionMigrationId = '20260503-add-espp-contribution-transaction-type';
+
+  if (!hasEsppContributionType && !hasMigrationRecord(db, esppContributionMigrationId)) {
+    if (!migrationsEnabled) {
+      throw new Error(`Pending migration ${esppContributionMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+    }
+
+    console.log('Migrating: adding ESPP_CONTRIBUTION transaction type...');
+    const beforeTransactions = getTableCount(db, 'transactions');
+    const backupPath = createPreMigrationBackup(db, 'add-espp-contribution-transaction-type');
+    if (backupPath) console.log(`Created migration backup: ${backupPath}`);
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE transactions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          portfolio_id INTEGER NOT NULL,
+          transaction_type TEXT NOT NULL CHECK(transaction_type IN (
+            'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST',
+            'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
+            'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
+            'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
+            'REDEMPTION', 'EPS_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE', 'ESPP_CONTRIBUTION'
+          )),
+          transaction_date TEXT NOT NULL,
+          units REAL,
+          price_per_unit REAL,
+          amount REAL NOT NULL,
+          fees REAL DEFAULT 0,
+          broker TEXT,
+          notes TEXT,
+          locked INTEGER DEFAULT 0,
+          folio_number TEXT,
+          exchange_rate_used REAL,
+          usd_amount REAL,
+          fmv_per_unit REAL,
+          gross_units REAL,
+          tax_withheld_units REAL,
+          created_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+        )
+      `);
+
+      const existingCols = db.prepare('PRAGMA table_info(transactions)').all().map((c) => c.name);
+      const knownCols = [
+        'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
+        'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
+        'locked', 'folio_number', 'exchange_rate_used', 'usd_amount', 'fmv_per_unit',
+        'gross_units', 'tax_withheld_units', 'created_at',
+      ];
+      const colsToCopy = knownCols.filter((c) => existingCols.includes(c));
+      db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
+
+      const copiedTransactions = getTableCount(db, 'transactions_new');
+      ensureRowCountPreserved({
+        before: beforeTransactions,
+        after: copiedTransactions,
+        table: 'transactions',
+        migrationName: 'add-espp-contribution-transaction-type',
+      });
+
+      db.exec('DROP TABLE transactions');
+      db.exec('ALTER TABLE transactions_new RENAME TO transactions');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id)');
+
+      db.exec('COMMIT');
+      assertDbIntegrity(db, esppContributionMigrationId);
+      recordMigration(db, esppContributionMigrationId, 'applied');
+      console.log('Migration complete: ESPP_CONTRIBUTION type added.');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('ESPP_CONTRIBUTION migration failed:', err);
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+  } else if (!hasMigrationRecord(db, esppContributionMigrationId) && hasEsppContributionType) {
+    recordMigration(db, esppContributionMigrationId, 'skipped', 'ESPP_CONTRIBUTION type already present');
   }
 }
 

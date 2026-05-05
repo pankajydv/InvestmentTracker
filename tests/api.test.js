@@ -25,6 +25,8 @@ let BASE_URL;
 let server;
 let db;
 let testDataDir;
+let mockCorporateActions = async () => ({ dividends: [], splits: [] });
+let mockUsdInrRate = async () => 80;
 
 function txnItems(body) {
   if (Array.isArray(body)) return body;
@@ -90,7 +92,8 @@ before(async () => {
   // ── Mock external API calls BEFORE requiring route modules ──
   const priceService = require('../server/services/priceService');
   priceService.lookupTickerByISIN = async (isin) => isin ? isin + '.NS' : null;
-  priceService.fetchCorporateActions = async () => ({ dividends: [], splits: [] });
+  priceService.fetchCorporateActions = async (...args) => mockCorporateActions(...args);
+  priceService.fetchHistoricalUSDToINR = async (...args) => mockUsdInrRate(...args);
   // toNSETicker is a pure function — no need to mock
 
   // Create the test DB
@@ -768,6 +771,53 @@ describe('Corporate Actions — Preview', () => {
     assert.ok(Array.isArray(body.corrections));
     assert.ok(Array.isArray(body.deletions));
     assert.ok(Array.isArray(body.errors));
+  });
+
+  it('GET /stocks/corporate-actions/preview supports foreign stocks', async () => {
+    mockCorporateActions = async (symbol, year) => {
+      if (symbol === 'MSFT' && year === 2023) {
+        return { dividends: [{ date: '2023-03-09', amount: 0.68 }], splits: [] };
+      }
+      return { dividends: [], splits: [] };
+    };
+    mockUsdInrRate = async () => 82.5;
+
+    const invRes = await api('POST', '/investments', {
+      name: 'Microsoft', asset_type: 'FOREIGN_STOCK', ticker_symbol: 'MSFT', currency: 'USD'
+    });
+    assert.equal(invRes.status, 201);
+
+    const txnRes = await api('POST', '/transactions', {
+      investment_id: invRes.body.id,
+      portfolio_id: 1,
+      transaction_type: 'VEST',
+      transaction_date: '2023-01-10',
+      units: 10,
+      price_per_unit: 250,
+      amount: 2500,
+      fees: 0,
+      broker: 'Fidelity'
+    });
+    assert.equal(txnRes.status, 201);
+
+    const { status, body } = await api('GET', '/stocks/corporate-actions/preview?portfolio_id=1&year=2023&asset_type=FOREIGN_STOCK');
+    assert.equal(status, 200);
+    assert.ok(Array.isArray(body.suggestions));
+    assert.ok(Array.isArray(body.corrections));
+    assert.ok(Array.isArray(body.deletions));
+    assert.ok(Array.isArray(body.errors));
+    assert.equal(body.suggestions.length, 1);
+    assert.equal(body.suggestions[0].investment_name, 'Microsoft');
+    assert.equal(body.suggestions[0].transaction_type, 'DIVIDEND');
+    assert.equal(body.suggestions[0].units, 10);
+    assert.equal(body.suggestions[0].price_per_unit, 0.68);
+    assert.equal(body.suggestions[0].usd_amount, 6.8);
+    assert.equal(body.suggestions[0].exchange_rate_used, 82.5);
+    assert.equal(body.suggestions[0].amount, 561);
+    assert.equal(body.suggestions[0].currency_symbol, '$');
+
+    mockCorporateActions = async () => ({ dividends: [], splits: [] });
+    mockUsdInrRate = async () => 80;
   });
 
   it('Missing params return 400', async () => {

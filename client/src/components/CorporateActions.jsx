@@ -14,6 +14,7 @@ const TYPE_BADGE = {
 
 const ASSET_TYPE_OPTIONS = [
   { value: 'INDIAN_STOCK', label: 'Stocks' },
+  { value: 'FOREIGN_STOCK', label: 'Foreign Stocks' },
   { value: 'PPF', label: 'PPF' },
   { value: 'SSY', label: 'SSY' },
   { value: 'PF', label: 'PF' },
@@ -149,6 +150,7 @@ export default function CorporateActions() {
   const portfolioLabel = selectedId
     ? portfolios.find(p => p.id === selectedId)?.name || 'Selected portfolio'
     : 'All Portfolios';
+  const moneySymbol = (row) => row?.currency_symbol || '₹';
 
   return (
     <div className="mx-auto d-flex flex-column gap-4" style={{ maxWidth: 960 }}>
@@ -244,12 +246,19 @@ export default function CorporateActions() {
               <td className="px-3 py-2"><TypeBadge type={s.transaction_type} /></td>
               <td className="px-3 py-2 text-end">{formatNumber(s.units, 4)}</td>
               <td className="px-3 py-2 text-end">
-                {s.transaction_type === 'DIVIDEND' ? `₹${formatNumber(s.price_per_unit, 2)}` : '-'}
+                {s.transaction_type === 'DIVIDEND' ? `${moneySymbol(s)}${formatNumber(s.price_per_unit, 2)}` : '-'}
               </td>
               <td className="px-3 py-2 text-end fw-medium">
-                {s.transaction_type === 'DIVIDEND'
-                  ? `₹${formatNumber(s.amount, 2)}`
-                  : `+${formatNumber(s.units, 4)} shares`}
+                {s.transaction_type === 'DIVIDEND' ? (
+                  <>
+                    ₹{formatNumber(s.amount, 2)}
+                    {s.usd_amount != null && (
+                      <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                        ${formatNumber(s.usd_amount, 2)}
+                      </div>
+                    )}
+                  </>
+                ) : `+${formatNumber(s.units, 4)} shares`}
               </td>
               <td className="px-3 py-2 text-muted small">{s.notes}</td>
             </tr>
@@ -297,11 +306,12 @@ export default function CorporateActions() {
           columns={['Stock', 'Type', 'Current', '', 'Corrected', 'Details']}
           renderRow={(c, i) => {
             const dateChanged = c.current_date && c.current_date !== c.transaction_date;
+            const symbol = moneySymbol(c);
             const currentVal = c.transaction_type === 'DIVIDEND'
-              ? `₹${formatNumber(c.current_amount, 2)}`
+              ? `${symbol}${formatNumber(c.current_amount, 2)}`
               : `${formatNumber(c.current_units, 4)} shares`;
             const expectedVal = c.transaction_type === 'DIVIDEND'
-              ? `₹${formatNumber(c.expected_amount, 2)}`
+              ? `${symbol}${formatNumber(c.expected_amount, 2)}`
               : `${formatNumber(c.expected_units, 4)} shares`;
             return (
             <tr key={i} className={!checkedFix[i] ? 'text-muted' : ''}>
@@ -400,7 +410,7 @@ export default function CorporateActions() {
                 <td className="px-3 py-2"><TypeBadge type={d.transaction_type} /></td>
                 <td className="px-3 py-2 text-end">
                   {d.transaction_type === 'DIVIDEND'
-                    ? `₹${formatNumber(d.amount, 2)}`
+                    ? `${moneySymbol(d)}${formatNumber(d.amount, 2)}`
                     : `${formatNumber(d.units, 4)} shares`}
                 </td>
                 <td className="px-3 py-2 text-muted small">{d.notes || '-'}</td>

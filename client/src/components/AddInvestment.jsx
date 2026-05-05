@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse, Table } from 'react-bootstrap';
-import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction, previewRsuGrantDocuments, importRsuGrantSchedule } from '../services/api';
+import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction, previewRsuGrantDocuments, importRsuGrantSchedule, getUSDINRRate } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp, Plus } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -53,6 +53,23 @@ export default function AddInvestment() {
   const [rsuCreating, setRsuCreating] = useState(false);
   const [rsuIncludeFuture, setRsuIncludeFuture] = useState(false);
   const [rsuOverwriteExisting, setRsuOverwriteExisting] = useState(false);
+
+  // Manual stock transaction state (for Foreign Stocks)
+  const [showManualStockTxn, setShowManualStockTxn] = useState(false);
+  const [manualStockTxn, setManualStockTxn] = useState({
+    transaction_type: 'BUY',
+    transaction_date: new Date().toISOString().split('T')[0],
+    units: '',
+    price_per_unit: '',
+    amount: '',
+    fees: '0',
+    broker: 'Fidelity',
+    exchange_rate_used: '',
+    usd_amount: '',
+    notes: '',
+  });
+  const [addingManualTxn, setAddingManualTxn] = useState(false);
+  const [rateLoading, setRateLoading] = useState(false);
 
   // Contract notes upload state
   const contractFileRef = useRef(null);
@@ -303,6 +320,101 @@ export default function AddInvestment() {
     setRsuIncludeFuture(false);
     setRsuOverwriteExisting(false);
     if (rsuGrantFileRef.current) rsuGrantFileRef.current.value = '';
+  };
+
+  const updateManualStockTxn = (field, value) => {
+    const updated = { ...manualStockTxn, [field]: value };
+    if ((field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
+      updated.amount = (parseFloat(updated.units) * parseFloat(updated.price_per_unit)).toFixed(2);
+    }
+    setManualStockTxn(updated);
+  };
+
+  const handleFetchUSDINRRate = async () => {
+    if (!manualStockTxn.transaction_date) return;
+    setRateLoading(true);
+    try {
+      const rate = await getUSDINRRate(manualStockTxn.transaction_date);
+      updateManualStockTxn('exchange_rate_used', rate);
+    } catch (e) {
+      alert('Failed to fetch USD/INR rate: ' + e.message);
+    } finally {
+      setRateLoading(false);
+    }
+  };
+
+  const handleAddManualStockTxn = async () => {
+    setError('');
+    if (!form.name || !form.ticker_symbol) {
+      setError('Please select a stock first');
+      return;
+    }
+    if (!portfolioId) {
+      setError('Please select a portfolio first');
+      return;
+    }
+    if (!manualStockTxn.units || !manualStockTxn.price_per_unit || !manualStockTxn.transaction_date) {
+      setError('Date, units, and price are required');
+      return;
+    }
+
+    setAddingManualTxn(true);
+    try {
+      // Create investment first
+      const inv = await createInvestment({
+        name: form.name.trim(),
+        asset_type: 'FOREIGN_STOCK',
+        ticker_symbol: form.ticker_symbol.trim().toUpperCase(),
+        currency: 'USD',
+        notes: form.notes || '',
+      });
+
+      // Auto-fetch exchange rate for the transaction date
+      let exchangeRate = null;
+      try {
+        exchangeRate = await getUSDINRRate(manualStockTxn.transaction_date);
+      } catch (e) {
+        console.warn('Could not fetch exchange rate:', e.message);
+      }
+
+      // Then add transaction to investment
+      await addTransaction({
+        investment_id: inv.id,
+        portfolio_id: Number(portfolioId),
+        transaction_type: manualStockTxn.transaction_type || 'BUY',
+        transaction_date: manualStockTxn.transaction_date,
+        units: parseFloat(manualStockTxn.units) || 0,
+        price_per_unit: parseFloat(manualStockTxn.price_per_unit) || 0,
+        amount: parseFloat(manualStockTxn.amount || 0),
+        fees: parseFloat(manualStockTxn.fees || 0),
+        broker: manualStockTxn.broker || 'Fidelity',
+        exchange_rate_used: exchangeRate,
+        notes: manualStockTxn.notes || '',
+      });
+
+      alert(`Investment ${inv.name} created. Now use the ESPP modal in the investment detail page to upload payslips.`);
+      navigate(`/investments/${inv.id}`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setAddingManualTxn(false);
+    }
+  };
+
+  const handleCancelManualStockTxn = () => {
+    setShowManualStockTxn(false);
+    setManualStockTxn({
+      transaction_type: 'BUY',
+      transaction_date: new Date().toISOString().split('T')[0],
+      units: '',
+      price_per_unit: '',
+      amount: '',
+      fees: '0',
+      broker: 'Fidelity',
+      exchange_rate_used: '',
+      usd_amount: '',
+      notes: '',
+    });
   };
 
   const handleContractUpload = async () => {
@@ -3018,11 +3130,23 @@ export default function AddInvestment() {
         <>
           {isForeignStock && (
             <Card className="shadow-sm">
-              <Card.Body>
-                <h2 className="h6 fw-semibold mb-2">2. Upload Stock Grant Documents (RSU)</h2>
+              <Card.Header
+                className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+                style={{ cursor: 'pointer' }}
+                onClick={() => toggleSection('rsu-grant')}
+              >
+                <Upload size={20} className="text-primary" />
+                <span className="h6 fw-semibold mb-0 flex-grow-1">Upload Stock Grant Documents (RSU)</span>
+                <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                  style={{ transition: 'transform 0.2s', transform: expandedSection === 'rsu-grant' ? 'rotate(180deg)' : 'rotate(0deg)' }}>
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                </svg>
+              </Card.Header>
+              <Collapse in={expandedSection === 'rsu-grant'}>
+                <Card.Body>
                 <p className="small text-muted mb-3">
                   Upload annual/on-hire/special grant files. The app maps award numbers, creates the Foreign Stock investment,
-                  and imports VEST transactions automatically.
+                  and imports VEST transactions automatically. Exchange rates are fetched automatically.
                 </p>
 
                 <Form.Label className="small">Grant Document Files</Form.Label>
@@ -3097,249 +3221,176 @@ export default function AddInvestment() {
                     </Button>
                   </div>
                 )}
-              </Card.Body>
+                </Card.Body>
+              </Collapse>
             </Card>
           )}
 
-          {/* Step 2: Investment Details */}
-          <Card className="shadow-sm">
-            <Card.Body>
-              <h2 className="h6 fw-semibold mb-3">2. Investment Details</h2>
-
-              {/* Mutual Fund Search */}
-              {isMF && (
-                <div className="mb-3">
-                  <Form.Label className="small">Search Mutual Fund</Form.Label>
-                  <div className="d-flex gap-2">
-                    <Form.Control
-                      size="sm"
-                      type="text"
-                      value={mfSearch}
-                      onChange={(e) => setMfSearch(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && handleMfSearch()}
-                      placeholder="Search by fund name (e.g., HDFC Flexi Cap)"
-                    />
-                    <Button size="sm" variant="primary" onClick={handleMfSearch} disabled={searching}>
-                      <Search size={16} />
-                    </Button>
-                  </div>
-                  {mfResults.length > 0 && (
-                    <div className="mt-2 border rounded" style={{ maxHeight: 240, overflowY: 'auto' }}>
-                      {mfResults.map((mf) => (
-                        <button
-                          key={mf.schemeCode}
-                          onClick={() => selectMf(mf)}
-                          className="w-100 text-start px-3 py-2 small border-bottom bg-transparent border-0"
-                          style={{ cursor: 'pointer' }}
-                          onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#eff6ff'}
-                          onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
-                        >
-                          <div className="fw-medium">{mf.schemeName}</div>
-                          <div className="text-muted" style={{ fontSize: '0.75rem' }}>Code: {mf.schemeCode}</div>
-                        </button>
-                      ))}
-                    </div>
-                  )}
+          {/* Add Manual Foreign Stock Transaction */}
+          {isForeignStock && (
+            <Card className="shadow-sm">
+              <Card.Header
+                className="bg-light d-flex justify-content-between align-items-center"
+                style={{ cursor: 'pointer' }}
+                onClick={() => toggleSection('manual-foreign-stock')}
+              >
+                <div className="d-flex align-items-center gap-2">
+                  <Search size={16} className="text-primary" />
+                  <span className="fw-semibold small">Add Foreign Stocks Manually</span>
                 </div>
-              )}
+                {expandedSection === 'manual-foreign-stock' ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+              </Card.Header>
+              <Collapse in={expandedSection === 'manual-foreign-stock'}>
+                <Card.Body>
+                  <p className="small text-muted mb-3">Search for a stock and enter the transaction details.</p>
 
-              {/* Foreign Stock Ticker Search */}
-              {isForeignStock && (
-                <div className="mb-3">
-                  <Form.Label className="small">Stock / ETF Name</Form.Label>
-                  <div className="d-flex gap-2">
-                    <Form.Control
-                      size="sm"
-                      type="text"
-                      value={stockQuery}
-                      onChange={(e) => { setStockQuery(e.target.value); setStockInfo(null); setStockResults([]); }}
-                      onKeyDown={(e) => e.key === 'Enter' && handleStockSearch()}
-                      placeholder="e.g., AAPL, Tesla, S&P 500 ETF"
-                    />
-                    <Button size="sm" variant="primary" onClick={handleStockSearch} disabled={searching}>
-                      {searching ? <Spinner size="sm" animation="border" /> : <Search size={16} />}
-                    </Button>
-                  </div>
-                  {stockResults.length > 0 && (
-                    <div className="border rounded mt-1 bg-white shadow-sm" style={{ maxHeight: 200, overflowY: 'auto' }}>
-                      {stockResults.map((r, i) => (
-                        <div
-                          key={i}
-                          className="px-3 py-2 border-bottom small d-flex justify-content-between align-items-center"
-                          style={{ cursor: 'pointer' }}
-                          onClick={() => selectStock(r)}
-                          onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f0f0f0'}
-                          onMouseLeave={(e) => e.currentTarget.style.backgroundColor = ''}
-                        >
-                          <div>
-                            <strong>{r.symbol}</strong>
-                            <span className="text-muted ms-2">{r.name}</span>
+                  {/* Stock Search & Selection */}
+                  <div className="mb-3">
+                    <Form.Label className="small fw-semibold">Stock Name</Form.Label>
+                    <div className="d-flex gap-2">
+                      <Form.Control
+                        size="sm"
+                        type="text"
+                        value={stockQuery}
+                        onChange={(e) => { setStockQuery(e.target.value); setStockInfo(null); setStockResults([]); }}
+                        onKeyDown={(e) => e.key === 'Enter' && handleStockSearch()}
+                        placeholder="e.g., AAPL, Tesla, S&P 500 ETF"
+                      />
+                      <Button size="sm" variant="primary" onClick={handleStockSearch} disabled={searching}>
+                        {searching ? <Spinner size="sm" animation="border" /> : <Search size={16} />}
+                      </Button>
+                    </div>
+                    {stockResults.length > 0 && (
+                      <div className="border rounded mt-2 bg-white shadow-sm" style={{ maxHeight: 200, overflowY: 'auto' }}>
+                        {stockResults.map((r, i) => (
+                          <div
+                            key={i}
+                            className="px-3 py-2 border-bottom small d-flex justify-content-between align-items-center"
+                            style={{ cursor: 'pointer' }}
+                            onClick={() => selectStock(r)}
+                            onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f0f0f0'}
+                            onMouseLeave={(e) => e.currentTarget.style.backgroundColor = ''}
+                          >
+                            <div>
+                              <strong>{r.symbol}</strong>
+                              <span className="text-muted ms-2">{r.name}</span>
+                            </div>
+                            <span className="badge bg-secondary">{r.type}</span>
                           </div>
-                          <span className="badge bg-secondary">{r.type}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                  {stockInfo && (
-                    <div className="mt-2 p-2 bg-success bg-opacity-10 rounded d-flex align-items-center gap-2">
-                      <CheckCircle size={16} className="text-success" />
-                      <span className="small text-success">
-                        Found: <strong>{stockInfo.name}</strong> ({form.ticker_symbol}) — ${stockInfo.price?.toFixed(2)} ({stockInfo.currency})
-                      </span>
-                    </div>
-                  )}
-                </div>
-              )}
+                        ))}
+                      </div>
+                    )}
+                    {stockInfo && (
+                      <div className="mt-2 p-2 bg-success bg-opacity-10 rounded d-flex align-items-center gap-2">
+                        <CheckCircle size={16} className="text-success" />
+                        <span className="small text-success">
+                          Found: <strong>{stockInfo.name}</strong> ({form.ticker_symbol}) — ${stockInfo.price?.toFixed(2)} ({stockInfo.currency})
+                        </span>
+                      </div>
+                    )}
+                  </div>
 
-              <Row className="g-3">
-                <Col md={6}>
-                  <Form.Label className="small">Name</Form.Label>
-                  <Form.Control
-                    size="sm"
-                    type="text"
-                    value={form.name}
-                    onChange={(e) => setForm({ ...form, name: e.target.value })}
-                    placeholder="Investment name"
-                    required
-                  />
-                </Col>
-
-                {isMF && (
-                  <>
+                  {/* Transaction Details */}
+                  <Row className="g-3 mb-3">
                     <Col md={6}>
-                      <Form.Label className="small">AMFI Code</Form.Label>
+                      <Form.Label className="small fw-semibold">Transaction Type</Form.Label>
+                      <Form.Select
+                        size="sm"
+                        value={manualStockTxn.transaction_type}
+                        onChange={(e) => updateManualStockTxn('transaction_type', e.target.value)}
+                      >
+                        <option value="BUY">Buy</option>
+                        <option value="SELL">Sell</option>
+                      </Form.Select>
+                    </Col>
+                    <Col md={6}>
+                      <Form.Label className="small fw-semibold">Date of Transaction</Form.Label>
                       <Form.Control
                         size="sm"
-                        type="text"
-                        value={form.amfi_code}
-                        onChange={(e) => setForm({ ...form, amfi_code: e.target.value })}
-                        placeholder="e.g., 118989"
+                        type="date"
+                        value={manualStockTxn.transaction_date}
+                        onChange={(e) => updateManualStockTxn('transaction_date', e.target.value)}
                       />
                     </Col>
                     <Col md={6}>
-                      <Form.Label className="small">Folio Number</Form.Label>
-                      <Form.Control
-                        size="sm"
-                        type="text"
-                        value={form.folio_number}
-                        onChange={(e) => setForm({ ...form, folio_number: e.target.value })}
-                        placeholder="Optional"
-                      />
-                    </Col>
-                  </>
-                )}
-
-                {isPPF && (
-                  <>
-                    <Col md={6}>
-                      <Form.Label className="small">Account Number</Form.Label>
-                      <Form.Control
-                        size="sm"
-                        type="text"
-                        value={form.account_number}
-                        onChange={(e) => setForm({ ...form, account_number: e.target.value })}
-                        placeholder="Account number"
-                      />
-                    </Col>
-                    <Col md={6}>
-                      <Form.Label className="small">Interest Rate (% p.a.)</Form.Label>
-                      <Form.Control
-                        size="sm"
-                        type="number"
-                        step="0.01"
-                        value={form.interest_rate}
-                        onChange={(e) => setForm({ ...form, interest_rate: e.target.value })}
-                        placeholder={assetType === 'PPF' ? '7.1' : assetType === 'SSY' ? '8.2' : '8.25'}
-                      />
-                    </Col>
-                  </>
-                )}
-
-                <Col md={6}>
-                  <Form.Label className="small">Notes</Form.Label>
-                  <Form.Control
-                    size="sm"
-                    type="text"
-                    value={form.notes}
-                    onChange={(e) => setForm({ ...form, notes: e.target.value })}
-                    placeholder="Optional notes"
-                  />
-                </Col>
-              </Row>
-            </Card.Body>
-          </Card>
-
-          {/* Step 3: Initial Transaction */}
-          <Card className="shadow-sm">
-            <Card.Body>
-              <h2 className="h6 fw-semibold mb-3">
-                3. Initial Transaction <span className="fw-normal text-muted small">(optional)</span>
-              </h2>
-
-              <Row className="g-3">
-                <Col md={6}>
-                  <Form.Label className="small">Date</Form.Label>
-                  <Form.Control
-                    size="sm"
-                    type="date"
-                    value={txn.transaction_date}
-                    onChange={(e) => updateTxn('transaction_date', e.target.value)}
-                  />
-                </Col>
-
-                {!isPPF && (
-                  <>
-                    <Col md={6}>
-                      <Form.Label className="small">Units / Shares</Form.Label>
+                      <Form.Label className="small fw-semibold">No. of Units / Shares</Form.Label>
                       <Form.Control
                         size="sm"
                         type="number"
                         step="0.001"
-                        value={txn.units}
-                        onChange={(e) => updateTxn('units', e.target.value)}
+                        value={manualStockTxn.units}
+                        onChange={(e) => updateManualStockTxn('units', e.target.value)}
                         placeholder="Number of units"
                       />
                     </Col>
                     <Col md={6}>
-                      <Form.Label className="small">Price per Unit (₹)</Form.Label>
+                      <Form.Label className="small fw-semibold">Price per Unit (USD)</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="number"
+                        step="0.0001"
+                        value={manualStockTxn.price_per_unit}
+                        onChange={(e) => updateManualStockTxn('price_per_unit', e.target.value)}
+                        placeholder="Price per unit"
+                      />
+                    </Col>
+                    <Col md={6}>
+                      <Form.Label className="small fw-semibold">Total Amount (USD)</Form.Label>
                       <Form.Control
                         size="sm"
                         type="number"
                         step="0.01"
-                        value={txn.price_per_unit}
-                        onChange={(e) => updateTxn('price_per_unit', e.target.value)}
-                        placeholder="Cost per unit"
+                        value={manualStockTxn.amount}
+                        placeholder={manualStockTxn.units && manualStockTxn.price_per_unit ? `${(parseFloat(manualStockTxn.units) * parseFloat(manualStockTxn.price_per_unit)).toFixed(2)}` : 'Auto-calculated'}
+                        disabled
                       />
                     </Col>
-                  </>
-                )}
+                    <Col md={6}>
+                      <Form.Label className="small fw-semibold">Broker</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="text"
+                        value={manualStockTxn.broker}
+                        onChange={(e) => updateManualStockTxn('broker', e.target.value)}
+                        placeholder="e.g., Fidelity, Interactive Brokers"
+                      />
+                    </Col>
+                    <Col md={6}>
+                      <Form.Label className="small fw-semibold">Fees (USD)</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="number"
+                        step="0.01"
+                        value={manualStockTxn.fees}
+                        onChange={(e) => updateManualStockTxn('fees', e.target.value)}
+                        placeholder="0"
+                      />
+                    </Col>
 
-                <Col md={6}>
-                  <Form.Label className="small">Total Amount (₹)</Form.Label>
-                  <Form.Control
-                    size="sm"
-                    type="number"
-                    step="0.01"
-                    value={txn.amount}
-                    onChange={(e) => updateTxn('amount', e.target.value)}
-                    placeholder="Total invested amount"
-                  />
-                </Col>
+                    <Col md={12}>
+                      <Form.Label className="small fw-semibold">Notes</Form.Label>
+                      <Form.Control
+                        size="sm"
+                        type="text"
+                        value={manualStockTxn.notes}
+                        onChange={(e) => updateManualStockTxn('notes', e.target.value)}
+                        placeholder="Optional notes"
+                      />
+                    </Col>
+                  </Row>
 
-                <Col md={6}>
-                  <Form.Label className="small">Charges (₹)</Form.Label>
-                  <Form.Control
-                    size="sm"
-                    type="number"
-                    step="0.01"
-                    value={txn.fees}
-                    onChange={(e) => updateTxn('fees', e.target.value)}
-                    placeholder="0"
-                  />
-                </Col>
-              </Row>
-            </Card.Body>
-          </Card>
+                  <div className="d-flex gap-2">
+                    <Button size="sm" variant="primary" onClick={handleAddManualStockTxn} disabled={addingManualTxn}>
+                      {addingManualTxn ? 'Creating...' : 'Add Investment'}
+                    </Button>
+                    <Button size="sm" variant="outline-secondary" onClick={handleCancelManualStockTxn}>
+                      Cancel
+                    </Button>
+                  </div>
+                </Card.Body>
+              </Collapse>
+            </Card>
+          )}
 
           {/* Submit */}
           <div className="d-flex justify-content-end gap-2">
