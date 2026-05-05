@@ -1,11 +1,14 @@
 const express = require('express');
 const cors = require('cors');
+const session = require('express-session');
 const path = require('path');
 const { getDb, initializeDb } = require('./db/schema');
 const { startScheduler } = require('./services/scheduler');
+const { requireAuth } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+const isProduction = process.env.NODE_ENV === 'production';
 
 // Initialize database
 const db = getDb();
@@ -15,7 +18,27 @@ initializeDb(db);
 app.use(cors());
 app.use(express.json());
 
+if (isProduction) {
+  app.set('trust proxy', 1);
+}
+
+app.use(session({
+  name: 'itrack.sid',
+  secret: process.env.SESSION_SECRET || 'dev-only-change-me',
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  },
+}));
+
 // API Routes
+app.use('/api/auth', require('./routes/auth')(db));
+app.use('/api', requireAuth);
+
 app.use('/api/portfolios', require('./routes/portfolios')(db));
 app.use('/api/investments', require('./routes/investments')(db));
 app.use('/api/transactions', require('./routes/transactions')(db));

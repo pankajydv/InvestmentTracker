@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText } from 'lucide-react';
+import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText, LogOut } from 'lucide-react';
 import { triggerPriceUpdate, cancelPriceUpdate, exportData } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 
@@ -15,7 +15,7 @@ const NAV_ITEMS = [
   { path: '/investments/add', label: 'Add Investment', icon: PlusCircle },
 ];
 
-export default function Navbar() {
+export default function Navbar({ user, onLogout }) {
   const location = useLocation();
   const [updating, setUpdating] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -109,6 +109,24 @@ export default function Navbar() {
             >
               <RefreshCw size={16} className={updating ? 'spinner-rotate' : ''} />
               {updating ? 'Cancel' : 'Update Prices'}
+            </Button>
+            <span className="small text-muted d-none d-md-inline ms-2">{user?.email}</span>
+            <Button
+              variant="outline-danger"
+              size="sm"
+              onClick={onLogout}
+              className="d-none d-md-flex align-items-center gap-1 ms-2"
+            >
+              <LogOut size={16} />
+              Logout
+            </Button>
+            <Button
+              variant="outline-danger"
+              size="sm"
+              onClick={onLogout}
+              className="d-md-none"
+            >
+              <LogOut size={16} />
             </Button>
           </Nav>
         </BsNavbar.Collapse>

@@ -3,6 +3,7 @@ const API_BASE = '/api';
 async function fetchJSON(url, options = {}) {
   const res = await fetch(`${API_BASE}${url}`, {
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
     ...options,
   });
   if (!res.ok) {
@@ -11,6 +12,13 @@ async function fetchJSON(url, options = {}) {
   }
   return res.json();
 }
+
+// Auth
+export const getAuthConfig = () => fetchJSON('/auth/config');
+export const loginWithGoogle = (credential) =>
+  fetchJSON('/auth/google', { method: 'POST', body: JSON.stringify({ credential }) });
+export const getCurrentUser = () => fetchJSON('/auth/me');
+export const logout = () => fetchJSON('/auth/logout', { method: 'POST' });
 
 // Dashboard
 export const getDashboardSummary = (portfolioId, { hideSold } = {}) => {
@@ -122,7 +130,7 @@ export const uploadCASPreview = async (file, portfolioId, password) => {
   formData.append('file', file);
   formData.append('portfolio_id', portfolioId);
   if (password) formData.append('password', password);
-  const res = await fetch(`${API_BASE}/cas/preview`, { method: 'POST', body: formData });
+  const res = await fetch(`${API_BASE}/cas/preview`, { method: 'POST', body: formData, credentials: 'include' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || 'Upload failed');
@@ -140,7 +148,7 @@ export const previewContractNotes = async (files, portfolioId) => {
   const formData = new FormData();
   files.forEach(f => formData.append('files', f));
   formData.append('portfolio_id', portfolioId);
-  const res = await fetch(`${API_BASE}/stocks/contract-notes/preview`, { method: 'POST', body: formData });
+  const res = await fetch(`${API_BASE}/stocks/contract-notes/preview`, { method: 'POST', body: formData, credentials: 'include' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || 'Upload failed');
@@ -194,6 +202,7 @@ export const previewEsppContributionsFromPayslips = async (files, investmentId, 
   const res = await fetch(`${API_BASE}/stocks/espp-contributions/preview`, {
     method: 'POST',
     body: formData,
+    credentials: 'include',
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -227,6 +236,7 @@ export const previewRsuGrantDocuments = async (files) => {
   const res = await fetch(`${API_BASE}/stocks/rsu-grants/documents/preview`, {
     method: 'POST',
     body: formData,
+    credentials: 'include',
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -247,6 +257,7 @@ export const reconcileRsuWithFidelityLots = async ({ investment_id, portfolio_id
   const res = await fetch(`${API_BASE}/stocks/rsu-grants/reconcile-fidelity`, {
     method: 'POST',
     body: formData,
+    credentials: 'include',
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
@@ -261,7 +272,7 @@ export const uploadPnLStatement = async (file, broker, portfolioId) => {
   formData.append('file', file);
   formData.append('broker', broker);
   formData.append('portfolio_id', portfolioId);
-  const res = await fetch(`${API_BASE}/stocks/pnl`, { method: 'POST', body: formData });
+  const res = await fetch(`${API_BASE}/stocks/pnl`, { method: 'POST', body: formData, credentials: 'include' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || 'Upload failed');
@@ -279,7 +290,7 @@ export const previewNPSStatements = async (files, portfolioId, password) => {
   files.forEach(f => formData.append('files', f));
   formData.append('portfolio_id', portfolioId);
   if (password) formData.append('password', password);
-  const res = await fetch(`${API_BASE}/nps/preview`, { method: 'POST', body: formData });
+  const res = await fetch(`${API_BASE}/nps/preview`, { method: 'POST', body: formData, credentials: 'include' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || 'Upload failed');
@@ -296,7 +307,7 @@ export const previewPPFStatements = async (files, portfolioId, password) => {
   files.forEach(f => formData.append('files', f));
   formData.append('portfolio_id', portfolioId);
   if (password) formData.append('password', password);
-  const res = await fetch(`${API_BASE}/ppf/preview`, { method: 'POST', body: formData });
+  const res = await fetch(`${API_BASE}/ppf/preview`, { method: 'POST', body: formData, credentials: 'include' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || 'Upload failed');
@@ -312,7 +323,7 @@ export const previewPFStatements = async (files, portfolioId) => {
   const formData = new FormData();
   files.forEach(f => formData.append('files', f));
   formData.append('portfolio_id', portfolioId);
-  const res = await fetch(`${API_BASE}/pf/preview`, { method: 'POST', body: formData });
+  const res = await fetch(`${API_BASE}/pf/preview`, { method: 'POST', body: formData, credentials: 'include' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || 'Upload failed');
@@ -375,7 +386,7 @@ export const applyInvestmentInterestUpdate = (investmentId, data = {}) =>
 
 // Export all data as XLSX download
 export const exportData = async () => {
-  const res = await fetch(`${API_BASE}/utils/export`);
+  const res = await fetch(`${API_BASE}/utils/export`, { credentials: 'include' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || 'Export failed');
