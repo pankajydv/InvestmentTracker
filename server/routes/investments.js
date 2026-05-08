@@ -1,6 +1,5 @@
 const express = require('express');
 const router = express.Router();
-const { INTEREST_RATES, DATASET_VERSION } = require('../data/interest-rates');
 const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = require('../services/pfInterestCalculator');
 
 const CASH_OUTFLOW_TYPES = new Set([
@@ -61,29 +60,6 @@ function calculateXirr(flows) {
   }
 
   return (low + high) / 2;
-}
-
-/**
- * Get the effective interest rate for a given asset type and date.
- * Returns the rate that was active on the given date, or the latest rate if date is after all rates.
- */
-function getEffectiveRate(assetType, date) {
-  if (!['PPF', 'SSY', 'PF'].includes(assetType)) return null;
-  
-  const rates = INTEREST_RATES.filter(r => r.rate_type === assetType);
-  
-  for (const rate of rates) {
-    const effectiveFrom = new Date(rate.effective_from);
-    const effectiveTo = rate.effective_to ? new Date(rate.effective_to) : new Date('2099-12-31');
-    const compareDate = new Date(date);
-    
-    if (compareDate >= effectiveFrom && compareDate <= effectiveTo) {
-      return rate.rate;
-    }
-  }
-  
-  // Fallback to latest rate if date is before first rate
-  return rates.length > 0 ? rates[rates.length - 1].rate : null;
 }
 
 module.exports = function (db) {
@@ -363,11 +339,10 @@ module.exports = function (db) {
     const dbRates = db.prepare(
       'SELECT rate, effective_from, effective_to FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
     ).all(assetType);
-    if (dbRates.length) return dbRates;
-
-    return INTEREST_RATES
-      .filter(r => r.rate_type === assetType)
-      .map(r => ({ rate: r.rate, effective_from: r.effective_from, effective_to: r.effective_to || null }));
+    if (!dbRates.length) {
+      throw new Error(`No interest rates found in database for ${assetType}. Please add rates in interest_rates table.`);
+    }
+    return dbRates;
   }
 
   function getInterestPreview(inv, queryParams) {
@@ -665,85 +640,17 @@ module.exports = function (db) {
 
   // ─── Interest Rate Sync: Preview ──────────────────────────────────────
   /**
-   * GET /api/investments/interest-rate-sync/preview?asset_type=PPF[&portfolio_id=1]
-   * Compare hardcoded rate dataset with what's in the interest_rates table.
-   * Also checks investments.interest_rate against the latest effective rate.
+   * GET /api/investments/interest-rate-sync/preview?asset_type=PPF
+   * DB-only mode: reference-dataset sync is intentionally disabled.
    */
   router.get('/interest-rate-sync/preview', (req, res) => {
     try {
-      const { asset_type, portfolio_id } = req.query;
+      const { asset_type } = req.query;
       if (!asset_type || !['PPF', 'SSY', 'PF'].includes(asset_type)) {
         return res.status(400).json({ error: 'asset_type must be PPF, SSY, or PF' });
       }
-
-      const datasetRates = INTEREST_RATES.filter(r => r.rate_type === asset_type);
-      const dbRates = db.prepare(
-        'SELECT * FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
-      ).all(asset_type);
-
-      const suggestions = [];
-      const corrections = [];
-      const deletions = [];
-
-      // Index DB rates by effective_from for fast lookup
-      const dbByDate = {};
-      for (const r of dbRates) { dbByDate[r.effective_from] = r; }
-
-      const matchedDbIds = new Set();
-
-      // Compare dataset → DB
-      for (const expected of datasetRates) {
-        const existing = dbByDate[expected.effective_from];
-
-        if (existing) {
-          matchedDbIds.add(existing.id);
-          const rateMatch = Math.abs(existing.rate - expected.rate) < 0.001;
-          const endMatch = (existing.effective_to || null) === (expected.effective_to || null);
-
-          if (rateMatch && endMatch) continue; // perfect match
-
-          corrections.push({
-            id: existing.id,
-            rate_type: asset_type,
-            effective_from: expected.effective_from,
-            effective_to: expected.effective_to,
-            current_rate: existing.rate,
-            current_effective_to: existing.effective_to,
-            expected_rate: expected.rate,
-            expected_effective_to: expected.effective_to,
-          });
-        } else {
-          suggestions.push({
-            rate_type: asset_type,
-            rate: expected.rate,
-            effective_from: expected.effective_from,
-            effective_to: expected.effective_to,
-          });
-        }
-      }
-
-      // DB entries not in dataset → propose deletion
-      for (const r of dbRates) {
-        if (!matchedDbIds.has(r.id)) {
-          deletions.push({
-            id: r.id,
-            rate_type: r.rate_type,
-            rate: r.rate,
-            effective_from: r.effective_from,
-            effective_to: r.effective_to,
-            reason: 'No matching rate in the reference dataset',
-          });
-        }
-      }
-
-      // Rates are now global only, no per-investment rate corrections needed
-
-      res.json({
-        suggestions,
-        corrections,
-        deletions,
-        datasetVersion: DATASET_VERSION,
-        rateType: asset_type,
+      return res.status(400).json({
+        error: 'Interest rate reference sync is disabled. This application now uses database-managed rates only.',
       });
     } catch (e) {
       res.status(500).json({ error: 'Failed to preview interest rate sync: ' + e.message });

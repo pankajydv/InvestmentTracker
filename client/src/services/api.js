@@ -123,6 +123,12 @@ export const getConfig = () => fetchJSON('/utils/config');
 export const updateConfig = (data) =>
   fetchJSON('/utils/config', { method: 'PUT', body: JSON.stringify(data) });
 export const getInterestRates = () => fetchJSON('/utils/interest-rates');
+export const createInterestRate = (data) =>
+  fetchJSON('/utils/interest-rates', { method: 'POST', body: JSON.stringify(data) });
+export const updateInterestRate = (id, data) =>
+  fetchJSON(`/utils/interest-rates/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+export const deleteInterestRate = (id) =>
+  fetchJSON(`/utils/interest-rates/${id}`, { method: 'DELETE' });
 
 // CAS Upload
 export const uploadCASPreview = async (file, portfolioId, password) => {

@@ -26,22 +26,22 @@ export default function PortfolioSelector() {
     <div className="position-relative" ref={ref}>
       <button
         onClick={() => setOpen(!open)}
-        className="d-flex align-items-center gap-2 px-3 py-2 rounded border bg-white small"
+        className="d-flex align-items-center gap-2 px-3 py-2 rounded border bg-white small text-nowrap"
       >
         {selectedPortfolio ? (
           <span className="portfolio-dot flex-shrink-0" style={{ backgroundColor: selectedPortfolio.color }} />
         ) : (
           <Users size={16} className="text-muted" />
         )}
-        <span className="fw-medium text-truncate" style={{ maxWidth: 140 }}>{label}</span>
+        <span className="fw-medium text-truncate" style={{ maxWidth: 132 }}>{label}</span>
         {portfolios.length > 0 && (
-          <span className="text-muted" style={{ fontSize: '0.75rem' }}>
-            {selectedCount} of {portfolios.length}
+          <span className="text-muted flex-shrink-0" style={{ fontSize: '0.75rem' }}>
+            {selectedCount}/{portfolios.length}
           </span>
         )}
         <ChevronDown
           size={16}
-          className="text-muted"
+          className="text-muted flex-shrink-0"
           style={{ transition: 'transform 0.2s', transform: open ? 'rotate(180deg)' : 'none' }}
         />
       </button>

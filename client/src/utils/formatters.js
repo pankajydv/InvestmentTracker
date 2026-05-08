@@ -75,7 +75,7 @@ export function profitBg(value) {
 export const ASSET_TYPE_LABELS = {
   MUTUAL_FUND: 'MF',
   INDIAN_STOCK: 'Stocks',
-  FOREIGN_STOCK: 'Foreign Stocks',
+  FOREIGN_STOCK: 'FS',
   PPF: 'PPF',
   SSY: 'SSY',
   PF: 'PF',
@@ -90,7 +90,7 @@ export const ASSET_TYPE_LABELS = {
 export const ASSET_TYPE_FULL_NAMES = {
   MUTUAL_FUND: 'Mutual Fund',
   INDIAN_STOCK: 'Indian Stock',
-  FOREIGN_STOCK: 'Foreign Stock',
+  FOREIGN_STOCK: 'Foreign Stocks',
   PPF: 'Public Provident Fund',
   SSY: 'Sukanya Samriddhi Yojana',
   PF: 'Provident Fund',

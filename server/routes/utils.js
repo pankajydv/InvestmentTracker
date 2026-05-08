@@ -3,7 +3,60 @@ const router = express.Router();
 const XLSX = require('xlsx');
 const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = require('../services/priceService');
 const { updateAllPrices, cancelUpdate } = require('../services/updater');
-const { INTEREST_RATES, DATASET_VERSION } = require('../data/interest-rates');
+
+const VALID_RATE_TYPES = new Set(['PPF', 'SSY', 'PF']);
+
+function parseDateOnly(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const d = new Date(`${value}T00:00:00.000Z`);
+  return Number.isNaN(d.getTime()) ? null : value;
+}
+
+function normalizeRatePayload(body) {
+  const rate_type = typeof body.rate_type === 'string' ? body.rate_type.trim().toUpperCase() : '';
+  const effective_from = parseDateOnly(body.effective_from);
+  const effective_to = body.effective_to ? parseDateOnly(body.effective_to) : null;
+  const rateNum = Number(body.rate);
+
+  if (!VALID_RATE_TYPES.has(rate_type)) {
+    throw new Error('rate_type must be one of PPF, SSY, PF');
+  }
+  if (!Number.isFinite(rateNum) || rateNum <= 0 || rateNum > 100) {
+    throw new Error('rate must be a valid percentage greater than 0 and at most 100');
+  }
+  if (!effective_from) {
+    throw new Error('effective_from must be a valid date in YYYY-MM-DD format');
+  }
+  if (body.effective_to && !effective_to) {
+    throw new Error('effective_to must be a valid date in YYYY-MM-DD format');
+  }
+  if (effective_to && effective_to < effective_from) {
+    throw new Error('effective_to must be greater than or equal to effective_from');
+  }
+
+  return {
+    rate_type,
+    rate: rateNum,
+    effective_from,
+    effective_to,
+  };
+}
+
+function findOverlappingRate(db, payload, excludeId = null) {
+  const rows = db.prepare(
+    'SELECT id, rate_type, rate, effective_from, effective_to FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
+  ).all(payload.rate_type);
+
+  const newFrom = payload.effective_from;
+  const newTo = payload.effective_to || '9999-12-31';
+
+  return rows.find((row) => {
+    if (excludeId != null && Number(row.id) === Number(excludeId)) return false;
+    const rowFrom = row.effective_from;
+    const rowTo = row.effective_to || '9999-12-31';
+    return newFrom <= rowTo && rowFrom <= newTo;
+  }) || null;
+}
 
 module.exports = function (db) {
 
@@ -162,27 +215,84 @@ module.exports = function (db) {
   // ─── Get interest rates ───────────────────────────────────────────────
   router.get('/interest-rates', (req, res) => {
     const dbRates = db.prepare('SELECT * FROM interest_rates ORDER BY rate_type, effective_from DESC').all();
-    const rates = dbRates.length > 0
-      ? dbRates
-      : [...INTEREST_RATES].sort((a, b) => {
-          if (a.rate_type !== b.rate_type) return a.rate_type.localeCompare(b.rate_type);
-          return b.effective_from.localeCompare(a.effective_from);
-        });
+
     res.json({
-      rates,
-      datasetVersion: DATASET_VERSION,
-      source: dbRates.length > 0 ? 'database' : 'reference-dataset',
+      rates: dbRates,
+      source: 'database',
     });
   });
 
   router.post('/interest-rates', (req, res) => {
-    const { rate_type, rate, effective_from } = req.body;
-    if (!rate_type || !rate || !effective_from) {
-      return res.status(400).json({ error: 'rate_type, rate, and effective_from are required' });
+    try {
+      const payload = normalizeRatePayload(req.body || {});
+      const overlap = findOverlappingRate(db, payload);
+      if (overlap) {
+        return res.status(409).json({
+          error: 'Overlapping interest rate range exists for this scheme.',
+          conflict: overlap,
+        });
+      }
+
+      const result = db.prepare(
+        'INSERT INTO interest_rates (rate_type, rate, effective_from, effective_to) VALUES (?, ?, ?, ?)'
+      ).run(payload.rate_type, payload.rate, payload.effective_from, payload.effective_to);
+
+      const created = db.prepare('SELECT * FROM interest_rates WHERE id = ?').get(result.lastInsertRowid);
+      return res.status(201).json({ success: true, rate: created });
+    } catch (e) {
+      return res.status(400).json({ error: e.message || 'Failed to create interest rate' });
     }
-    db.prepare('INSERT INTO interest_rates (rate_type, rate, effective_from) VALUES (?, ?, ?)')
-      .run(rate_type, rate, effective_from);
-    res.status(201).json({ success: true });
+  });
+
+  router.put('/interest-rates/:id', (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid id' });
+      }
+
+      const existing = db.prepare('SELECT * FROM interest_rates WHERE id = ?').get(id);
+      if (!existing) {
+        return res.status(404).json({ error: 'Interest rate entry not found' });
+      }
+
+      const payload = normalizeRatePayload(req.body || {});
+      const overlap = findOverlappingRate(db, payload, id);
+      if (overlap) {
+        return res.status(409).json({
+          error: 'Overlapping interest rate range exists for this scheme.',
+          conflict: overlap,
+        });
+      }
+
+      db.prepare(
+        'UPDATE interest_rates SET rate_type = ?, rate = ?, effective_from = ?, effective_to = ? WHERE id = ?'
+      ).run(payload.rate_type, payload.rate, payload.effective_from, payload.effective_to, id);
+
+      const updated = db.prepare('SELECT * FROM interest_rates WHERE id = ?').get(id);
+      return res.json({ success: true, rate: updated });
+    } catch (e) {
+      return res.status(400).json({ error: e.message || 'Failed to update interest rate' });
+    }
+  });
+
+  router.delete('/interest-rates/:id', (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'Invalid id' });
+      }
+
+      const existing = db.prepare('SELECT * FROM interest_rates WHERE id = ?').get(id);
+      if (!existing) {
+        return res.status(404).json({ error: 'Interest rate entry not found' });
+      }
+
+      db.prepare('DELETE FROM interest_rates WHERE id = ?').run(id);
+      return res.json({ success: true });
+    } catch (e) {
+      return res.status(400).json({ error: e.message || 'Failed to delete interest rate' });
+    }
   });
 
   return router;

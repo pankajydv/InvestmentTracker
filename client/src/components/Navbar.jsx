@@ -6,13 +6,12 @@ import { triggerPriceUpdate, cancelPriceUpdate, exportData } from '../services/a
 import PortfolioSelector from './PortfolioSelector';
 
 const NAV_ITEMS = [
-  { path: '/', label: 'Dashboard', icon: BarChart3 },
-  { path: '/investments', label: 'Investments', icon: List },
-  { path: '/performance', label: 'Performance', icon: TrendingUp },
-  { path: '/transactions', label: 'Transactions', icon: List },
-  { path: '/tax', label: 'Tax Report', icon: FileText },
-
-  { path: '/investments/add', label: 'Add Investment', icon: PlusCircle },
+  { path: '/', label: 'Dashboard', shortLabel: 'Dashboard', icon: BarChart3 },
+  { path: '/investments', label: 'Investments', shortLabel: 'Investments', icon: List },
+  { path: '/performance', label: 'Performance', shortLabel: 'Performance', icon: TrendingUp },
+  { path: '/transactions', label: 'Transactions', shortLabel: 'Transactions', icon: List },
+  { path: '/tax', label: 'Tax Report', shortLabel: 'Tax', icon: FileText },
+  { path: '/investments/add', label: 'Add Investment', shortLabel: 'Add', icon: PlusCircle },
 ];
 
 export default function Navbar({ user, onLogout }) {
@@ -49,7 +48,7 @@ export default function Navbar({ user, onLogout }) {
 
   return (
     <BsNavbar bg="white" expand="md" sticky="top" className="shadow-sm border-bottom">
-      <Container>
+      <Container fluid="lg">
         <BsNavbar.Brand as={Link} to="/" className="d-flex align-items-center gap-2 me-3">
           <TrendingUp size={28} className="text-primary" />
           <span className="fw-bold d-none d-sm-inline">Investment Tracker</span>
@@ -77,18 +76,20 @@ export default function Navbar({ user, onLogout }) {
           <div className="d-sm-hidden pb-2 border-bottom mb-2 d-block d-sm-none">
             <PortfolioSelector />
           </div>
-          <Nav className="ms-auto align-items-md-center gap-1">
-            {NAV_ITEMS.map(({ path, label, icon: Icon }) => (
+          <Nav className="ms-auto align-items-md-center gap-1 flex-nowrap">
+            {NAV_ITEMS.map(({ path, label, shortLabel, icon: Icon }) => (
               <Nav.Link
                 key={path}
                 as={Link}
                 to={path}
-                className={`d-flex align-items-center gap-1 rounded px-2 py-2 small fw-medium ${
+                className={`d-flex align-items-center gap-1 rounded px-2 py-2 small fw-medium text-nowrap ${
                   location.pathname === path ? 'active-nav' : 'text-secondary'
                 }`}
+                title={label}
               >
                 <Icon size={16} />
-                {label}
+                <span className="d-none d-xl-inline">{label}</span>
+                <span className="d-xl-none">{shortLabel}</span>
               </Nav.Link>
             ))}
             <Button
@@ -96,29 +97,32 @@ export default function Navbar({ user, onLogout }) {
               size="sm"
               onClick={handleExport}
               disabled={exporting}
-              className="d-none d-md-flex align-items-center gap-1 ms-2"
+              className="d-none d-md-flex align-items-center gap-1 ms-2 text-nowrap"
+              title="Export data"
             >
               <Download size={16} className={exporting ? 'spinner-rotate' : ''} />
-              {exporting ? 'Exporting...' : 'Export'}
+              <span className="d-none d-xxl-inline">{exporting ? 'Exporting...' : 'Export'}</span>
             </Button>
             <Button
               variant={updating ? 'danger' : 'success'}
               size="sm"
               onClick={updating ? handleCancel : handleUpdate}
-              className="d-none d-md-flex align-items-center gap-1 ms-2"
+              className="d-none d-md-flex align-items-center gap-1 ms-2 text-nowrap"
+              title={updating ? 'Cancel price update' : 'Update prices'}
             >
               <RefreshCw size={16} className={updating ? 'spinner-rotate' : ''} />
-              {updating ? 'Cancel' : 'Update Prices'}
+              <span className="d-none d-xxl-inline">{updating ? 'Cancel' : 'Update Prices'}</span>
             </Button>
-            <span className="small text-muted d-none d-md-inline ms-2">{user?.email}</span>
+            <span className="small text-muted d-none d-xxl-inline ms-2 text-nowrap">{user?.email}</span>
             <Button
               variant="outline-danger"
               size="sm"
               onClick={onLogout}
-              className="d-none d-md-flex align-items-center gap-1 ms-2"
+              className="d-none d-md-flex align-items-center gap-1 ms-2 text-nowrap"
+              title="Logout"
             >
               <LogOut size={16} />
-              Logout
+              <span className="d-none d-xxl-inline">Logout</span>
             </Button>
             <Button
               variant="outline-danger"

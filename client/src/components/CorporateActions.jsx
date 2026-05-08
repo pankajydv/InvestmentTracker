@@ -15,9 +15,6 @@ const TYPE_BADGE = {
 const ASSET_TYPE_OPTIONS = [
   { value: 'INDIAN_STOCK', label: 'Stocks' },
   { value: 'FOREIGN_STOCK', label: 'Foreign Stocks' },
-  { value: 'PPF', label: 'PPF' },
-  { value: 'SSY', label: 'SSY' },
-  { value: 'PF', label: 'PF' },
 ];
 
 const RATE_TYPES = new Set(['PPF', 'SSY', 'PF']);

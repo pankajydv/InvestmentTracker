@@ -899,7 +899,7 @@ describe('Utils', () => {
 
   it('POST /utils/interest-rates creates rate', async () => {
     const { status, body } = await api('POST', '/utils/interest-rates', {
-      rate_type: 'PPF', rate: 7.1, effective_from: '2024-04-01',
+      rate_type: 'PPF', rate: 7.1, effective_from: '2019-04-01', effective_to: '2020-03-31',
     });
     assert.equal(status, 201);
     assert.equal(body.success, true);
