@@ -1,6 +1,66 @@
 const express = require('express');
 const router = express.Router();
 
+const CASH_OUTFLOW_TYPES = new Set([
+  'BUY', 'VEST', 'ESPP_CONTRIBUTION', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
+]);
+
+const CASH_INFLOW_TYPES = new Set([
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST'
+]);
+
+function xnpv(rate, flows, baseDate) {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return flows.reduce((sum, flow) => {
+    const years = (flow.date - baseDate) / msPerDay / 365;
+    return sum + flow.amount / ((1 + rate) ** years);
+  }, 0);
+}
+
+function calculateXirr(flows) {
+  if (!Array.isArray(flows) || flows.length < 2) return null;
+
+  let hasPositive = false;
+  let hasNegative = false;
+  for (const flow of flows) {
+    if (flow.amount > 0) hasPositive = true;
+    if (flow.amount < 0) hasNegative = true;
+  }
+  if (!hasPositive || !hasNegative) return null;
+
+  const sortedFlows = [...flows].sort((a, b) => a.date - b.date);
+  const baseDate = sortedFlows[0].date;
+
+  let low = -0.9999;
+  let high = 10;
+  let fLow = xnpv(low, sortedFlows, baseDate);
+  let fHigh = xnpv(high, sortedFlows, baseDate);
+
+  for (let i = 0; i < 25 && fLow * fHigh > 0; i += 1) {
+    high *= 2;
+    fHigh = xnpv(high, sortedFlows, baseDate);
+  }
+
+  if (fLow * fHigh > 0) return null;
+
+  for (let i = 0; i < 100; i += 1) {
+    const mid = (low + high) / 2;
+    const fMid = xnpv(mid, sortedFlows, baseDate);
+
+    if (Math.abs(fMid) < 1e-7) return mid;
+
+    if (fLow * fMid < 0) {
+      high = mid;
+      fHigh = fMid;
+    } else {
+      low = mid;
+      fLow = fMid;
+    }
+  }
+
+  return (low + high) / 2;
+}
+
 module.exports = function (db) {
 
   // ─── Portfolio Summary (Dashboard) ────────────────────────────────────
@@ -123,15 +183,73 @@ module.exports = function (db) {
       `SELECT COALESCE(SUM(amount), 0) as total_expenses FROM portfolio_expenses${expenseFilter}`
     ).get(...expenseParams);
 
+    const txnFilter = portfolio_id ? 'WHERE portfolio_id = ?' : '';
+    const txnParams = portfolio_id ? [portfolio_id] : [];
+    const transactionRows = db.prepare(`
+      SELECT transaction_type, transaction_date, COALESCE(amount, 0) as amount, COALESCE(fees, 0) as fees
+      FROM transactions
+      ${txnFilter}
+    `).all(...txnParams);
+
+    const xirrCashflows = [];
+    for (const txn of transactionRows) {
+      const txnDate = new Date(txn.transaction_date);
+      if (Number.isNaN(txnDate.getTime())) continue;
+
+      const amount = Number(txn.amount) || 0;
+      const fees = Number(txn.fees) || 0;
+      let cashflow = 0;
+
+      if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+        cashflow = -(amount + fees);
+      } else if (CASH_INFLOW_TYPES.has(txn.transaction_type)) {
+        cashflow = amount - fees;
+      }
+
+      if (Math.abs(cashflow) > 1e-9) {
+        xirrCashflows.push({ amount: cashflow, date: txnDate });
+      }
+    }
+
+    const expenseRows = db.prepare(`
+      SELECT expense_date, COALESCE(amount, 0) as amount
+      FROM portfolio_expenses${expenseFilter}
+    `).all(...expenseParams);
+
+    for (const expense of expenseRows) {
+      const expenseDate = new Date(expense.expense_date);
+      if (Number.isNaN(expenseDate.getTime())) continue;
+
+      const amount = Number(expense.amount) || 0;
+      if (amount > 0) {
+        xirrCashflows.push({ amount: -amount, date: expenseDate });
+      }
+    }
+
+    const terminalValue = Number(latest?.total_value) || 0;
+    if (terminalValue > 0 && latest?.date) {
+      const valuationDate = new Date(latest.date);
+      if (!Number.isNaN(valuationDate.getTime())) {
+        xirrCashflows.push({ amount: terminalValue, date: valuationDate });
+      }
+    }
+
+    const xirrRate = calculateXirr(xirrCashflows);
+    const xirrPct = xirrRate == null ? null : xirrRate * 100;
+    const portfolioSummary = latest
+      ? { ...latest, xirr_pct: xirrPct }
+      : {
+          total_value: 0,
+          total_invested: 0,
+          total_profit_loss: 0,
+          total_profit_loss_pct: 0,
+          day_change: 0,
+          day_change_pct: 0,
+          xirr_pct: null,
+        };
+
     res.json({
-      portfolio: latest || {
-        total_value: 0,
-        total_invested: 0,
-        total_profit_loss: 0,
-        total_profit_loss_pct: 0,
-        day_change: 0,
-        day_change_pct: 0,
-      },
+      portfolio: portfolioSummary,
       investments,
       byType,
       portfolioCount,

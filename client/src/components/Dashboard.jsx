@@ -1,13 +1,12 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardSummary, triggerPriceUpdate, cancelPriceUpdate } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, Receipt, RefreshCw, EyeOff, Eye } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, RefreshCw, EyeOff, Eye } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 export default function Dashboard() {
-  const navigate = useNavigate();
   const { selectedId, selectedPortfolio } = usePortfolio();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -87,6 +86,16 @@ export default function Dashboard() {
 
   const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses } = data;
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
+  const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
+  const formatINRExact = (amount) => {
+    if (amount == null || Number.isNaN(Number(amount))) return '₹0';
+    const value = Number(amount);
+    const sign = value < 0 ? '-' : '';
+    return `${sign}₹${Math.abs(value).toLocaleString('en-IN', {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0,
+    })}`;
+  };
 
   const handleSort = (type, key) => {
     setSortConfigs(prev => {
@@ -165,19 +174,19 @@ export default function Dashboard() {
       {/* Portfolio Summary Cards */}
       <Row className="g-3 mb-4">
         <Col md={4}>
-          <Card className="shadow-sm h-100">
-            <Card.Body>
+          <Card className="shadow-sm">
+            <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 <Wallet size={16} /> CURRENT VALUE
               </div>
-              <div className="fs-3 fw-bold">{formatINR(portfolio.total_value)}</div>
-              <div className="text-muted small mt-1">{formatINR(portfolio.total_invested)} Invested</div>
+              <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINRExact(portfolio.total_value)}</div>
+              <div className="text-muted small">{formatINRExact(portfolio.total_invested)} Invested</div>
             </Card.Body>
           </Card>
         </Col>
         <Col md={4}>
-          <Card className="shadow-sm h-100">
-            <Card.Body>
+          <Card className="shadow-sm">
+            <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 {portfolio.day_change >= 0 ? (
                   <TrendingUp size={16} className="text-success" />
@@ -189,38 +198,26 @@ export default function Dashboard() {
               <div className={`fs-3 fw-bold ${profitColor(portfolio.day_change)}`}>
                 {formatINR(portfolio.day_change)}
               </div>
-              <div className={`small mt-1 ${profitColor(portfolio.day_change_pct)}`}>
+              <div className={`small ${profitColor(portfolio.day_change_pct)}`}>
                 {formatPct(portfolio.day_change_pct)}
               </div>
             </Card.Body>
           </Card>
         </Col>
         <Col md={4}>
-          <Card className="shadow-sm h-100">
-            <Card.Body>
+          <Card className="shadow-sm">
+            <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
-                <PiggyBank size={16} /> ALL-TIME RETURNS
+                <PiggyBank size={16} /> NET RETURNS
               </div>
-              <div className={`fs-3 fw-bold ${profitColor(portfolio.total_profit_loss)}`}>
-                {portfolio.total_profit_loss >= 0 ? '+' : ''}{formatINR(portfolio.total_profit_loss)}
+              <div className={`fw-bold ${profitColor(netProfitLoss)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
+                {netProfitLoss >= 0 ? '+' : ''}{formatINRExact(netProfitLoss)}
               </div>
-              <div className={`small mt-1 ${profitColor(portfolio.total_profit_loss_pct)}`}>
-                {formatPct(portfolio.total_profit_loss_pct)}
+              <div className={`small ${profitColor(netReturnPct)}`}>
+                <span>Abs: {formatPct(netReturnPct)}</span>
+                <span className="mx-2 text-muted">|</span>
+                <span>XIRR: {portfolio.xirr_pct == null ? 'N/A' : formatPct(portfolio.xirr_pct)}</span>
               </div>
-              {totalExpenses > 0 && (
-                <div className="mt-2 pt-2 border-top" style={{ cursor: 'pointer' }} onClick={() => navigate('/portfolios?tab=charges')} title="View all charges">
-                  <div className="d-flex justify-content-between small text-muted">
-                    <span><Receipt size={12} className="me-1" />Account Charges</span>
-                    <span className="text-danger">-{formatINR(totalExpenses)}</span>
-                  </div>
-                  <div className="d-flex justify-content-between small fw-semibold mt-1">
-                    <span>Net Returns</span>
-                    <span className={profitColor(netProfitLoss)}>
-                      {netProfitLoss >= 0 ? '+' : ''}{formatINR(netProfitLoss)}
-                    </span>
-                  </div>
-                </div>
-              )}
             </Card.Body>
           </Card>
         </Col>
@@ -246,7 +243,7 @@ export default function Dashboard() {
                   >
                     {ASSET_TYPE_LABELS[type]} ↓
                   </a>
-                  <div className="fs-6 fw-semibold">{formatINR(info.totalValue)}</div>
+                  <div className="fw-semibold text-nowrap" style={{ fontSize: '1.05rem' }}>{formatINR(info.totalValue)}</div>
                   <div className={profitColor(info.totalProfitLoss)} style={{ fontSize: '0.75rem' }}>
                     {info.totalProfitLoss >= 0 ? '+' : ''}{formatINR(info.totalProfitLoss)}
                   </div>
