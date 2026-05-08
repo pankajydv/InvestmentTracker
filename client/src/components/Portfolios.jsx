@@ -18,7 +18,7 @@ const EXPENSE_TYPE_LABELS = {
 const EXPENSE_TYPES = Object.keys(EXPENSE_TYPE_LABELS);
 
 export default function Portfolios() {
-  const { refreshPortfolios, portfolios: ctxPortfolios } = usePortfolio();
+  const { refreshPortfolios, portfolios: ctxPortfolios, selectedId, selectedPortfolio } = usePortfolio();
   const [searchParams, setSearchParams] = useSearchParams();
   const [tab, setTab] = useState(searchParams.get('tab') || 'members');
   const [portfolios, setPortfolios] = useState([]);
@@ -42,7 +42,6 @@ export default function Portfolios() {
   const [summary, setSummary] = useState(null);
   const [chargesLoading, setChargesLoading] = useState(false);
   const [filterType, setFilterType] = useState('');
-  const [filterPortfolio, setFilterPortfolio] = useState('');
   const [showAddCharge, setShowAddCharge] = useState(false);
   const [chargeForm, setChargeForm] = useState({ portfolio_id: '', expense_type: 'AMC', expense_date: '', amount: '', broker: '', notes: '' });
   const [chargeSaving, setChargeSaving] = useState(false);
@@ -52,7 +51,12 @@ export default function Portfolios() {
 
   useEffect(() => {
     if (tab === 'charges') loadCharges();
-  }, [tab, filterType, filterPortfolio]);
+  }, [tab, filterType, selectedId]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    setChargeForm(prev => ({ ...prev, portfolio_id: String(selectedId) }));
+  }, [selectedId]);
 
   const switchTab = (t) => {
     setTab(t);
@@ -75,11 +79,11 @@ export default function Portfolios() {
     try {
       setChargesLoading(true);
       const params = {};
-      if (filterPortfolio) params.portfolio_id = filterPortfolio;
+      if (selectedId) params.portfolio_id = selectedId;
       if (filterType) params.expense_type = filterType;
       const [expList, sum] = await Promise.all([
         getExpenses(params),
-        getExpensesSummary(filterPortfolio || undefined),
+        getExpensesSummary(selectedId || undefined),
       ]);
       setExpenses(expList);
       setSummary(sum);
@@ -153,12 +157,13 @@ export default function Portfolios() {
   // ── Charges CRUD ────────────────────────────────────────────────────
 
   const handleAddCharge = async () => {
-    if (!chargeForm.portfolio_id) return alert('Please select a portfolio');
+    const effectivePortfolioId = selectedId || Number(chargeForm.portfolio_id);
+    if (!effectivePortfolioId) return alert('Please select a portfolio');
     if (!chargeForm.expense_date || !chargeForm.amount) return alert('Date and Amount are required');
     try {
       setChargeSaving(true);
       await addAmcCharge({
-        portfolio_id: Number(chargeForm.portfolio_id),
+        portfolio_id: effectivePortfolioId,
         expense_type: chargeForm.expense_type,
         expense_date: chargeForm.expense_date,
         amount: Number(chargeForm.amount),
@@ -335,40 +340,27 @@ export default function Portfolios() {
         <>
           {/* Summary Cards */}
           {summary && (
-            <Row className="g-3">
-              <Col sm={4}>
-                <Card className="shadow-sm h-100">
+            <div className="d-flex gap-3 overflow-auto pb-1" style={{ scrollbarWidth: 'thin' }}>
+              <Card className="shadow-sm flex-shrink-0" style={{ minWidth: 220, flex: '1 1 220px' }}>
+                <Card.Body className="text-center">
+                  <div className="text-muted small mb-1">TOTAL CHARGES</div>
+                  <div className="fs-4 fw-bold text-danger">{formatINR(summary.total_expenses)}</div>
+                </Card.Body>
+              </Card>
+              {summary.byType?.map((t) => (
+                <Card key={t.expense_type} className="shadow-sm flex-shrink-0" style={{ minWidth: 220, flex: '1 1 220px' }}>
                   <Card.Body className="text-center">
-                    <div className="text-muted small mb-1">TOTAL CHARGES</div>
-                    <div className="fs-4 fw-bold text-danger">{formatINR(summary.total_expenses)}</div>
+                    <div className="text-muted small mb-1">{EXPENSE_TYPE_LABELS[t.expense_type] || t.expense_type}</div>
+                    <div className="fs-5 fw-semibold">{formatINR(t.total)}</div>
+                    <div className="text-muted" style={{ fontSize: '0.75rem' }}>{t.count} charge{t.count !== 1 ? 's' : ''}</div>
                   </Card.Body>
                 </Card>
-              </Col>
-              {summary.byType?.map((t) => (
-                <Col sm={4} key={t.expense_type}>
-                  <Card className="shadow-sm h-100">
-                    <Card.Body className="text-center">
-                      <div className="text-muted small mb-1">{EXPENSE_TYPE_LABELS[t.expense_type] || t.expense_type}</div>
-                      <div className="fs-5 fw-semibold">{formatINR(t.total)}</div>
-                      <div className="text-muted" style={{ fontSize: '0.75rem' }}>{t.count} charge{t.count !== 1 ? 's' : ''}</div>
-                    </Card.Body>
-                  </Card>
-                </Col>
               ))}
-            </Row>
+            </div>
           )}
 
           {/* Filters */}
           <div className="d-flex flex-wrap align-items-center gap-3">
-            <div className="d-flex align-items-center gap-2">
-              <label className="small fw-semibold text-muted text-uppercase">Portfolio</label>
-              <Form.Select size="sm" value={filterPortfolio} onChange={(e) => setFilterPortfolio(e.target.value)} style={{ width: 180 }}>
-                <option value="">All Portfolios</option>
-                {ctxPortfolios.map((p) => (
-                  <option key={p.id} value={p.id}>{p.name}</option>
-                ))}
-              </Form.Select>
-            </div>
             <div className="d-flex align-items-center gap-2">
               <label className="small fw-semibold text-muted text-uppercase">Type</label>
               <Form.Select size="sm" value={filterType} onChange={(e) => setFilterType(e.target.value)} style={{ width: 180 }}>
@@ -508,13 +500,15 @@ export default function Portfolios() {
         <Modal.Header closeButton><Modal.Title className="h6">Add Charge</Modal.Title></Modal.Header>
         <Modal.Body>
           <div className="d-flex flex-column gap-3">
-            <Form.Group>
-              <Form.Label className="small fw-semibold">Portfolio *</Form.Label>
-              <Form.Select value={chargeForm.portfolio_id} onChange={(e) => setChargeForm({ ...chargeForm, portfolio_id: e.target.value })}>
-                <option value="">Select portfolio</option>
-                {ctxPortfolios.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </Form.Select>
-            </Form.Group>
+            {!selectedPortfolio && (
+              <Form.Group>
+                <Form.Label className="small fw-semibold">Portfolio *</Form.Label>
+                <Form.Select value={chargeForm.portfolio_id} onChange={(e) => setChargeForm({ ...chargeForm, portfolio_id: e.target.value })}>
+                  <option value="">Select portfolio</option>
+                  {ctxPortfolios.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </Form.Select>
+              </Form.Group>
+            )}
             <Form.Group>
               <Form.Label className="small fw-semibold">Type</Form.Label>
               <Form.Select value={chargeForm.expense_type} onChange={(e) => setChargeForm({ ...chargeForm, expense_type: e.target.value })}>
