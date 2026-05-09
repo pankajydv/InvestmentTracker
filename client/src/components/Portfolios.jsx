@@ -18,7 +18,7 @@ const EXPENSE_TYPE_LABELS = {
 const EXPENSE_TYPES = Object.keys(EXPENSE_TYPE_LABELS);
 
 export default function Portfolios() {
-  const { refreshPortfolios, portfolios: ctxPortfolios, selectedId, selectedPortfolio } = usePortfolio();
+  const { refreshPortfolios, portfolios: ctxPortfolios, selectedId, selectedIds, selectedPortfolio } = usePortfolio();
   const [searchParams, setSearchParams] = useSearchParams();
   const [tab, setTab] = useState(searchParams.get('tab') || 'members');
   const [portfolios, setPortfolios] = useState([]);
@@ -51,7 +51,7 @@ export default function Portfolios() {
 
   useEffect(() => {
     if (tab === 'charges') loadCharges();
-  }, [tab, filterType, selectedId]);
+  }, [tab, filterType, selectedId, selectedIds]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -79,14 +79,51 @@ export default function Portfolios() {
     try {
       setChargesLoading(true);
       const params = {};
-      if (selectedId) params.portfolio_id = selectedId;
       if (filterType) params.expense_type = filterType;
-      const [expList, sum] = await Promise.all([
-        getExpenses(params),
-        getExpensesSummary(selectedId || undefined),
-      ]);
-      setExpenses(expList);
-      setSummary(sum);
+
+      if (selectedIds.length > 1) {
+        const responses = await Promise.all(
+          selectedIds.map((id) => Promise.all([
+            getExpenses({ ...params, portfolio_id: id }),
+            getExpensesSummary(id),
+          ]))
+        );
+
+        const mergedExpenses = responses
+          .flatMap(([list]) => list)
+          .sort((a, b) => String(b.expense_date || '').localeCompare(String(a.expense_date || '')));
+
+        const summaryByType = {};
+        let totalExpenses = 0;
+        for (const [, sum] of responses) {
+          totalExpenses += Number(sum?.total_expenses) || 0;
+          for (const row of sum?.byType || []) {
+            if (!summaryByType[row.expense_type]) {
+              summaryByType[row.expense_type] = {
+                expense_type: row.expense_type,
+                total: 0,
+                count: 0,
+              };
+            }
+            summaryByType[row.expense_type].total += Number(row.total) || 0;
+            summaryByType[row.expense_type].count += Number(row.count) || 0;
+          }
+        }
+
+        setExpenses(mergedExpenses);
+        setSummary({
+          total_expenses: totalExpenses,
+          byType: Object.values(summaryByType).sort((a, b) => b.total - a.total),
+        });
+      } else {
+        if (selectedId) params.portfolio_id = selectedId;
+        const [expList, sum] = await Promise.all([
+          getExpenses(params),
+          getExpensesSummary(selectedId || undefined),
+        ]);
+        setExpenses(expList);
+        setSummary(sum);
+      }
     } catch (e) {
       setError(e.message);
     } finally {

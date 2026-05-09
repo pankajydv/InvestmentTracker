@@ -16,6 +16,7 @@ import CorporateActions from './components/CorporateActions';
 import InvestmentSettings from './components/InvestmentSettings';
 import InterestRates from './components/InterestRates';
 import TaxReport from './components/TaxReport';
+import BackToTopButton from './components/BackToTopButton';
 import { getAuthConfig, getCurrentUser, loginWithGoogle, logout } from './services/api';
 
 import Portfolios from './components/Portfolios';
@@ -128,6 +129,7 @@ export default function App() {
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </main>
+          <BackToTopButton />
         </div>
       </PortfolioProvider>
     </BrowserRouter>

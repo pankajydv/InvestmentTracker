@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Card, Row, Col, Form, Button, Table, Badge, Spinner, Accordion } from 'react-bootstrap';
 import { Download } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -49,8 +49,40 @@ function downloadCSV(filename, rows) {
   URL.revokeObjectURL(url);
 }
 
+function combineTaxReports(reports) {
+  if (!Array.isArray(reports) || !reports.length) return null;
+
+  const combined = {
+    perquisite_income: [],
+    capital_gains: [],
+    dividend_income: [],
+    schedule_fa: [],
+    summary: {
+      total_perquisite_inr: 0,
+      total_stcg_inr: 0,
+      total_ltcg_inr: 0,
+      total_dividend_inr: 0,
+      tax_note: reports[0]?.summary?.tax_note || '',
+    },
+  };
+
+  for (const report of reports) {
+    combined.perquisite_income.push(...(report?.perquisite_income || []));
+    combined.capital_gains.push(...(report?.capital_gains || []));
+    combined.dividend_income.push(...(report?.dividend_income || []));
+    combined.schedule_fa.push(...(report?.schedule_fa || []));
+
+    combined.summary.total_perquisite_inr += Number(report?.summary?.total_perquisite_inr) || 0;
+    combined.summary.total_stcg_inr += Number(report?.summary?.total_stcg_inr) || 0;
+    combined.summary.total_ltcg_inr += Number(report?.summary?.total_ltcg_inr) || 0;
+    combined.summary.total_dividend_inr += Number(report?.summary?.total_dividend_inr) || 0;
+  }
+
+  return combined;
+}
+
 export default function TaxReport() {
-  const { selectedId, portfolios } = usePortfolio();
+  const { selectedId, selectedIds, portfolios } = usePortfolio();
   const options = useMemo(() => fyOptions(), []);
   const [fy, setFy] = useState(options[0]);
   const [portfolioId, setPortfolioId] = useState(selectedId || '');
@@ -58,12 +90,29 @@ export default function TaxReport() {
   const [report, setReport] = useState(null);
   const [error, setError] = useState('');
 
+  useEffect(() => {
+    if (selectedIds.length === 1) {
+      setPortfolioId(String(selectedIds[0]));
+    } else {
+      setPortfolioId('');
+    }
+  }, [selectedId, selectedIds]);
+
   const load = async () => {
     setLoading(true);
     setError('');
     try {
-      const data = await getTaxReport(fy, portfolioId || undefined);
-      setReport(data);
+      if (portfolioId) {
+        const data = await getTaxReport(fy, portfolioId);
+        setReport(data);
+      } else if (selectedIds.length > 1) {
+        const results = await Promise.all(selectedIds.map((id) => getTaxReport(fy, id)));
+        setReport(combineTaxReports(results));
+      } else {
+        const effectivePortfolioId = selectedId || undefined;
+        const data = await getTaxReport(fy, effectivePortfolioId);
+        setReport(data);
+      }
     } catch (e) {
       setError(e.message || 'Failed to load tax report');
       setReport(null);

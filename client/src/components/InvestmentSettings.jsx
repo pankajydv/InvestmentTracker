@@ -22,6 +22,7 @@ export default function InvestmentSettings() {
     isin_code: '',
     amfi_code: '',
     is_active: true,
+    exclude_from_tracking: false,
   });
 
   useEffect(() => { loadData(); }, [id]);
@@ -37,6 +38,7 @@ export default function InvestmentSettings() {
         isin_code: result.isin_code || '',
         amfi_code: result.amfi_code || '',
         is_active: result.is_active !== 0,
+        exclude_from_tracking: result.exclude_from_tracking !== 0,
       });
     } catch (e) {
       setError(e.message);
@@ -60,6 +62,7 @@ export default function InvestmentSettings() {
         isin_code: form.isin_code || null,
         amfi_code: form.amfi_code || null,
         is_active: form.is_active,
+        exclude_from_tracking: form.exclude_from_tracking,
       });
       setSuccess(true);
       setTimeout(() => setSuccess(false), 3000);
@@ -185,6 +188,21 @@ export default function InvestmentSettings() {
                   />
                   <Form.Text className="text-muted ms-2">
                     Inactive investments are excluded from price updates (e.g. delisted stocks).
+                  </Form.Text>
+                </Form.Group>
+              </Col>
+
+              <Col xs={12} className="mt-3">
+                <Form.Group className="d-flex align-items-center gap-2">
+                  <Form.Check
+                    type="switch"
+                    id="exclude-from-tracking-switch"
+                    checked={form.exclude_from_tracking}
+                    onChange={(e) => setForm({ ...form, exclude_from_tracking: e.target.checked })}
+                    label={form.exclude_from_tracking ? 'Excluded' : 'Included'}
+                  />
+                  <Form.Text className="text-muted ms-2">
+                    Excluded investments are hidden from dashboard and daily value calculations (e.g. derived positions).
                   </Form.Text>
                 </Form.Group>
               </Col>

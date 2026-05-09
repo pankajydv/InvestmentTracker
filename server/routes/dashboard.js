@@ -123,7 +123,7 @@ module.exports = function (db) {
       LEFT JOIN daily_values dv ON i.id = dv.investment_id
         ${dvPortfolioJoin}
         AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id ${dvPortfolioSub})
-      WHERE 1=1${portfolioFilter}${soldFilter}
+      WHERE 1=1${portfolioFilter}${soldFilter} AND i.exclude_from_tracking = 0
       ORDER BY i.asset_type, i.name
     `).all(...dvParams, ...dvParams, ...portfolioParams, ...soldParams);
 

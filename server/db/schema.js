@@ -106,6 +106,7 @@ function initializeDb(db) {
       previous_isin_codes TEXT,      -- Comma-separated historical ISINs (e.g. after stock splits)
       opening_balance REAL DEFAULT 0, -- For PPF/SSY/PF: balance carried forward from before first imported statement
       is_active INTEGER DEFAULT 1,   -- 1 = active (price updates), 0 = inactive (delisted etc.)
+      exclude_from_tracking INTEGER DEFAULT 0, -- 1 = exclude from daily_values calculations and dashboard (e.g. derived investments)
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -451,6 +452,15 @@ function initializeDb(db) {
     recordMigration(db, '20260412-add-investments-is-active', 'applied');
   } else if (!hasMigrationRecord(db, '20260412-add-investments-is-active') && invCols.includes('is_active')) {
     recordMigration(db, '20260412-add-investments-is-active', 'skipped', 'already present');
+  }
+
+  // Add exclude_from_tracking column for skipping derived/synthetic investments in daily_values and dashboard
+  if (requireMigrationsEnabled('20260412-add-investments-exclude-from-tracking', !invCols.includes('exclude_from_tracking'), 'investments.exclude_from_tracking missing')) {
+    db.exec("ALTER TABLE investments ADD COLUMN exclude_from_tracking INTEGER DEFAULT 0");
+    assertDbIntegrity(db, '20260412-add-investments-exclude-from-tracking');
+    recordMigration(db, '20260412-add-investments-exclude-from-tracking', 'applied');
+  } else if (!hasMigrationRecord(db, '20260412-add-investments-exclude-from-tracking') && invCols.includes('exclude_from_tracking')) {
+    recordMigration(db, '20260412-add-investments-exclude-from-tracking', 'skipped', 'already present');
   }
 
   // Add category to investments (Equity, Debt, Hybrid, ELSS, etc.)

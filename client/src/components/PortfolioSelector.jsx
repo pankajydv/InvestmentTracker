@@ -2,10 +2,10 @@ import React, { useState, useRef, useEffect } from 'react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 import { Link } from 'react-router-dom';
-import { ChevronDown, Users, Settings } from 'lucide-react';
+import { ChevronDown, Users, Settings, Check } from 'lucide-react';
 
 export default function PortfolioSelector() {
-  const { portfolios, selectedId, selectedPortfolio, selectPortfolio } = usePortfolio();
+  const { portfolios, selectedIds, selectedId, selectedPortfolio, selectPortfolio, togglePortfolio } = usePortfolio();
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
 
@@ -19,8 +19,13 @@ export default function PortfolioSelector() {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  const selectedCount = selectedId ? 1 : portfolios.length;
-  const label = selectedPortfolio ? selectedPortfolio.name : 'All Portfolios';
+  const allSelected = selectedIds.length === 0 || (portfolios.length > 0 && selectedIds.length === portfolios.length);
+  const selectedCount = allSelected ? portfolios.length : selectedIds.length;
+  const label = selectedPortfolio
+    ? selectedPortfolio.name
+    : allSelected
+      ? 'All Portfolios'
+      : `${selectedIds.length} Portfolios`;
 
   return (
     <div className="position-relative" ref={ref}>
@@ -49,24 +54,25 @@ export default function PortfolioSelector() {
       {open && (
         <div
           className="position-absolute top-100 start-0 mt-1 bg-white rounded shadow-lg border overflow-hidden"
-          style={{ width: 288, zIndex: 1050 }}
+          style={{ width: 276, zIndex: 1050 }}
         >
           {/* All Portfolios */}
           <button
-            onClick={() => { selectPortfolio(null); setOpen(false); }}
-            className="w-100 d-flex align-items-center gap-3 px-3 py-3 border-0 bg-transparent text-start"
+            onClick={() => { selectPortfolio(null); }}
+            className="w-100 d-flex align-items-center gap-2 px-3 py-2 border-0 bg-transparent text-start"
             style={{
-              borderLeft: selectedId === null ? '4px solid #0d6efd' : '4px solid transparent',
-              backgroundColor: selectedId === null ? '#e8f0fe' : undefined,
+              borderLeft: allSelected ? '4px solid #0d6efd' : '4px solid transparent',
+              backgroundColor: allSelected ? '#e8f0fe' : undefined,
             }}
-            onMouseEnter={(e) => { if (selectedId !== null) e.currentTarget.style.backgroundColor = '#f8f9fa'; }}
-            onMouseLeave={(e) => { if (selectedId !== null) e.currentTarget.style.backgroundColor = 'transparent'; }}
+            onMouseEnter={(e) => { if (!allSelected) e.currentTarget.style.backgroundColor = '#f8f9fa'; }}
+            onMouseLeave={(e) => { if (!allSelected) e.currentTarget.style.backgroundColor = 'transparent'; }}
           >
-            <Users size={20} className="text-muted" />
-            <div>
+            <Users size={18} className="text-muted" />
+            <div className="flex-grow-1">
               <div className="fw-medium">All Portfolios</div>
-              <div className="text-muted" style={{ fontSize: '0.75rem' }}>{portfolios.length} member{portfolios.length !== 1 ? 's' : ''}</div>
+              <div className="text-muted" style={{ fontSize: '0.72rem', lineHeight: 1.2 }}>{portfolios.length} member{portfolios.length !== 1 ? 's' : ''}</div>
             </div>
+            {allSelected && <Check size={16} className="text-primary" />}
           </button>
 
           <hr className="my-0" />
@@ -75,25 +81,31 @@ export default function PortfolioSelector() {
           {portfolios.map((p) => (
             <button
               key={p.id}
-              onClick={() => { selectPortfolio(p.id); setOpen(false); }}
-              className="w-100 d-flex align-items-center gap-3 px-3 py-3 border-0 bg-transparent text-start"
+              onClick={() => { togglePortfolio(p.id); }}
+              className="w-100 d-flex align-items-center gap-2 px-3 py-2 border-0 bg-transparent text-start"
               style={{
-                borderLeft: selectedId === p.id ? '4px solid #0d6efd' : '4px solid transparent',
-                backgroundColor: selectedId === p.id ? '#e8f0fe' : undefined,
+                borderLeft: selectedIds.includes(p.id) ? '4px solid #0d6efd' : '4px solid transparent',
+                backgroundColor: selectedIds.includes(p.id) ? '#e8f0fe' : undefined,
               }}
-              onMouseEnter={(e) => { if (selectedId !== p.id) e.currentTarget.style.backgroundColor = '#f8f9fa'; }}
-              onMouseLeave={(e) => { if (selectedId !== p.id) e.currentTarget.style.backgroundColor = selectedId === p.id ? '#e8f0fe' : 'transparent'; }}
+              onMouseEnter={(e) => { if (!selectedIds.includes(p.id)) e.currentTarget.style.backgroundColor = '#f8f9fa'; }}
+              onMouseLeave={(e) => { if (!selectedIds.includes(p.id)) e.currentTarget.style.backgroundColor = 'transparent'; }}
             >
               <span
                 className="portfolio-dot flex-shrink-0"
-                style={{ backgroundColor: p.color, width: 16, height: 16 }}
+                style={{ backgroundColor: p.color, width: 14, height: 14 }}
               />
               <div className="flex-grow-1" style={{ minWidth: 0 }}>
                 <div className="fw-medium text-truncate">{p.name}</div>
-                <div className="text-muted" style={{ fontSize: '0.75rem' }}>
+                <div className="text-muted" style={{ fontSize: '0.72rem', lineHeight: 1.2 }}>
                   {p.investment_count || 0} investment{(p.investment_count || 0) !== 1 ? 's' : ''}
                 </div>
               </div>
+              <input
+                type="checkbox"
+                className="form-check-input m-0"
+                checked={selectedIds.length === 0 || selectedIds.includes(p.id)}
+                readOnly
+              />
             </button>
           ))}
 
@@ -103,7 +115,7 @@ export default function PortfolioSelector() {
           <Link
             to="/portfolios"
             onClick={() => setOpen(false)}
-            className="w-100 d-flex align-items-center gap-3 px-3 py-2 text-decoration-none text-secondary small fw-medium"
+            className="w-100 d-flex align-items-center gap-2 px-3 py-2 text-decoration-none text-secondary small fw-medium"
             onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#f8f9fa'}
             onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
           >

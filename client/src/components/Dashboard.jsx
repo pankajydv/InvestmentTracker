@@ -6,8 +6,101 @@ import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE
 import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, RefreshCw, EyeOff, Eye } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
+function combineDashboardSummaries(results, selectedIds) {
+  if (!Array.isArray(results) || !results.length) return null;
+
+  const mergedInvestments = new Map();
+  const byType = {};
+  let totalExpenses = 0;
+
+  const portfolio = {
+    total_value: 0,
+    total_invested: 0,
+    total_profit_loss: 0,
+    day_change: 0,
+    xirr_pct: null,
+  };
+
+  for (const result of results) {
+    const p = result?.portfolio || {};
+    portfolio.total_value += Number(p.total_value) || 0;
+    portfolio.total_invested += Number(p.total_invested) || 0;
+    portfolio.total_profit_loss += Number(p.total_profit_loss) || 0;
+    portfolio.day_change += Number(p.day_change) || 0;
+    totalExpenses += Number(result?.totalExpenses) || 0;
+
+    for (const inv of result?.investments || []) {
+      if (!mergedInvestments.has(inv.id)) {
+        mergedInvestments.set(inv.id, {
+          ...inv,
+          current_value: 0,
+          invested_amount: 0,
+          profit_loss: 0,
+          day_change: 0,
+          total_units: 0,
+        });
+      }
+
+      const target = mergedInvestments.get(inv.id);
+      target.current_value += Number(inv.current_value) || 0;
+      target.invested_amount += Number(inv.invested_amount) || 0;
+      target.profit_loss += Number(inv.profit_loss) || 0;
+      target.day_change += Number(inv.day_change) || 0;
+      target.total_units += Number(inv.total_units) || 0;
+      target.price_per_unit = Number(inv.price_per_unit) || target.price_per_unit || 0;
+    }
+  }
+
+  const investments = Array.from(mergedInvestments.values()).map((inv) => {
+    const prevValue = inv.current_value - inv.day_change;
+    const profitLossPct = inv.invested_amount > 0 ? (inv.profit_loss / inv.invested_amount) * 100 : 0;
+    const dayChangePct = prevValue > 0 ? (inv.day_change / prevValue) * 100 : 0;
+    const portfolioPct = portfolio.total_value > 0 ? (inv.current_value / portfolio.total_value) * 100 : 0;
+    return {
+      ...inv,
+      profit_loss_pct: profitLossPct,
+      day_change_pct: dayChangePct,
+      portfolio_pct: portfolioPct,
+    };
+  });
+
+  for (const inv of investments) {
+    if (!byType[inv.asset_type]) {
+      byType[inv.asset_type] = {
+        investments: [],
+        totalValue: 0,
+        totalInvested: 0,
+        totalProfitLoss: 0,
+        dayChange: 0,
+      };
+    }
+    byType[inv.asset_type].investments.push(inv);
+    byType[inv.asset_type].totalValue += Number(inv.current_value) || 0;
+    byType[inv.asset_type].totalInvested += Number(inv.invested_amount) || 0;
+    byType[inv.asset_type].totalProfitLoss += Number(inv.profit_loss) || 0;
+    byType[inv.asset_type].dayChange += Number(inv.day_change) || 0;
+  }
+
+  const prevPortfolioValue = portfolio.total_value - portfolio.day_change;
+  portfolio.total_profit_loss_pct = portfolio.total_invested > 0
+    ? (portfolio.total_profit_loss / portfolio.total_invested) * 100
+    : 0;
+  portfolio.day_change_pct = prevPortfolioValue > 0
+    ? (portfolio.day_change / prevPortfolioValue) * 100
+    : 0;
+
+  return {
+    portfolio,
+    investments,
+    byType,
+    portfolioCount: selectedIds.length,
+    totalExpenses,
+    lastUpdate: results.map((r) => r.lastUpdate).filter(Boolean).sort().at(-1) || null,
+  };
+}
+
 export default function Dashboard() {
-  const { selectedId, selectedPortfolio } = usePortfolio();
+  const { selectedId, selectedIds, selectedPortfolio } = usePortfolio();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -56,7 +149,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
-  }, [selectedId, hideSold]);
+  }, [selectedId, selectedIds, hideSold]);
 
   useEffect(() => {
     const hash = window.location.hash;
@@ -71,8 +164,13 @@ export default function Dashboard() {
   const loadData = async () => {
     try {
       setLoading(true);
-      const result = await getDashboardSummary(selectedId, { hideSold });
-      setData(result);
+      if (selectedIds.length > 1) {
+        const results = await Promise.all(selectedIds.map((id) => getDashboardSummary(id, { hideSold })));
+        setData(combineDashboardSummaries(results, selectedIds));
+      } else {
+        const result = await getDashboardSummary(selectedId, { hideSold });
+        setData(result);
+      }
     } catch (e) {
       setError(e.message);
     } finally {

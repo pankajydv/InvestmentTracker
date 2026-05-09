@@ -115,7 +115,7 @@ const TYPE_BADGE = {
 export default function Transactions() {
   const [searchParams, setSearchParams] = useSearchParams();
   const isInitialLoad = useRef(true);
-  const { selectedId } = usePortfolio();
+  const { selectedId, selectedIds } = usePortfolio();
   const [transactions, setTransactions] = useState([]);
   const [totalTransactions, setTotalTransactions] = useState(0);
   const [portfolioMeta, setPortfolioMeta] = useState({});
@@ -259,30 +259,59 @@ export default function Transactions() {
   // Load brokers based on selected portfolio and active filters
   useEffect(() => {
     const params = {};
-    if (selectedId) params.portfolio_id = selectedId;
     if (filterType.length) params.type = filterType.join(',');
     if (filterInvestment) params.investment_name = filterInvestment;
     if (filterStartDate) params.from = filterStartDate;
     if (filterEndDate) params.to = filterEndDate;
-    getBrokers(params).then(b => {
-      setBrokers(b);
-      setFilterBroker(prev => b.includes(prev) ? prev : '');
-    }).catch(() => {});
-  }, [selectedId, filterType, filterInvestment, filterStartDate, filterEndDate]);
+
+    const load = async () => {
+      try {
+        let values = [];
+        if (selectedIds.length > 1) {
+          const lists = await Promise.all(selectedIds.map((id) => getBrokers({ ...params, portfolio_id: id })));
+          values = Array.from(new Set(lists.flat())).sort((a, b) => String(a).localeCompare(String(b)));
+        } else {
+          if (selectedId) params.portfolio_id = selectedId;
+          values = await getBrokers(params);
+        }
+        setBrokers(values);
+        setFilterBroker((prev) => values.includes(prev) ? prev : '');
+      } catch (_) {
+        // ignore filter metadata fetch errors
+      }
+    };
+
+    load();
+  }, [selectedId, selectedIds, filterType, filterInvestment, filterStartDate, filterEndDate]);
 
   // Load transaction types based on selected portfolio and active filters
   useEffect(() => {
-    const params = {};
-    if (selectedId) params.portfolio_id = selectedId;
-    getTransactionTypes(params).then(types => {
-      setTransactionTypes(types.length ? types : TRANSACTION_TYPES_DEFAULT);
-      // Clear any selected types that aren't available in the new list
-      setFilterType(prev => {
-        const next = prev.filter(t => types.includes(t));
-        return next.length === prev.length ? prev : next;
-      });
-    }).catch(() => {});
-  }, [selectedId]);
+    const load = async () => {
+      try {
+        let types = [];
+        if (selectedIds.length > 1) {
+          const lists = await Promise.all(selectedIds.map((id) => getTransactionTypes({ portfolio_id: id })));
+          types = Array.from(new Set(lists.flat()));
+        } else {
+          const params = {};
+          if (selectedId) params.portfolio_id = selectedId;
+          types = await getTransactionTypes(params);
+        }
+
+        const effectiveTypes = types.length ? types : TRANSACTION_TYPES_DEFAULT;
+        setTransactionTypes(effectiveTypes);
+        // Clear any selected types that aren't available in the new list
+        setFilterType(prev => {
+          const next = prev.filter(t => effectiveTypes.includes(t));
+          return next.length === prev.length ? prev : next;
+        });
+      } catch (_) {
+        // ignore filter metadata fetch errors
+      }
+    };
+
+    load();
+  }, [selectedId, selectedIds]);
 
   // Close type dropdown on outside click
   useEffect(() => {
@@ -297,39 +326,74 @@ export default function Transactions() {
 
   useEffect(() => {
     const params = {};
-    if (selectedId) params.portfolio_id = selectedId;
     if (filterType.length) params.type = filterType.join(',');
     if (filterBroker) params.broker = filterBroker;
     if (filterStartDate) params.from = filterStartDate;
     if (filterEndDate) params.to = filterEndDate;
-    getInvestmentNames(params).then(names => {
-      setInvestmentNames(names);
-      setFilterInvestment(prev => names.includes(prev) ? prev : '');
-    }).catch(() => {});
-  }, [selectedId, filterType, filterBroker, filterStartDate, filterEndDate]);
+
+    const load = async () => {
+      try {
+        let names = [];
+        if (selectedIds.length > 1) {
+          const lists = await Promise.all(selectedIds.map((id) => getInvestmentNames({ ...params, portfolio_id: id })));
+          names = Array.from(new Set(lists.flat())).sort((a, b) => String(a).localeCompare(String(b)));
+        } else {
+          if (selectedId) params.portfolio_id = selectedId;
+          names = await getInvestmentNames(params);
+        }
+        setInvestmentNames(names);
+        setFilterInvestment(prev => names.includes(prev) ? prev : '');
+      } catch (_) {
+        // ignore filter metadata fetch errors
+      }
+    };
+
+    load();
+  }, [selectedId, selectedIds, filterType, filterBroker, filterStartDate, filterEndDate]);
 
   useEffect(() => {
     loadTransactions();
-  }, [selectedId, filterType, filterBroker, filterInvestment, filterStartDate, filterEndDate]);
+  }, [selectedId, selectedIds, filterType, filterBroker, filterInvestment, filterStartDate, filterEndDate]);
 
   const loadTransactions = async () => {
     try {
       setLoading(true);
       const params = {};
-      if (selectedId) params.portfolio_id = selectedId;
       if (filterType.length) params.type = filterType.join(',');
       if (filterBroker) params.broker = filterBroker;
       if (filterInvestment) params.investment_name = filterInvestment;
       if (filterStartDate) params.from = filterStartDate;
       if (filterEndDate) params.to = filterEndDate;
       params.group_pf = '1';
-      const result = await getTransactions(params);
-      if (Array.isArray(result)) {
-        setTransactions(result);
-        setTotalTransactions(result.length);
+
+      if (selectedIds.length > 1) {
+        const results = await Promise.all(
+          selectedIds.map((id) => getTransactions({ ...params, portfolio_id: id }))
+        );
+        const mergedMap = new Map();
+        for (const result of results) {
+          const items = Array.isArray(result) ? result : (result.items || []);
+          for (const row of items) {
+            if (!mergedMap.has(row.id)) mergedMap.set(row.id, row);
+          }
+        }
+        const merged = Array.from(mergedMap.values()).sort((a, b) => {
+          const dateCmp = String(b.transaction_date || '').localeCompare(String(a.transaction_date || ''));
+          if (dateCmp !== 0) return dateCmp;
+          return (b.id || 0) - (a.id || 0);
+        });
+        setTransactions(merged);
+        setTotalTransactions(merged.length);
       } else {
-        setTransactions(result.items || []);
-        setTotalTransactions(result.total || 0);
+        if (selectedId) params.portfolio_id = selectedId;
+        const result = await getTransactions(params);
+        if (Array.isArray(result)) {
+          setTransactions(result);
+          setTotalTransactions(result.length);
+        } else {
+          setTransactions(result.items || []);
+          setTotalTransactions(result.total || 0);
+        }
       }
     } catch (e) {
       console.error(e);
@@ -726,7 +790,7 @@ export default function Transactions() {
                               <Link to={`/investments/${txn.investment_id}`} state={{ from: 'transactions', transactionsSearch: window.location.search }} className="text-primary fw-medium text-decoration-none">
                                 {txn.investment_name}
                               </Link>
-                              {!selectedId && txn.portfolio_name && (
+                              {(selectedIds.length !== 1) && txn.portfolio_name && (
                                 <span
                                   title={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
                                   aria-label={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}

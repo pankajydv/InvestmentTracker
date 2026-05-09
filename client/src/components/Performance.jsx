@@ -7,8 +7,49 @@ import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts';
 
+function combinePerformanceResults(results, startDate, endDate, periodLabel = 'custom') {
+  if (!Array.isArray(results) || !results.length) return null;
+
+  const byDate = new Map();
+
+  for (const result of results) {
+    for (const row of result?.portfolioData || []) {
+      const date = row.date;
+      if (!date) continue;
+      if (!byDate.has(date)) {
+        byDate.set(date, {
+          date,
+          total_value: 0,
+          total_invested: 0,
+          total_profit_loss: 0,
+        });
+      }
+      const target = byDate.get(date);
+      target.total_value += Number(row.total_value) || 0;
+      target.total_invested += Number(row.total_invested) || 0;
+      target.total_profit_loss += Number(row.total_profit_loss) || 0;
+    }
+  }
+
+  const portfolioData = Array.from(byDate.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const first = portfolioData[0];
+  const last = portfolioData[portfolioData.length - 1];
+  const periodReturn = first && last ? (last.total_value - first.total_value) : 0;
+  const periodReturnPct = first && first.total_value > 0 ? (periodReturn / first.total_value) * 100 : 0;
+
+  return {
+    period: periodLabel,
+    startDate: startDate || results[0]?.startDate,
+    endDate: endDate || results[0]?.endDate,
+    portfolioData,
+    investmentData: [],
+    periodReturn,
+    periodReturnPct,
+  };
+}
+
 export default function Performance() {
-  const { selectedId } = usePortfolio();
+  const { selectedId, selectedIds } = usePortfolio();
   const [period, setPeriod] = useState('1M');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -17,13 +58,18 @@ export default function Performance() {
 
   useEffect(() => {
     loadData();
-  }, [period, selectedId]);
+  }, [period, selectedId, selectedIds]);
 
   const loadData = async () => {
     try {
       setLoading(true);
-      const result = await getPerformance(period, null, null, selectedId);
-      setData(result);
+      if (selectedIds.length > 1) {
+        const results = await Promise.all(selectedIds.map((id) => getPerformance(period, null, null, id)));
+        setData(combinePerformanceResults(results, results[0]?.startDate, results[0]?.endDate, period));
+      } else {
+        const result = await getPerformance(period, null, null, selectedId);
+        setData(result);
+      }
     } catch (e) {
       console.error(e);
     } finally {
@@ -35,8 +81,13 @@ export default function Performance() {
     if (!customFrom || !customTo) return;
     try {
       setLoading(true);
-      const result = await getPerformance(null, customFrom, customTo, selectedId);
-      setData(result);
+      if (selectedIds.length > 1) {
+        const results = await Promise.all(selectedIds.map((id) => getPerformance(null, customFrom, customTo, id)));
+        setData(combinePerformanceResults(results, customFrom, customTo, 'custom'));
+      } else {
+        const result = await getPerformance(null, customFrom, customTo, selectedId);
+        setData(result);
+      }
       setPeriod('custom');
     } catch (e) {
       console.error(e);

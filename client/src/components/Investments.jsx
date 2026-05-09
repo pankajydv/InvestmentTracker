@@ -9,7 +9,7 @@ import { usePortfolio } from '../context/PortfolioContext';
 const ASSET_TYPES = ['', 'MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND', 'SGB'];
 
 export default function Investments() {
-  const { selectedId } = usePortfolio();
+  const { selectedId, selectedIds } = usePortfolio();
   const [searchParams, setSearchParams] = useSearchParams();
   const [investments, setInvestments] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -18,7 +18,7 @@ export default function Investments() {
 
   useEffect(() => {
     loadInvestments();
-  }, [typeFilter, selectedId, hideSold]);
+  }, [typeFilter, selectedId, selectedIds, hideSold]);
 
   const toggleHideSold = () => {
     setHideSold(prev => {
@@ -31,8 +31,22 @@ export default function Investments() {
   const loadInvestments = async () => {
     try {
       setLoading(true);
-      const result = await getInvestments(typeFilter, selectedId, { hideSold });
-      setInvestments(result);
+      if (selectedIds.length > 1) {
+        const results = await Promise.all(selectedIds.map((id) => getInvestments(typeFilter, id, { hideSold })));
+        const seen = new Set();
+        const merged = [];
+        for (const list of results) {
+          for (const inv of list || []) {
+            if (seen.has(inv.id)) continue;
+            seen.add(inv.id);
+            merged.push(inv);
+          }
+        }
+        setInvestments(merged);
+      } else {
+        const result = await getInvestments(typeFilter, selectedId, { hideSold });
+        setInvestments(result);
+      }
     } catch (e) {
       console.error(e);
     } finally {

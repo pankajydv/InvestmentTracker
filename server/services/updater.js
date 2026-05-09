@@ -41,6 +41,8 @@ async function updateAllPrices(db, options = {}) {
   }
   // Skip inactive investments (delisted, etc.)
   investments = investments.filter(i => i.is_active !== 0);
+  // Skip investments excluded from tracking (derived/synthetic)
+  investments = investments.filter(i => i.exclude_from_tracking !== 1);
 
   // Auto-resolve missing AMFI codes for mutual funds using ISIN (single download)
   const mfsWithoutAmfi = investments.filter(i => i.asset_type === 'MUTUAL_FUND' && !i.amfi_code && i.isin_code);
