@@ -14,7 +14,8 @@ const TYPE_LABELS = {
   DEPOSIT: 'Deposit',
   EMPLOYER_CONTRIBUTION: 'Employer',
   VOLUNTARY_CONTRIBUTION: 'Voluntary',
-  ESPP_CONTRIBUTION: 'ESPP Contribution',
+  ESPP_CONTRIBUTION: 'ESPP Deduction',
+  ESPP_PURCHASE: 'ESPP Purchase',
   EPS_CONTRIBUTION: 'EPS',
   INTEREST: 'Interest',
   WITHDRAWAL: 'Withdrawal'
@@ -422,7 +423,6 @@ export default function InvestmentDetail() {
   const isPPF = data.asset_type === 'PPF' || data.asset_type === 'SSY' || data.asset_type === 'PF';
   const isEpsInvestment = isPPF && /eps/i.test(String(data.name || ''));
   const isBond = data.asset_type === 'BOND';
-  const isNPS = data.asset_type === 'NPS';
   const isSGB = data.asset_type === 'SGB';
   const isForeignUSD = data.asset_type === 'FOREIGN_STOCK' && data.currency === 'USD';
   const isMSFTStock = /MSFT/i.test(String(data.ticker_symbol || '')) || /microsoft/i.test(String(data.name || ''));
@@ -841,15 +841,15 @@ export default function InvestmentDetail() {
       )}
 
       {/* Transactions Table */}
-      <Card className="shadow-sm">
-        <Card.Header className="bg-white">
+      <Card className="shadow-sm transactions-card">
+        <Card.Header className="bg-white px-3 py-2">
           <div className="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2">
             <h2 className="h6 fw-semibold mb-0">Transactions</h2>
-            <div className="d-flex flex-wrap align-items-center gap-2 ms-md-auto">
+            <div className="d-flex flex-wrap justify-content-md-end align-items-center gap-2 ms-md-auto">
               {isForeignUSD && (
                 <Dropdown autoClose="outside">
                   <Dropdown.Toggle variant="outline-secondary" size="sm">
-                    {selectedGrants.length === 0 ? 'All grants' : `${selectedGrants.length} grant(s)`}
+                    {selectedGrants.length === 0 ? 'Grants' : `${selectedGrants.length} grant(s)`}
                   </Dropdown.Toggle>
                   <Dropdown.Menu style={{ minWidth: 240, maxHeight: 260, overflowY: 'auto' }}>
                     {grantOptions.length === 0 ? (
@@ -871,7 +871,7 @@ export default function InvestmentDetail() {
 
               <Dropdown autoClose="outside">
                 <Dropdown.Toggle variant="outline-secondary" size="sm">
-                  {selectedTypes.length === 0 ? 'All types' : `${selectedTypes.length} type(s)`}
+                  {selectedTypes.length === 0 ? 'Types' : `${selectedTypes.length} type(s)`}
                 </Dropdown.Toggle>
                 <Dropdown.Menu style={{ minWidth: 220, maxHeight: 260, overflowY: 'auto' }}>
                   {typeOptions.map((type) => (
@@ -893,7 +893,7 @@ export default function InvestmentDetail() {
                 type="date"
                 value={dateFrom}
                 onChange={(e) => setDateFrom(e.target.value)}
-                style={{ width: 145 }}
+                style={{ width: 132 }}
                 aria-label="Date from"
               />
               <Form.Control
@@ -901,7 +901,7 @@ export default function InvestmentDetail() {
                 type="date"
                 value={dateTo}
                 onChange={(e) => setDateTo(e.target.value)}
-                style={{ width: 145 }}
+                style={{ width: 132 }}
                 aria-label="Date to"
               />
 
@@ -910,7 +910,7 @@ export default function InvestmentDetail() {
                   size="sm"
                   value={selectedFolio}
                   onChange={(e) => setSelectedFolio(e.target.value)}
-                  style={{ width: 170 }}
+                  style={{ width: 150 }}
                 >
                   <option value="ALL">All folios</option>
                   {folioOptions.map((folio) => (
@@ -959,7 +959,7 @@ export default function InvestmentDetail() {
                 Hidden {hiddenPlaceholderCount} placeholder RSU rows with no amount/price/withholding data.
               </div>
             )}
-            <Table hover size="sm" className="mb-0 small">
+            <Table hover size="sm" className="mb-0 small transactions-table">
               <thead className="table-light">
                 <tr>
                   <th className="px-3 text-nowrap">Date</th>
@@ -967,16 +967,15 @@ export default function InvestmentDetail() {
                   {!isPPF && <th className="px-3 text-end">Units</th>}
                   {isForeignUSD && <th className="px-3 text-end">Withheld</th>}
                   {isForeignUSD && <th className="px-3 text-end">FX</th>}
-                  {!isPPF && <th className="px-3 text-end">Price/Unit</th>}
-                  <th className="px-3 text-end">Amount</th>
-                  {!isPPF && <th className="px-3 text-end">Charges</th>}
+                  {!isPPF && <th className="px-3 text-end">Price</th>}
+                  <th className="px-3 text-end">Amt</th>
+                  {!isPPF && <th className="px-3 text-end">Fees</th>}
                   {isPPF && <th className="px-3 text-end">Balance</th>}
-                  {!isPPF && <th className="px-3 text-end">Holding</th>}
+                  {!isPPF && <th className="px-3 text-end">Hold</th>}
                   {hasFolioColumn && <th className="px-3">Folio</th>}
                   {isForeignUSD && <th className="px-3">Grant</th>}
-                  {!isNPS && !isPPF && <th className="px-3">Broker</th>}
                   <th className="px-3">Notes</th>
-                  <th className="px-3 text-center" style={{ width: 80 }}>Actions</th>
+                  <th className="px-3 text-center" style={{ width: 64 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -1086,8 +1085,7 @@ export default function InvestmentDetail() {
                         {grantProgress ? <div className="text-muted" style={{ fontSize: '0.75rem', lineHeight: 1.1 }}>{grantProgress}</div> : null}
                       </td>
                     )}
-                    {!isNPS && !isPPF && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.broker || '-'}</td>}
-                    <td className="px-3 text-muted" style={{ maxWidth: 260, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
+                    <td className="px-3 text-muted" style={{ maxWidth: 150, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
                     <td className="px-3">
                       {EDITABLE_TYPES.includes(txn.transaction_type) && (
                         <div className="d-flex gap-1 row-actions">

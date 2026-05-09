@@ -39,6 +39,16 @@ tr:hover .row-actions {
   border-radius: 0.75rem;
 }
 
+.transactions-card {
+  overflow: hidden;
+}
+
+.transactions-table th,
+.transactions-table td {
+  padding-left: 0.5rem !important;
+  padding-right: 0.5rem !important;
+}
+
 /* Type badge colors */
 .badge-buy { background-color: #dcfce7 !important; color: #15803d !important; }
 .badge-sell { background-color: #fee2e2 !important; color: #b91c1c !important; }
