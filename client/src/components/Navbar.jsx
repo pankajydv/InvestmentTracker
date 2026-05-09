@@ -59,7 +59,7 @@ export default function Navbar({ user, onLogout }) {
           <PortfolioSelector />
         </div>
 
-        <Nav className="ms-auto align-items-center gap-1 flex-nowrap">
+        <Nav className="align-items-center gap-1 flex-nowrap">
           {PRIMARY_NAV_ITEMS.map(({ path, label, shortLabel, icon: Icon }) => (
             <Nav.Link
               key={path}
@@ -75,8 +75,9 @@ export default function Navbar({ user, onLogout }) {
               <span className="d-lg-none d-none d-md-inline">{shortLabel}</span>
             </Nav.Link>
           ))}
+        </Nav>
 
-          <Dropdown align="end" className="ms-1">
+        <Dropdown align="end" className="ms-auto ms-1">
             <Dropdown.Toggle
               as="button"
               id="profile-menu"
@@ -137,7 +138,6 @@ export default function Navbar({ user, onLogout }) {
               </Dropdown.Item>
             </Dropdown.Menu>
           </Dropdown>
-        </Nav>
       </Container>
     </BsNavbar>
   );
