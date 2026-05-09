@@ -2,12 +2,35 @@ const express = require('express');
 const router = express.Router();
 const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = require('../services/pfInterestCalculator');
 
+/**
+ * Normalize transaction_date to YYYY-MM-DD format (no time component)
+ * Handles inputs like "2016-03-31", "2016-03-31 00:00:00", or Date objects
+ */
+function normalizeTransactionDate(dateInput) {
+  if (!dateInput) return null;
+  
+  // Handle Date objects
+  if (dateInput instanceof Date) {
+    return dateInput.toISOString().split('T')[0];
+  }
+  
+  // Convert to string and extract date part (handles both space and ISO T separators)
+  const dateStr = String(dateInput).split(/[ T]/)[0].trim();
+  
+  // Validate YYYY-MM-DD format
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+  
+  // Verify it's a valid date
+  const d = new Date(`${dateStr}T00:00:00.000Z`);
+  return Number.isNaN(d.getTime()) ? null : dateStr;
+}
+
 const CASH_OUTFLOW_TYPES = new Set([
   'BUY', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC', 'ESPP_CONTRIBUTION'
 ]);
 
 const CASH_INFLOW_TYPES = new Set([
-  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST'
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE'
 ]);
 
 function xnpv(rate, flows, baseDate) {
@@ -336,6 +359,15 @@ module.exports = function (db) {
     return `${endYear}-03-31`;
   }
 
+  function normalizeDateOnly(input) {
+    if (input == null) return null;
+    const s = String(input).trim();
+    if (!s) return null;
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (!m) return null;
+    return m[1];
+  }
+
   function getRateRowsForType(assetType) {
     const dbRates = db.prepare(
       'SELECT rate, effective_from, effective_to FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
@@ -344,6 +376,14 @@ module.exports = function (db) {
       throw new Error(`No interest rates found in database for ${assetType}. Please add rates in interest_rates table.`);
     }
     return dbRates;
+  }
+
+  function getInterestInvestment(invId) {
+    const invCols = new Set(db.prepare("PRAGMA table_info(investments)").all().map(c => c.name));
+    const openingBalanceExpr = invCols.has('opening_balance')
+      ? 'opening_balance'
+      : '0 AS opening_balance';
+    return db.prepare(`SELECT id, name, asset_type, ${openingBalanceExpr} FROM investments WHERE id = ?`).get(invId);
   }
 
   function getInterestPreview(inv, queryParams) {
@@ -355,12 +395,12 @@ module.exports = function (db) {
     const portfolioArgs = Number.isFinite(requestedPortfolioId) ? [requestedPortfolioId] : [];
 
     const minDateRow = db.prepare(`
-      SELECT MIN(transaction_date) AS d
+      SELECT MIN(date(transaction_date)) AS d
       FROM transactions
       WHERE investment_id = ?${portfolioFilter}
     `).get(inv.id, ...portfolioArgs);
     const maxDateRow = db.prepare(`
-      SELECT MAX(transaction_date) AS d
+      SELECT MAX(date(transaction_date)) AS d
       FROM transactions
       WHERE investment_id = ?${portfolioFilter}
     `).get(inv.id, ...portfolioArgs);
@@ -369,27 +409,84 @@ module.exports = function (db) {
       throw new Error('No transactions found for this investment.');
     }
 
-    const fromDate = queryParams.from_date || minDateRow.d;
-    const toDate = queryParams.to_date || maxDateRow.d;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
+    const fromDate = normalizeDateOnly(queryParams.from_date) || normalizeDateOnly(minDateRow.d);
+    const toDate = normalizeDateOnly(queryParams.to_date) || normalizeDateOnly(maxDateRow.d);
+    if (!fromDate || !toDate || !/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
       throw new Error('from_date and to_date must be YYYY-MM-DD');
     }
 
     const contributionMonthShift = queryParams.contribution_month_shift != null
       ? parseInt(queryParams.contribution_month_shift, 10)
       : 0;
+    const defaultMonthlyRoundingDecimals = (inv.asset_type === 'SSY' || inv.asset_type === 'PPF') ? 0 : 2;
     const monthlyRoundingDecimals = queryParams.monthly_rounding_decimals != null
       ? parseInt(queryParams.monthly_rounding_decimals, 10)
-      : 2;
+      : defaultMonthlyRoundingDecimals;
     const ignoreExistingInterest = queryParams.ignore_existing_interest !== 'false';
     const includeTransferTransactions = parseBool(queryParams.include_transfer_transactions, false);
 
     const txns = db.prepare(`
-      SELECT id, transaction_date, transaction_type, amount, portfolio_id
+      SELECT id, date(transaction_date) AS transaction_date, transaction_type, amount, portfolio_id
       FROM transactions
       WHERE investment_id = ?${portfolioFilter}
       ORDER BY transaction_date, id
     `).all(inv.id, ...portfolioArgs);
+
+    const existingInterestRows = db.prepare(`
+      SELECT id, transaction_date, transaction_type, amount, notes, portfolio_id
+      FROM transactions
+      WHERE investment_id = ?
+        AND transaction_type IN ('INTEREST', 'RECONCILE')
+        AND date(transaction_date) >= ?
+        AND date(transaction_date) <= ?${portfolioFilter}
+      ORDER BY transaction_date ASC, id ASC
+    `).all(inv.id, fromDate, toDate, ...portfolioArgs);
+
+    const existingByDate = new Map();
+    const aggregateReconcileWithInterest = inv.asset_type === 'SSY' || inv.asset_type === 'PPF';
+    for (const r of existingInterestRows) {
+      // Always fetch INTEREST rows; fetch RECONCILE only if we need to aggregate with INTEREST internally
+      if (r.transaction_type !== 'INTEREST' && !aggregateReconcileWithInterest) {
+        continue;
+      }
+      // Normalize transaction_date to YYYY-MM-DD format (handle both with and without time component)
+      const normalizedDate = r.transaction_date.split(' ')[0];
+      if (!existingByDate.has(normalizedDate)) {
+        existingByDate.set(normalizedDate, {
+          rows: [],
+          interest_rows: [],        // Track INTEREST rows separately for display filtering
+          reconcile_rows: [],       // Track RECONCILE rows separately
+          total_amount: 0,          // For carry-forward: INTEREST + RECONCILE
+          interest_only_amount: 0,  // For display comparison: INTEREST-only
+          primary_interest_id: null,
+          portfolio_id: r.portfolio_id,
+        });
+      }
+      const agg = existingByDate.get(normalizedDate);
+      agg.rows.push(r);
+      
+      if (r.transaction_type === 'INTEREST') {
+        agg.interest_rows.push(r);
+        agg.interest_only_amount = Number(agg.interest_only_amount || 0) + Number(r.amount || 0);
+        if (agg.primary_interest_id == null) {
+          agg.primary_interest_id = r.id;
+        }
+      } else if (r.transaction_type === 'RECONCILE') {
+        agg.reconcile_rows.push(r);
+      }
+      
+      // total_amount = INTEREST + RECONCILE (for carry-forward accuracy)
+      agg.total_amount = Number(agg.total_amount || 0) + Number(r.amount || 0);
+    }
+
+    const yearEndCreditOverrides = {};
+    if (inv.asset_type === 'SSY' && ignoreExistingInterest) {
+      for (const [dateKey, agg] of existingByDate.entries()) {
+        if (/^\d{4}-03-31$/.test(dateKey)) {
+          yearEndCreditOverrides[dateKey] = Math.round(Number(agg.total_amount || 0));
+        }
+      }
+    }
 
     const rateRows = getRateRowsForType(inv.asset_type);
 
@@ -407,22 +504,10 @@ module.exports = function (db) {
       monthlyRoundingDecimals,
       ignoreExistingInterest,
       includeTransferTransactions,
+      interestBaseMethod: inv.asset_type === 'SSY' ? 'month_end_balance' : 'min_balance_between_5th_and_month_end',
+      annualRounding: inv.asset_type === 'SSY' || inv.asset_type === 'PPF',
+      yearEndCreditOverrides,
     });
-
-    const existingInterestRows = db.prepare(`
-      SELECT id, transaction_date, amount, notes, portfolio_id
-      FROM transactions
-      WHERE investment_id = ?
-        AND transaction_type = 'INTEREST'
-        AND transaction_date >= ?
-        AND transaction_date <= ?${portfolioFilter}
-      ORDER BY transaction_date ASC, id ASC
-    `).all(inv.id, fromDate, toDate, ...portfolioArgs);
-
-    const existingByDate = new Map();
-    for (const r of existingInterestRows) {
-      if (!existingByDate.has(r.transaction_date)) existingByDate.set(r.transaction_date, r);
-    }
 
     const proposedEntries = preview.annualRows
       .map((row) => {
@@ -430,19 +515,40 @@ module.exports = function (db) {
         if (!creditDate || creditDate < fromDate || creditDate > toDate) return null;
 
         const existing = existingByDate.get(creditDate) || null;
-        const amount = Math.round(Number(row.interest || 0) * 100) / 100;
+        const amount = (inv.asset_type === 'SSY' || inv.asset_type === 'PPF')
+          ? Math.round(Number(row.interest || 0))
+          : Math.round(Number(row.interest || 0) * 100) / 100;
         if (amount <= 0) return null;
 
-        const sameAmount = existing && Math.abs(Number(existing.amount || 0) - amount) < 0.005;
+        // CRITICAL: Compare against INTEREST-only amount, not aggregate (INTEREST + RECONCILE).
+        // This ensures Interest Update Preview only shows mismatched INTEREST entries.
+        // RECONCILE rows are used internally for carry-forward but never shown in the preview.
+        const hasInterestEntry = existing && existing.interest_rows.length > 0;
+        
+        // If only RECONCILE exists (no INTEREST), don't show in preview
+        if (existing && !hasInterestEntry) {
+          return null;
+        }
+
+        // Compare calculated amount against INTEREST-only amount (not aggregate with RECONCILE)
+        const comparisonAmount = existing ? Number(existing.interest_only_amount || 0) : 0;
+        const sameAmount = existing && Math.abs(comparisonAmount - amount) < 0.005;
         const action = existing ? (sameAmount ? 'unchanged' : 'update') : 'insert';
 
         return {
           fy: row.fy,
           date: creditDate,
           amount,
-          existing_id: existing?.id || null,
-          existing_amount: existing ? Number(existing.amount) : null,
-          existing_notes: existing?.notes || null,
+          existing_id: existing?.primary_interest_id || null,
+          existing_date: existing?.interest_rows?.[0]?.transaction_date
+            ? normalizeTransactionDate(existing.interest_rows[0].transaction_date)
+            : null,
+          existing_amount: existing ? Number(existing.interest_only_amount) : null,
+          existing_notes: existing?.rows?.map((x) => x.notes).filter(Boolean).join(' | ') || null,
+          existing_row_count: existing?.rows?.length || 0,
+          interest_row_count: existing?.interest_rows?.length || 0,
+          reconcile_row_count: existing?.reconcile_rows?.length || 0,
+          has_existing_entries: !!existing,
           portfolio_id: existing?.portfolio_id || requestedPortfolioId || null,
           action,
         };
@@ -480,7 +586,7 @@ module.exports = function (db) {
         return res.status(400).json({ error: 'Invalid investment id' });
       }
 
-      const inv = db.prepare('SELECT id, name, asset_type, opening_balance FROM investments WHERE id = ?').get(invId);
+      const inv = getInterestInvestment(invId);
       if (!inv) return res.status(404).json({ error: 'Investment not found' });
       if (!['PF', 'PPF', 'SSY'].includes(inv.asset_type)) {
         return res.status(400).json({ error: 'Interest preview is supported only for PF, PPF, and SSY investments.' });
@@ -501,7 +607,7 @@ module.exports = function (db) {
         return res.status(400).json({ error: 'Invalid investment id' });
       }
 
-      const inv = db.prepare('SELECT id, name, asset_type, opening_balance FROM investments WHERE id = ?').get(invId);
+      const inv = getInterestInvestment(invId);
       if (!inv) return res.status(404).json({ error: 'Investment not found' });
       if (inv.asset_type !== 'PF') {
         return res.status(400).json({ error: 'EPFO preview is supported only for PF investments.' });
@@ -519,7 +625,7 @@ module.exports = function (db) {
 
       const checkpointTransferIn = db.prepare(
         "SELECT ROUND(COALESCE(SUM(amount),0),2) AS amt FROM transactions " +
-        "WHERE investment_id = ? AND transaction_type = 'TRANSFER_IN' AND transaction_date = ?"
+        "WHERE investment_id = ? AND transaction_type = 'TRANSFER_IN' AND date(transaction_date) = ?"
       ).get(invId, toDate).amt;
 
       const opening = Number(inv.opening_balance || 0);
@@ -550,7 +656,7 @@ module.exports = function (db) {
         return res.status(400).json({ error: 'Invalid investment id' });
       }
 
-      const inv = db.prepare('SELECT id, name, asset_type, opening_balance FROM investments WHERE id = ?').get(invId);
+      const inv = getInterestInvestment(invId);
       if (!inv) return res.status(404).json({ error: 'Investment not found' });
       if (!['PF', 'PPF', 'SSY'].includes(inv.asset_type)) {
         return res.status(400).json({ error: 'Interest apply is supported only for PF, PPF, and SSY investments.' });
@@ -564,6 +670,14 @@ module.exports = function (db) {
 
       const replaceExisting = parseBool(req.body?.replace_existing, false);
       const dryRun = parseBool(req.body?.dry_run, false);
+
+      const selectedEntries = Array.isArray(req.body?.selected_entries)
+        ? req.body.selected_entries
+        : null;
+      const buildEntryKey = (e) => `${String(e.fy || '')}|${String(e.date || '')}|${(Math.round(Number(e.amount || 0) * 100) / 100).toFixed(2)}`;
+      const selectedEntryKeys = selectedEntries
+        ? new Set(selectedEntries.map(buildEntryKey))
+        : null;
 
       const explicitPortfolioId = req.body?.portfolio_id != null
         ? parseInt(req.body.portfolio_id, 10)
@@ -589,6 +703,11 @@ module.exports = function (db) {
       const updateStmt = db.prepare(
         "UPDATE transactions SET amount = ?, notes = ? WHERE id = ?"
       );
+      // CRITICAL: Only delete INTEREST rows, not RECONCILE.
+      // RECONCILE rows are permanent anchors for carry-forward calculations and must be preserved.
+      const replaceDayEntriesStmt = db.prepare(
+        "DELETE FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ? AND transaction_type = 'INTEREST'"
+      );
 
       let inserted = 0;
       let updated = 0;
@@ -599,29 +718,51 @@ module.exports = function (db) {
         for (const entry of previewResult.proposed_entries) {
           const note = `Auto interest update (${inv.asset_type} model) ${entry.fy}`;
 
+          if (selectedEntryKeys && !selectedEntryKeys.has(buildEntryKey(entry))) {
+            skipped += 1;
+            appliedEntries.push({ ...entry, result: 'skipped_not_selected' });
+            continue;
+          }
+
           if (entry.action === 'unchanged') {
             skipped += 1;
             appliedEntries.push({ ...entry, result: 'skipped_unchanged' });
             continue;
           }
 
-          if (entry.existing_id) {
+          if (entry.has_existing_entries) {
             if (!replaceExisting) {
               skipped += 1;
               appliedEntries.push({ ...entry, result: 'skipped_existing' });
               continue;
             }
-            if (!dryRun) updateStmt.run(entry.amount, note, entry.existing_id);
+            if (!dryRun) {
+              // For SSY: if multiple INTEREST rows or RECONCILE exists alongside INTEREST,
+              // delete all INTEREST rows (only) and insert fresh INTEREST.
+              // RECONCILE rows are preserved as permanent anchors.
+              const shouldReplaceAllDateRows = inv.asset_type === 'SSY' 
+                && (entry.interest_row_count > 1 || entry.reconcile_row_count > 0 || !entry.existing_id);
+              if (shouldReplaceAllDateRows) {
+                replaceDayEntriesStmt.run(inv.id, targetPortfolioId, normalizeTransactionDate(entry.date));
+                insertStmt.run(inv.id, targetPortfolioId, normalizeTransactionDate(entry.date), entry.amount, note);
+              } else {
+                updateStmt.run(entry.amount, note, entry.existing_id);
+              }
+            }
             updated += 1;
             appliedEntries.push({ ...entry, result: dryRun ? 'would_update' : 'updated' });
             continue;
           }
 
-          if (!dryRun) insertStmt.run(inv.id, targetPortfolioId, entry.date, entry.amount, note);
+          if (!dryRun) insertStmt.run(inv.id, targetPortfolioId, normalizeTransactionDate(entry.date), entry.amount, note);
           inserted += 1;
           appliedEntries.push({ ...entry, result: dryRun ? 'would_insert' : 'inserted' });
         }
       });
+
+      if (selectedEntryKeys && selectedEntryKeys.size === 0) {
+        return res.status(400).json({ error: 'No preview entries selected to apply.' });
+      }
 
       runApply();
 

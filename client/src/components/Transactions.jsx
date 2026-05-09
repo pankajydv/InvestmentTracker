@@ -6,7 +6,7 @@ import { formatNumber, formatDate, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '
 import { usePortfolio } from '../context/PortfolioContext';
 
 const TRANSACTION_TYPES_DEFAULT = [
-  'BUY', 'SELL', 'DIVIDEND', 'INTEREST', 'BONUS', 'IPO', 'AMC', 'TRANSFER',
+  'BUY', 'SELL', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'BONUS', 'IPO', 'AMC', 'TRANSFER',
 ];
 
 // User-action types that can be edited/deleted (not corporate actions)
@@ -16,7 +16,7 @@ const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN',
 const UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES'];
 const DEBT_LIKE_TYPES = new Set(['PPF', 'SSY', 'PF']);
 
-const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY', EPS_CONTRIBUTION: 'EPS', PF_CONTRIBUTION: 'CONTRIBUTION' };
+const TYPE_LABELS = { EMPLOYER_CONTRIBUTION: 'EMPLOYER', VOLUNTARY_CONTRIBUTION: 'VOLUNTARY', EPS_CONTRIBUTION: 'EPS', PF_CONTRIBUTION: 'CONTRIBUTION', RECONCILE: 'RECONCILE' };
 const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
 
 function txnSortKey(t) { return CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1; }
@@ -96,6 +96,7 @@ const TYPE_BADGE = {
   SPLIT: 'badge-split',
   DIVIDEND: 'badge-dividend',
   INTEREST: 'badge-interest',
+  RECONCILE: 'badge-interest',
   MERGER: 'badge-merger',
   CONSOLIDATION: 'badge-merger',
   SELL: 'badge-sell',

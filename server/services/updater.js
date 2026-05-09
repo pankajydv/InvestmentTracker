@@ -44,6 +44,22 @@ async function updateAllPrices(db, options = {}) {
   // Skip investments excluded from tracking (derived/synthetic)
   investments = investments.filter(i => i.exclude_from_tracking !== 1);
 
+  // Skip fully-sold investments (net units ≤ 0). Balance-based types (PPF/SSY/PF/NPS)
+  // don't use units, so they are always included.
+  const BALANCE_BASED_TYPES = new Set(['PPF', 'SSY', 'PF', 'NPS']);
+  const openInvestmentIds = new Set(
+    db.prepare(`
+      SELECT investment_id FROM transactions
+      GROUP BY investment_id
+      HAVING SUM(CASE
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+        ELSE 0
+      END) > 0.0001
+    `).all().map(r => r.investment_id)
+  );
+  investments = investments.filter(i => BALANCE_BASED_TYPES.has(i.asset_type) || openInvestmentIds.has(i.id));
+
   // Auto-resolve missing AMFI codes for mutual funds using ISIN (single download)
   const mfsWithoutAmfi = investments.filter(i => i.asset_type === 'MUTUAL_FUND' && !i.amfi_code && i.isin_code);
   if (mfsWithoutAmfi.length > 0) {

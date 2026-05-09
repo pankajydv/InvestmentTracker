@@ -6,7 +6,7 @@ const CASH_OUTFLOW_TYPES = new Set([
 ]);
 
 const CASH_INFLOW_TYPES = new Set([
-  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST'
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE'
 ]);
 
 function xnpv(rate, flows, baseDate) {

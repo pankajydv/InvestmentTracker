@@ -2,6 +2,29 @@ const express = require('express');
 const router = express.Router();
 const { fetchHistoricalUSDToINR, fetchUSDToINR } = require('../services/priceService');
 
+/**
+ * Normalize transaction_date to YYYY-MM-DD format (no time component)
+ * Handles inputs like "2016-03-31", "2016-03-31 00:00:00", or Date objects
+ */
+function normalizeTransactionDate(dateInput) {
+  if (!dateInput) return null;
+  
+  // Handle Date objects
+  if (dateInput instanceof Date) {
+    return dateInput.toISOString().split('T')[0];
+  }
+  
+  // Convert to string and extract date part (handles both space and ISO T separators)
+  const dateStr = String(dateInput).split(/[ T]/)[0].trim();
+  
+  // Validate YYYY-MM-DD format
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+  
+  // Verify it's a valid date
+  const d = new Date(`${dateStr}T00:00:00.000Z`);
+  return Number.isNaN(d.getTime()) ? null : dateStr;
+}
+
 // PF transaction types that get merged into a single contribution row per date
 const PF_GROUPABLE_TYPES = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'EPS_CONTRIBUTION']);
 
@@ -105,11 +128,16 @@ module.exports = function (db) {
     const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(investment_id);
     if (!inv) return res.status(404).json({ error: 'Investment not found' });
 
+    const normalizedTransactionDate = normalizeTransactionDate(transaction_date);
+    if (!normalizedTransactionDate) {
+      return res.status(400).json({ error: 'transaction_date must be a valid date in YYYY-MM-DD format' });
+    }
+
     // Auto-fetch RBI rate for USD investments if not provided
     let resolvedRate = exchange_rate_used || null;
     if (inv.currency === 'USD' && !resolvedRate) {
       try {
-        resolvedRate = await fetchHistoricalUSDToINR(transaction_date);
+        resolvedRate = await fetchHistoricalUSDToINR(normalizedTransactionDate);
       } catch (_) {
         resolvedRate = null;
       }
@@ -118,7 +146,7 @@ module.exports = function (db) {
     const result = db.prepare(`
       INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(investment_id, portfolio_id, transaction_type, transaction_date,
+    `).run(investment_id, portfolio_id, transaction_type, normalizedTransactionDate,
       units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null,
       resolvedRate, usd_amount || null, fmv_per_unit || null, gross_units || null, tax_withheld_units || null);
 

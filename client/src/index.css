@@ -59,6 +59,7 @@ tr:hover .row-actions {
 .badge-withdrawal { background-color: #fee2e2 !important; color: #b91c1c !important; }
 .badge-split { background-color: #dbeafe !important; color: #1d4ed8 !important; }
 .badge-interest { background-color: #dbeafe !important; color: #1d4ed8 !important; }
+.badge-reconcile { background-color: #cffafe !important; color: #155e75 !important; }
 .badge-merger { background-color: #f3e8ff !important; color: #7c3aed !important; }
 .badge-amc { background-color: #fef3c7 !important; color: #b45309 !important; }
 .badge-charges { background-color: #fef3c7 !important; color: #b45309 !important; }

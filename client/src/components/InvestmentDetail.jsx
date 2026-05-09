@@ -18,6 +18,7 @@ const TYPE_LABELS = {
   ESPP_PURCHASE: 'ESPP Purchase',
   EPS_CONTRIBUTION: 'EPS',
   INTEREST: 'Interest',
+  RECONCILE: 'Reconcile',
   WITHDRAWAL: 'Withdrawal'
 };
 
@@ -26,7 +27,7 @@ const CASH_OUTFLOW_TYPES = new Set([
 ]);
 
 const CASH_INFLOW_TYPES = new Set([
-  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST'
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE'
 ]);
 
 function getTxnTypesForInvestment(investment) {
@@ -37,7 +38,7 @@ function getTxnTypesForInvestment(investment) {
   const isSGBType = investment.asset_type === 'SGB';
   const isForeignUsdType = investment.asset_type === 'FOREIGN_STOCK' && investment.currency === 'USD';
 
-  if (isPPFType) return ['DEPOSIT', 'WITHDRAWAL', 'INTEREST'];
+  if (isPPFType) return ['DEPOSIT', 'WITHDRAWAL', 'INTEREST', 'RECONCILE'];
   if (isBondType || isSGBType) return ['BUY', 'SELL', 'INTEREST'];
   if (isForeignUsdType) return ['VEST', 'ESPP_CONTRIBUTION', 'ESPP_PURCHASE', 'BUY', 'SELL', 'DIVIDEND'];
   return ['BUY', 'SELL', 'DIVIDEND'];
@@ -226,6 +227,11 @@ export default function InvestmentDetail() {
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [deleteText, setDeleteText] = useState('');
   const [interestUpdating, setInterestUpdating] = useState(false);
+  const [showInterestPreviewModal, setShowInterestPreviewModal] = useState(false);
+  const [interestPreviewRows, setInterestPreviewRows] = useState([]);
+  const [interestPreviewWindow, setInterestPreviewWindow] = useState(null);
+  const [interestHiddenExistingCount, setInterestHiddenExistingCount] = useState(0);
+  const [selectedInterestRows, setSelectedInterestRows] = useState({});
   const [showEsppModal, setShowEsppModal] = useState(false);
   const [esppPayslipFiles, setEsppPayslipFiles] = useState([]);
   const [esppContributionLoading, setEsppContributionLoading] = useState(false);
@@ -310,29 +316,47 @@ export default function InvestmentDetail() {
       });
 
       const entries = preview.proposed_entries || [];
-      const inserts = entries.filter(e => e.action === 'insert').length;
-      const updates = entries.filter(e => e.action === 'update').length;
+      // Show both INSERT (new) and UPDATE (changed amount/date) entries
+      // Hide only UNCHANGED entries (perfect match on date and amount)
+      const entriesToShow = entries.filter(e => e.action !== 'unchanged');
+      const hiddenUnchangedCount = entries.length - entriesToShow.length;
 
-      if (!entries.length) {
-        alert('No interest entries to post for the selected period.');
+      if (!entriesToShow.length) {
+        alert('No missing or updated interest entries for the selected period.');
         return;
       }
 
-      const proceed = window.confirm(
-        `Interest preview complete. ${inserts} new and ${updates} existing FY entries found.\n\n` +
-        'Click OK to continue with interest update.'
-      );
-      if (!proceed) return;
+      const initialSelection = {};
+      entriesToShow.forEach((_, idx) => { initialSelection[idx] = true; });
 
-      const replaceExisting = updates > 0
-        ? window.confirm('Replace existing INTEREST transactions on FY-end dates? Click Cancel to keep existing rows and only insert missing ones.')
-        : false;
+      setInterestPreviewRows(entriesToShow);
+      setInterestHiddenExistingCount(hiddenUnchangedCount);
+      setInterestPreviewWindow(preview.window || null);
+      setSelectedInterestRows(initialSelection);
+      setShowInterestPreviewModal(true);
+    } catch (e) {
+      alert('Interest update failed: ' + e.message);
+    } finally {
+      setInterestUpdating(false);
+    }
+  };
 
+  const handleApplySelectedInterestRows = async () => {
+    const selected = interestPreviewRows.filter((_, idx) => !!selectedInterestRows[idx]);
+    if (!selected.length) {
+      alert('Select at least one entry to insert or update.');
+      return;
+    }
+
+    try {
+      setInterestUpdating(true);
       const applied = await applyInvestmentInterestUpdate(id, {
         portfolio_id: selectedId || undefined,
-        replace_existing: replaceExisting,
+        replace_existing: true,
+        selected_entries: selected.map((e) => ({ fy: e.fy, date: e.date, amount: e.amount })),
       });
 
+      setShowInterestPreviewModal(false);
       alert(`Interest update completed. Inserted: ${applied.summary.inserted}, Updated: ${applied.summary.updated}, Skipped: ${applied.summary.skipped}`);
       await loadData();
     } catch (e) {
@@ -421,6 +445,8 @@ export default function InvestmentDetail() {
   if (!data) return <div className="text-danger">Investment not found</div>;
 
   const isPPF = data.asset_type === 'PPF' || data.asset_type === 'SSY' || data.asset_type === 'PF';
+  const isSSY = data.asset_type === 'SSY';
+  const isPPFOnly = data.asset_type === 'PPF';
   const isEpsInvestment = isPPF && /eps/i.test(String(data.name || ''));
   const isBond = data.asset_type === 'BOND';
   const isSGB = data.asset_type === 'SGB';
@@ -654,9 +680,11 @@ export default function InvestmentDetail() {
     !isPPF ? { label: 'Total Units', value: formatNumber(data.totalUnits, 4) } : null,
     isPPF && data.account_number ? { label: 'Account', value: data.account_number } : null,
     !isPPF && data.latestValue ? { label: 'Last Price', value: `₹${formatNumber(data.latestValue.price_per_unit, 2)}` } : null,
-    data.ticker_symbol ? { label: 'Ticker', value: data.ticker_symbol } : null,
+    !isPPF && data.ticker_symbol ? { label: 'Ticker', value: data.ticker_symbol } : null,
     data.category ? { label: 'Category', value: data.category } : null,
     isPPF && data.interest_rate ? { label: 'Interest', value: `${data.interest_rate}% p.a.` } : null,
+    isSSY ? { label: 'Interest Calc', value: 'Month-end balance x rate/1200; rounded at FY end' } : null,
+    isPPFOnly ? { label: 'Interest Calc', value: 'Min balance (5th-month-end) x rate/1200; rounded at FY end' } : null,
     isPPF && data.maturity_date ? { label: 'Maturity', value: formatDate(data.maturity_date) } : null,
     isPPF && data.opening_balance > 0 ? { label: 'Opening Balance', value: `₹${formatNumber(data.opening_balance, 2)}` } : null,
     isSGB && sgbDetails && sgbDetails.coupon_rate ? { label: 'Coupon Rate', value: `${sgbDetails.coupon_rate}% p.a.` } : null,
@@ -989,7 +1017,7 @@ export default function InvestmentDetail() {
                   const balanceMap = {};
                   const creditTypes = isEpsInvestment
                     ? ['EPS_CONTRIBUTION', 'INTEREST', 'TRANSFER_IN']
-                    : ['DEPOSIT', 'INTEREST', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'TRANSFER_IN'];
+                    : ['DEPOSIT', 'INTEREST', 'RECONCILE', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'TRANSFER_IN'];
                   let unitBal = 0;
                   let amtBal = data.opening_balance || 0;
                   for (const txn of sorted) {
@@ -1265,6 +1293,110 @@ export default function InvestmentDetail() {
           <Button variant="secondary" size="sm" onClick={() => setEditTxn(null)}>Cancel</Button>
           <Button variant="primary" size="sm" onClick={handleEditSave} disabled={saving || !hasChanges}>
             {saving ? 'Saving...' : hasChanges ? 'Save Changes' : 'No Changes'}
+          </Button>
+        </Modal.Footer>
+      </Modal>
+
+      <Modal show={showInterestPreviewModal} onHide={() => setShowInterestPreviewModal(false)} centered size="lg">
+        <Modal.Header closeButton>
+          <Modal.Title className="h6">Interest Update Preview</Modal.Title>
+        </Modal.Header>
+        <Modal.Body>
+          <div className="small text-muted mb-2">
+            New and updated FY-end interest entries are shown below. Select exactly what you want to insert or update.
+          </div>
+          {interestPreviewWindow ? (
+            <div className="small mb-2">
+              <strong>Window:</strong> {formatDate(interestPreviewWindow.from_date)} to {formatDate(interestPreviewWindow.to_date)}
+            </div>
+          ) : null}
+          {interestHiddenExistingCount > 0 ? (
+            <div className="small mb-2 text-muted">
+              {interestHiddenExistingCount} unchanged FY entries (matching both date and amount) are hidden from this list.
+            </div>
+          ) : null}
+          <div className="responsive-table" style={{ maxHeight: 280, overflowY: 'auto' }}>
+            <Table size="sm" hover className="mb-0 small">
+              <thead className="table-light">
+                <tr>
+                  <th>
+                    <Form.Check
+                      type="checkbox"
+                      checked={interestPreviewRows.length > 0 && interestPreviewRows.every((_, idx) => !!selectedInterestRows[idx])}
+                      onChange={(e) => {
+                        const next = {};
+                        if (e.target.checked) interestPreviewRows.forEach((_, idx) => { next[idx] = true; });
+                        setSelectedInterestRows(next);
+                      }}
+                    />
+                  </th>
+                  <th>FY</th>
+                  <th>Date</th>
+                  <th className="text-end">Interest Amount</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {interestPreviewRows.map((row, idx) => (
+                  <tr key={`${row.fy}-${row.date}-${idx}`} className={!selectedInterestRows[idx] ? 'text-muted' : ''}>
+                    <td>
+                      <Form.Check
+                        type="checkbox"
+                        checked={!!selectedInterestRows[idx]}
+                        onChange={(e) => setSelectedInterestRows({ ...selectedInterestRows, [idx]: e.target.checked })}
+                      />
+                    </td>
+                    <td>{row.fy}</td>
+                    <td>
+                      {row.action === 'update' && row.existing_id && row.date !== row.existing_date ? (
+                        <div style={{ fontSize: '0.9em' }}>
+                          <div style={{ textDecoration: 'line-through', color: '#6c757d' }}>
+                            {formatDate(row.existing_date)}
+                          </div>
+                          <div style={{ color: '#28a745', fontWeight: '500' }}>
+                            {formatDate(row.date)}
+                          </div>
+                        </div>
+                      ) : (
+                        formatDate(row.date)
+                      )}
+                    </td>
+                    <td className="text-end">
+                      {row.action === 'update' && row.existing_id && Math.abs(Number(row.existing_amount || 0) - Number(row.amount || 0)) >= 0.005 ? (
+                        <div style={{ fontSize: '0.9em' }}>
+                          <div style={{ textDecoration: 'line-through', color: '#6c757d' }}>
+                            ₹{formatNumber(row.existing_amount, 2)}
+                          </div>
+                          <div style={{ color: '#28a745', fontWeight: '500' }}>
+                            ₹{formatNumber(row.amount, 2)}
+                          </div>
+                        </div>
+                      ) : (
+                        `₹${formatNumber(row.amount, 2)}`
+                      )}
+                    </td>
+                    <td>
+                      {row.action === 'insert' ? (
+                        <Badge bg="success">New</Badge>
+                      ) : row.action === 'update' ? (
+                        <Badge bg="info">Update</Badge>
+                      ) : (
+                        <Badge bg="secondary">Unchanged</Badge>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+          </div>
+          <div className="small mt-2">
+            Selected: <strong>{interestPreviewRows.filter((_, idx) => !!selectedInterestRows[idx]).length}</strong> / {interestPreviewRows.length}
+          </div>
+        </Modal.Body>
+        <Modal.Footer>
+          <Button variant="secondary" size="sm" onClick={() => setShowInterestPreviewModal(false)}>Cancel</Button>
+          <Button variant="primary" size="sm" onClick={handleApplySelectedInterestRows} disabled={interestUpdating}>
+            {interestUpdating ? 'Applying...' : 'Apply Selected Entries'}
           </Button>
         </Modal.Footer>
       </Modal>

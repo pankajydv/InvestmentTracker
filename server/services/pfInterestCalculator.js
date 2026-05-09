@@ -222,6 +222,9 @@ function calculateSmallSavingsInterestPreview({
   monthlyRoundingDecimals = 2,
   ignoreExistingInterest = true,
   includeTransferTransactions = false,
+  interestBaseMethod = 'min_balance_between_5th_and_month_end',
+  annualRounding = false,
+  yearEndCreditOverrides = null,
 }) {
   const creditTypes = new Set(['DEPOSIT', 'BUY']);
   const debitTypes = new Set(['WITHDRAWAL']);
@@ -247,6 +250,7 @@ function calculateSmallSavingsInterestPreview({
     let signed = 0;
     if (creditTypes.has(type)) signed = Number(t.amount || 0);
     else if (debitTypes.has(type)) signed = -Math.abs(Number(t.amount || 0));
+    else if (type === 'RECONCILE' && !ignoreExistingInterest) signed = Number(t.amount || 0);
     else if (type === 'INTEREST' && !ignoreExistingInterest) signed = Number(t.amount || 0);
     else continue;
 
@@ -254,7 +258,11 @@ function calculateSmallSavingsInterestPreview({
     if (ym < startYm || ym > endYm) continue;
 
     if (!postingsByMonth.has(ym)) postingsByMonth.set(ym, []);
-    postingsByMonth.get(ym).push({ date: dateStr, amount: signed });
+    postingsByMonth.get(ym).push({
+      date: dateStr,
+      amount: signed,
+      isReconcile: type === 'RECONCILE',
+    });
   }
 
   for (const arr of postingsByMonth.values()) {
@@ -275,6 +283,8 @@ function calculateSmallSavingsInterestPreview({
     const monthEnd = fmtDate(yy, mm, lastDayOfMonth(yy, mm));
     const fifthDate = fmtDate(yy, mm, 5);
     const monthPostings = postingsByMonth.get(ym) || [];
+    const regularPostings = monthPostings.filter((p) => !p.isReconcile);
+    const reconcilePostings = monthPostings.filter((p) => p.isReconcile);
 
     if (currentFy == null) currentFy = fy;
     if (fy !== currentFy) {
@@ -292,7 +302,7 @@ function calculateSmallSavingsInterestPreview({
     // Apply postings up to and including the 5th to get base at close of 5th.
     let baseAtFifthClose = balance;
     let monthContribution = 0;
-    for (const p of monthPostings) {
+    for (const p of regularPostings) {
       if (p.date <= fifthDate) {
         baseAtFifthClose = roundTo(baseAtFifthClose + p.amount, 2);
       }
@@ -304,7 +314,7 @@ function calculateSmallSavingsInterestPreview({
     // Minimum balance from close of 5th to month-end.
     let minBalance = baseAtFifthClose;
     let rolling = baseAtFifthClose;
-    for (const p of monthPostings) {
+    for (const p of regularPostings) {
       if (p.date > fifthDate) {
         rolling = roundTo(rolling + p.amount, 2);
         if (rolling < minBalance) minBalance = rolling;
@@ -313,29 +323,43 @@ function calculateSmallSavingsInterestPreview({
 
     // Month-end running balance (all postings in month).
     let endBalance = balance;
-    for (const p of monthPostings) {
+    for (const p of regularPostings) {
       endBalance = roundTo(endBalance + p.amount, 2);
     }
+    const reconcileDelta = roundTo(reconcilePostings.reduce((s, p) => s + p.amount, 0), 2);
 
     const rate = getRateForDate(parsedRates, monthEnd);
     if (rate == null) {
       throw new Error(`No interest rate configured for month ${ym}.`);
     }
 
-    const eligibleBalance = roundTo(Math.max(minBalance, 0), 2);
-    const monthInterest = roundTo(eligibleBalance * (Number(rate) / 1200), monthlyRoundingDecimals);
-    runningInterest = roundTo(runningInterest + monthInterest, 2);
+    const eligibleBase = interestBaseMethod === 'month_end_balance' ? endBalance : minBalance;
+    const eligibleBalance = roundTo(Math.max(eligibleBase, 0), 2);
+    const rawMonthInterest = eligibleBalance * (Number(rate) / 1200);
+    const monthInterest = annualRounding
+      ? roundTo(rawMonthInterest, 2)
+      : roundTo(rawMonthInterest, monthlyRoundingDecimals);
+    runningInterest = annualRounding
+      ? roundTo(runningInterest + rawMonthInterest, 8)
+      : roundTo(runningInterest + monthInterest, 2);
     fyContribution = roundTo(fyContribution + monthContribution, 2);
 
-    balance = endBalance;
+    balance = roundTo(endBalance + reconcileDelta, 2);
 
     const isFyEnd = mm === 3;
     if (isFyEnd) {
-      balance = roundTo(balance + runningInterest, 2);
+      const fyEndDate = fmtDate(yy, mm, lastDayOfMonth(yy, mm));
+      const overrideInterest = yearEndCreditOverrides && Object.prototype.hasOwnProperty.call(yearEndCreditOverrides, fyEndDate)
+        ? Number(yearEndCreditOverrides[fyEndDate])
+        : null;
+      const fyInterest = overrideInterest != null
+        ? roundTo(overrideInterest, 2)
+        : (annualRounding ? Math.round(runningInterest) : roundTo(runningInterest, 2));
+      balance = roundTo(balance + fyInterest, 2);
       annualRows.push({
         fy: `FY${fy - 1}-${String(fy).slice(2)}`,
         contributions: roundTo(fyContribution, 2),
-        interest: roundTo(runningInterest, 2),
+        interest: fyInterest,
         balanceAfterInterest: roundTo(balance, 2),
       });
       currentFy = null;
@@ -375,7 +399,9 @@ function calculateSmallSavingsInterestPreview({
       monthlyRoundingDecimals,
       ignoreExistingInterest,
       includeTransferTransactions,
-      rule: 'min_balance_between_5th_and_month_end',
+      interestBaseMethod,
+      annualRounding,
+      yearEndCreditOverridesApplied: yearEndCreditOverrides ? Object.keys(yearEndCreditOverrides).length : 0,
     },
   };
 }

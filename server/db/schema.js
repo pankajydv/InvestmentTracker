@@ -116,7 +116,7 @@ function initializeDb(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       investment_id INTEGER NOT NULL,
       portfolio_id INTEGER NOT NULL, -- Owner (family member) portfolio
-      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC', 'REDEMPTION', 'ESPP_CONTRIBUTION')),
+      transaction_type TEXT NOT NULL CHECK(transaction_type IN ('BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC', 'REDEMPTION', 'ESPP_CONTRIBUTION')),
       transaction_date TEXT NOT NULL,
       units REAL,                  -- Number of units/shares bought or sold
       price_per_unit REAL,         -- Price at which transaction happened
@@ -1054,6 +1054,83 @@ function initializeDb(db) {
     recordMigration(db, sgbMigrationId, 'skipped', 'SGB already present');
   }
 
+  // Reconcile investments columns that older table-recreate migrations may have dropped.
+  // This is additive and safe to run in all environments.
+  const reconcileInvestmentColsMigrationId = '20260509-reconcile-investments-missing-columns';
+  const invColsNow = new Set(db.prepare("PRAGMA table_info(investments)").all().map(c => c.name));
+  const addedInvestmentCols = [];
+
+  if (!invColsNow.has('opening_balance')) {
+    db.exec("ALTER TABLE investments ADD COLUMN opening_balance REAL DEFAULT 0");
+    addedInvestmentCols.push('opening_balance');
+  }
+  if (!invColsNow.has('exclude_from_tracking')) {
+    db.exec("ALTER TABLE investments ADD COLUMN exclude_from_tracking INTEGER DEFAULT 0");
+    addedInvestmentCols.push('exclude_from_tracking');
+  }
+
+  if (addedInvestmentCols.length > 0) {
+    assertDbIntegrity(db, reconcileInvestmentColsMigrationId);
+    recordMigration(db, reconcileInvestmentColsMigrationId, 'applied', `Added: ${addedInvestmentCols.join(', ')}`);
+  } else if (!hasMigrationRecord(db, reconcileInvestmentColsMigrationId)) {
+    recordMigration(db, reconcileInvestmentColsMigrationId, 'skipped', 'required columns already present');
+  }
+
+  // Normalize transaction_date storage to date-only across all transaction types.
+  // Also enforce normalization for future inserts/updates via triggers.
+  const normalizeTxnDateMigrationId = '20260509-normalize-transaction-date-storage';
+  if (!hasMigrationRecord(db, normalizeTxnDateMigrationId)) {
+    if (!migrationsEnabled) {
+      throw new Error(`Pending migration ${normalizeTxnDateMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+    }
+
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        UPDATE transactions
+        SET transaction_date = date(transaction_date)
+        WHERE transaction_date IS NOT NULL
+          AND date(transaction_date) IS NOT NULL
+          AND transaction_date != date(transaction_date)
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_transactions_normalize_date_after_insert
+        AFTER INSERT ON transactions
+        FOR EACH ROW
+        WHEN NEW.transaction_date IS NOT NULL
+         AND date(NEW.transaction_date) IS NOT NULL
+         AND NEW.transaction_date != date(NEW.transaction_date)
+        BEGIN
+          UPDATE transactions
+          SET transaction_date = date(NEW.transaction_date)
+          WHERE id = NEW.id;
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_transactions_normalize_date_after_update
+        AFTER UPDATE OF transaction_date ON transactions
+        FOR EACH ROW
+        WHEN NEW.transaction_date IS NOT NULL
+         AND date(NEW.transaction_date) IS NOT NULL
+         AND NEW.transaction_date != date(NEW.transaction_date)
+        BEGIN
+          UPDATE transactions
+          SET transaction_date = date(NEW.transaction_date)
+          WHERE id = NEW.id;
+        END;
+      `);
+
+      db.exec('COMMIT');
+      assertDbIntegrity(db, normalizeTxnDateMigrationId);
+      recordMigration(db, normalizeTxnDateMigrationId, 'applied', 'normalized existing rows and added normalization triggers');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
   // ── Migration: add VEST / ESPP_PURCHASE transaction types + RSU/ESPP columns ──
   // Adds:
   //   - VEST and ESPP_PURCHASE to the transactions CHECK constraint
@@ -1327,6 +1404,125 @@ function initializeDb(db) {
     }
   } else if (!hasMigrationRecord(db, esppContributionMigrationId) && hasEsppContributionType) {
     recordMigration(db, esppContributionMigrationId, 'skipped', 'ESPP_CONTRIBUTION type already present');
+  }
+
+  // ── Migration: add RECONCILE transaction type ─────────────────────────────
+  const hasReconcileType = (() => {
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'").get();
+    return row && row.sql && row.sql.includes("'RECONCILE'");
+  })();
+  const reconcileTypeMigrationId = '20260509-add-reconcile-transaction-type';
+
+  if (!hasReconcileType && !hasMigrationRecord(db, reconcileTypeMigrationId)) {
+    if (!migrationsEnabled) {
+      throw new Error(`Pending migration ${reconcileTypeMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+    }
+
+    console.log('Migrating: adding RECONCILE transaction type...');
+    const beforeTransactions = getTableCount(db, 'transactions');
+    const backupPath = createPreMigrationBackup(db, 'add-reconcile-transaction-type');
+    if (backupPath) console.log(`Created migration backup: ${backupPath}`);
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE transactions_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          portfolio_id INTEGER NOT NULL,
+          transaction_type TEXT NOT NULL CHECK(transaction_type IN (
+            'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'RECONCILE',
+            'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
+            'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
+            'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
+            'REDEMPTION', 'EPS_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE', 'ESPP_CONTRIBUTION'
+          )),
+          transaction_date TEXT NOT NULL,
+          units REAL,
+          price_per_unit REAL,
+          amount REAL NOT NULL,
+          fees REAL DEFAULT 0,
+          broker TEXT,
+          notes TEXT,
+          locked INTEGER DEFAULT 0,
+          folio_number TEXT,
+          exchange_rate_used REAL,
+          usd_amount REAL,
+          fmv_per_unit REAL,
+          gross_units REAL,
+          tax_withheld_units REAL,
+          created_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+        )
+      `);
+
+      const existingCols = db.prepare('PRAGMA table_info(transactions)').all().map((c) => c.name);
+      const knownCols = [
+        'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
+        'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
+        'locked', 'folio_number', 'exchange_rate_used', 'usd_amount', 'fmv_per_unit',
+        'gross_units', 'tax_withheld_units', 'created_at',
+      ];
+      const colsToCopy = knownCols.filter((c) => existingCols.includes(c));
+      db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
+
+      const copiedTransactions = getTableCount(db, 'transactions_new');
+      ensureRowCountPreserved({
+        before: beforeTransactions,
+        after: copiedTransactions,
+        table: 'transactions',
+        migrationName: 'add-reconcile-transaction-type',
+      });
+
+      db.exec('DROP TABLE transactions');
+      db.exec('ALTER TABLE transactions_new RENAME TO transactions');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id)');
+
+      // Recreate date-normalization triggers because table recreation drops existing triggers.
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_transactions_normalize_date_after_insert
+        AFTER INSERT ON transactions
+        FOR EACH ROW
+        WHEN NEW.transaction_date IS NOT NULL
+         AND date(NEW.transaction_date) IS NOT NULL
+         AND NEW.transaction_date != date(NEW.transaction_date)
+        BEGIN
+          UPDATE transactions
+          SET transaction_date = date(NEW.transaction_date)
+          WHERE id = NEW.id;
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_transactions_normalize_date_after_update
+        AFTER UPDATE OF transaction_date ON transactions
+        FOR EACH ROW
+        WHEN NEW.transaction_date IS NOT NULL
+         AND date(NEW.transaction_date) IS NOT NULL
+         AND NEW.transaction_date != date(NEW.transaction_date)
+        BEGIN
+          UPDATE transactions
+          SET transaction_date = date(NEW.transaction_date)
+          WHERE id = NEW.id;
+        END;
+      `);
+
+      db.exec('COMMIT');
+      assertDbIntegrity(db, reconcileTypeMigrationId);
+      recordMigration(db, reconcileTypeMigrationId, 'applied');
+      console.log('Migration complete: RECONCILE transaction type added.');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      console.error('RECONCILE migration failed:', err);
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+  } else if (!hasMigrationRecord(db, reconcileTypeMigrationId) && hasReconcileType) {
+    recordMigration(db, reconcileTypeMigrationId, 'skipped', 'RECONCILE type already present');
   }
 }
 
