@@ -9,7 +9,7 @@
  *            transactions[] }
  *
  * Each transaction = { date, description, type, amount, balance }
- *   type: 'DEPOSIT' | 'INTEREST' | 'WITHDRAWAL'
+ *   type: 'DEPOSIT' | 'INTEREST' | 'WITHDRAWAL' | 'RECONCILE'
  */
 const { PDFParse } = require('pdf-parse');
 
@@ -45,6 +45,9 @@ function parseAmount(raw) {
  */
 function classifyTransaction(description) {
   const upper = description.toUpperCase();
+  if (upper.includes('RECONCIL')) {
+    return 'RECONCILE';
+  }
   if (upper.includes('CREDIT INTEREST') || upper.includes('INT.CAPITALISED')) {
     return 'INTEREST';
   }

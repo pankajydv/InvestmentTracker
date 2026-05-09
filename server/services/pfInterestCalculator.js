@@ -64,11 +64,13 @@ function getRateForDate(rateRows, dateStr) {
 }
 
 /**
- * EPFO-style PF interest preview.
+ * EPFO-style PF interest preview (simplified post-date-migration).
  *
+ * - Contributions are dated on the 10th of the month they belong to (no Shift+1 needed).
  * - Interest computed monthly on month-end running EPF balance.
  * - Interest is accumulated monthly and credited yearly (Mar end).
- * - EPS_CONTRIBUTION excluded from EPF corpus.
+ * - All transaction types included in running balance with appropriate signs.
+ * - RECONCILE rows always included in running balance as checkpoint adjustments.
  */
 function calculatePfInterestPreview({
   openingBalance = 0,
@@ -76,18 +78,18 @@ function calculatePfInterestPreview({
   rateRows = [],
   fromDate,
   toDate,
-  contributionMonthShift = 0,
   monthlyRoundingDecimals = 2,
   ignoreExistingInterest = true,
   includeTransferTransactions = false,
 }) {
-  const epfCreditTypes = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION']);
-  const epfDebitTypes = new Set(['WITHDRAWAL']);
-  if (includeTransferTransactions) {
-    epfCreditTypes.add('TRANSFER_IN');
-    epfDebitTypes.add('TRANSFER_OUT');
+  // Define which transaction types increase (credit) or decrease (debit) the balance
+  const creditTypes = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'TRANSFER_IN', 'INTEREST', 'RECONCILE', 'DIVIDEND', 'BONUS', 'RIGHTS', 'MERGER']);
+  const debitTypes = new Set(['WITHDRAWAL', 'TRANSFER_OUT', 'CHARGES', 'AMC', 'CONSOLIDATION']);
+  const deferredContributionTypes = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION']);
+  if (!includeTransferTransactions) {
+    debitTypes.delete('TRANSFER_OUT');
+    creditTypes.delete('TRANSFER_IN');
   }
-  const contributionTypes = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION']);
 
   const startYm = toYearMonth(fromDate);
   const endYm = toYearMonth(toDate);
@@ -98,6 +100,7 @@ function calculatePfInterestPreview({
   const parsedRates = parseRateEntries(rateRows);
 
   const postingsByMonth = new Map();
+  const deferredContributionsByMonth = new Map();
 
   for (const t of transactions) {
     const dateStr = String(t.transaction_date || '');
@@ -106,18 +109,26 @@ function calculatePfInterestPreview({
     const type = String(t.transaction_type || '');
     let signed = 0;
 
-    if (epfCreditTypes.has(type)) signed = Number(t.amount || 0);
-    else if (epfDebitTypes.has(type)) signed = -Math.abs(Number(t.amount || 0));
-    else if (type === 'INTEREST' && !ignoreExistingInterest) signed = Number(t.amount || 0);
-    else continue;
-
-    let ym = toYearMonth(dateStr);
-    if (contributionMonthShift && contributionTypes.has(type)) {
-      ym = addMonths(ym, contributionMonthShift);
+    // Include ALL transaction types with appropriate signs
+    if (type === 'INTEREST' && ignoreExistingInterest) {
+      // Skip existing INTEREST rows if ignoring them
+      continue;
+    } else if (creditTypes.has(type)) {
+      signed = Number(t.amount || 0);
+    } else if (debitTypes.has(type)) {
+      signed = -Math.abs(Number(t.amount || 0));
+    } else {
+      // Default: treat unknown transaction types as credits
+      signed = Number(t.amount || 0);
     }
+
+    const ym = toYearMonth(dateStr);
     if (ym < startYm || ym > endYm) continue;
 
     postingsByMonth.set(ym, (postingsByMonth.get(ym) || 0) + signed);
+    if (deferredContributionTypes.has(type)) {
+      deferredContributionsByMonth.set(ym, (deferredContributionsByMonth.get(ym) || 0) + signed);
+    }
   }
 
   const monthlyRows = [];
@@ -132,7 +143,8 @@ function calculatePfInterestPreview({
     const [yy, mm] = ym.split('-').map(Number);
     const fy = fiscalYearForMonth(ym);
     const monthPostings = roundTo(postingsByMonth.get(ym) || 0, 2);
-    const monthContribution = roundTo(Math.max(monthPostings, 0), 2);
+    const monthDeferredContribution = roundTo(deferredContributionsByMonth.get(ym) || 0, 2);
+    const monthContribution = roundTo(Math.max(monthDeferredContribution, 0), 2);
 
     if (currentFy == null) currentFy = fy;
     if (fy !== currentFy) {
@@ -150,22 +162,28 @@ function calculatePfInterestPreview({
     balance = roundTo(balance + monthPostings, 2);
     fyContribution = roundTo(fyContribution + monthContribution, 2);
 
-    const monthEndDate = `${yy}-${String(mm).padStart(2, '0')}-31`;
+    const monthEndDate = fmtDate(yy, mm, lastDayOfMonth(yy, mm));
     const rate = getRateForDate(parsedRates, monthEndDate);
     if (rate == null) {
       throw new Error(`No PF interest rate configured for month ${ym}.`);
     }
 
-    const monthInterest = roundTo(balance * (Number(rate) / 1200), monthlyRoundingDecimals);
-    runningInterest = roundTo(runningInterest + monthInterest, 2);
+    // EPFO-style: withdrawals/reconcile impact this month's interest base,
+    // while same-month PF contributions start earning from next month.
+    const interestBase = roundTo(balance - monthDeferredContribution, 2);
+    const rawMonthInterest = interestBase * (Number(rate) / 1200);
+    const monthInterest = roundTo(rawMonthInterest, monthlyRoundingDecimals);
+    // Keep full precision for annual PF credit and round only at FY close.
+    runningInterest += rawMonthInterest;
 
     const isFyEnd = mm === 3;
     if (isFyEnd) {
-      balance = roundTo(balance + runningInterest, 2);
+      const fyInterest = Math.round(runningInterest);
+      balance = roundTo(balance + fyInterest, 2);
       annualRows.push({
         fy: `FY${fy - 1}-${String(fy).slice(2)}`,
         contributions: roundTo(fyContribution, 2),
-        interest: roundTo(runningInterest, 2),
+        interest: fyInterest,
         balanceAfterInterest: roundTo(balance, 2),
       });
       currentFy = null;
@@ -176,17 +194,20 @@ function calculatePfInterestPreview({
     monthlyRows.push({
       month: ym,
       postingDelta: monthPostings,
+      deferredContributionDelta: monthDeferredContribution,
       rate,
+      interestBase: roundTo(interestBase, 2),
       monthInterest,
       runningBalance: roundTo(balance, 2),
     });
   }
 
   if (currentFy != null) {
+    const fyInterest = Math.round(runningInterest);
     annualRows.push({
       fy: `FY${currentFy - 1}-${String(currentFy).slice(2)}`,
       contributions: roundTo(fyContribution, 2),
-      interest: roundTo(runningInterest, 2),
+      interest: fyInterest,
       balanceAfterInterest: roundTo(balance, 2),
     });
   }
@@ -194,11 +215,10 @@ function calculatePfInterestPreview({
   return {
     openingBalance: roundTo(Number(openingBalance || 0), 2),
     closingBalance: roundTo(balance, 2),
-    totalInterest: roundTo(annualRows.reduce((s, r) => s + r.interest, 0), 2),
+    totalInterest: Math.round(annualRows.reduce((s, r) => s + Number(r.interest || 0), 0)),
     annualRows,
     monthlyRows,
     options: {
-      contributionMonthShift,
       monthlyRoundingDecimals,
       ignoreExistingInterest,
       includeTransferTransactions,

@@ -317,8 +317,9 @@ export default function InvestmentDetail() {
 
       const entries = preview.proposed_entries || [];
       // Show both INSERT (new) and UPDATE (changed amount/date) entries
-      // Hide only UNCHANGED entries (perfect match on date and amount)
-      const entriesToShow = entries.filter(e => e.action !== 'unchanged');
+      // Hide only unchanged entries that have no note attached.
+      // Noise-tolerant rows stay visible so the user can see why they were ignored.
+      const entriesToShow = entries.filter(e => e.action !== 'unchanged' || e.preview_note);
       const hiddenUnchangedCount = entries.length - entriesToShow.length;
 
       if (!entriesToShow.length) {
@@ -327,7 +328,7 @@ export default function InvestmentDetail() {
       }
 
       const initialSelection = {};
-      entriesToShow.forEach((_, idx) => { initialSelection[idx] = true; });
+      entriesToShow.forEach((entry, idx) => { initialSelection[idx] = entry.action !== 'unchanged'; });
 
       setInterestPreviewRows(entriesToShow);
       setInterestHiddenExistingCount(hiddenUnchangedCount);
@@ -447,6 +448,7 @@ export default function InvestmentDetail() {
   const isPPF = data.asset_type === 'PPF' || data.asset_type === 'SSY' || data.asset_type === 'PF';
   const isSSY = data.asset_type === 'SSY';
   const isPPFOnly = data.asset_type === 'PPF';
+  const interestPreviewDecimals = isPPF ? 0 : 2;
   const isEpsInvestment = isPPF && /eps/i.test(String(data.name || ''));
   const isBond = data.asset_type === 'BOND';
   const isSGB = data.asset_type === 'SGB';
@@ -1365,14 +1367,14 @@ export default function InvestmentDetail() {
                       {row.action === 'update' && row.existing_id && Math.abs(Number(row.existing_amount || 0) - Number(row.amount || 0)) >= 0.005 ? (
                         <div style={{ fontSize: '0.9em' }}>
                           <div style={{ textDecoration: 'line-through', color: '#6c757d' }}>
-                            ₹{formatNumber(row.existing_amount, 2)}
+                            ₹{formatNumber(row.existing_amount, interestPreviewDecimals)}
                           </div>
                           <div style={{ color: '#28a745', fontWeight: '500' }}>
-                            ₹{formatNumber(row.amount, 2)}
+                            ₹{formatNumber(row.amount, interestPreviewDecimals)}
                           </div>
                         </div>
                       ) : (
-                        `₹${formatNumber(row.amount, 2)}`
+                        `₹${formatNumber(row.amount, interestPreviewDecimals)}`
                       )}
                     </td>
                     <td>
@@ -1383,6 +1385,9 @@ export default function InvestmentDetail() {
                       ) : (
                         <Badge bg="secondary">Unchanged</Badge>
                       )}
+                      {row.preview_note ? (
+                        <div className="small text-muted mt-1">{row.preview_note}</div>
+                      ) : null}
                     </td>
                   </tr>
                 ))}

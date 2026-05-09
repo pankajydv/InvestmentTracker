@@ -30,7 +30,7 @@ const CASH_OUTFLOW_TYPES = new Set([
 ]);
 
 const CASH_INFLOW_TYPES = new Set([
-  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE'
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'TDS'
 ]);
 
 function xnpv(rate, flows, baseDate) {
@@ -415,9 +415,6 @@ module.exports = function (db) {
       throw new Error('from_date and to_date must be YYYY-MM-DD');
     }
 
-    const contributionMonthShift = queryParams.contribution_month_shift != null
-      ? parseInt(queryParams.contribution_month_shift, 10)
-      : 0;
     const defaultMonthlyRoundingDecimals = (inv.asset_type === 'SSY' || inv.asset_type === 'PPF') ? 0 : 2;
     const monthlyRoundingDecimals = queryParams.monthly_rounding_decimals != null
       ? parseInt(queryParams.monthly_rounding_decimals, 10)
@@ -500,7 +497,6 @@ module.exports = function (db) {
       rateRows,
       fromDate,
       toDate,
-      contributionMonthShift,
       monthlyRoundingDecimals,
       ignoreExistingInterest,
       includeTransferTransactions,
@@ -532,7 +528,11 @@ module.exports = function (db) {
 
         // Compare calculated amount against INTEREST-only amount (not aggregate with RECONCILE)
         const comparisonAmount = existing ? Number(existing.interest_only_amount || 0) : 0;
-        const sameAmount = existing && Math.abs(comparisonAmount - amount) < 0.005;
+        const drift = existing ? Math.abs(comparisonAmount - amount) : null;
+        const sameAmount = existing && drift <= 1;
+        const previewNote = existing && drift > 0 && drift <= 1
+          ? 'Ignore the ₹1 drift from DB calculations.'
+          : null;
         const action = existing ? (sameAmount ? 'unchanged' : 'update') : 'insert';
 
         return {
@@ -548,6 +548,7 @@ module.exports = function (db) {
           existing_row_count: existing?.rows?.length || 0,
           interest_row_count: existing?.interest_rows?.length || 0,
           reconcile_row_count: existing?.reconcile_rows?.length || 0,
+          preview_note: previewNote,
           has_existing_entries: !!existing,
           portfolio_id: existing?.portfolio_id || requestedPortfolioId || null,
           action,
@@ -563,7 +564,6 @@ module.exports = function (db) {
       investment: { id: inv.id, name: inv.name, asset_type: inv.asset_type },
       window: { from_date: fromDate, to_date: toDate },
       options: {
-        contribution_month_shift: contributionMonthShift,
         monthly_rounding_decimals: monthlyRoundingDecimals,
         ignore_existing_interest: ignoreExistingInterest,
         include_transfer_transactions: includeTransferTransactions,
