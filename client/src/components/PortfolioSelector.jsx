@@ -5,7 +5,15 @@ import { Link } from 'react-router-dom';
 import { ChevronDown, Users, Settings, Check } from 'lucide-react';
 
 export default function PortfolioSelector() {
-  const { portfolios, selectedIds, selectedId, selectedPortfolio, selectPortfolio, togglePortfolio } = usePortfolio();
+  const {
+    portfolios,
+    selectionMode,
+    selectedIds,
+    selectedPortfolio,
+    selectAll,
+    selectNone,
+    togglePortfolio,
+  } = usePortfolio();
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
 
@@ -19,12 +27,15 @@ export default function PortfolioSelector() {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  const allSelected = selectedIds.length === 0 || (portfolios.length > 0 && selectedIds.length === portfolios.length);
+  const allSelected = selectionMode === 'all';
+  const noneSelected = selectionMode === 'none';
   const selectedCount = allSelected ? portfolios.length : selectedIds.length;
   const label = selectedPortfolio
     ? selectedPortfolio.name
     : allSelected
       ? 'All Portfolios'
+      : noneSelected
+        ? 'No Portfolio'
       : `${selectedIds.length} Portfolios`;
 
   return (
@@ -58,7 +69,7 @@ export default function PortfolioSelector() {
         >
           {/* All Portfolios */}
           <button
-            onClick={() => { selectPortfolio(null); }}
+            onClick={() => { if (allSelected) selectNone(); else selectAll(); }}
             className="w-100 d-flex align-items-center gap-2 px-3 py-2 border-0 bg-transparent text-start"
             style={{
               borderLeft: allSelected ? '4px solid #0d6efd' : '4px solid transparent',
@@ -103,7 +114,7 @@ export default function PortfolioSelector() {
               <input
                 type="checkbox"
                 className="form-check-input m-0"
-                checked={selectedIds.length === 0 || selectedIds.includes(p.id)}
+                checked={selectedIds.includes(p.id)}
                 readOnly
               />
             </button>

@@ -6,30 +6,35 @@ const STORAGE_KEY = 'selectedPortfolioIds';
 const LEGACY_STORAGE_KEY = 'selectedPortfolioId';
 
 function parseStoredSelection(raw) {
-  if (!raw || raw === 'all') return [];
+  if (!raw || raw === 'all') return { mode: 'all', ids: [] };
+  if (raw === 'none') return { mode: 'none', ids: [] };
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) {
-      return parsed
+      const ids = parsed
         .map((v) => Number(v))
         .filter((v) => Number.isInteger(v) && v > 0);
+      if (!ids.length) return { mode: 'none', ids: [] };
+      return { mode: 'some', ids };
     }
   } catch (_) {
     const legacyId = Number(raw);
-    if (Number.isInteger(legacyId) && legacyId > 0) return [legacyId];
+    if (Number.isInteger(legacyId) && legacyId > 0) return { mode: 'some', ids: [legacyId] };
   }
-  return [];
+  return { mode: 'all', ids: [] };
 }
 
 export function PortfolioProvider({ children }) {
   const [portfolios, setPortfolios] = useState([]);
-  const [selectedIds, setSelectedIds] = useState(() => {
+  const initialSelection = useMemo(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored != null) return parseStoredSelection(stored);
 
     const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
     return parseStoredSelection(legacy);
-  });
+  }, []);
+  const [selectionMode, setSelectionMode] = useState(initialSelection.mode);
+  const [explicitSelectedIds, setExplicitSelectedIds] = useState(initialSelection.ids);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -52,16 +57,37 @@ export function PortfolioProvider({ children }) {
     }
   };
 
+  const selectedIds = useMemo(() => {
+    const validPortfolioIds = new Set(portfolios.map((p) => p.id));
+    if (selectionMode === 'all') return portfolios.map((p) => p.id);
+    if (selectionMode === 'none') return [];
+    return explicitSelectedIds.filter((id) => validPortfolioIds.has(id));
+  }, [portfolios, selectionMode, explicitSelectedIds]);
+
   useEffect(() => {
-    if (!selectedIds.length) {
+    if (selectionMode === 'all') {
       localStorage.setItem(STORAGE_KEY, 'all');
+      localStorage.setItem(LEGACY_STORAGE_KEY, 'all');
+      return;
+    }
+
+    if (selectionMode === 'none') {
+      localStorage.setItem(STORAGE_KEY, 'none');
       localStorage.setItem(LEGACY_STORAGE_KEY, 'all');
       return;
     }
 
     localStorage.setItem(STORAGE_KEY, JSON.stringify(selectedIds));
     localStorage.setItem(LEGACY_STORAGE_KEY, selectedIds.length === 1 ? String(selectedIds[0]) : 'all');
-  }, [selectedIds]);
+  }, [selectionMode, selectedIds]);
+
+  const setSelection = (mode, ids = []) => {
+    setSelectionMode(mode);
+    setExplicitSelectedIds(ids);
+  };
+
+  const selectAll = () => setSelection('all');
+  const selectNone = () => setSelection('none');
 
   const selectPortfolios = (ids) => {
     const normalized = Array.from(new Set((ids || [])
@@ -69,15 +95,22 @@ export function PortfolioProvider({ children }) {
       .filter((v) => Number.isInteger(v) && v > 0)));
 
     if (!normalized.length) {
-      setSelectedIds([]);
+      setSelection('none');
       return;
     }
-    setSelectedIds(normalized);
+
+    const allIds = portfolios.map((p) => p.id);
+    if (allIds.length > 0 && normalized.length === allIds.length) {
+      setSelection('all');
+      return;
+    }
+
+    setSelection('some', normalized);
   };
 
   const selectPortfolio = (id) => {
     if (id == null) {
-      setSelectedIds([]);
+      setSelection('all');
       return;
     }
     selectPortfolios([id]);
@@ -88,10 +121,19 @@ export function PortfolioProvider({ children }) {
     if (!Number.isInteger(portfolioId) || portfolioId <= 0) return;
 
     const allIds = portfolios.map((p) => p.id);
+    if (!allIds.length) {
+      setSelection('none');
+      return;
+    }
 
-    if (!selectedIds.length) {
+    if (selectionMode === 'all') {
       // When "All" is active, toggling one item should deselect only that item.
-      setSelectedIds(allIds.filter((v) => v !== portfolioId));
+      setSelection('some', allIds.filter((v) => v !== portfolioId));
+      return;
+    }
+
+    if (selectionMode === 'none') {
+      setSelection('some', [portfolioId]);
       return;
     }
 
@@ -100,11 +142,16 @@ export function PortfolioProvider({ children }) {
       : [...selectedIds, portfolioId];
 
     if (!next.length) {
-      setSelectedIds([]);
+      setSelection('none');
       return;
     }
 
-    setSelectedIds(next);
+    if (next.length === allIds.length) {
+      setSelection('all');
+      return;
+    }
+
+    setSelection('some', next);
   };
 
   const selectedId = selectedIds.length === 1 ? selectedIds[0] : null;
@@ -121,10 +168,13 @@ export function PortfolioProvider({ children }) {
     <PortfolioContext.Provider
       value={{
         portfolios,
+        selectionMode,
         selectedIds,
         selectedPortfolios,
         selectedId,
         selectedPortfolio,
+        selectAll,
+        selectNone,
         selectPortfolios,
         selectPortfolio,
         togglePortfolio,
