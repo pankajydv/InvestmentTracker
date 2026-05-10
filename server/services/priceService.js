@@ -624,21 +624,30 @@ async function lookupTickerByISIN(isin) {
 
 /**
  * Fetch corporate actions (dividends & splits) for a stock in a given year.
- * Uses Yahoo Finance v8 chart API with events parameter.
+ * - FOREIGN_STOCK: NASDAQ dividends (record/payment dates), Yahoo splits
+ * - Others: Yahoo dividends + splits
  * @param {string} symbol - Yahoo Finance symbol (e.g., 'RELIANCE.NS')
  * @param {number} year - Calendar year to fetch actions for
- * @returns {Promise<{dividends: Array, splits: Array}>}
+ * @param {{assetType?: string}} [options]
+ * @returns {Promise<{dividends: Array, splits: Array, warnings?: Array<string>}>}
  */
-async function fetchCorporateActions(symbol, year) {
+async function fetchCorporateActions(symbol, year, options = {}) {
+  const assetType = options.assetType || null;
   const period1 = Math.floor(new Date(`${year}-01-01`).getTime() / 1000);
   const period2 = Math.floor(new Date(`${year}-12-31T23:59:59`).getTime() / 1000);
 
-  const { dividends, splits } = await _fetchChartEvents(symbol, period1, period2);
+  const { dividends: yahooDividends, splits } = await _fetchChartEvents(symbol, period1, period2);
+
+  if (assetType === 'FOREIGN_STOCK') {
+    const { dividends, warnings } = await _fetchNasdaqDividends(symbol, year);
+    return { dividends, splits, warnings };
+  }
 
   // Yahoo Finance returns split-adjusted dividend amounts for historical data.
   // If a stock paid ₹10/share and later had a 1:1 bonus, Yahoo reports ₹5/share.
   // We reverse this by fetching all splits from the dividend year to today and
   // computing a cumulative adjustment factor for each dividend.
+  const dividends = yahooDividends;
   const currentYear = new Date().getFullYear();
   if (dividends.length > 0 && year < currentYear) {
     // Fetch splits from start of the requested year to today
@@ -661,7 +670,102 @@ async function fetchCorporateActions(symbol, year) {
     }
   }
 
-  return { dividends, splits };
+  return { dividends, splits, warnings: [] };
+}
+
+/**
+ * Fetch foreign-stock dividends from NASDAQ with record/payment dates.
+ * Returns normalized rows with:
+ * - date: payment date (for transaction posting)
+ * - record_date: date used for entitlement units
+ * - payment_date: payment date
+ * - amount: dividend cash amount per share
+ */
+function _fetchNasdaqDividends(symbol, year) {
+  const url = `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/dividends?assetclass=stocks`;
+
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) {
+            reject(new Error(`NASDAQ dividends API returned ${res.statusCode} for ${symbol}`));
+            return;
+          }
+
+          const json = JSON.parse(data);
+          const rows = json?.data?.dividends?.rows;
+          if (!Array.isArray(rows)) {
+            reject(new Error(`NASDAQ dividends data missing for ${symbol}`));
+            return;
+          }
+
+          const dividends = [];
+          const warnings = [];
+          for (const row of rows) {
+            const amount = _parseCurrencyAmount(row?.amount);
+            const exDate = _parseNasdaqDate(row?.exOrEffDate);
+            const recordDate = _parseNasdaqDate(row?.recordDate || row?.exOrEffDate);
+            const paymentDate = _parseNasdaqDate(row?.paymentDate);
+            const rowId = `ex=${row?.exOrEffDate || 'NA'}, record=${row?.recordDate || 'NA'}, pay=${row?.paymentDate || 'NA'}, amount=${row?.amount || 'NA'}`;
+            const rowYears = [paymentDate, recordDate, exDate]
+              .filter(Boolean)
+              .map(d => Number(d.slice(0, 4)));
+            const isRelevantYear = rowYears.includes(year);
+
+            if (!(amount > 0)) {
+              if (isRelevantYear) {
+                warnings.push(`NASDAQ dividend row ignored due to non-cash/invalid amount (${rowId})`);
+              }
+              continue;
+            }
+            if (!paymentDate || !recordDate) {
+              if (isRelevantYear) {
+                warnings.push(`NASDAQ dividend row missing payment/record date (${rowId})`);
+              }
+              continue;
+            }
+
+            const paymentYear = Number(paymentDate.slice(0, 4));
+            if (paymentYear !== year) continue;
+
+            dividends.push({
+              date: paymentDate,
+              amount,
+              record_date: recordDate,
+              payment_date: paymentDate,
+            });
+          }
+
+          if (dividends.length === 0 && warnings.length === 0) {
+            warnings.push(`No NASDAQ dividend rows found for ${symbol} in ${year}`);
+          }
+
+          dividends.sort((a, b) => a.date.localeCompare(b.date));
+          resolve({ dividends, warnings });
+        } catch (e) {
+          reject(new Error(`Failed to parse NASDAQ dividends for ${symbol}: ${e.message}`));
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+function _parseNasdaqDate(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const m = raw.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return null;
+  return `${m[3]}-${m[1]}-${m[2]}`;
+}
+
+function _parseCurrencyAmount(raw) {
+  if (raw == null) return null;
+  const cleaned = String(raw).replace(/[^0-9.-]/g, '');
+  const value = parseFloat(cleaned);
+  return Number.isFinite(value) ? value : null;
 }
 
 /**

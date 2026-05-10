@@ -204,16 +204,21 @@ export default function CorporateActions() {
         </Alert>
       )}
 
-      {/* Errors from Yahoo Finance */}
+      {/* Errors/warnings from providers */}
       {errors.length > 0 && (
         <Alert variant="warning" className="small py-2">
           <AlertTriangle size={14} className="me-1" />
-          Could not fetch data for: {errors.map(e => e.investment).join(', ')}
+          <div className="fw-semibold mb-1">Issues detected while fetching provider data:</div>
+          <ul className="mb-0 ps-3">
+            {errors.map((e, i) => (
+              <li key={i}>{e.investment ? `${e.investment}: ${e.error}` : e.error}</li>
+            ))}
+          </ul>
         </Alert>
       )}
 
       {/* No changes needed */}
-      {hasData && totalItems === 0 && (
+      {hasData && totalItems === 0 && errors.length === 0 && (
         <Alert variant="info" className="small py-2">
           {isRateSync
             ? `All ${assetType} interest rates are up to date!`

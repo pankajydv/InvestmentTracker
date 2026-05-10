@@ -1579,13 +1579,17 @@ module.exports = function (db) {
           ORDER BY transaction_date ASC
         `).all(inv.id);
 
-        // Fetch from Yahoo Finance (once per investment, outside portfolio loop)
+        // Fetch provider corporate actions (foreign dividends from NASDAQ, splits from Yahoo)
         const ticker = assetType === 'FOREIGN_STOCK'
           ? inv.ticker_symbol
           : (inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol));
         let actions;
         try {
-          actions = await fetchCorporateActions(ticker, yearNum);
+          actions = await fetchCorporateActions(ticker, yearNum, { assetType });
+          const actionWarnings = Array.isArray(actions?.warnings) ? actions.warnings : [];
+          for (const warning of actionWarnings) {
+            errors.push({ investment: inv.name, error: warning });
+          }
         } catch (e) {
           errors.push({ investment: inv.name, error: e.message });
           continue;
@@ -1663,15 +1667,25 @@ module.exports = function (db) {
 
         // Process dividends
         for (const div of actions.dividends) {
-          const holdingUnits = holdingAt(div.date, null, true);
-          if (holdingUnits <= 0) continue;
           const isForeignDividend = assetType === 'FOREIGN_STOCK';
+          const entitlementDate = isForeignDividend ? (div.record_date || div.date) : div.date;
+          const payoutDate = isForeignDividend ? (div.payment_date || div.date) : div.date;
+          if (!entitlementDate || !payoutDate) {
+            errors.push({
+              investment: inv.name,
+              error: `Dividend missing required record/payment date (${JSON.stringify(div)})`,
+            });
+            continue;
+          }
+
+          const holdingUnits = holdingAt(entitlementDate, null, true);
+          if (holdingUnits <= 0) continue;
           const usdDividendAmount = Math.round(holdingUnits * div.amount * 100) / 100;
-          const fxRate = isForeignDividend ? await getFxForDate(div.date) : null;
+          const fxRate = isForeignDividend ? await getFxForDate(payoutDate) : null;
           if (isForeignDividend && !(fxRate > 0)) {
             errors.push({
               investment: inv.name,
-              error: `Missing USD/INR FX for ${div.date}; cannot compute INR dividend amount`,
+              error: `Missing USD/INR FX for ${payoutDate}; cannot compute INR dividend amount`,
             });
             continue;
           }
@@ -1682,7 +1696,7 @@ module.exports = function (db) {
           // Find any existing dividend within the date window
           const existing = existingActions.find(e =>
             e.transaction_type === 'DIVIDEND' &&
-            daysApart(e.transaction_date, div.date) <= DATE_WINDOW &&
+            daysApart(e.transaction_date, payoutDate) <= DATE_WINDOW &&
             !matchedExistingIds.has(e.id)
           );
 
@@ -1692,7 +1706,7 @@ module.exports = function (db) {
             // Locked transactions are never proposed as corrections
             if (existing.locked) continue;
 
-            const dateMatch = existing.transaction_date === div.date;
+            const dateMatch = existing.transaction_date === payoutDate;
             const amountMatch = Math.abs(existing.amount - dividendAmount) < 1;
             const unitsMatch = existing.units === holdingUnits;
             const priceMatch = existing.price_per_unit != null && Math.abs(existing.price_per_unit - div.amount) < 0.01;
@@ -1708,7 +1722,7 @@ module.exports = function (db) {
               investment_id: inv.id,
               investment_name: inv.name,
               transaction_type: 'DIVIDEND',
-              transaction_date: div.date,
+              transaction_date: payoutDate,
               current_units: existing.units,
               current_amount: existing.amount,
               current_price_per_unit: existing.price_per_unit,
@@ -1718,11 +1732,11 @@ module.exports = function (db) {
               expected_price_per_unit: div.amount,
               expected_exchange_rate_used: fxRate,
               expected_usd_amount: isForeignDividend ? usdDividendAmount : null,
-              broker: brokerAt(div.date),
+              broker: brokerAt(payoutDate),
               portfolio_id: pid,
               currency_symbol: currencySymbol,
               notes: isForeignDividend
-                ? `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares (FX \u20B9${fxRate}/$)`
+                ? `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares (Record ${entitlementDate}, Payment ${payoutDate}, FX \u20B9${fxRate}/$)`
                 : `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares`,
             });
             continue;
@@ -1732,18 +1746,18 @@ module.exports = function (db) {
             investment_id: inv.id,
             investment_name: inv.name,
             transaction_type: 'DIVIDEND',
-            transaction_date: div.date,
+            transaction_date: payoutDate,
             units: holdingUnits,
             price_per_unit: div.amount,
             amount: dividendAmount,
             exchange_rate_used: fxRate,
             usd_amount: isForeignDividend ? usdDividendAmount : null,
             fees: 0,
-            broker: brokerAt(div.date),
+            broker: brokerAt(payoutDate),
             portfolio_id: pid,
             currency_symbol: currencySymbol,
             notes: isForeignDividend
-              ? `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares (FX \u20B9${fxRate}/$)`
+              ? `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares (Record ${entitlementDate}, Payment ${payoutDate}, FX \u20B9${fxRate}/$)`
               : `Dividend ${currencySymbol}${div.amount}/share \u00D7 ${holdingUnits} shares`,
           });
         }
@@ -1818,7 +1832,7 @@ module.exports = function (db) {
           });
         }
 
-        // Any existing actions NOT matched to Yahoo data → suggest deletion (skip locked)
+        // Any existing actions NOT matched to provider data → suggest deletion (skip locked)
         for (const ea of existingActions) {
           if (!matchedExistingIds.has(ea.id) && !ea.locked) {
             deletions.push({
@@ -1831,7 +1845,7 @@ module.exports = function (db) {
               amount: ea.amount,
               price_per_unit: ea.price_per_unit,
               notes: ea.notes,
-              reason: 'No matching corporate action found in Yahoo Finance data',
+              reason: 'No matching corporate action found in provider data',
             });
           }
         }
