@@ -448,6 +448,7 @@ export default function InvestmentDetail() {
   const isPPF = data.asset_type === 'PPF' || data.asset_type === 'SSY' || data.asset_type === 'PF';
   const isSSY = data.asset_type === 'SSY';
   const isPPFOnly = data.asset_type === 'PPF';
+  const isPFOnly = data.asset_type === 'PF';
   const interestPreviewDecimals = isPPF ? 0 : 2;
   const isEpsInvestment = isPPF && /eps/i.test(String(data.name || ''));
   const isBond = data.asset_type === 'BOND';
@@ -687,6 +688,7 @@ export default function InvestmentDetail() {
     isPPF && data.interest_rate ? { label: 'Interest', value: `${data.interest_rate}% p.a.` } : null,
     isSSY ? { label: 'Interest Calc', value: 'Month-end balance x rate/1200; rounded at FY end' } : null,
     isPPFOnly ? { label: 'Interest Calc', value: 'Min balance (5th-month-end) x rate/1200; rounded at FY end' } : null,
+    isPFOnly ? { label: 'Interest Calc', value: 'Month-end balance (excluding same-month PF contributions) x rate/1200; rounded at FY end' } : null,
     isPPF && data.maturity_date ? { label: 'Maturity', value: formatDate(data.maturity_date) } : null,
     isPPF && data.opening_balance > 0 ? { label: 'Opening Balance', value: `₹${formatNumber(data.opening_balance, 2)}` } : null,
     isSGB && sgbDetails && sgbDetails.coupon_rate ? { label: 'Coupon Rate', value: `${sgbDetails.coupon_rate}% p.a.` } : null,
