@@ -107,6 +107,9 @@ function initializeDb(db) {
       opening_balance REAL DEFAULT 0, -- For PPF/SSY/PF: balance carried forward from before first imported statement
       is_active INTEGER DEFAULT 1,   -- 1 = active (price updates), 0 = inactive (delisted etc.)
       exclude_from_tracking INTEGER DEFAULT 0, -- 1 = exclude from daily_values calculations and dashboard (e.g. derived investments)
+      is_dirty_daily_values INTEGER DEFAULT 0,
+      dirty_from_date TEXT,
+      last_active_date TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -138,8 +141,10 @@ function initializeDb(db) {
       total_units REAL,            -- Total units held on that day
       current_value REAL NOT NULL, -- total_units * price_per_unit
       invested_amount REAL NOT NULL, -- Total amount invested till date
+      realized_gain REAL DEFAULT 0, -- Cumulative realized gain (cash-out types)
       profit_loss REAL NOT NULL,   -- current_value - invested_amount
       profit_loss_pct REAL,        -- Percentage gain/loss
+      price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED')),
       day_change REAL DEFAULT 0,   -- Change from previous day
       day_change_pct REAL DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now')),
@@ -162,6 +167,24 @@ function initializeDb(db) {
       UNIQUE(portfolio_id, date)
     );
 
+    -- Asset-type level daily snapshot (per portfolio + combined/null portfolio)
+    CREATE TABLE IF NOT EXISTS asset_type_daily (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      portfolio_id INTEGER,
+      asset_type TEXT NOT NULL,
+      date TEXT NOT NULL,
+      total_value REAL NOT NULL,
+      total_invested REAL NOT NULL,
+      total_profit_loss REAL NOT NULL,
+      total_realized_gain REAL DEFAULT 0,
+      total_unrealized_gain REAL DEFAULT 0,
+      total_profit_loss_pct REAL,
+      day_change REAL DEFAULT 0,
+      day_change_pct REAL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(portfolio_id, asset_type, date)
+    );
+
     -- PPF/SSY/PF interest rates history
     CREATE TABLE IF NOT EXISTS interest_rates (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,6 +202,20 @@ function initializeDb(db) {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- Dirty backfill scopes: track impacted ranges that must be recomputed.
+    CREATE TABLE IF NOT EXISTS dirty_backfill_scope (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      investment_id INTEGER,
+      portfolio_id INTEGER,
+      dirty_from_date TEXT NOT NULL,
+      dirty_reason TEXT,
+      source_event_id TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+    );
+
     -- Applied schema migrations (audit + idempotency)
     CREATE TABLE IF NOT EXISTS schema_migrations (
       id TEXT PRIMARY KEY,
@@ -193,7 +230,11 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
     CREATE INDEX IF NOT EXISTS idx_portfolio_daily_date ON portfolio_daily(date);
     CREATE INDEX IF NOT EXISTS idx_portfolio_daily_portfolio ON portfolio_daily(portfolio_id, date);
+    CREATE INDEX IF NOT EXISTS idx_asset_type_daily_portfolio_date ON asset_type_daily(portfolio_id, date);
+    CREATE INDEX IF NOT EXISTS idx_asset_type_daily_type_date ON asset_type_daily(asset_type, date);
     CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id);
+    CREATE INDEX IF NOT EXISTS idx_dirty_scope_status_date ON dirty_backfill_scope(status, dirty_from_date);
+    CREATE INDEX IF NOT EXISTS idx_dirty_scope_investment_portfolio ON dirty_backfill_scope(investment_id, portfolio_id, status);
 
     -- Portfolio-level expenses (AMC, platform fees, CDSL charges, etc.)
     CREATE TABLE IF NOT EXISTS portfolio_expenses (
@@ -496,6 +537,7 @@ function initializeDb(db) {
     insertConfig.run('last_price_update', '');
     insertConfig.run('auto_update_enabled', 'true');
     insertConfig.run('update_time', '18:00'); // 6 PM IST
+    insertConfig.run('backfill_watermark', '');
   }
 
   // Add opening_balance to investments (for PPF/SSY/PF: balance carried forward from before first imported statement)
@@ -1643,6 +1685,143 @@ function initializeDb(db) {
   } else if (!hasMigrationRecord(db, tdsTypeMigrationId) && hasTdsType) {
     recordMigration(db, tdsTypeMigrationId, 'skipped', 'TDS type already present');
   }
+
+  // ── Migration: add dirty tracking columns to investments ───────────────
+  const dirtyInvCols = db.prepare("PRAGMA table_info(investments)").all().map(c => c.name);
+  if (requireMigrationsEnabled(
+    '20260510-add-investments-dirty-flags',
+    !dirtyInvCols.includes('is_dirty_daily_values') || !dirtyInvCols.includes('dirty_from_date'),
+    'investments dirty tracking columns missing'
+  )) {
+    db.exec('BEGIN');
+    try {
+      if (!dirtyInvCols.includes('is_dirty_daily_values')) {
+        db.exec('ALTER TABLE investments ADD COLUMN is_dirty_daily_values INTEGER DEFAULT 0');
+      }
+      if (!dirtyInvCols.includes('dirty_from_date')) {
+        db.exec('ALTER TABLE investments ADD COLUMN dirty_from_date TEXT');
+      }
+      db.exec('CREATE INDEX IF NOT EXISTS idx_investments_dirty_date ON investments(is_dirty_daily_values, dirty_from_date)');
+      db.exec('COMMIT');
+      assertDbIntegrity(db, '20260510-add-investments-dirty-flags');
+      recordMigration(db, '20260510-add-investments-dirty-flags', 'applied');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, '20260510-add-investments-dirty-flags') && dirtyInvCols.includes('is_dirty_daily_values') && dirtyInvCols.includes('dirty_from_date')) {
+    recordMigration(db, '20260510-add-investments-dirty-flags', 'skipped', 'already present');
+  }
+
+  // ── Migration: add dirty_backfill_scope table ─────────────────────────
+  const hasDirtyScopeTable = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='dirty_backfill_scope'").get();
+  if (requireMigrationsEnabled('20260510-add-dirty-backfill-scope-table', !hasDirtyScopeTable, 'dirty_backfill_scope missing')) {
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS dirty_backfill_scope (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER,
+          portfolio_id INTEGER,
+          dirty_from_date TEXT NOT NULL,
+          dirty_reason TEXT,
+          source_event_id TEXT,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+        )
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_dirty_scope_status_date ON dirty_backfill_scope(status, dirty_from_date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_dirty_scope_investment_portfolio ON dirty_backfill_scope(investment_id, portfolio_id, status)');
+      db.exec('COMMIT');
+      assertDbIntegrity(db, '20260510-add-dirty-backfill-scope-table');
+      recordMigration(db, '20260510-add-dirty-backfill-scope-table', 'applied');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, '20260510-add-dirty-backfill-scope-table') && hasDirtyScopeTable) {
+    recordMigration(db, '20260510-add-dirty-backfill-scope-table', 'skipped', 'already present');
+  }
+
+  // ── Migration: add daily_values price_source + realized_gain columns ─────
+  const dvColsNow = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
+  const dailyValuesEnhancementId = '20260510-add-daily-values-price-source-realized-gain';
+  if (requireMigrationsEnabled(
+    dailyValuesEnhancementId,
+    !dvColsNow.has('price_source') || !dvColsNow.has('realized_gain'),
+    'daily_values price_source/realized_gain missing'
+  )) {
+    db.exec('BEGIN');
+    try {
+      if (!dvColsNow.has('price_source')) {
+        db.exec("ALTER TABLE daily_values ADD COLUMN price_source TEXT DEFAULT 'LIVE'");
+      }
+      if (!dvColsNow.has('realized_gain')) {
+        db.exec('ALTER TABLE daily_values ADD COLUMN realized_gain REAL DEFAULT 0');
+      }
+      db.exec('COMMIT');
+      assertDbIntegrity(db, dailyValuesEnhancementId);
+      recordMigration(db, dailyValuesEnhancementId, 'applied');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, dailyValuesEnhancementId) && dvColsNow.has('price_source') && dvColsNow.has('realized_gain')) {
+    recordMigration(db, dailyValuesEnhancementId, 'skipped', 'already present');
+  }
+
+  // ── Migration: add investments.last_active_date ───────────────────────────
+  const invColsLatest = new Set(db.prepare('PRAGMA table_info(investments)').all().map((c) => c.name));
+  const lastActiveMigrationId = '20260510-add-investments-last-active-date';
+  if (requireMigrationsEnabled(lastActiveMigrationId, !invColsLatest.has('last_active_date'), 'investments.last_active_date missing')) {
+    db.exec('ALTER TABLE investments ADD COLUMN last_active_date TEXT');
+    assertDbIntegrity(db, lastActiveMigrationId);
+    recordMigration(db, lastActiveMigrationId, 'applied');
+  } else if (!hasMigrationRecord(db, lastActiveMigrationId) && invColsLatest.has('last_active_date')) {
+    recordMigration(db, lastActiveMigrationId, 'skipped', 'already present');
+  }
+
+  // ── Migration: add asset_type_daily table ─────────────────────────────────
+  const hasAssetTypeDaily = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='asset_type_daily'").get();
+  const assetTypeDailyMigrationId = '20260510-add-asset-type-daily-table';
+  if (requireMigrationsEnabled(assetTypeDailyMigrationId, !hasAssetTypeDaily, 'asset_type_daily missing')) {
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS asset_type_daily (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          portfolio_id INTEGER,
+          asset_type TEXT NOT NULL,
+          date TEXT NOT NULL,
+          total_value REAL NOT NULL,
+          total_invested REAL NOT NULL,
+          total_profit_loss REAL NOT NULL,
+          total_realized_gain REAL DEFAULT 0,
+          total_unrealized_gain REAL DEFAULT 0,
+          total_profit_loss_pct REAL,
+          day_change REAL DEFAULT 0,
+          day_change_pct REAL DEFAULT 0,
+          created_at TEXT DEFAULT (datetime('now')),
+          UNIQUE(portfolio_id, asset_type, date)
+        )
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_asset_type_daily_portfolio_date ON asset_type_daily(portfolio_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_asset_type_daily_type_date ON asset_type_daily(asset_type, date)');
+      db.exec('COMMIT');
+      assertDbIntegrity(db, assetTypeDailyMigrationId);
+      recordMigration(db, assetTypeDailyMigrationId, 'applied');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, assetTypeDailyMigrationId) && hasAssetTypeDaily) {
+    recordMigration(db, assetTypeDailyMigrationId, 'skipped', 'already present');
+  }
+
+  // Ensure backfill watermark key exists even on upgraded DBs.
+  db.prepare("INSERT OR IGNORE INTO config (key, value, updated_at) VALUES ('backfill_watermark', '', datetime('now'))").run();
 }
 
 /**

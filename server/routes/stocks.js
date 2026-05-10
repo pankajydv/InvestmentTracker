@@ -8,6 +8,7 @@ const { GRANTS, generateRsuSchedule } = require('../services/rsuGrantService');
 const { OFFERINGS, generateEsppSchedule } = require('../services/esppGrantService');
 const { parseOpenLots, parseClosedLots, reconcileVestTransactions } = require('../services/fidelityVestReconciler');
 const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisitionImportService');
+const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -1875,6 +1876,7 @@ module.exports = function (db) {
   router.post('/corporate-actions/import', (req, res) => {
     try {
       const { transactions, corrections, deletions } = req.body;
+      const dirtyCandidates = [];
 
       const inferPortfolioId = (investmentId) => {
         const row = db.prepare(`
@@ -1928,6 +1930,11 @@ module.exports = function (db) {
               txn.units || null, txn.price_per_unit || null, txn.amount, txn.fees || 0, txn.notes || null,
               txn.broker || null, portfolioId, txn.exchange_rate_used || null, txn.usd_amount || null
             );
+            dirtyCandidates.push({
+              investment_id: txn.investment_id,
+              portfolio_id: portfolioId,
+              transaction_date: txn.transaction_date,
+            });
             created++;
           }
         }
@@ -1953,6 +1960,11 @@ module.exports = function (db) {
               c.expected_usd_amount || null,
               c.id
             );
+            dirtyCandidates.push({
+              investment_id: c.investment_id,
+              portfolio_id: portfolioId,
+              transaction_date: c.transaction_date || c.current_date,
+            });
             corrected++;
           }
         }
@@ -1960,8 +1972,13 @@ module.exports = function (db) {
         // Deletions
         if (deletions && deletions.length) {
           for (const d of deletions) {
-            const existing = db.prepare('SELECT id FROM transactions WHERE id = ?').get(d.id);
+            const existing = db.prepare('SELECT id, investment_id, portfolio_id, transaction_date FROM transactions WHERE id = ?').get(d.id);
             if (!existing) continue;
+            dirtyCandidates.push({
+              investment_id: existing.investment_id,
+              portfolio_id: existing.portfolio_id,
+              transaction_date: existing.transaction_date,
+            });
             remove.run(d.id);
             deleted++;
           }
@@ -1969,6 +1986,7 @@ module.exports = function (db) {
       });
 
       runAll();
+      markDirtyFromTransactions(db, dirtyCandidates, 'corporate-actions-import');
       res.json({ created, skipped, corrected, deleted });
     } catch (e) {
       res.status(500).json({ error: 'Failed to import corporate actions: ' + e.message });

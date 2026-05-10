@@ -11,6 +11,7 @@ function combinePerformanceResults(results, startDate, endDate, periodLabel = 'c
   if (!Array.isArray(results) || !results.length) return null;
 
   const byDate = new Map();
+  const byType = new Map();
 
   for (const result of results) {
     for (const row of result?.portfolioData || []) {
@@ -29,9 +30,53 @@ function combinePerformanceResults(results, startDate, endDate, periodLabel = 'c
       target.total_invested += Number(row.total_invested) || 0;
       target.total_profit_loss += Number(row.total_profit_loss) || 0;
     }
+
+    const typeEntries = Object.entries(result?.performanceByAssetType || {});
+    for (const [assetType, payload] of typeEntries) {
+      if (!byType.has(assetType)) byType.set(assetType, new Map());
+      const typeMap = byType.get(assetType);
+      for (const row of payload?.dailyData || []) {
+        const date = row.date;
+        if (!date) continue;
+        if (!typeMap.has(date)) {
+          typeMap.set(date, {
+            date,
+            total_value: 0,
+            total_invested: 0,
+            total_profit_loss: 0,
+            total_realized_gain: 0,
+            total_unrealized_gain: 0,
+            day_change: 0,
+          });
+        }
+        const target = typeMap.get(date);
+        target.total_value += Number(row.total_value) || 0;
+        target.total_invested += Number(row.total_invested) || 0;
+        target.total_profit_loss += Number(row.total_profit_loss) || 0;
+        target.total_realized_gain += Number(row.total_realized_gain) || 0;
+        target.total_unrealized_gain += Number(row.total_unrealized_gain) || 0;
+        target.day_change += Number(row.day_change) || 0;
+      }
+    }
   }
 
   const portfolioData = Array.from(byDate.values()).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const performanceByAssetType = {};
+  for (const [assetType, typeMap] of byType.entries()) {
+    performanceByAssetType[assetType] = {
+      asset_type: assetType,
+      dailyData: Array.from(typeMap.values())
+        .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+        .map((row) => {
+          const invested = Number(row.total_invested || 0);
+          const pl = Number(row.total_profit_loss || 0);
+          return {
+            ...row,
+            total_profit_loss_pct: invested > 0 ? (pl / invested) * 100 : 0,
+          };
+        }),
+    };
+  }
   const first = portfolioData[0];
   const last = portfolioData[portfolioData.length - 1];
   const periodReturn = first && last ? (last.total_value - first.total_value) : 0;
@@ -42,6 +87,7 @@ function combinePerformanceResults(results, startDate, endDate, periodLabel = 'c
     startDate: startDate || results[0]?.startDate,
     endDate: endDate || results[0]?.endDate,
     portfolioData,
+    performanceByAssetType,
     investmentData: [],
     periodReturn,
     periodReturnPct,
@@ -51,6 +97,7 @@ function combinePerformanceResults(results, startDate, endDate, periodLabel = 'c
 export default function Performance() {
   const { selectedId, selectedIds } = usePortfolio();
   const [period, setPeriod] = useState('1M');
+  const [selectedAssetType, setSelectedAssetType] = useState('ALL');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [customFrom, setCustomFrom] = useState('');
@@ -58,16 +105,28 @@ export default function Performance() {
 
   useEffect(() => {
     loadData();
-  }, [period, selectedId, selectedIds]);
+  }, [period, selectedId, selectedIds, selectedAssetType]);
 
   const loadData = async () => {
     try {
       setLoading(true);
       if (selectedIds.length > 1) {
-        const results = await Promise.all(selectedIds.map((id) => getPerformance(period, null, null, id)));
+        const results = await Promise.all(selectedIds.map((id) => getPerformance(
+          period,
+          null,
+          null,
+          id,
+          selectedAssetType !== 'ALL' ? selectedAssetType : null
+        )));
         setData(combinePerformanceResults(results, results[0]?.startDate, results[0]?.endDate, period));
       } else {
-        const result = await getPerformance(period, null, null, selectedId);
+        const result = await getPerformance(
+          period,
+          null,
+          null,
+          selectedId,
+          selectedAssetType !== 'ALL' ? selectedAssetType : null
+        );
         setData(result);
       }
     } catch (e) {
@@ -82,10 +141,22 @@ export default function Performance() {
     try {
       setLoading(true);
       if (selectedIds.length > 1) {
-        const results = await Promise.all(selectedIds.map((id) => getPerformance(null, customFrom, customTo, id)));
+        const results = await Promise.all(selectedIds.map((id) => getPerformance(
+          null,
+          customFrom,
+          customTo,
+          id,
+          selectedAssetType !== 'ALL' ? selectedAssetType : null
+        )));
         setData(combinePerformanceResults(results, customFrom, customTo, 'custom'));
       } else {
-        const result = await getPerformance(null, customFrom, customTo, selectedId);
+        const result = await getPerformance(
+          null,
+          customFrom,
+          customTo,
+          selectedId,
+          selectedAssetType !== 'ALL' ? selectedAssetType : null
+        );
         setData(result);
       }
       setPeriod('custom');
@@ -96,12 +167,26 @@ export default function Performance() {
     }
   };
 
-  const chartData = data?.portfolioData?.map((d) => ({
+  const activeSeries = selectedAssetType === 'ALL'
+    ? (data?.portfolioData || [])
+    : (data?.performanceByAssetType?.[selectedAssetType]?.dailyData || []);
+
+  const chartData = activeSeries.map((d) => ({
     date: d.date,
-    value: d.total_value,
-    invested: d.total_invested,
-    profit: d.total_profit_loss,
-  })) || [];
+    value: d.total_value || 0,
+    invested: d.total_invested || 0,
+    profit: d.total_profit_loss || 0,
+  }));
+
+  const startPoint = activeSeries[0];
+  const endPoint = activeSeries[activeSeries.length - 1];
+  const periodReturn = startPoint && endPoint
+    ? (Number(endPoint.total_value || 0) - Number(startPoint.total_value || 0))
+    : 0;
+  const periodReturnPct = startPoint && Number(startPoint.total_value) > 0
+    ? (periodReturn / Number(startPoint.total_value)) * 100
+    : 0;
+  const availableAssetTypes = Object.keys(data?.performanceByAssetType || {});
 
   return (
     <div className="d-flex flex-column gap-4">
@@ -119,6 +204,26 @@ export default function Performance() {
                 onClick={() => setPeriod(key)}
               >
                 {label}
+              </Button>
+            ))}
+          </div>
+
+          <div className="d-flex flex-wrap gap-2 mb-3 border-top pt-3">
+            <Button
+              size="sm"
+              variant={selectedAssetType === 'ALL' ? 'dark' : 'outline-dark'}
+              onClick={() => setSelectedAssetType('ALL')}
+            >
+              All Types
+            </Button>
+            {availableAssetTypes.map((type) => (
+              <Button
+                key={type}
+                size="sm"
+                variant={selectedAssetType === type ? 'dark' : 'outline-dark'}
+                onClick={() => setSelectedAssetType(type)}
+              >
+                {type.replace(/_/g, ' ')}
               </Button>
             ))}
           </div>
@@ -160,23 +265,23 @@ export default function Performance() {
               <Card className="shadow-sm h-100">
                 <Card.Body>
                   <div className="small text-muted mb-1">Period Return</div>
-                  <div className={`fs-4 fw-bold ${profitColor(data.periodReturn)}`}>
-                    {data.periodReturn >= 0 ? '+' : ''}{formatINR(data.periodReturn)}
+                  <div className={`fs-4 fw-bold ${profitColor(periodReturn)}`}>
+                    {periodReturn >= 0 ? '+' : ''}{formatINR(periodReturn)}
                   </div>
-                  <div className={`small ${profitColor(data.periodReturnPct)}`}>
-                    {formatPct(data.periodReturnPct)}
+                  <div className={`small ${profitColor(periodReturnPct)}`}>
+                    {formatPct(periodReturnPct)}
                   </div>
                 </Card.Body>
               </Card>
             </Col>
-            {data.portfolioData.length > 0 && (
+            {activeSeries.length > 0 && (
               <>
                 <Col md={4}>
                   <Card className="shadow-sm h-100">
                     <Card.Body>
                       <div className="small text-muted mb-1">Start Value ({data.startDate})</div>
                       <div className="fs-4 fw-bold">
-                        {formatINR(data.portfolioData[0]?.total_value)}
+                        {formatINR(startPoint?.total_value || 0)}
                       </div>
                     </Card.Body>
                   </Card>
@@ -186,7 +291,7 @@ export default function Performance() {
                     <Card.Body>
                       <div className="small text-muted mb-1">End Value ({data.endDate})</div>
                       <div className="fs-4 fw-bold">
-                        {formatINR(data.portfolioData[data.portfolioData.length - 1]?.total_value)}
+                        {formatINR(endPoint?.total_value || 0)}
                       </div>
                     </Card.Body>
                   </Card>

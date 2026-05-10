@@ -3,6 +3,8 @@ const router = express.Router();
 const XLSX = require('xlsx');
 const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = require('../services/priceService');
 const { updateAllPrices, cancelUpdate } = require('../services/updater');
+const { getPendingDirtyScopes, markDirtyForAssetTypeFromDate, markDirtyFromTransactions, runDirtyBackfillPreflight } = require('../services/dirtyBackfillService');
+const { todayIso } = require('../services/backfillService');
 
 const VALID_RATE_TYPES = new Set(['PPF', 'SSY', 'PF']);
 
@@ -237,6 +239,14 @@ module.exports = function (db) {
         'INSERT INTO interest_rates (rate_type, rate, effective_from, effective_to) VALUES (?, ?, ?, ?)'
       ).run(payload.rate_type, payload.rate, payload.effective_from, payload.effective_to);
 
+      markDirtyForAssetTypeFromDate(
+        db,
+        payload.rate_type,
+        payload.effective_from,
+        'interest-rate-created',
+        `interest_rate:${result.lastInsertRowid}`
+      );
+
       const created = db.prepare('SELECT * FROM interest_rates WHERE id = ?').get(result.lastInsertRowid);
       return res.status(201).json({ success: true, rate: created });
     } catch (e) {
@@ -265,9 +275,19 @@ module.exports = function (db) {
         });
       }
 
+      const dirtyFrom = payload.effective_from < existing.effective_from ? payload.effective_from : existing.effective_from;
+
       db.prepare(
         'UPDATE interest_rates SET rate_type = ?, rate = ?, effective_from = ?, effective_to = ? WHERE id = ?'
       ).run(payload.rate_type, payload.rate, payload.effective_from, payload.effective_to, id);
+
+      markDirtyForAssetTypeFromDate(
+        db,
+        payload.rate_type,
+        dirtyFrom,
+        'interest-rate-updated',
+        `interest_rate:${id}`
+      );
 
       const updated = db.prepare('SELECT * FROM interest_rates WHERE id = ?').get(id);
       return res.json({ success: true, rate: updated });
@@ -289,9 +309,182 @@ module.exports = function (db) {
       }
 
       db.prepare('DELETE FROM interest_rates WHERE id = ?').run(id);
+
+      markDirtyForAssetTypeFromDate(
+        db,
+        existing.rate_type,
+        existing.effective_from,
+        'interest-rate-deleted',
+        `interest_rate:${id}`
+      );
+
       return res.json({ success: true });
     } catch (e) {
       return res.status(400).json({ error: e.message || 'Failed to delete interest rate' });
+    }
+  });
+
+  // ─── Dirty backfill scope visibility ───────────────────────────────────
+  router.get('/dirty-backfill-scopes', (req, res) => {
+    try {
+      const runDate = parseDateOnly(req.query.run_date) || todayIso();
+      const pending = getPendingDirtyScopes(db, runDate);
+      res.json({ run_date: runDate, pending_count: pending.length, pending });
+    } catch (e) {
+      res.status(500).json({ error: e.message || 'Failed to fetch dirty scopes' });
+    }
+  });
+
+  // ─── Backfill status ───────────────────────────────────────────────────
+  router.get('/backfill-status', (req, res) => {
+    try {
+      const cfgRows = db.prepare(`
+        SELECT key, value, updated_at
+        FROM config
+        WHERE key IN ('backfill_watermark', 'backfill_last_result', 'backfill_last_error', 'backfill_progress')
+      `).all();
+
+      const pending = db.prepare("SELECT COUNT(*) AS c FROM dirty_backfill_scope WHERE status = 'pending'").get().c;
+      const running = db.prepare("SELECT COUNT(*) AS c FROM dirty_backfill_scope WHERE status = 'running'").get().c;
+      const failed = db.prepare("SELECT COUNT(*) AS c FROM dirty_backfill_scope WHERE status = 'failed'").get().c;
+      const completed = db.prepare("SELECT COUNT(*) AS c FROM dirty_backfill_scope WHERE status = 'completed'").get().c;
+
+      const cfg = {};
+      for (const row of cfgRows) cfg[row.key] = row.value;
+
+      let lastResult = null;
+      if (cfg.backfill_last_result) {
+        try {
+          lastResult = JSON.parse(cfg.backfill_last_result);
+        } catch (_) {
+          lastResult = { raw: cfg.backfill_last_result };
+        }
+      }
+
+      let progress = null;
+      if (cfg.backfill_progress) {
+        try {
+          progress = JSON.parse(cfg.backfill_progress);
+        } catch (_) {
+          progress = { raw: cfg.backfill_progress };
+        }
+      }
+
+      const percent = progress && Number(progress.total) > 0
+        ? Math.round((Number(progress.completed || 0) / Number(progress.total)) * 1000) / 10
+        : null;
+
+      res.json({
+        watermark: cfg.backfill_watermark || null,
+        progress,
+        progressPct: percent,
+        lastResult,
+        lastError: cfg.backfill_last_error || null,
+        counts: { pending, running, failed, completed },
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message || 'Failed to fetch backfill status' });
+    }
+  });
+
+  // ─── Backfill trigger (from date / investment) ───────────────────────
+  router.post('/backfill', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const runDate = parseDateOnly(body.run_date) || todayIso();
+      const fromDate = parseDateOnly(body.from_date);
+      const investmentId = body.investment_id != null ? Number(body.investment_id) : null;
+      const portfolioId = body.portfolio_id != null ? Number(body.portfolio_id) : null;
+      const execute = body.execute !== false;
+
+      if (investmentId != null && (!Number.isInteger(investmentId) || investmentId <= 0)) {
+        return res.status(400).json({ error: 'investment_id must be a positive integer' });
+      }
+      if (portfolioId != null && (!Number.isInteger(portfolioId) || portfolioId <= 0)) {
+        return res.status(400).json({ error: 'portfolio_id must be a positive integer' });
+      }
+
+      let scopes = [];
+      if (investmentId != null) {
+        scopes = db.prepare(`
+          SELECT
+            investment_id,
+            portfolio_id,
+            COALESCE(?, MIN(date(transaction_date))) AS transaction_date
+          FROM transactions
+          WHERE investment_id = ?
+            ${portfolioId != null ? 'AND portfolio_id = ?' : ''}
+            AND date(transaction_date) <= ?
+          GROUP BY investment_id, portfolio_id
+        `).all(...(portfolioId != null ? [fromDate, investmentId, portfolioId, runDate] : [fromDate, investmentId, runDate]));
+      } else {
+        scopes = db.prepare(`
+          SELECT
+            investment_id,
+            portfolio_id,
+            CASE WHEN ? IS NOT NULL THEN ? ELSE MIN(date(transaction_date)) END AS transaction_date
+          FROM transactions
+          WHERE date(transaction_date) <= ?
+            ${portfolioId != null ? 'AND portfolio_id = ?' : ''}
+          GROUP BY investment_id, portfolio_id
+        `).all(...(portfolioId != null ? [fromDate, fromDate, runDate, portfolioId] : [fromDate, fromDate, runDate]));
+      }
+
+      if (!scopes.length) {
+        return res.json({ success: true, run_date: runDate, seeded_scopes: 0, executed: false, message: 'No eligible scopes found' });
+      }
+
+      const marked = markDirtyFromTransactions(db, scopes, 'manual-backfill-trigger', `manual:${new Date().toISOString()}`);
+      if (!execute) {
+        return res.json({ success: true, run_date: runDate, seeded_scopes: marked, executed: false });
+      }
+
+      const result = await runDirtyBackfillPreflight(db, runDate);
+      return res.json({ success: true, run_date: runDate, seeded_scopes: marked, executed: true, result });
+    } catch (e) {
+      return res.status(500).json({ error: e.message || 'Backfill trigger failed' });
+    }
+  });
+
+  // ─── Dirty backfill preflight trigger ─────────────────────────────────
+  router.post('/backfill/preflight', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const runDate = parseDateOnly(body.run_date) || todayIso();
+      const result = await runDirtyBackfillPreflight(db, runDate);
+      res.json({ success: true, ...result });
+    } catch (e) {
+      res.status(500).json({ error: e.message || 'Dirty backfill preflight failed' });
+    }
+  });
+
+  // ─── Full backfill seed + optional run ────────────────────────────────
+  router.post('/backfill/full', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const runDate = parseDateOnly(body.run_date) || todayIso();
+      const execute = body.execute !== false;
+
+      const scopes = db.prepare(`
+        SELECT t.investment_id, t.portfolio_id, MIN(date(t.transaction_date)) AS transaction_date
+        FROM transactions t
+        JOIN investments i ON i.id = t.investment_id
+        WHERE date(t.transaction_date) <= ?
+          AND i.is_active != 0
+          AND i.exclude_from_tracking != 1
+        GROUP BY t.investment_id, t.portfolio_id
+      `).all(runDate);
+
+      const marked = markDirtyFromTransactions(db, scopes, 'full-backfill-seed', `run:${runDate}`);
+
+      if (!execute) {
+        return res.json({ success: true, run_date: runDate, seeded_scopes: marked, executed: false });
+      }
+
+      const result = await runDirtyBackfillPreflight(db, runDate);
+      return res.json({ success: true, run_date: runDate, seeded_scopes: marked, executed: true, result });
+    } catch (e) {
+      return res.status(500).json({ error: e.message || 'Full backfill failed' });
     }
   });
 

@@ -9,6 +9,7 @@ const { requireAuth } = require('./middleware/auth');
 const app = express();
 const PORT = process.env.PORT || 4000;
 const isProduction = process.env.NODE_ENV === 'production';
+const schedulerEnabled = process.env.ENABLE_SCHEDULER === 'true';
 
 // Initialize database
 const db = getDb();
@@ -70,8 +71,12 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Investment Tracker API running on http://localhost:${PORT}`);
 
-  // Start scheduled price updates
-  startScheduler(db);
+  // Start scheduled price updates only when explicitly enabled.
+  if (schedulerEnabled) {
+    startScheduler(db);
+  } else {
+    console.log('[Scheduler] Disabled (set ENABLE_SCHEDULER=true to enable).');
+  }
 });
 
 // Graceful shutdown

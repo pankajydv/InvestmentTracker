@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { fetchHistoricalUSDToINR, fetchUSDToINR } = require('../services/priceService');
+const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -151,6 +152,12 @@ module.exports = function (db) {
       resolvedRate, usd_amount || null, fmv_per_unit || null, gross_units || null, tax_withheld_units || null);
 
     const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
+    markDirtyFromTransactions(
+      db,
+      [{ investment_id, portfolio_id, transaction_date: normalizedTransactionDate }],
+      'transaction-created',
+      `txn:${result.lastInsertRowid}`
+    );
     res.status(201).json(txn);
   });
 
@@ -290,13 +297,14 @@ module.exports = function (db) {
       folio_number, exchange_rate_used, usd_amount, fmv_per_unit,
       gross_units, tax_withheld_units,
     } = req.body;
+    const nextDate = normalizeTransactionDate(transaction_date || existing.transaction_date) || existing.transaction_date;
     db.prepare(`
       UPDATE transactions
       SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?, broker = ?, folio_number = ?,
           exchange_rate_used = ?, usd_amount = ?, fmv_per_unit = ?, gross_units = ?, tax_withheld_units = ?
       WHERE id = ?
     `).run(
-      transaction_date || existing.transaction_date,
+      nextDate,
       units ?? existing.units,
       price_per_unit ?? existing.price_per_unit,
       amount ?? existing.amount,
@@ -312,13 +320,32 @@ module.exports = function (db) {
       req.params.id
     );
 
+    const dirtyFrom = existing.transaction_date < nextDate ? existing.transaction_date : nextDate;
+    markDirtyFromTransactions(
+      db,
+      [{ investment_id: existing.investment_id, portfolio_id: existing.portfolio_id, transaction_date: dirtyFrom }],
+      'transaction-updated',
+      `txn:${existing.id}`
+    );
+
     const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
     res.json(txn);
   });
 
   // --- Delete transaction ---
   router.delete('/:id', (req, res) => {
+    const existing = db.prepare('SELECT id, investment_id, portfolio_id, transaction_date FROM transactions WHERE id = ?').get(req.params.id);
+    if (!existing) return res.status(404).json({ error: 'Transaction not found' });
+
     db.prepare('DELETE FROM transactions WHERE id = ?').run(req.params.id);
+
+    markDirtyFromTransactions(
+      db,
+      [{ investment_id: existing.investment_id, portfolio_id: existing.portfolio_id, transaction_date: existing.transaction_date }],
+      'transaction-deleted',
+      `txn:${existing.id}`
+    );
+
     res.json({ success: true });
   });
 

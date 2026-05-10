@@ -260,7 +260,7 @@ module.exports = function (db) {
 
   // ─── Performance over time periods ─────────────────────────────────────
   router.get('/performance', (req, res) => {
-    const { period, from, to, portfolio_id } = req.query;
+    const { period, from, to, portfolio_id, asset_type } = req.query;
 
     let startDate, endDate;
     const now = new Date();
@@ -315,6 +315,30 @@ module.exports = function (db) {
       ORDER BY dv.date ASC, i.name ASC
     `).all(...investmentParams);
 
+    const typeFilterClause = asset_type ? 'AND atd.asset_type = ?' : '';
+    const typeParams = portfolio_id
+      ? [startDate, endDate, portfolio_id, ...(asset_type ? [asset_type] : [])]
+      : [startDate, endDate, ...(asset_type ? [asset_type] : [])];
+    const typeRows = db.prepare(`
+      SELECT atd.*
+      FROM asset_type_daily atd
+      WHERE atd.date BETWEEN ? AND ?
+        ${portfolio_id ? 'AND atd.portfolio_id = ?' : 'AND atd.portfolio_id IS NULL'}
+        ${typeFilterClause}
+      ORDER BY atd.date ASC, atd.asset_type ASC
+    `).all(...typeParams);
+
+    const performanceByAssetType = {};
+    for (const row of typeRows) {
+      if (!performanceByAssetType[row.asset_type]) {
+        performanceByAssetType[row.asset_type] = {
+          asset_type: row.asset_type,
+          dailyData: [],
+        };
+      }
+      performanceByAssetType[row.asset_type].dailyData.push(row);
+    }
+
     // Calculate period returns
     const startSnapshot = portfolioData[0];
     const endSnapshot = portfolioData[portfolioData.length - 1];
@@ -333,8 +357,59 @@ module.exports = function (db) {
       endDate,
       portfolioData,
       investmentData,
+      performanceByAssetType,
       periodReturn: Math.round(periodReturn * 100) / 100,
       periodReturnPct: Math.round(periodReturnPct * 100) / 100,
+    });
+  });
+
+  // ─── Asset-type performance time series ──────────────────────────────
+  router.get('/performance-by-type', (req, res) => {
+    const { asset_type, period, from, to, portfolio_id } = req.query;
+    if (!asset_type) {
+      return res.status(400).json({ error: 'asset_type is required' });
+    }
+
+    let startDate;
+    let endDate;
+    const now = new Date();
+    endDate = now.toISOString().split('T')[0];
+
+    if (from && to) {
+      startDate = from;
+      endDate = to;
+    } else {
+      switch (period) {
+        case '1D': startDate = new Date(now - 1 * 86400000).toISOString().split('T')[0]; break;
+        case '7D': startDate = new Date(now - 7 * 86400000).toISOString().split('T')[0]; break;
+        case '1M': { const d = new Date(now); d.setMonth(d.getMonth() - 1); startDate = d.toISOString().split('T')[0]; break; }
+        case '3M': { const d = new Date(now); d.setMonth(d.getMonth() - 3); startDate = d.toISOString().split('T')[0]; break; }
+        case '6M': { const d = new Date(now); d.setMonth(d.getMonth() - 6); startDate = d.toISOString().split('T')[0]; break; }
+        case '1Y': { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); startDate = d.toISOString().split('T')[0]; break; }
+        case '2Y': { const d = new Date(now); d.setFullYear(d.getFullYear() - 2); startDate = d.toISOString().split('T')[0]; break; }
+        case '3Y': { const d = new Date(now); d.setFullYear(d.getFullYear() - 3); startDate = d.toISOString().split('T')[0]; break; }
+        case '5Y': { const d = new Date(now); d.setFullYear(d.getFullYear() - 5); startDate = d.toISOString().split('T')[0]; break; }
+        default: { const d = new Date(now); d.setMonth(d.getMonth() - 1); startDate = d.toISOString().split('T')[0]; }
+      }
+    }
+
+    const rows = db.prepare(`
+      SELECT *
+      FROM asset_type_daily
+      WHERE asset_type = ?
+        ${portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL'}
+        AND date BETWEEN ? AND ?
+      ORDER BY date ASC
+    `).all(
+      ...(portfolio_id ? [asset_type, portfolio_id, startDate, endDate] : [asset_type, startDate, endDate])
+    );
+
+    return res.json({
+      asset_type,
+      period: period || 'custom',
+      startDate,
+      endDate,
+      data: rows,
     });
   });
 
