@@ -111,6 +111,7 @@ const TYPE_BADGE = {
   VOLUNTARY_CONTRIBUTION: 'badge-buy',
   EPS_CONTRIBUTION: 'badge-interest',
   PF_CONTRIBUTION: 'badge-buy',
+  TDS: 'badge-tds',
 };
 
 export default function Transactions() {

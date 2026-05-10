@@ -10,6 +10,7 @@ const TYPE_BADGE = {
   DIVIDEND: 'badge-dividend',
   SPLIT: 'badge-split',
   BONUS: 'badge-bonus',
+  TDS: 'badge-tds',
 };
 
 const ASSET_TYPE_OPTIONS = [

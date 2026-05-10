@@ -81,6 +81,7 @@ tr:hover .row-actions {
 .badge-redemption { background-color: #fee2e2 !important; color: #b91c1c !important; }
 .badge-consolidation { background-color: #f3e8ff !important; color: #7c3aed !important; }
 .badge-rights { background-color: #dcfce7 !important; color: #15803d !important; }
+.badge-tds { background-color: #ede9fe !important; color: #7c3aed !important; }
 
 /* Portfolio color dot */
 .portfolio-dot {
