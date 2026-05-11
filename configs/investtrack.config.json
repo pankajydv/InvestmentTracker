@@ -1,0 +1,56 @@
+{
+  "oracle": {
+    "host": "92.4.90.130",
+    "user": "ubuntu",
+    "port": 22,
+    "deployDir": "/home/ubuntu/investment-tracker",
+    "envFile": "/opt/investment-tracker.env",
+    "dataDir": "/data",
+    "backupScript": "/usr/local/bin/investment-backup.sh"
+  },
+  "deployment": {
+    "enableScheduler": true,
+    "enableAuth": true,
+    "allowDbMigrations": false,
+    "backupBeforeDeploy": true,
+    "domain": "investtrack.duckdns.org"
+  },
+  "docker": {
+    "imageName": "investment-tracker",
+    "imageTag": "latest",
+    "containerName": "investment-tracker",
+    "port": 8080,
+    "restartPolicy": "unless-stopped"
+  },
+  "scheduler": {
+    "enabled": true,
+    "timezone": "Asia/Kolkata",
+    "schedules": {
+      "intradayStocks": "9:25 AM - 4:25 PM IST (weekdays)",
+      "dailyFinal": "10:25 PM IST (weekdays)"
+    }
+  },
+  "backup": {
+    "retentionDays": 30,
+    "schedule": "02:30 UTC daily (via cron)"
+  },
+  "auth": {
+    "provider": "google",
+    "authDisabled": false,
+    "allowedEmails": [
+      "pankaj.ydv@gmail.com",
+      "hianju.yadav@gmail.com",
+      "yashita.ydv@gmail.com"
+    ]
+  },
+  "database": {
+    "type": "sqlite",
+    "filename": "investments.db",
+    "walMode": true,
+    "location": "/data/investments.db"
+  },
+  "monitoring": {
+    "healthCheckEndpoint": "/api/auth/config",
+    "healthCheckInterval": 30
+  }
+}
