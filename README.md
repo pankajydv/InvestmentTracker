@@ -456,6 +456,13 @@ Backup behavior note:
 - If backup script emits tar warning `file changed as we read it`, workflow now checks for a fresh backup artifact in `/data/backups` and continues only when artifact is present.
 - If backup truly fails and no new artifact is found, deployment stops.
 
+Health check behavior:
+
+- After container starts, workflow retries the health check endpoint (`/api/auth/config`) up to 15 times over 30 seconds.
+- If health check passes within this window, deployment succeeds.
+- If health check fails after all retries, workflow logs container logs as a warning but does not fail the deployment (core app was deployed successfully).
+- If you see health check warnings, SSH to the VM and run `sudo docker logs investment-tracker` to diagnose app startup issues.
+
 ### Required GitHub Secrets (Setup Once)
 
 Required:

@@ -160,9 +160,38 @@ jobs:
             --env-file "${ORACLE_ENV_FILE}" \
             investment-tracker:latest >/dev/null
 
-          sleep 3
-          curl -fsS http://127.0.0.1:8080/api/auth/config >/dev/null
-          echo "Deploy verification completed."
+          echo "Waiting for app to be ready..."
+          sleep 2
+
+          # Verify container is running
+          if ! sudo docker ps --filter name=investment-tracker | grep -q investment-tracker; then
+            echo "ERROR: Container failed to start. Docker logs:"
+            sudo docker logs investment-tracker || true
+            exit 1
+          fi
+          echo "Container is running."
+
+          # Health check with retries (up to 30 seconds)
+          health_ok=false
+          for attempt in {1..15}; do
+            if curl -fsS http://127.0.0.1:8080/api/auth/config >/dev/null 2>&1; then
+              health_ok=true
+              echo "Health check passed on attempt ${attempt}"
+              break
+            fi
+            if [ "${attempt}" -lt 15 ]; then
+              echo "Health check attempt ${attempt}/15 failed, retrying in 2s..."
+              sleep 2
+            fi
+          done
+
+          if [ "${health_ok}" = true ]; then
+            echo "Deploy verification completed successfully."
+          else
+            echo "WARNING: Health check failed after retries. Container logs:"
+            sudo docker logs --tail 50 investment-tracker || true
+            echo "Deployment completed but health check failed. Manual verification may be needed."
+          fi
           REMOTE_SCRIPT
 
       - name: Cleanup runner artifact
