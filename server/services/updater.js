@@ -455,7 +455,8 @@ function updatePortfolioDaily(db, date) {
   for (const pid of allIds) {
     let totals;
     if (pid === null) {
-      // Combined: sum from combined (NULL portfolio_id) daily_values rows
+      // Combined: use latest available row per investment (handles partial intraday runs where
+      // only stocks are updated — non-stock types carry forward from their most recent row).
       totals = db.prepare(`
         SELECT
           COALESCE(SUM(dv.current_value), 0) as total_value,
@@ -463,10 +464,16 @@ function updatePortfolioDaily(db, date) {
           COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
           COALESCE(SUM(dv.day_change), 0) as day_change
         FROM daily_values dv
-        WHERE dv.portfolio_id IS NULL AND dv.date = ?
+        INNER JOIN (
+          SELECT investment_id, MAX(date) as max_date
+          FROM daily_values
+          WHERE portfolio_id IS NULL AND date <= ?
+          GROUP BY investment_id
+        ) latest ON dv.investment_id = latest.investment_id AND dv.date = latest.max_date
+        WHERE dv.portfolio_id IS NULL
       `).get(date);
     } else {
-      // Per-portfolio: sum from portfolio-scoped daily_values rows
+      // Per-portfolio: use latest available row per investment (same carry-forward logic).
       totals = db.prepare(`
         SELECT
           COALESCE(SUM(dv.current_value), 0) as total_value,
@@ -474,8 +481,14 @@ function updatePortfolioDaily(db, date) {
           COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
           COALESCE(SUM(dv.day_change), 0) as day_change
         FROM daily_values dv
-        WHERE dv.portfolio_id = ? AND dv.date = ?
-      `).get(pid, date);
+        INNER JOIN (
+          SELECT investment_id, MAX(date) as max_date
+          FROM daily_values
+          WHERE portfolio_id = ? AND date <= ?
+          GROUP BY investment_id
+        ) latest ON dv.investment_id = latest.investment_id AND dv.date = latest.max_date
+        WHERE dv.portfolio_id = ?
+      `).get(pid, date, pid);
     }
 
     const profitPct = totals.total_invested > 0
@@ -543,6 +556,8 @@ function updateAssetTypeDaily(db, date) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
+  // Use latest available row per (investment, portfolio) pair so that a partial
+  // intraday run (e.g. stocks-only) still carries forward non-updated asset types.
   const aggregateRows = db.prepare(`
     SELECT
       dv.portfolio_id,
@@ -555,8 +570,15 @@ function updateAssetTypeDaily(db, date) {
       COALESCE(SUM(dv.day_change), 0) AS day_change
     FROM daily_values dv
     JOIN investments i ON i.id = dv.investment_id
-    WHERE dv.date = ?
-      AND i.exclude_from_tracking != 1
+    INNER JOIN (
+      SELECT investment_id, portfolio_id, MAX(date) as max_date
+      FROM daily_values
+      WHERE date <= ?
+      GROUP BY investment_id, portfolio_id
+    ) latest ON dv.investment_id = latest.investment_id
+      AND dv.portfolio_id IS latest.portfolio_id
+      AND dv.date = latest.max_date
+    WHERE i.exclude_from_tracking != 1
     GROUP BY dv.portfolio_id, i.asset_type
   `);
 
