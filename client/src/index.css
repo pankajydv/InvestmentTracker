@@ -1,6 +1,12 @@
+html, body, #root {
+  height: 100%;
+}
+
 body {
+  margin: 0;
   font-family: 'Roboto', system-ui, -apple-system, sans-serif;
   background-color: #f8f9fa;
+  overflow-x: hidden;
 }
 
 /* Custom scrollbar */

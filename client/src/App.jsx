@@ -108,7 +108,7 @@ export default function App() {
   return (
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <PortfolioProvider>
-        <div style={{ minHeight: '100vh', backgroundColor: '#f8f9fa' }}>
+        <div style={{ minHeight: '100%', backgroundColor: '#f8f9fa' }}>
           <Navbar user={user} onLogout={handleLogout} />
           <main className="container py-4">
             <Routes>
