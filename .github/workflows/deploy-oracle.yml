@@ -28,12 +28,15 @@ jobs:
       - name: Create source archive
         run: |
           tar -czf source.tar.gz \
+            --ignore-failed-read \
             --exclude=.git \
             --exclude=.github \
             --exclude=node_modules \
             --exclude=.venv \
             --exclude=deployment-oracle-auth-sequencing-plan.md \
             --exclude=InvestmentTracker.code-workspace \
+            --exclude=.git/** \
+            --exclude=**/.git \
             .
           ls -lh source.tar.gz
 
