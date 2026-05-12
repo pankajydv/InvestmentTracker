@@ -14,9 +14,14 @@ on:
         default: true
         type: boolean
 
+concurrency:
+  group: deploy-oracle-production
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
@@ -85,11 +90,27 @@ jobs:
         run: |
           set -euo pipefail
           PORT="${{ steps.config.outputs.oracle_port }}"
-          scp \
-            -P "${PORT}" \
-            -o StrictHostKeyChecking=accept-new \
-            /tmp/investment-tracker-src.tar.gz \
-            "${{ steps.config.outputs.oracle_user }}@${{ steps.config.outputs.oracle_host }}:/tmp/investment-tracker-src.tar.gz"
+          for attempt in 1 2 3; do
+            if scp \
+              -P "${PORT}" \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=6 \
+              /tmp/investment-tracker-src.tar.gz \
+              "${{ steps.config.outputs.oracle_user }}@${{ steps.config.outputs.oracle_host }}:/tmp/investment-tracker-src.tar.gz"; then
+              echo "Source archive copied successfully on attempt ${attempt}."
+              break
+            fi
+
+            if [ "${attempt}" -eq 3 ]; then
+              echo "SCP failed after 3 attempts."
+              exit 1
+            fi
+
+            echo "SCP failed on attempt ${attempt}, retrying in 5s..."
+            sleep 5
+          done
 
       - name: Deploy on Oracle VM
         shell: bash
@@ -109,9 +130,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          ssh -p "${ORACLE_PORT}" -o StrictHostKeyChecking=accept-new "${ORACLE_USER}@${ORACLE_HOST}" \
-            "GOOGLE_CLIENT_ID='${GOOGLE_CLIENT_ID}' ALLOWED_EMAILS='${ALLOWED_EMAILS}' ENABLE_SCHEDULER='${ENABLE_SCHEDULER}' ALLOW_DB_MIGRATIONS='${ALLOW_DB_MIGRATIONS}' BACKUP_BEFORE_DEPLOY='${BACKUP_BEFORE_DEPLOY}' ORACLE_DEPLOY_DIR='${ORACLE_DEPLOY_DIR}' ORACLE_ENV_FILE='${ORACLE_ENV_FILE}' ORACLE_DATA_DIR='${ORACLE_DATA_DIR}' ORACLE_BACKUP_SCRIPT='${ORACLE_BACKUP_SCRIPT}' bash -s" <<'REMOTE_SCRIPT'
-          set -euo pipefail
+          run_remote_deploy() {
+            ssh -p "${ORACLE_PORT}" \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=10 \
+              "${ORACLE_USER}@${ORACLE_HOST}" \
+              "GOOGLE_CLIENT_ID='${GOOGLE_CLIENT_ID}' ALLOWED_EMAILS='${ALLOWED_EMAILS}' ENABLE_SCHEDULER='${ENABLE_SCHEDULER}' ALLOW_DB_MIGRATIONS='${ALLOW_DB_MIGRATIONS}' BACKUP_BEFORE_DEPLOY='${BACKUP_BEFORE_DEPLOY}' ORACLE_DEPLOY_DIR='${ORACLE_DEPLOY_DIR}' ORACLE_ENV_FILE='${ORACLE_ENV_FILE}' ORACLE_DATA_DIR='${ORACLE_DATA_DIR}' ORACLE_BACKUP_SCRIPT='${ORACLE_BACKUP_SCRIPT}' bash -s" <<'REMOTE_SCRIPT'
+            set -euo pipefail
+
+            echo "Remote deploy started on $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           if [ "${BACKUP_BEFORE_DEPLOY}" = "true" ] && [ -x "${ORACLE_BACKUP_SCRIPT}" ]; then
             set +e
@@ -135,6 +164,7 @@ jobs:
           tar -xzf /tmp/investment-tracker-src.tar.gz -C "${ORACLE_DEPLOY_DIR}"
           cd "${ORACLE_DEPLOY_DIR}"
 
+          echo "Starting Docker build..."
           sudo docker build -t investment-tracker:latest .
 
           sudo touch "${ORACLE_ENV_FILE}"
@@ -192,7 +222,23 @@ jobs:
             sudo docker logs --tail 50 investment-tracker || true
             echo "Deployment completed but health check failed. Manual verification may be needed."
           fi
-          REMOTE_SCRIPT
+            REMOTE_SCRIPT
+          }
+
+          for attempt in 1 2; do
+            if run_remote_deploy; then
+              echo "Remote deploy completed on attempt ${attempt}."
+              exit 0
+            fi
+
+            if [ "${attempt}" -eq 2 ]; then
+              echo "Remote deploy failed after 2 attempts."
+              exit 1
+            fi
+
+            echo "Remote deploy failed on attempt ${attempt}, retrying in 10s..."
+            sleep 10
+          done
 
       - name: Cleanup runner artifact
         if: always()
