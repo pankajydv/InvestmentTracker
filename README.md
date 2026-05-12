@@ -368,16 +368,16 @@ This repo includes a manual GitHub Actions workflow:
 **One-touch deployment:** After code changes, trigger the workflow with just one click. All configuration is centralized:
 
 - Deployment config (host, user, paths, etc.) is in `configs/investtrack.config.json` (committed to repo)
-- Google OAuth client ID auto-extracts from `configs/gcp-client.json`
-- Allowed emails default to: `pankaj.ydv@gmail.com,hianju.yadav@gmail.com,yashita.ydv@gmail.com`
+- Google OAuth client ID is read from GitHub secret `GOOGLE_CLIENT_ID`
+- Allowed emails default to: `pankaj.ydv@gmail.com,hianju.yadav@gmail.com,yashita.ydv@gmail.com` (or optional `ALLOWED_EMAILS` secret)
 - Scheduler enabled by default in production
 - Only optional overrides: `allow_db_migrations` and `backup_before_deploy`
 
 The workflow performs:
 
 1. Load Oracle VM config from `configs/investtrack.config.json`
-2. Parse Google client ID from `configs/gcp-client.json`
-3. Validate GitHub secrets (SSH private key only)
+2. Read Google client ID from GitHub secret `GOOGLE_CLIENT_ID`
+3. Validate GitHub secrets
 4. Package latest repository source
 5. Copy archive to Oracle VM over SSH
 6. Build `investment-tracker:latest` on VM
@@ -453,17 +453,24 @@ git push origin main
 
 ### Required GitHub Secrets (Setup Once)
 
-Only ONE secret is required:
+Required:
 
 - `ORACLE_SSH_PRIVATE_KEY` (private key matching an authorized key on VM)
+- `GOOGLE_CLIENT_ID` (Google OAuth web client id)
 
-All other parameters are read from `configs/investtrack.config.json`, eliminating the need for multiple secrets.
+Optional:
+
+- `ALLOWED_EMAILS` (comma-separated allowlist; if not set, workflow uses default three emails)
+
+All Oracle host/path/runtime parameters are read from `configs/investtrack.config.json`.
 
 ### Setup Instructions
 
 1. **Add GitHub secret:**
    - Go to GitHub repo → Settings → Secrets and variables → Actions
-   - Create secret `ORACLE_SSH_PRIVATE_KEY` with your private key content
+  - Create secret `ORACLE_SSH_PRIVATE_KEY` with your private key content
+  - Create secret `GOOGLE_CLIENT_ID` with your OAuth client id value
+  - Optional: create `ALLOWED_EMAILS` for custom allowlist
 
 2. **Verify config file:**
    - Check `configs/investtrack.config.json` has correct Oracle host/user/paths

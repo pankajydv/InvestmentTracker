@@ -49,29 +49,17 @@ jobs:
           
           echo "Loaded deployment config from ${CONFIG_FILE}"
 
-      - name: Parse app config
-        id: defaults
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Extract Google client ID from configs/gcp-client.json
-          GOOGLE_CLIENT_ID=$(jq -r '.web.client_id' configs/gcp-client.json)
-          if [ -z "${GOOGLE_CLIENT_ID}" ] || [ "${GOOGLE_CLIENT_ID}" = "null" ]; then
-            echo "Failed to extract GOOGLE_CLIENT_ID from configs/gcp-client.json"
-            exit 1
-          fi
-          echo "google_client_id=${GOOGLE_CLIENT_ID}" >> "$GITHUB_OUTPUT"
-          echo "Resolved GOOGLE_CLIENT_ID from configs/gcp-client.json"
-
       - name: Validate required secrets and config
         shell: bash
         env:
           ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
+          GOOGLE_CLIENT_ID_SECRET: ${{ secrets.GOOGLE_CLIENT_ID }}
         run: |
           set -euo pipefail
           test -n "${{ steps.config.outputs.oracle_host }}" || { echo "Missing oracle.host in investtrack.config.json"; exit 1; }
           test -n "${{ steps.config.outputs.oracle_user }}" || { echo "Missing oracle.user in investtrack.config.json"; exit 1; }
           test -n "${ORACLE_SSH_PRIVATE_KEY}" || { echo "Missing secret ORACLE_SSH_PRIVATE_KEY"; exit 1; }
+          test -n "${GOOGLE_CLIENT_ID_SECRET}" || { echo "Missing secret GOOGLE_CLIENT_ID"; exit 1; }
           echo "Config validation passed"
 
       - name: Load SSH private key
@@ -104,8 +92,8 @@ jobs:
       - name: Deploy on Oracle VM
         shell: bash
         env:
-          GOOGLE_CLIENT_ID: ${{ steps.defaults.outputs.google_client_id }}
-          ALLOWED_EMAILS: pankaj.ydv@gmail.com,hianju.yadav@gmail.com,yashita.ydv@gmail.com
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          ALLOWED_EMAILS_SECRET: ${{ secrets.ALLOWED_EMAILS }}
           ENABLE_SCHEDULER: true
           ALLOW_DB_MIGRATIONS: ${{ inputs.allow_db_migrations }}
           BACKUP_BEFORE_DEPLOY: ${{ inputs.backup_before_deploy }}
@@ -118,6 +106,9 @@ jobs:
           ORACLE_BACKUP_SCRIPT: ${{ steps.config.outputs.oracle_backup_script }}
         run: |
           set -euo pipefail
+
+          # Use ALLOWED_EMAILS secret when provided; else use safe default allowlist.
+          ALLOWED_EMAILS="${ALLOWED_EMAILS_SECRET:-pankaj.ydv@gmail.com,hianju.yadav@gmail.com,yashita.ydv@gmail.com}"
 
           ssh -p "${ORACLE_PORT}" -o StrictHostKeyChecking=accept-new "${ORACLE_USER}@${ORACLE_HOST}" \
             "GOOGLE_CLIENT_ID='${GOOGLE_CLIENT_ID}' ALLOWED_EMAILS='${ALLOWED_EMAILS}' ENABLE_SCHEDULER='${ENABLE_SCHEDULER}' ALLOW_DB_MIGRATIONS='${ALLOW_DB_MIGRATIONS}' BACKUP_BEFORE_DEPLOY='${BACKUP_BEFORE_DEPLOY}' ORACLE_DEPLOY_DIR='${ORACLE_DEPLOY_DIR}' ORACLE_ENV_FILE='${ORACLE_ENV_FILE}' ORACLE_DATA_DIR='${ORACLE_DATA_DIR}' ORACLE_BACKUP_SCRIPT='${ORACLE_BACKUP_SCRIPT}' bash -s" <<'REMOTE_SCRIPT'
