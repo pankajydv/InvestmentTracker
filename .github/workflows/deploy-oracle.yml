@@ -130,7 +130,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          run_remote_deploy() {
+          for attempt in 1 2; do
+            echo "Starting remote deploy attempt ${attempt}..."
+            set +e
             ssh -p "${ORACLE_PORT}" \
               -o StrictHostKeyChecking=accept-new \
               -o ConnectTimeout=20 \
@@ -142,93 +144,91 @@ jobs:
 
             echo "Remote deploy started on $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          if [ "${BACKUP_BEFORE_DEPLOY}" = "true" ] && [ -x "${ORACLE_BACKUP_SCRIPT}" ]; then
-            set +e
-            sudo "${ORACLE_BACKUP_SCRIPT}"
-            backup_exit=$?
-            set -e
+            if [ "${BACKUP_BEFORE_DEPLOY}" = "true" ] && [ -x "${ORACLE_BACKUP_SCRIPT}" ]; then
+              set +e
+              sudo "${ORACLE_BACKUP_SCRIPT}"
+              backup_exit=$?
+              set -e
 
-            if [ "${backup_exit}" -ne 0 ]; then
-              echo "Backup script exited with code ${backup_exit}. Checking for fresh backup artifact..."
-              if sudo find "${ORACLE_DATA_DIR}/backups" -maxdepth 1 -type f -name 'data-*.tar.gz' -mmin -20 | grep -q .; then
-                echo "Fresh backup artifact found under ${ORACLE_DATA_DIR}/backups. Continuing deployment."
-              else
-                echo "Backup failed and no fresh backup artifact found. Aborting deployment."
-                exit 1
+              if [ "${backup_exit}" -ne 0 ]; then
+                echo "Backup script exited with code ${backup_exit}. Checking for fresh backup artifact..."
+                if sudo find "${ORACLE_DATA_DIR}/backups" -maxdepth 1 -type f -name 'data-*.tar.gz' -mmin -20 | grep -q .; then
+                  echo "Fresh backup artifact found under ${ORACLE_DATA_DIR}/backups. Continuing deployment."
+                else
+                  echo "Backup failed and no fresh backup artifact found. Aborting deployment."
+                  exit 1
+                fi
               fi
             fi
-          fi
 
-          rm -rf "${ORACLE_DEPLOY_DIR}"
-          mkdir -p "${ORACLE_DEPLOY_DIR}"
-          tar -xzf /tmp/investment-tracker-src.tar.gz -C "${ORACLE_DEPLOY_DIR}"
-          cd "${ORACLE_DEPLOY_DIR}"
+            rm -rf "${ORACLE_DEPLOY_DIR}"
+            mkdir -p "${ORACLE_DEPLOY_DIR}"
+            tar -xzf /tmp/investment-tracker-src.tar.gz -C "${ORACLE_DEPLOY_DIR}"
+            cd "${ORACLE_DEPLOY_DIR}"
 
-          echo "Starting Docker build..."
-          sudo docker build -t investment-tracker:latest .
+            echo "Starting Docker build..."
+            sudo docker build -t investment-tracker:latest .
 
-          sudo touch "${ORACLE_ENV_FILE}"
-          sudo sed -i '/^GOOGLE_CLIENT_ID=/d;/^ALLOWED_EMAILS=/d;/^AUTH_DISABLED=/d;/^ENABLE_SCHEDULER=/d;/^ALLOW_DB_MIGRATIONS=/d' "${ORACLE_ENV_FILE}"
-          {
-            echo "GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}"
-            echo "ALLOWED_EMAILS=${ALLOWED_EMAILS}"
-            echo "AUTH_DISABLED=false"
-            echo "ENABLE_SCHEDULER=${ENABLE_SCHEDULER}"
-            echo "ALLOW_DB_MIGRATIONS=${ALLOW_DB_MIGRATIONS}"
-          } | sudo tee -a "${ORACLE_ENV_FILE}" >/dev/null
+            sudo touch "${ORACLE_ENV_FILE}"
+            sudo sed -i '/^GOOGLE_CLIENT_ID=/d;/^ALLOWED_EMAILS=/d;/^AUTH_DISABLED=/d;/^ENABLE_SCHEDULER=/d;/^ALLOW_DB_MIGRATIONS=/d' "${ORACLE_ENV_FILE}"
+            {
+              echo "GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}"
+              echo "ALLOWED_EMAILS=${ALLOWED_EMAILS}"
+              echo "AUTH_DISABLED=false"
+              echo "ENABLE_SCHEDULER=${ENABLE_SCHEDULER}"
+              echo "ALLOW_DB_MIGRATIONS=${ALLOW_DB_MIGRATIONS}"
+            } | sudo tee -a "${ORACLE_ENV_FILE}" >/dev/null
 
-          if sudo docker ps -a --format '{{.Names}}' | grep -q '^investment-tracker$'; then
-            sudo docker stop investment-tracker >/dev/null || true
-            sudo docker rm investment-tracker >/dev/null || true
-          fi
-
-          sudo docker run -d \
-            --name investment-tracker \
-            --restart unless-stopped \
-            -p 8080:8080 \
-            -v "${ORACLE_DATA_DIR}:/data" \
-            --env-file "${ORACLE_ENV_FILE}" \
-            investment-tracker:latest >/dev/null
-
-          echo "Waiting for app to be ready..."
-          sleep 2
-
-          # Verify container is running
-          if ! sudo docker ps --filter name=investment-tracker | grep -q investment-tracker; then
-            echo "ERROR: Container failed to start. Docker logs:"
-            sudo docker logs investment-tracker || true
-            exit 1
-          fi
-          echo "Container is running."
-
-          # Health check with retries (up to 30 seconds)
-          health_ok=false
-          for attempt in {1..15}; do
-            if curl -fsS http://127.0.0.1:8080/api/auth/config >/dev/null 2>&1; then
-              health_ok=true
-              echo "Health check passed on attempt ${attempt}"
-              break
+            if sudo docker ps -a --format '{{.Names}}' | grep -q '^investment-tracker$'; then
+              sudo docker stop investment-tracker >/dev/null || true
+              sudo docker rm investment-tracker >/dev/null || true
             fi
-            if [ "${attempt}" -lt 15 ]; then
-              echo "Health check attempt ${attempt}/15 failed, retrying in 2s..."
-              sleep 2
-            fi
-          done
 
-          if [ "${health_ok}" = true ]; then
-            echo "Deploy verification completed successfully."
-          else
-            echo "WARNING: Health check failed after retries. Container logs:"
-            sudo docker logs --tail 50 investment-tracker || true
-            echo "Deployment completed but health check failed. Manual verification may be needed."
-          fi
+            sudo docker run -d \
+              --name investment-tracker \
+              --restart unless-stopped \
+              -p 8080:8080 \
+              -v "${ORACLE_DATA_DIR}:/data" \
+              --env-file "${ORACLE_ENV_FILE}" \
+              investment-tracker:latest >/dev/null
+
+            echo "Waiting for app to be ready..."
+            sleep 2
+
+            if ! sudo docker ps --filter name=investment-tracker | grep -q investment-tracker; then
+              echo "ERROR: Container failed to start. Docker logs:"
+              sudo docker logs investment-tracker || true
+              exit 1
+            fi
+            echo "Container is running."
+
+            health_ok=false
+            for attempt in {1..15}; do
+              if curl -fsS http://127.0.0.1:8080/api/auth/config >/dev/null 2>&1; then
+                health_ok=true
+                echo "Health check passed on attempt ${attempt}"
+                break
+              fi
+              if [ "${attempt}" -lt 15 ]; then
+                echo "Health check attempt ${attempt}/15 failed, retrying in 2s..."
+                sleep 2
+              fi
+            done
+
+            if [ "${health_ok}" = true ]; then
+              echo "Deploy verification completed successfully."
+            else
+              echo "WARNING: Health check failed after retries. Container logs:"
+              sudo docker logs --tail 50 investment-tracker || true
+              echo "Deployment completed but health check failed. Manual verification may be needed."
+            fi
             REMOTE_SCRIPT
-          }
+            ssh_exit=$?
+            set -e
 
-          for attempt in 1 2; do
-            if run_remote_deploy; then
+            if [ "${ssh_exit}" -eq 0 ]; then
               echo "Remote deploy completed on attempt ${attempt}."
-              exit 0
+              break
             fi
 
             if [ "${attempt}" -eq 2 ]; then
