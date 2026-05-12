@@ -54,12 +54,14 @@ jobs:
         env:
           ORACLE_SSH_PRIVATE_KEY: ${{ secrets.ORACLE_SSH_PRIVATE_KEY }}
           GOOGLE_CLIENT_ID_SECRET: ${{ secrets.GOOGLE_CLIENT_ID }}
+          ALLOWED_EMAILS_SECRET: ${{ secrets.ALLOWED_EMAILS }}
         run: |
           set -euo pipefail
           test -n "${{ steps.config.outputs.oracle_host }}" || { echo "Missing oracle.host in investtrack.config.json"; exit 1; }
           test -n "${{ steps.config.outputs.oracle_user }}" || { echo "Missing oracle.user in investtrack.config.json"; exit 1; }
           test -n "${ORACLE_SSH_PRIVATE_KEY}" || { echo "Missing secret ORACLE_SSH_PRIVATE_KEY"; exit 1; }
           test -n "${GOOGLE_CLIENT_ID_SECRET}" || { echo "Missing secret GOOGLE_CLIENT_ID"; exit 1; }
+          test -n "${ALLOWED_EMAILS_SECRET}" || { echo "Missing secret ALLOWED_EMAILS"; exit 1; }
           echo "Config validation passed"
 
       - name: Load SSH private key
@@ -93,7 +95,7 @@ jobs:
         shell: bash
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          ALLOWED_EMAILS_SECRET: ${{ secrets.ALLOWED_EMAILS }}
+          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
           ENABLE_SCHEDULER: true
           ALLOW_DB_MIGRATIONS: ${{ inputs.allow_db_migrations }}
           BACKUP_BEFORE_DEPLOY: ${{ inputs.backup_before_deploy }}
@@ -107,15 +109,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Use ALLOWED_EMAILS secret when provided; else use safe default allowlist.
-          ALLOWED_EMAILS="${ALLOWED_EMAILS_SECRET:-pankaj.ydv@gmail.com,hianju.yadav@gmail.com,yashita.ydv@gmail.com}"
-
           ssh -p "${ORACLE_PORT}" -o StrictHostKeyChecking=accept-new "${ORACLE_USER}@${ORACLE_HOST}" \
             "GOOGLE_CLIENT_ID='${GOOGLE_CLIENT_ID}' ALLOWED_EMAILS='${ALLOWED_EMAILS}' ENABLE_SCHEDULER='${ENABLE_SCHEDULER}' ALLOW_DB_MIGRATIONS='${ALLOW_DB_MIGRATIONS}' BACKUP_BEFORE_DEPLOY='${BACKUP_BEFORE_DEPLOY}' ORACLE_DEPLOY_DIR='${ORACLE_DEPLOY_DIR}' ORACLE_ENV_FILE='${ORACLE_ENV_FILE}' ORACLE_DATA_DIR='${ORACLE_DATA_DIR}' ORACLE_BACKUP_SCRIPT='${ORACLE_BACKUP_SCRIPT}' bash -s" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           if [ "${BACKUP_BEFORE_DEPLOY}" = "true" ] && [ -x "${ORACLE_BACKUP_SCRIPT}" ]; then
+            set +e
             sudo "${ORACLE_BACKUP_SCRIPT}"
+            backup_exit=$?
+            set -e
+
+            if [ "${backup_exit}" -ne 0 ]; then
+              echo "Backup script exited with code ${backup_exit}. Checking for fresh backup artifact..."
+              if sudo find "${ORACLE_DATA_DIR}/backups" -maxdepth 1 -type f -name 'data-*.tar.gz' -mmin -20 | grep -q .; then
+                echo "Fresh backup artifact found under ${ORACLE_DATA_DIR}/backups. Continuing deployment."
+              else
+                echo "Backup failed and no fresh backup artifact found. Aborting deployment."
+                exit 1
+              fi
+            fi
           fi
 
           rm -rf "${ORACLE_DEPLOY_DIR}"

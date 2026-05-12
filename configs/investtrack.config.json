@@ -38,9 +38,7 @@
     "provider": "google",
     "authDisabled": false,
     "allowedEmails": [
-      "pankaj.ydv@gmail.com",
-      "hianju.yadav@gmail.com",
-      "yashita.ydv@gmail.com"
+      "abc.xyz@gmail.com"
     ]
   },
   "database": {

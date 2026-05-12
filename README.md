@@ -369,7 +369,7 @@ This repo includes a manual GitHub Actions workflow:
 
 - Deployment config (host, user, paths, etc.) is in `configs/investtrack.config.json` (committed to repo)
 - Google OAuth client ID is read from GitHub secret `GOOGLE_CLIENT_ID`
-- Allowed emails default to: `pankaj.ydv@gmail.com,hianju.yadav@gmail.com,yashita.ydv@gmail.com` (or optional `ALLOWED_EMAILS` secret)
+- Allowed emails are read from GitHub secret `ALLOWED_EMAILS`
 - Scheduler enabled by default in production
 - Only optional overrides: `allow_db_migrations` and `backup_before_deploy`
 
@@ -451,16 +451,18 @@ git push origin main
 - `allow_db_migrations` (default `false`) – set to `true` when deploying schema changes
 - `backup_before_deploy` (default `true`) – disable to skip pre-deploy backup
 
+Backup behavior note:
+
+- If backup script emits tar warning `file changed as we read it`, workflow now checks for a fresh backup artifact in `/data/backups` and continues only when artifact is present.
+- If backup truly fails and no new artifact is found, deployment stops.
+
 ### Required GitHub Secrets (Setup Once)
 
 Required:
 
 - `ORACLE_SSH_PRIVATE_KEY` (private key matching an authorized key on VM)
 - `GOOGLE_CLIENT_ID` (Google OAuth web client id)
-
-Optional:
-
-- `ALLOWED_EMAILS` (comma-separated allowlist; if not set, workflow uses default three emails)
+- `ALLOWED_EMAILS` (comma-separated allowlist)
 
 All Oracle host/path/runtime parameters are read from `configs/investtrack.config.json`.
 
@@ -470,7 +472,7 @@ All Oracle host/path/runtime parameters are read from `configs/investtrack.confi
    - Go to GitHub repo → Settings → Secrets and variables → Actions
   - Create secret `ORACLE_SSH_PRIVATE_KEY` with your private key content
   - Create secret `GOOGLE_CLIENT_ID` with your OAuth client id value
-  - Optional: create `ALLOWED_EMAILS` for custom allowlist
+  - Create secret `ALLOWED_EMAILS` with comma-separated emails, for example: `pankaj.ydv@gmail.com,hianju.yadav@gmail.com,yashita.ydv@gmail.com`
 
 2. **Verify config file:**
    - Check `configs/investtrack.config.json` has correct Oracle host/user/paths
