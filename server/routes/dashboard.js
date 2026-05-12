@@ -148,6 +148,11 @@ module.exports = function (db) {
       }
     }
 
+    const latestSnapshotDate = investments.reduce((maxDate, inv) => {
+      if (!inv.date) return maxDate;
+      return !maxDate || inv.date > maxDate ? inv.date : maxDate;
+    }, null);
+
     // Group by asset type
     const byType = {};
     for (const inv of investments) {
@@ -167,8 +172,31 @@ module.exports = function (db) {
       byType[inv.asset_type].dayChange += inv.day_change || 0;
     }
 
+    const derivedPortfolio = {
+      date: latestSnapshotDate || latest?.date || null,
+      total_value: investments.reduce((sum, inv) => sum + (Number(inv.current_value) || 0), 0),
+      total_invested: investments.reduce((sum, inv) => sum + (Number(inv.invested_amount) || 0), 0),
+      total_profit_loss: investments.reduce((sum, inv) => sum + (Number(inv.profit_loss) || 0), 0),
+      day_change: investments.reduce((sum, inv) => sum + (Number(inv.day_change) || 0), 0),
+    };
+    derivedPortfolio.total_profit_loss_pct = derivedPortfolio.total_invested > 0
+      ? (derivedPortfolio.total_profit_loss / derivedPortfolio.total_invested) * 100
+      : 0;
+
+    const previousPortfolioSnapshot = portfolio_id
+      ? db.prepare(
+          'SELECT total_value FROM portfolio_daily WHERE portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
+        ).get(portfolio_id, derivedPortfolio.date || '9999-12-31')
+      : db.prepare(
+          'SELECT total_value FROM portfolio_daily WHERE portfolio_id IS NULL AND date < ? ORDER BY date DESC LIMIT 1'
+        ).get(derivedPortfolio.date || '9999-12-31');
+    const previousPortfolioValue = Number(previousPortfolioSnapshot?.total_value || 0);
+    derivedPortfolio.day_change_pct = previousPortfolioValue > 0
+      ? (derivedPortfolio.day_change / previousPortfolioValue) * 100
+      : 0;
+
     // Calculate percentages of portfolio
-    const totalValue = latest?.total_value || investments.reduce((s, i) => s + (i.current_value || 0), 0);
+    const totalValue = derivedPortfolio.total_value;
     for (const inv of investments) {
       inv.portfolio_pct = totalValue > 0 ? ((inv.current_value || 0) / totalValue) * 100 : 0;
     }
@@ -226,9 +254,9 @@ module.exports = function (db) {
       }
     }
 
-    const terminalValue = Number(latest?.total_value) || 0;
-    if (terminalValue > 0 && latest?.date) {
-      const valuationDate = new Date(latest.date);
+    const terminalValue = Number(derivedPortfolio.total_value) || 0;
+    if (terminalValue > 0 && derivedPortfolio.date) {
+      const valuationDate = new Date(derivedPortfolio.date);
       if (!Number.isNaN(valuationDate.getTime())) {
         xirrCashflows.push({ amount: terminalValue, date: valuationDate });
       }
@@ -236,17 +264,11 @@ module.exports = function (db) {
 
     const xirrRate = calculateXirr(xirrCashflows);
     const xirrPct = xirrRate == null ? null : xirrRate * 100;
-    const portfolioSummary = latest
-      ? { ...latest, xirr_pct: xirrPct }
-      : {
-          total_value: 0,
-          total_invested: 0,
-          total_profit_loss: 0,
-          total_profit_loss_pct: 0,
-          day_change: 0,
-          day_change_pct: 0,
-          xirr_pct: null,
-        };
+    const portfolioSummary = {
+      ...latest,
+      ...derivedPortfolio,
+      xirr_pct: xirrPct,
+    };
 
     res.json({
       portfolio: portfolioSummary,
