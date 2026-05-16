@@ -4,6 +4,7 @@ const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = req
 const { updateAssetTypeDaily, updatePortfolioDaily } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
 const { toIsoDate, todayIso } = require('./dateUtils');
+const { logBackfillInfo } = require('./appLogger');
 
 function clampEndDateToToday(endDate) {
   const end = toIsoDate(endDate) || todayIso();
@@ -26,6 +27,12 @@ function addDays(dateIso, days) {
   const d = new Date(`${dateIso}T00:00:00.000Z`);
   d.setUTCDate(d.getUTCDate() + Number(days || 0));
   return d.toISOString().split('T')[0];
+}
+
+function progressLogStride(total, maxSteps = 10) {
+  const t = Number(total || 0);
+  if (t <= 0) return 1;
+  return Math.max(1, Math.ceil(t / Math.max(1, maxSteps)));
 }
 
 function normalizeMfDate(dateValue) {
@@ -871,10 +878,25 @@ async function preloadStockHistoryForRun(invMap, scopeList, runDate, startByInve
   }
 
   cache.stockRangeBySymbol = symbolStart;
+  const totalSymbols = symbolStart.size;
+  if (totalSymbols > 0) {
+    logBackfillInfo(`[Backfill][Step-1] Prefetching historical prices for ${totalSymbols} symbol(s)...`);
+  }
+
+  let fetched = 0;
+  const stride = progressLogStride(totalSymbols, 8);
   for (const [symbol, startDate] of symbolStart.entries()) {
     if (cache.stock.has(symbol)) continue;
     const series = await fetchStockSeries(symbol, startDate, runDate).catch(() => new Map());
     cache.stock.set(symbol, series);
+    fetched += 1;
+    if (fetched === totalSymbols || fetched % stride === 0) {
+      logBackfillInfo(`[Backfill][Step-1] Price prefetch ${fetched}/${totalSymbols}`);
+    }
+  }
+
+  if (totalSymbols > 0) {
+    logBackfillInfo('[Backfill][Step-1] Historical price prefetch completed.');
   }
 }
 
@@ -926,23 +948,36 @@ async function processAutoBackfillCAEntries(db, options = {}) {
       AND status IN ('pending', 'running')
   `);
 
+  const totalPairs = corporateActionSyncPairs.size;
+  logBackfillInfo(`[Backfill][Step-1] Processing AutoBackfill CA for ${totalPairs} investment-portfolio pair(s)...`);
+  const stride = progressLogStride(totalPairs, 10);
+  let donePairs = 0;
+
   for (const pair of corporateActionSyncPairs.values()) {
     const inv = invMap.get(pair.investmentId);
-    if (!inv) continue;
-    const result = await syncCorporateActionsForScope(db, inv, pair.portfolioId, pair.fromDate, runDate, cache);
-    inserted += Number(result?.inserted || 0);
-    updated += Number(result?.updated || 0);
-    const changedDate = result?.earliestChangedDate || null;
-    if (changedDate && (!earliestChangedDate || changedDate < earliestChangedDate)) {
-      earliestChangedDate = changedDate;
+    if (inv) {
+      const result = await syncCorporateActionsForScope(db, inv, pair.portfolioId, pair.fromDate, runDate, cache);
+      inserted += Number(result?.inserted || 0);
+      updated += Number(result?.updated || 0);
+      const changedDate = result?.earliestChangedDate || null;
+      if (changedDate && (!earliestChangedDate || changedDate < earliestChangedDate)) {
+        earliestChangedDate = changedDate;
+      }
+
+      if (changedDate) {
+        mergeDirtyDateIntoScopes(scopeList, pair.investmentId, pair.portfolioId, changedDate);
+        bringDirtyDateEarlier.run(changedDate, changedDate, pair.investmentId, pair.portfolioId, pair.portfolioId);
+        bringDirtyDateEarlier.run(changedDate, changedDate, pair.investmentId, null, null);
+      }
     }
 
-    if (changedDate) {
-      mergeDirtyDateIntoScopes(scopeList, pair.investmentId, pair.portfolioId, changedDate);
-      bringDirtyDateEarlier.run(changedDate, changedDate, pair.investmentId, pair.portfolioId, pair.portfolioId);
-      bringDirtyDateEarlier.run(changedDate, changedDate, pair.investmentId, null, null);
+    donePairs += 1;
+    if (donePairs === totalPairs || donePairs % stride === 0) {
+      logBackfillInfo(`[Backfill][Step-1] CA sync ${donePairs}/${totalPairs} | inserted=${inserted}, updated=${updated}`);
     }
   }
+
+  logBackfillInfo(`[Backfill][Step-1] Completed AutoBackfill CA. inserted=${inserted}, updated=${updated}, modified=${inserted + updated}`);
 
   return {
     inserted,
@@ -964,6 +999,10 @@ async function updateDailyValues(db, options = {}) {
   let totalRows = 0;
   let completedScopes = 0;
   let earliestTouchedDate = runDate;
+  const totalScopes = scopeList.length;
+  const stride = progressLogStride(totalScopes, 10);
+
+  logBackfillInfo(`[Backfill][Step-2] Recomputing daily values for ${totalScopes} scope(s)...`);
 
   for (const scope of scopeList) {
     const inv = invMap.get(scope.investment_id);
@@ -1006,8 +1045,13 @@ async function updateDailyValues(db, options = {}) {
       runDate,
       startedAt: new Date().toISOString(),
     });
+
+    if (completedScopes === totalScopes || completedScopes % stride === 0) {
+      logBackfillInfo(`[Backfill][Step-2] Scope ${completedScopes}/${totalScopes} complete | rowsWritten=${totalRows}`);
+    }
   }
 
+  logBackfillInfo(`[Backfill][Step-2] Refreshing aggregate tables from ${earliestTouchedDate} to ${runDate}...`);
   for (const d of eachDate(earliestTouchedDate, runDate)) {
     updatePortfolioDaily(db, d);
     updateAssetTypeDaily(db, d);
@@ -1023,6 +1067,8 @@ async function updateDailyValues(db, options = {}) {
     startedAt: new Date().toISOString(),
   });
 
+  logBackfillInfo(`[Backfill][Step-2] Completed daily recompute. scopes=${totalScopes}, rowsWritten=${totalRows}`);
+
   return {
     rowsWritten: totalRows,
     details,
@@ -1037,6 +1083,8 @@ async function updateDailyValues(db, options = {}) {
 async function backfillDirtyScopes(db, scopes, options = {}) {
   const runDate = clampEndDateToToday(options.runDate || todayIso());
   const { eligible, scopeList } = normalizeScopesForRun(scopes, runDate);
+
+  logBackfillInfo(`[Backfill] Eligible scopes for ${runDate}: ${eligible.length}/${(scopes || []).length}`);
 
   if (!eligible.length) {
     return {
@@ -1080,6 +1128,7 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
   });
 
   if (options.step1Only === true) {
+    logBackfillInfo(`[Backfill] Step-1 only mode completed. modified=${Number(step1Result?.modified || 0)}`);
     return {
       runDate,
       processed: scopeList.length,
@@ -1110,10 +1159,10 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
 async function runBackfillInTwoSteps(db, options = {}) {
   const runDate = clampEndDateToToday(options.runDate || todayIso());
   const scopes = options.scopes || [];
-  console.log(`[Backfill] Starting two-step backfill for ${runDate} with ${scopes.length} scope(s)...`);
+  logBackfillInfo(`[Backfill] Starting two-step backfill for ${runDate} with ${scopes.length} scope(s)...`);
 
   const result = await backfillDirtyScopes(db, scopes, { runDate });
-  console.log('[Backfill] Two-step backfill completed.');
+  logBackfillInfo('[Backfill] Two-step backfill completed.');
   return result;
 }
 

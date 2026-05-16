@@ -119,6 +119,26 @@ export const triggerPriceUpdate = (assetTypes) =>
   });
 export const cancelPriceUpdate = () =>
   fetchJSON('/utils/cancel-update', { method: 'POST' });
+export const getLogFiles = () => fetchJSON('/utils/log-files');
+export const downloadLogFile = async (name) => {
+  const safeName = encodeURIComponent(String(name || '').trim());
+  const res = await fetch(`${API_BASE}/utils/log-files/${safeName}`, { credentials: 'include' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Log download failed');
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const cd = res.headers.get('Content-Disposition') || '';
+  const match = cd.match(/filename="?([^"]+)"?/);
+  a.download = match ? match[1] : String(name || 'app.log');
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
 export const getConfig = () => fetchJSON('/utils/config');
 export const updateConfig = (data) =>
   fetchJSON('/utils/config', { method: 'PUT', body: JSON.stringify(data) });

@@ -16,6 +16,7 @@ import CorporateActions from './components/CorporateActions';
 import InvestmentSettings from './components/InvestmentSettings';
 import InterestRates from './components/InterestRates';
 import TaxReport from './components/TaxReport';
+import AppLogs from './components/AppLogs';
 import BackToTopButton from './components/BackToTopButton';
 import { getAuthConfig, getCurrentUser, loginWithGoogle, logout } from './services/api';
 
@@ -122,6 +123,7 @@ export default function App() {
               <Route path="/performance" element={<Performance />} />
               <Route path="/transactions" element={<Transactions />} />
               <Route path="/tax" element={<TaxReport />} />
+              <Route path="/logs" element={<AppLogs />} />
               <Route path="/interest-rates" element={<InterestRates />} />
   
               <Route path="/portfolios" element={<Portfolios />} />

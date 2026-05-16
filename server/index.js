@@ -5,6 +5,7 @@ const path = require('path');
 const { getDb, initializeDb } = require('./db/schema');
 const { startScheduler } = require('./services/scheduler');
 const { requireAuth } = require('./middleware/auth');
+const { logAppInfo, logAppError, getAppLogPathForDate, getBackfillLogPathForDate } = require('./services/appLogger');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -64,29 +65,44 @@ if (process.env.NODE_ENV === 'production') {
 // Error handler
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
+  logAppError('Server error', {
+    path: req?.originalUrl,
+    method: req?.method,
+    error: err?.message || String(err),
+  });
   res.status(500).json({ error: err.message || 'Internal server error' });
 });
 
 // Start server
 app.listen(PORT, () => {
   console.log(`Investment Tracker API running on http://localhost:${PORT}`);
+  logAppInfo('Investment Tracker API started', {
+    port: Number(PORT),
+    nodeEnv: process.env.NODE_ENV || 'development',
+    schedulerEnabled,
+    appLogFile: getAppLogPathForDate(),
+    backfillLogFile: getBackfillLogPathForDate(),
+  });
 
   // Start scheduled price updates only when explicitly enabled.
   if (schedulerEnabled) {
     startScheduler(db);
   } else {
     console.log('[Scheduler] Disabled (set ENABLE_SCHEDULER=true to enable).');
+    logAppInfo('[Scheduler] Disabled (set ENABLE_SCHEDULER=true to enable).');
   }
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('Shutting down...');
+  logAppInfo('Received SIGINT, shutting down');
   db.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
+  logAppInfo('Received SIGTERM, shutting down');
   db.close();
   process.exit(0);
 });

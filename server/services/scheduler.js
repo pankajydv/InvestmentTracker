@@ -8,21 +8,30 @@ const cron = require('node-cron');
 const { updateAllPrices } = require('./updater');
 const { runDirtyBackfillPreflight } = require('./dirtyBackfillService');
 const { todayIso } = require('./backfillService');
+const { logAppInfo, logAppError } = require('./appLogger');
 
 function startScheduler(db) {
   const runScheduledUpdate = async (label, options = {}) => {
     const runDate = todayIso();
     console.log(`[Scheduler] ${label}: preflight dirty backfill check for ${runDate}...`);
+    logAppInfo(`[Scheduler] ${label}: started`, { runDate, options });
     await runDirtyBackfillPreflight(db, runDate);
-    await updateAllPrices(db, options);
+    const result = await updateAllPrices(db, options);
+    logAppInfo(`[Scheduler] ${label}: completed`, {
+      runDate,
+      processed: result?.processed || 0,
+      errors: result?.errors || 0,
+    });
   };
 
   // Startup catch-up: ensure pending dirty scopes are reconciled even before first cron tick.
   setTimeout(async () => {
     try {
       await runDirtyBackfillPreflight(db, todayIso());
+      logAppInfo('[Scheduler] Startup preflight completed');
     } catch (e) {
       console.error('[Scheduler] Startup preflight failed:', e.message);
+      logAppError('[Scheduler] Startup preflight failed', { error: e.message });
     }
   }, 0);
 
@@ -49,6 +58,7 @@ function startScheduler(db) {
         });
       } catch (e) {
         console.error(`[Scheduler] ${hour}:25 update failed:`, e.message);
+        logAppError(`[Scheduler] Intraday run ${hour}:25 failed`, { error: e.message });
       }
     }, {
       timezone: 'Asia/Kolkata',
@@ -62,6 +72,7 @@ function startScheduler(db) {
       await runScheduledUpdate('Final nightly run (all types)');
     } catch (e) {
       console.error('[Scheduler] Final nightly update failed:', e.message);
+      logAppError('[Scheduler] Final nightly run failed', { error: e.message });
     }
   }, {
     timezone: 'Asia/Kolkata',
@@ -70,6 +81,11 @@ function startScheduler(db) {
   console.log('[Scheduler] Daily price updates scheduled:');
   console.log('  - 9:25 AM–4:25 PM IST (hourly, stocks only, weekdays)');
   console.log('  - 10:25 PM IST (all asset types, weekdays)');
+  logAppInfo('[Scheduler] Scheduled jobs initialized', {
+    timezone: 'Asia/Kolkata',
+    intradayRuns: 8,
+    nightlyRun: '22:25',
+  });
 }
 
 module.exports = { startScheduler };

@@ -1,10 +1,13 @@
 const express = require('express');
 const router = express.Router();
+const fs = require('fs');
+const path = require('path');
 const XLSX = require('xlsx');
 const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = require('../services/priceService');
 const { updateAllPrices, cancelUpdate } = require('../services/updater');
 const { getPendingDirtyScopes, markDirtyForAssetTypeFromDate, markDirtyFromTransactions, runDirtyBackfillPreflight } = require('../services/dirtyBackfillService');
 const { todayIso } = require('../services/backfillService');
+const { logAppInfo, logAppError, getLogDir } = require('../services/appLogger');
 
 const VALID_RATE_TYPES = new Set(['PPF', 'SSY', 'PF']);
 
@@ -183,16 +186,80 @@ module.exports = function (db) {
         options.assetTypes = Array.isArray(req.body.assetTypes)
           ? req.body.assetTypes : [req.body.assetTypes];
       }
+      logAppInfo('[UI] Manual update-prices requested', {
+        assetTypes: options.assetTypes || 'ALL',
+      });
       const result = await updateAllPrices(db, options);
+      logAppInfo('[UI] Manual update-prices completed', {
+        processed: result?.processed || 0,
+        errors: result?.errors || 0,
+      });
       res.json(result);
     } catch (e) {
+      logAppError('[UI] Manual update-prices failed', { error: e.message });
       res.status(500).json({ error: e.message });
     }
   });
 
   router.post('/cancel-update', (req, res) => {
     cancelUpdate();
+    logAppInfo('[UI] Manual cancel-update requested');
     res.json({ cancelled: true });
+  });
+
+  // ─── List and download app/backfill logs ──────────────────────────────
+  router.get('/log-files', (req, res) => {
+    try {
+      const logDir = getLogDir();
+      if (!fs.existsSync(logDir)) {
+        return res.json({
+          files: [],
+          log_dir: logDir,
+        });
+      }
+
+      const rows = fs.readdirSync(logDir, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => {
+          const fullPath = path.join(logDir, entry.name);
+          const stat = fs.statSync(fullPath);
+          return {
+            name: entry.name,
+            size_bytes: Number(stat.size || 0),
+            updated_at: new Date(stat.mtimeMs).toISOString(),
+          };
+        })
+        .filter((file) => /^(app|backfill)-\d{4}-\d{2}-\d{2}\.log$/.test(file.name))
+        .sort((a, b) => b.name.localeCompare(a.name));
+
+      return res.json({
+        files: rows,
+        log_dir: logDir,
+      });
+    } catch (e) {
+      logAppError('[API] Failed to list log files', { error: e.message });
+      return res.status(500).json({ error: e.message || 'Failed to list log files' });
+    }
+  });
+
+  router.get('/log-files/:name', (req, res) => {
+    try {
+      const fileName = String(req.params.name || '').trim();
+      if (!/^(app|backfill)-\d{4}-\d{2}-\d{2}\.log$/.test(fileName)) {
+        return res.status(400).json({ error: 'Invalid log file name' });
+      }
+
+      const logDir = getLogDir();
+      const fullPath = path.join(logDir, fileName);
+      if (!fs.existsSync(fullPath)) {
+        return res.status(404).json({ error: 'Log file not found' });
+      }
+
+      return res.download(fullPath, fileName);
+    } catch (e) {
+      logAppError('[API] Failed to download log file', { error: e.message });
+      return res.status(500).json({ error: e.message || 'Failed to download log file' });
+    }
   });
 
   // ─── Get/update config ────────────────────────────────────────────────
@@ -396,6 +463,13 @@ module.exports = function (db) {
       const investmentId = body.investment_id != null ? Number(body.investment_id) : null;
       const portfolioId = body.portfolio_id != null ? Number(body.portfolio_id) : null;
       const execute = body.execute !== false;
+      logAppInfo('[UI] Manual backfill trigger requested', {
+        runDate,
+        fromDate: fromDate || null,
+        investmentId,
+        portfolioId,
+        execute,
+      });
 
       if (investmentId != null && (!Number.isInteger(investmentId) || investmentId <= 0)) {
         return res.status(400).json({ error: 'investment_id must be a positive integer' });
@@ -436,12 +510,15 @@ module.exports = function (db) {
 
       const marked = markDirtyFromTransactions(db, scopes, 'manual-backfill-trigger', `manual:${new Date().toISOString()}`);
       if (!execute) {
+        logAppInfo('[UI] Manual backfill trigger seeded only', { runDate, seededScopes: marked });
         return res.json({ success: true, run_date: runDate, seeded_scopes: marked, executed: false });
       }
 
       const result = await runDirtyBackfillPreflight(db, runDate);
+      logAppInfo('[UI] Manual backfill trigger executed', { runDate, seededScopes: marked, result });
       return res.json({ success: true, run_date: runDate, seeded_scopes: marked, executed: true, result });
     } catch (e) {
+      logAppError('[UI] Manual backfill trigger failed', { error: e.message });
       return res.status(500).json({ error: e.message || 'Backfill trigger failed' });
     }
   });
@@ -451,9 +528,12 @@ module.exports = function (db) {
     try {
       const body = req.body || {};
       const runDate = parseDateOnly(body.run_date) || todayIso();
+      logAppInfo('[UI] Backfill preflight requested', { runDate });
       const result = await runDirtyBackfillPreflight(db, runDate);
+      logAppInfo('[UI] Backfill preflight completed', { runDate, result });
       res.json({ success: true, ...result });
     } catch (e) {
+      logAppError('[UI] Backfill preflight failed', { error: e.message });
       res.status(500).json({ error: e.message || 'Dirty backfill preflight failed' });
     }
   });
@@ -464,6 +544,7 @@ module.exports = function (db) {
       const body = req.body || {};
       const runDate = parseDateOnly(body.run_date) || todayIso();
       const execute = body.execute !== false;
+      logAppInfo('[UI] Full backfill requested', { runDate, execute });
 
       const scopes = db.prepare(`
         SELECT t.investment_id, t.portfolio_id, MIN(date(t.transaction_date)) AS transaction_date
@@ -478,12 +559,15 @@ module.exports = function (db) {
       const marked = markDirtyFromTransactions(db, scopes, 'full-backfill-seed', `run:${runDate}`);
 
       if (!execute) {
+        logAppInfo('[UI] Full backfill seeded only', { runDate, seededScopes: marked });
         return res.json({ success: true, run_date: runDate, seeded_scopes: marked, executed: false });
       }
 
       const result = await runDirtyBackfillPreflight(db, runDate);
+      logAppInfo('[UI] Full backfill completed', { runDate, seededScopes: marked, result });
       return res.json({ success: true, run_date: runDate, seeded_scopes: marked, executed: true, result });
     } catch (e) {
+      logAppError('[UI] Full backfill failed', { error: e.message });
       return res.status(500).json({ error: e.message || 'Full backfill failed' });
     }
   });

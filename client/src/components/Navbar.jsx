@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button, Dropdown } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText, LogOut, Menu } from 'lucide-react';
+import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText, LogOut, Menu, ScrollText } from 'lucide-react';
 import { triggerPriceUpdate, cancelPriceUpdate, exportData } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 
@@ -110,6 +110,10 @@ export default function Navbar({ user, onLogout }) {
 
             <Dropdown.Item as={Link} to="/tax" className="d-flex align-items-center gap-2">
               <FileText size={14} /> Tax Report
+            </Dropdown.Item>
+
+            <Dropdown.Item as={Link} to="/logs" className="d-flex align-items-center gap-2">
+              <ScrollText size={14} /> App Logs
             </Dropdown.Item>
 
             <Dropdown.Divider />
