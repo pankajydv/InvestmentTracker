@@ -1,7 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const { PDFParse } = require('pdf-parse');
-const { lookupTickerByISIN, fetchCorporateActions, toNSETicker, fetchHistoricalStockPrice, fetchHistoricalUSDToINR } = require('../services/priceService');
+const { lookupTickerByISIN, fetchCorporateActions, toNSETicker, fetchHistoricalStockPrice, fetchHistoricalOHLC, fetchHistoricalUSDToINR } = require('../services/priceService');
 const { parseContractNotes } = require('../services/contractNoteParser');
 const { parsePnLStatement } = require('../services/pnlParser');
 const { GRANTS, generateRsuSchedule } = require('../services/rsuGrantService');
@@ -1609,14 +1609,18 @@ module.exports = function (db) {
         // Compute holding at any given date, optionally excluding specific transaction IDs.
         // When excludeSameDayTrading is true, same-day BUY/SELL/IPO transactions are
         // excluded so corporate actions are applied only to shares held at record date.
+        // When excludeSameDayCorporateUnitAdds is true, same-day BONUS/SPLIT are also excluded
+        // (used for dividend entitlement so a same-day bonus doesn't inflate the count).
         const CORPORATE_TYPES = ['BONUS', 'SPLIT', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST'];
-        function holdingAt(date, excludeIds, excludeSameDayTrading) {
+        const SAME_DAY_UNIT_ADD_CORPORATE = ['BONUS', 'SPLIT', 'RIGHTS'];
+        function holdingAt(date, excludeIds, excludeSameDayTrading, excludeSameDayCorporateUnitAdds) {
           let units = 0;
           for (const t of allTxns) {
             if (t.transaction_date > date) break;
             if (scopeByPortfolio && t.portfolio_id !== pid) continue;
             if (excludeIds && excludeIds.has(t.id)) continue;
             if (excludeSameDayTrading && t.transaction_date === date && !CORPORATE_TYPES.includes(t.transaction_type)) continue;
+            if (excludeSameDayCorporateUnitAdds && t.transaction_date === date && SAME_DAY_UNIT_ADD_CORPORATE.includes(t.transaction_type)) continue;
             if (CORPORATE_ACTION_UNIT_ADD_TYPES.includes(t.transaction_type)) {
               units += t.units || 0;
             } else if (CORPORATE_ACTION_UNIT_SUB_TYPES.includes(t.transaction_type)) {
@@ -1660,12 +1664,6 @@ module.exports = function (db) {
         // Track which existing actions are matched to Yahoo data
         const matchedExistingIds = new Set();
 
-        // Helper: check if two dates are within N days of each other
-        function daysApart(d1, d2) {
-          return Math.abs(new Date(d1) - new Date(d2)) / 86400000;
-        }
-        const DATE_WINDOW = 20; // days
-
         // Process dividends
         for (const div of actions.dividends) {
           const isForeignDividend = assetType === 'FOREIGN_STOCK';
@@ -1679,7 +1677,11 @@ module.exports = function (db) {
             continue;
           }
 
-          const holdingUnits = holdingAt(entitlementDate, null, true);
+          // Dividend entitlement calculated on previous day's holding (ex-date - 1)
+          const prevDay = new Date(entitlementDate);
+          prevDay.setDate(prevDay.getDate() - 1);
+          const prevDayStr = prevDay.toISOString().split('T')[0];
+          const holdingUnits = holdingAt(prevDayStr, null, true, true);
           if (holdingUnits <= 0) continue;
           const usdDividendAmount = Math.round(holdingUnits * div.amount * 100) / 100;
           const fxRate = isForeignDividend ? await getFxForDate(payoutDate) : null;
@@ -1694,10 +1696,10 @@ module.exports = function (db) {
             ? Math.round(usdDividendAmount * fxRate * 100) / 100
             : usdDividendAmount;
 
-          // Find any existing dividend within the date window
+          // Match existing dividend strictly by provider date.
           const existing = existingActions.find(e =>
             e.transaction_type === 'DIVIDEND' &&
-            daysApart(e.transaction_date, payoutDate) <= DATE_WINDOW &&
+            e.transaction_date === payoutDate &&
             !matchedExistingIds.has(e.id)
           );
 
@@ -1767,7 +1769,7 @@ module.exports = function (db) {
         for (const split of actions.splits) {
           const existing = existingActions.find(e =>
             (e.transaction_type === 'SPLIT' || e.transaction_type === 'BONUS') &&
-            daysApart(e.transaction_date, split.date) <= DATE_WINDOW &&
+            e.transaction_date === split.date &&
             !matchedExistingIds.has(e.id)
           );
 
@@ -1784,6 +1786,19 @@ module.exports = function (db) {
           const newUnits = txnType === 'BONUS' ? Math.floor(rawNewUnits) : Math.round(rawNewUnits * 1000) / 1000;
           if (newUnits <= 0) continue;
 
+          // Fractional bonus entitlement → cash payout (using previous day's LOW price)
+          const fractional = txnType === 'BONUS' ? Math.round((rawNewUnits - newUnits) * 1e6) / 1e6 : 0;
+          let fractionalAmount = 0;
+          if (fractional > 0.0001) {
+            // Use previous day's LOW price for fractional payout calculation
+            const prevDay = new Date(split.date);
+            prevDay.setDate(prevDay.getDate() - 1);
+            const prevDayStr = prevDay.toISOString().split('T')[0];
+            const ohlc = await fetchHistoricalOHLC(ticker, prevDayStr).catch(() => null);
+            const lowPrice = ohlc?.low || 0;
+            fractionalAmount = lowPrice > 0 ? Math.round(fractional * lowPrice * 100) / 100 : 0;
+          }
+
           if (existing) {
             matchedExistingIds.add(existing.id);
 
@@ -1793,8 +1808,9 @@ module.exports = function (db) {
             const dateMatch = existing.transaction_date === split.date;
             const unitsMatch = (existing.units || 0) === newUnits;
             const typeMatch = existing.transaction_type === txnType;
+            const amountMatch = Math.abs((existing.amount || 0) - fractionalAmount) < 1;
 
-            if (dateMatch && unitsMatch && typeMatch) {
+            if (dateMatch && unitsMatch && typeMatch && amountMatch) {
               continue;
             }
 
@@ -1809,11 +1825,13 @@ module.exports = function (db) {
               current_price_per_unit: existing.price_per_unit,
               current_date: existing.transaction_date,
               expected_units: newUnits,
-              expected_amount: 0,
+              expected_amount: fractionalAmount,
               expected_price_per_unit: 0,
               broker: brokerAt(split.date),
               portfolio_id: pid,
-              notes: `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 +${newUnits} new shares`,
+              notes: fractional > 0.0001
+                ? `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 +${newUnits} new shares + \u20B9${fractionalAmount} fractional payout (${fractional.toFixed(4)} shares)`
+                : `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 +${newUnits} new shares`,
             });
             continue;
           }
@@ -1825,11 +1843,13 @@ module.exports = function (db) {
             transaction_date: split.date,
             units: newUnits,
             price_per_unit: 0,
-            amount: 0,
+            amount: fractionalAmount,
             fees: 0,
             broker: brokerAt(split.date),
             portfolio_id: pid,
-            notes: `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 ${holdingUnits} held \u2192 +${newUnits} new shares`,
+            notes: fractional > 0.0001
+              ? `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 ${holdingUnits} held \u2192 +${newUnits} new shares + \u20B9${fractionalAmount} fractional payout (${fractional.toFixed(4)} shares)`
+              : `${txnType === 'BONUS' ? 'Bonus' : 'Split'} ${split.numerator}:${split.denominator} \u2014 ${holdingUnits} held \u2192 +${newUnits} new shares`,
           });
         }
 

@@ -1,5 +1,5 @@
 const https = require('https');
-const { fetchCorporateActions, fetchHistoricalStockPrice, fetchHistoricalUSDToINR, fetchMutualFundHistory } = require('./priceService');
+const { fetchCorporateActions, fetchHistoricalStockPrice, fetchHistoricalOHLC, fetchHistoricalUSDToINR, fetchMutualFundHistory } = require('./priceService');
 const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = require('./pfInterestCalculator');
 const { updateAssetTypeDaily, updatePortfolioDaily } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
@@ -436,7 +436,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache)
   return written;
 }
 
-function holdingUnitsAtDate(db, investmentId, portfolioId, date, excludeSameDayTrading = false) {
+function holdingUnitsAtDate(db, investmentId, portfolioId, date, excludeSameDayTrading = false, excludeSameDayCorporateUnitAdds = false) {
   const rows = db.prepare(`
     SELECT transaction_type, COALESCE(units, 0) AS units, transaction_date
     FROM transactions
@@ -445,9 +445,13 @@ function holdingUnitsAtDate(db, investmentId, portfolioId, date, excludeSameDayT
   `).all(investmentId, portfolioId, date);
 
   const corporateTypes = new Set(['BONUS', 'SPLIT', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
+  const sameDayCorporateUnitAdds = new Set(['BONUS', 'SPLIT', 'RIGHTS']);
   let units = 0;
   for (const row of rows) {
     if (excludeSameDayTrading && row.transaction_date === date && !corporateTypes.has(row.transaction_type)) {
+      continue;
+    }
+    if (excludeSameDayCorporateUnitAdds && row.transaction_date === date && sameDayCorporateUnitAdds.has(row.transaction_type)) {
       continue;
     }
 
@@ -506,7 +510,11 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
         : div.date;
 
       if (!eventDate || eventDate < fromDate || eventDate > toDate) continue;
-      const units = holdingUnitsAtDate(db, inv.id, portfolioId, recordDate || eventDate, true);
+      // Dividend entitlement calculated on previous day's holding (record date - 1)
+      const prevDay = new Date(recordDate || eventDate);
+      prevDay.setDate(prevDay.getDate() - 1);
+      const prevDayStr = prevDay.toISOString().split('T')[0];
+      const units = holdingUnitsAtDate(db, inv.id, portfolioId, prevDayStr, true, true);
       if (units <= 0) continue;
 
       const perShare = Number(div.amount || 0);
@@ -571,6 +579,19 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
         : Math.round(addedUnitsRaw * 1000) / 1000;
       if (addedUnits <= 0) continue;
 
+      // Fractional bonus entitlement → cash payout (using previous day's LOW price)
+      const fractional = txnType === 'BONUS' ? Math.round((addedUnitsRaw - addedUnits) * 1e6) / 1e6 : 0;
+      let fractionalAmount = 0;
+      if (fractional > 0.0001) {
+        // Use previous day's LOW price for fractional payout calculation
+        const prevDay = new Date(eventDate);
+        prevDay.setDate(prevDay.getDate() - 1);
+        const prevDayStr = prevDay.toISOString().split('T')[0];
+        const ohlc = await fetchHistoricalOHLC(ticker, prevDayStr).catch(() => null);
+        const lowPrice = ohlc?.low || 0;
+        fractionalAmount = lowPrice > 0 ? Math.round(fractional * lowPrice * 100) / 100 : 0;
+      }
+
       const existing = db.prepare(`
         SELECT id FROM transactions
         WHERE investment_id = ? AND portfolio_id = ?
@@ -581,8 +602,10 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       `).get(inv.id, portfolioId, eventDate, addedUnits);
       if (existing) continue;
 
-      const notes = `AutoBackfill CA ${txnType} ${split.numerator}:${split.denominator}`;
-      insertTxn.run(inv.id, portfolioId, txnType, eventDate, addedUnits, 0, 0, notes, null, null, null);
+      const notes = fractional > 0.0001
+        ? `AutoBackfill CA ${txnType} ${split.numerator}:${split.denominator} + \u20B9${fractionalAmount} fractional payout`
+        : `AutoBackfill CA ${txnType} ${split.numerator}:${split.denominator}`;
+      insertTxn.run(inv.id, portfolioId, txnType, eventDate, addedUnits, 0, fractionalAmount, notes, null, null, null);
       inserted += 1;
     }
   }

@@ -277,6 +277,74 @@ async function fetchHistoricalStockPrice(symbol, date) {
 }
 
 /**
+ * Fetch historical OHLC (Open, High, Low, Close) data for a given date.
+ * Returns the OHLC for the exact date or the nearest trading date on or before.
+ * @param {string} symbol - Stock ticker
+ * @param {string} date - Date as YYYY-MM-DD
+ * @returns {Promise<{open: number, high: number, low: number, close: number}|null>}
+ */
+async function fetchHistoricalOHLC(symbol, date) {
+  if (!symbol || !date) throw new Error('symbol and date are required');
+
+  const target = new Date(date);
+  const from = new Date(target);
+  from.setDate(from.getDate() - 7);
+  const to = new Date(target);
+  to.setDate(to.getDate() + 1);
+
+  const p1 = Math.floor(from.getTime() / 1000);
+  const p2 = Math.floor(to.getTime() / 1000);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${p1}&period2=${p2}&interval=1d`;
+
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const result = json.chart?.result?.[0];
+          if (!result) {
+            reject(new Error(`No Yahoo data for ${symbol}`));
+            return;
+          }
+
+          const timestamps = result.timestamp || [];
+          const quote = result.indicators?.quote?.[0] || {};
+          const opens = quote.open || [];
+          const highs = quote.high || [];
+          const lows = quote.low || [];
+          const closes = quote.close || [];
+          const isoTarget = date.split('T')[0];
+
+          let bestOHLC = null;
+          let bestDate = null;
+          for (let i = 0; i < timestamps.length; i += 1) {
+            const o = opens[i];
+            const h = highs[i];
+            const l = lows[i];
+            const c = closes[i];
+            if (o == null || h == null || l == null || c == null) continue;
+
+            const pointDate = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            if (pointDate <= isoTarget && (!bestDate || pointDate > bestDate)) {
+              bestDate = pointDate;
+              bestOHLC = { open: o, high: h, low: l, close: c };
+            }
+          }
+
+          if (bestOHLC) resolve(bestOHLC);
+          else resolve(null);
+        } catch (e) {
+          reject(new Error(`Failed to parse historical OHLC for ${symbol}: ${e.message}`));
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+/**
  * Fetch USD to INR exchange rate (current)
  */
 async function fetchUSDToINR() {
@@ -778,7 +846,7 @@ function _parseCurrencyAmount(raw) {
  */
 function _fetchChartEvents(symbol, period1, period2, splitsOnly) {
   const events = splitsOnly ? 'split' : 'div%2Csplit';
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1mo&events=${events}`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d&events=${events}`;
 
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
@@ -960,6 +1028,7 @@ module.exports = {
   fetchStockPrice,
   fetchStockHistory,
   fetchHistoricalStockPrice,
+  fetchHistoricalOHLC,
   fetchCorporateActions,
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
