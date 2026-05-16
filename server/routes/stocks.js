@@ -1774,7 +1774,11 @@ module.exports = function (db) {
           );
 
           const excludeIds = existing ? new Set([existing.id]) : null;
-          const holdingUnits = holdingAt(split.date, excludeIds, true);
+          // Split/bonus entitlement is based on previous day's holdings.
+          const prevDay = new Date(split.date);
+          prevDay.setDate(prevDay.getDate() - 1);
+          const prevDayStr = prevDay.toISOString().split('T')[0];
+          const holdingUnits = holdingAt(prevDayStr, excludeIds, true, true);
           if (holdingUnits <= 0) continue;
 
           const ratio = split.numerator / split.denominator;

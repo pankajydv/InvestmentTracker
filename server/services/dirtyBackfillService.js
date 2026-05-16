@@ -1,4 +1,4 @@
-const { backfillDirtyScopes, toIsoDate, todayIso } = require('./backfillService');
+const { toIsoDate, todayIso } = require('./dateUtils');
 
 function minDate(a, b) {
   if (!a) return b;
@@ -134,6 +134,7 @@ function getPendingDirtyScopes(db, runDate = todayIso()) {
 }
 
 async function runDirtyBackfillPreflight(db, runDate = todayIso()) {
+  const { runBackfillInTwoSteps } = require('./backfillService');
   const effectiveRunDate = normalizeDirtyDate(runDate) || todayIso();
   const scopes = getPendingDirtyScopes(db, effectiveRunDate);
   if (!scopes.length) {
@@ -165,7 +166,7 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso()) {
   });
 
   try {
-    const result = await backfillDirtyScopes(db, scopes, { runDate: effectiveRunDate });
+    const result = await runBackfillInTwoSteps(db, { runDate: effectiveRunDate, scopes });
 
     const markDone = db.prepare(`
       UPDATE dirty_backfill_scope
