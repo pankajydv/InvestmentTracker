@@ -1,9 +1,9 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
-import { getDashboardSummary, triggerPriceUpdate, cancelPriceUpdate } from '../services/api';
+import { getDashboardSummary } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, RefreshCw, EyeOff, Eye } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, EyeOff, Eye } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 function combineDashboardSummaries(results, selectedIds) {
@@ -106,7 +106,6 @@ export default function Dashboard() {
   const [error, setError] = useState(null);
   const [hideSold, setHideSold] = useState(() => localStorage.getItem('hideSoldInvestments') !== 'false');
   const [sortConfigs, setSortConfigs] = useState({});
-  const [updatingType, setUpdatingType] = useState(null);
 
   const scrollToSection = useCallback((sectionId, { smooth = true, updateHash = true } = {}) => {
     const el = document.getElementById(sectionId);
@@ -122,22 +121,6 @@ export default function Dashboard() {
       window.history.replaceState(null, '', `#${sectionId}`);
     }
   }, []);
-
-  const handleUpdateType = async (assetType) => {
-    setUpdatingType(assetType);
-    try {
-      await triggerPriceUpdate([assetType]);
-      await loadData();
-    } catch (e) {
-      alert('Price update failed: ' + e.message);
-    } finally {
-      setUpdatingType(null);
-    }
-  };
-
-  const handleCancelUpdate = async () => {
-    try { await cancelPriceUpdate(); } catch (_) { /* best effort */ }
-  };
 
   const toggleHideSold = () => {
     setHideSold(prev => {
@@ -360,30 +343,6 @@ export default function Dashboard() {
               {ASSET_TYPE_LABELS[type]} ({info.investments.length})
             </h2>
             <div className="d-flex align-items-center gap-2">
-              {updatingType === type ? (
-                <Button
-                  variant="outline-danger"
-                  size="sm"
-                  className="d-flex align-items-center gap-1 py-0 px-2"
-                  style={{ fontSize: '0.75rem' }}
-                  onClick={handleCancelUpdate}
-                >
-                  <RefreshCw size={12} className="spinner-rotate" />
-                  Cancel
-                </Button>
-              ) : (
-                <Button
-                  variant="outline-success"
-                  size="sm"
-                  className="d-flex align-items-center gap-1 py-0 px-2"
-                  style={{ fontSize: '0.75rem' }}
-                  disabled={updatingType != null}
-                  onClick={() => handleUpdateType(type)}
-                >
-                  <RefreshCw size={12} />
-                  Update
-                </Button>
-              )}
               <Link to={`/investments?type=${type}`} className="small text-decoration-none d-flex align-items-center gap-1">
                 View All <ArrowRight size={12} />
               </Link>

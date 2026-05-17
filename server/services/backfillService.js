@@ -35,6 +35,10 @@ function progressLogStride(total, maxSteps = 10) {
   return Math.max(1, Math.ceil(t / Math.max(1, maxSteps)));
 }
 
+function shouldHeartbeat(lastAtMs, intervalMs = 60_000) {
+  return (Date.now() - Number(lastAtMs || 0)) >= intervalMs;
+}
+
 function normalizeMfDate(dateValue) {
   const value = String(dateValue || '').trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
@@ -309,7 +313,7 @@ function computeRealizedProceeds(db, inv, date, portfolioId) {
   return Number(row?.total || 0);
 }
 
-async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache) {
+async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache, onProgress = null) {
     const dailyStatements = {
       upsertScoped: db.prepare(`
         INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
@@ -373,6 +377,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache)
   let written = 0;
   let lastNonZeroDate = null;
   let exitDate = null;
+  const dayStride = progressLogStride(dates.length, 20);
   for (const date of dates) {
     const unitsRow = getUnits.get(...baseParams, date);
     const units = Number(unitsRow?.total || 0);
@@ -449,6 +454,19 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache)
       day_change_pct: round2(dayChangePct),
     }, dailyStatements);
     written += 1;
+
+    if (typeof onProgress === 'function' && (written === dates.length || written % dayStride === 0)) {
+      onProgress({
+        processedDays: written,
+        totalDays: dates.length,
+        date,
+      });
+    }
+
+    // Yield periodically so heartbeat/log updates are not starved by long sync loops.
+    if (written % 200 === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
   }
 
   if (latestTxnDate && (lastNonZeroDate || exitDate)) {
@@ -1001,6 +1019,7 @@ async function updateDailyValues(db, options = {}) {
   let earliestTouchedDate = runDate;
   const totalScopes = scopeList.length;
   const stride = progressLogStride(totalScopes, 10);
+  let lastScopeHeartbeatAt = Date.now();
 
   logBackfillInfo(`[Backfill][Step-2] Recomputing daily values for ${totalScopes} scope(s)...`);
 
@@ -1025,7 +1044,37 @@ async function updateDailyValues(db, options = {}) {
       startedAt: new Date().toISOString(),
     });
 
-    const rows = await recomputeScopeRows(db, inv, scope.portfolio_id, fromDate, runDate, cache);
+    const rows = await recomputeScopeRows(
+      db,
+      inv,
+      scope.portfolio_id,
+      fromDate,
+      runDate,
+      cache,
+      ({ processedDays, totalDays, date }) => {
+        if (!shouldHeartbeat(lastScopeHeartbeatAt, 60_000) && processedDays !== totalDays) return;
+        lastScopeHeartbeatAt = Date.now();
+
+        const scopeLabel = `${scope.investment_id}:${scope.portfolio_id ?? 'ALL'}`;
+        const message = `Running scope ${completedScopes + 1}/${scopeList.length} (${scopeLabel}) day ${processedDays}/${totalDays} @ ${date}`;
+
+        setBackfillProgress(db, {
+          phase: 'running',
+          total: scopeList.length,
+          completed: completedScopes,
+          current: {
+            investment_id: scope.investment_id,
+            portfolio_id: scope.portfolio_id,
+            dirty_from_date: fromDate,
+          },
+          message,
+          runDate,
+          startedAt: new Date().toISOString(),
+        });
+
+        logBackfillInfo(`[Backfill][Step-2][Heartbeat] ${message}`);
+      }
+    );
     totalRows += rows;
     completedScopes += 1;
     details.push({
@@ -1051,10 +1100,54 @@ async function updateDailyValues(db, options = {}) {
     }
   }
 
+  const aggregateDates = eachDate(earliestTouchedDate, runDate);
+  const aggregateTotal = aggregateDates.length;
+  const aggregateStride = progressLogStride(aggregateTotal, 20);
+  let lastAggregateHeartbeatAt = Date.now();
+  const aggregateStartedAtMs = Date.now();
+
   logBackfillInfo(`[Backfill][Step-2] Refreshing aggregate tables from ${earliestTouchedDate} to ${runDate}...`);
-  for (const d of eachDate(earliestTouchedDate, runDate)) {
+  setBackfillProgress(db, {
+    phase: 'finalizing',
+    total: scopeList.length,
+    completed: scopeList.length,
+    current: null,
+    message: `Refreshing daily aggregates: completed=0, remaining=${aggregateTotal}, progress=0.00%`,
+    runDate,
+    startedAt: new Date().toISOString(),
+  });
+
+  for (let i = 0; i < aggregateDates.length; i += 1) {
+    const d = aggregateDates[i];
     updatePortfolioDaily(db, d);
     updateAssetTypeDaily(db, d);
+
+    const done = i + 1;
+    const shouldLog = done === aggregateTotal || (done % aggregateStride === 0) || shouldHeartbeat(lastAggregateHeartbeatAt, 60_000);
+    if (shouldLog) {
+      lastAggregateHeartbeatAt = Date.now();
+      const remaining = Math.max(aggregateTotal - done, 0);
+      const pct = aggregateTotal > 0 ? (done / aggregateTotal) * 100 : 100;
+      const elapsedMs = Math.max(Date.now() - aggregateStartedAtMs, 1);
+      const perDayMs = done > 0 ? elapsedMs / done : 0;
+      const etaMs = Math.max(Math.round(perDayMs * remaining), 0);
+      const etaSeconds = Math.ceil(etaMs / 1000);
+      const message = `Refreshing daily aggregates: completed=${done}/${aggregateTotal}, remaining=${remaining}, progress=${pct.toFixed(2)}%, current_date=${d}, eta_seconds=${etaSeconds}`;
+      setBackfillProgress(db, {
+        phase: 'finalizing',
+        total: scopeList.length,
+        completed: scopeList.length,
+        current: null,
+        message,
+        runDate,
+        startedAt: new Date().toISOString(),
+      });
+      logBackfillInfo(`[Backfill][Step-2][Heartbeat] ${message}`);
+    }
+
+    if (done % 60 === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
   }
 
   setBackfillProgress(db, {

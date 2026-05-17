@@ -4,9 +4,38 @@ const path = require('path');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const LOG_DIR = process.env.APP_LOG_DIR || path.join(DATA_DIR, 'logs');
 const RETENTION_DAYS = Math.max(1, Number(process.env.APP_LOG_RETENTION_DAYS || (process.env.NODE_ENV === 'production' ? 10 : 30)));
+const IST_OFFSET_MINUTES = 330;
+
+function toIstDate(date = new Date()) {
+  return new Date(date.getTime() + (IST_OFFSET_MINUTES * 60 * 1000));
+}
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function pad3(n) {
+  return String(n).padStart(3, '0');
+}
 
 function currentDateStamp() {
-  return new Date().toISOString().slice(0, 10);
+  const d = toIstDate();
+  const y = d.getUTCFullYear();
+  const m = pad2(d.getUTCMonth() + 1);
+  const day = pad2(d.getUTCDate());
+  return `${y}-${m}-${day}`;
+}
+
+function currentTimestampIst() {
+  const d = toIstDate();
+  const y = d.getUTCFullYear();
+  const m = pad2(d.getUTCMonth() + 1);
+  const day = pad2(d.getUTCDate());
+  const hh = pad2(d.getUTCHours());
+  const mm = pad2(d.getUTCMinutes());
+  const ss = pad2(d.getUTCSeconds());
+  const ms = pad3(d.getUTCMilliseconds());
+  return `${y}-${m}-${day}T${hh}:${mm}:${ss}.${ms}+05:30`;
 }
 
 function safeStringify(value) {
@@ -44,7 +73,7 @@ function writeLog(prefix, level, message, meta = null) {
   try {
     ensureLogDir();
     const filePath = path.join(LOG_DIR, `${prefix}-${currentDateStamp()}.log`);
-    const ts = new Date().toISOString();
+    const ts = currentTimestampIst();
     const metaPart = meta == null ? '' : ` | ${safeStringify(meta)}`;
     const line = `[${ts}] [${level}] ${message}${metaPart}\n`;
     fs.appendFileSync(filePath, line, 'utf8');

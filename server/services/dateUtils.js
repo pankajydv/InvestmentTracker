@@ -9,7 +9,18 @@ function todayIso() {
   return new Date().toISOString().split('T')[0];
 }
 
+// Returns true if current IST time is after 10:25 PM (22:25)
+function isAfterStaticAssetCutoff() {
+  const now = new Date();
+  // IST = UTC+5:30
+  const utcMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const istMinutes = (utcMinutes + 330) % 1440;
+  // 22:25 = 1345 minutes
+  return istMinutes >= 1345;
+}
+
 module.exports = {
   toIsoDate,
   todayIso,
+  isAfterStaticAssetCutoff,
 };

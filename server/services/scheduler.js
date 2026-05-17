@@ -6,28 +6,115 @@
 
 const cron = require('node-cron');
 const { updateAllPrices } = require('./updater');
-const { runDirtyBackfillPreflight } = require('./dirtyBackfillService');
+const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate } = require('./dirtyBackfillService');
 const { todayIso } = require('./backfillService');
 const { logAppInfo, logAppError } = require('./appLogger');
 
-function startScheduler(db) {
-  const runScheduledUpdate = async (label, options = {}) => {
-    const runDate = todayIso();
-    console.log(`[Scheduler] ${label}: preflight dirty backfill check for ${runDate}...`);
-    logAppInfo(`[Scheduler] ${label}: started`, { runDate, options });
-    await runDirtyBackfillPreflight(db, runDate);
-    const result = await updateAllPrices(db, options);
-    logAppInfo(`[Scheduler] ${label}: completed`, {
-      runDate,
-      processed: result?.processed || 0,
-      errors: result?.errors || 0,
-    });
-  };
+function addDays(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().split('T')[0];
+}
 
+function diffDays(startIso, endIso) {
+  const startMs = new Date(`${startIso}T00:00:00.000Z`).getTime();
+  const endMs = new Date(`${endIso}T00:00:00.000Z`).getTime();
+  return Math.max(Math.floor((endMs - startMs) / 86400000), 0);
+}
+
+function resolvePriceWatermark(db) {
+  const cfg = db.prepare(`
+    SELECT value
+    FROM config
+    WHERE key = 'price_update_watermark'
+    LIMIT 1
+  `).get();
+
+  if (cfg?.value && /^\d{4}-\d{2}-\d{2}$/.test(String(cfg.value))) {
+    return String(cfg.value);
+  }
+
+  const maxDaily = db.prepare('SELECT MAX(date) AS max_date FROM daily_values').get();
+  if (maxDaily?.max_date && /^\d{4}-\d{2}-\d{2}$/.test(String(maxDaily.max_date))) {
+    return String(maxDaily.max_date);
+  }
+
+  return null;
+}
+
+function ensureSchedulerCatchUpScopes(db, runDate, label) {
+  const watermark = resolvePriceWatermark(db);
+  if (!watermark) {
+    logAppInfo(`[Scheduler] ${label}: no price watermark found; skipping gap enqueue`, { runDate });
+    return { watermark: null, catchUpFrom: null, gapDays: 0, enqueued: 0 };
+  }
+
+  const catchUpFrom = addDays(watermark, 1);
+  if (catchUpFrom > runDate) {
+    return { watermark, catchUpFrom: null, gapDays: 0, enqueued: 0 };
+  }
+
+  const reason = 'scheduler-downtime-catchup';
+  const sourceEventId = `scheduler-catchup:${runDate}`;
+  const enqueued = markAllTrackedInvestmentsDirtyFromDate(db, catchUpFrom, reason, sourceEventId);
+  const gapDays = diffDays(catchUpFrom, runDate) + 1;
+
+  logAppInfo(`[Scheduler] ${label}: enqueued catch-up dirty scopes`, {
+    watermark,
+    catchUpFrom,
+    runDate,
+    gapDays,
+    enqueued,
+  });
+
+  return { watermark, catchUpFrom, gapDays, enqueued };
+}
+
+/**
+ * Core scheduler cycle: catch-up gap detection → dirty backfill preflight → price update.
+ * Exported so it can be triggered from the API (manual "Update Prices" in the UI) in addition
+ * to the cron jobs.
+ *
+ * @param {object} db   - better-sqlite3 database instance
+ * @param {string} label - descriptive label for logging
+ * @param {object} [options]
+ * @param {boolean} [options.skipPriceUpdate] - run preflight only, skip actual price fetch
+ * @param {string[]} [options.assetTypes]     - restrict price update to these asset types
+ */
+async function runSchedulerCycle(db, label, options = {}) {
+  const runDate = todayIso();
+  console.log(`[Scheduler] ${label}: preflight dirty backfill check for ${runDate}...`);
+  logAppInfo(`[Scheduler] ${label}: started`, { runDate, options });
+
+  const catchUp = ensureSchedulerCatchUpScopes(db, runDate, label);
+  const preflight = await runDirtyBackfillPreflight(db, runDate);
+
+  if (options.skipPriceUpdate) {
+    logAppInfo(`[Scheduler] ${label}: completed (preflight-only)`, {
+      runDate,
+      catchUp,
+      preflight,
+    });
+    return { preflightOnly: true, catchUp, preflight };
+  }
+
+  const result = await updateAllPrices(db, options);
+  logAppInfo(`[Scheduler] ${label}: completed`, {
+    runDate,
+    catchUp,
+    preflight,
+    processed: result?.processed || 0,
+    errors: result?.errors || 0,
+    watermarkUpdated: !!result?.watermarkUpdated,
+  });
+  return { catchUp, preflight, result };
+}
+
+function startScheduler(db) {
   // Startup catch-up: ensure pending dirty scopes are reconciled even before first cron tick.
   setTimeout(async () => {
     try {
-      await runDirtyBackfillPreflight(db, todayIso());
+      await runSchedulerCycle(db, 'Startup catch-up', { skipPriceUpdate: true });
       logAppInfo('[Scheduler] Startup preflight completed');
     } catch (e) {
       console.error('[Scheduler] Startup preflight failed:', e.message);
@@ -53,7 +140,7 @@ function startScheduler(db) {
       const hour = [9, 10, 11, 12, 13, 14, 15, 16][index];
       console.log(`[Scheduler] Running ${hour}:25 intraday price update (stocks only)...`);
       try {
-        await runScheduledUpdate(`Intraday run ${hour}:25`, {
+        await runSchedulerCycle(db, `Intraday run ${hour}:25`, {
           assetTypes: ['INDIAN_STOCK', 'FOREIGN_STOCK'],
         });
       } catch (e) {
@@ -69,7 +156,7 @@ function startScheduler(db) {
   cron.schedule('25 22 * * 1-5', async () => {
     console.log('[Scheduler] Running 10:25 PM final price update (all asset types)...');
     try {
-      await runScheduledUpdate('Final nightly run (all types)');
+      await runSchedulerCycle(db, 'Final nightly run (all types)');
     } catch (e) {
       console.error('[Scheduler] Final nightly update failed:', e.message);
       logAppError('[Scheduler] Final nightly run failed', { error: e.message });
@@ -88,4 +175,4 @@ function startScheduler(db) {
   });
 }
 
-module.exports = { startScheduler };
+module.exports = { startScheduler, runSchedulerCycle };

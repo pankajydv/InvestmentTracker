@@ -51,7 +51,7 @@ function markScopeDirty(db, { investmentId = null, portfolioId = null, dirtyFrom
     FROM dirty_backfill_scope
     WHERE COALESCE(investment_id, 0) = COALESCE(?, 0)
       AND COALESCE(portfolio_id, 0) = COALESCE(?, 0)
-      AND status IN ('pending', 'running')
+      AND status IN ('pending', 'running', 'failed')
     ORDER BY id DESC
     LIMIT 1
   `).get(investmentId, portfolioId);
@@ -122,12 +122,38 @@ function markDirtyForAssetTypeFromDate(db, assetType, dirtyFromDate, reason, sou
   return markDirtyFromTransactions(db, rows, reason, sourceEventId);
 }
 
+function markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourceEventId = null) {
+  const normalized = normalizeDirtyDate(dirtyFromDate);
+  if (!normalized) return 0;
+
+  const rows = db.prepare(`
+    SELECT id
+    FROM investments
+    WHERE is_active != 0
+      AND COALESCE(exclude_from_tracking, 0) != 1
+  `).all();
+
+  let count = 0;
+  for (const row of rows) {
+    const dirtyDate = markScopeDirty(db, {
+      investmentId: row.id,
+      portfolioId: null,
+      dirtyFromDate: normalized,
+      reason,
+      sourceEventId,
+    });
+    if (dirtyDate) count += 1;
+  }
+
+  return count;
+}
+
 function getPendingDirtyScopes(db, runDate = todayIso()) {
   const effectiveRunDate = normalizeDirtyDate(runDate) || todayIso();
   return db.prepare(`
     SELECT id, investment_id, portfolio_id, dirty_from_date, dirty_reason, source_event_id, status, created_at, updated_at
     FROM dirty_backfill_scope
-    WHERE status IN ('pending', 'running')
+    WHERE status IN ('pending', 'running', 'failed')
       AND dirty_from_date <= ?
     ORDER BY dirty_from_date ASC, id ASC
   `).all(effectiveRunDate);
@@ -260,6 +286,7 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso()) {
 module.exports = {
   clearBackfillProgress,
   getPendingDirtyScopes,
+  markAllTrackedInvestmentsDirtyFromDate,
   markDirtyForAssetTypeFromDate,
   markDirtyFromTransactions,
   markScopeDirty,

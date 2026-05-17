@@ -5,6 +5,7 @@ const path = require('path');
 const XLSX = require('xlsx');
 const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = require('../services/priceService');
 const { updateAllPrices, cancelUpdate } = require('../services/updater');
+const { runSchedulerCycle } = require('../services/scheduler');
 const { getPendingDirtyScopes, markDirtyForAssetTypeFromDate, markDirtyFromTransactions, runDirtyBackfillPreflight } = require('../services/dirtyBackfillService');
 const { todayIso } = require('../services/backfillService');
 const { logAppInfo, logAppError, getLogDir } = require('../services/appLogger');
@@ -177,24 +178,21 @@ module.exports = function (db) {
     }
   });
 
-  // ─── Trigger manual price update ──────────────────────────────────────
+  // ─── Trigger manual price update (full scheduler cycle) ────────────────
+  // Runs the same flow as the cron scheduler: gap catch-up → dirty backfill
+  // preflight → today's price fetch. This ensures missed days are recovered
+  // even when triggered manually from the UI.
   router.post('/update-prices', async (req, res) => {
     try {
-      const options = {};
-      // Accept optional assetType filter (single string or array)
-      if (req.body && req.body.assetTypes) {
-        options.assetTypes = Array.isArray(req.body.assetTypes)
-          ? req.body.assetTypes : [req.body.assetTypes];
-      }
-      logAppInfo('[UI] Manual update-prices requested', {
-        assetTypes: options.assetTypes || 'ALL',
+      logAppInfo('[UI] Manual update-prices (scheduler cycle) requested');
+      const cycleResult = await runSchedulerCycle(db, '[UI] Manual trigger');
+      logAppInfo('[UI] Manual update-prices (scheduler cycle) completed', {
+        processed: cycleResult?.result?.processed || 0,
+        errors: cycleResult?.result?.errors || 0,
+        catchUpEnqueued: cycleResult?.catchUp?.enqueued || 0,
+        preflightRan: cycleResult?.preflight?.ran || false,
       });
-      const result = await updateAllPrices(db, options);
-      logAppInfo('[UI] Manual update-prices completed', {
-        processed: result?.processed || 0,
-        errors: result?.errors || 0,
-      });
-      res.json(result);
+      res.json(cycleResult);
     } catch (e) {
       logAppError('[UI] Manual update-prices failed', { error: e.message });
       res.status(500).json({ error: e.message });

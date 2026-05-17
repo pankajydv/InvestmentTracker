@@ -13,6 +13,8 @@ const {
   fetchSGBPrice,
 } = require('./priceService');
 
+
+const { isAfterStaticAssetCutoff } = require('./dateUtils');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ─── Cancellation support ──────────────────────────────────────────────────
@@ -176,15 +178,22 @@ async function updateAllPrices(db, options = {}) {
   let successCount = 0;
   let errorCount = 0;
 
+
+  const STATIC_TYPES = new Set(['PPF', 'SSY', 'PF', 'NPS', 'BOND']);
   for (const inv of investments) {
     if (_cancelled) {
       console.log('  ⏹ Update cancelled by user.');
       break;
     }
+    // Only skip static assets for today’s row if before cutoff and not a backfill/dirty scope
+    if (STATIC_TYPES.has(inv.asset_type) && !isAfterStaticAssetCutoff()) {
+      console.log(`  ⏭ Skipping static asset ${inv.name} (type ${inv.asset_type}) before cutoff`);
+      continue;
+    }
+
     try {
       let pricePerUnit = 0;
       let priceSource = 'COMPUTED';
-      // Per-share change from the API (used for stocks; null means fall back to DB).
       let apiChange = null;
       let apiChangePct = null;
 
@@ -201,47 +210,38 @@ async function updateAllPrices(db, options = {}) {
           }
           break;
         }
-
         case 'INDIAN_STOCK': {
           if (!inv.ticker_symbol) {
             console.warn(`  Skipping ${inv.name}: No ticker symbol`);
             continue;
           }
-          await delay(500); // Avoid Yahoo Finance rate limiting
-          // ticker_symbol stores full Yahoo symbol (e.g. BAJFINANCE.NS, NSDL.BO)
+          await delay(500);
           const stockTicker = inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol);
           const stockData = await fetchStockPrice(stockTicker);
           pricePerUnit = stockData.price;
-          // Use Yahoo's per-share change (last close vs previous close)
-          // so weekends/holidays still show the last trading session's move.
           apiChange = stockData.change;
           apiChangePct = stockData.changePercent;
           priceSource = 'LIVE';
           break;
         }
-
         case 'FOREIGN_STOCK': {
           if (!inv.ticker_symbol) {
             console.warn(`  Skipping ${inv.name}: No ticker symbol`);
             continue;
           }
-          await delay(500); // Avoid Yahoo Finance rate limiting
+          await delay(500);
           const foreignData = await fetchStockPrice(inv.ticker_symbol);
           pricePerUnit = foreignData.price;
-          // For foreign stocks, pricePerUnit stays in USD; currentValue converted to INR below
           apiChange = foreignData.change;
           apiChangePct = foreignData.changePercent;
           priceSource = 'LIVE';
           break;
         }
-
         case 'BOND': {
           pricePerUnit = inv.face_value || 1000;
           break;
         }
-
         case 'SGB': {
-          // SGBs trade on NSE - fetch live price via NSE quote-equity API using ticker_symbol
           if (inv.ticker_symbol) {
             try {
               const sgbData = await fetchSGBPrice(inv.ticker_symbol);
@@ -253,7 +253,6 @@ async function updateAllPrices(db, options = {}) {
               console.warn(`  ${inv.name}: NSE price fetch failed (${e.message}), falling back to last known price`);
             }
           }
-          // Fallback: use last known price from daily_values
           if (!pricePerUnit) {
             const lastKnown = db.prepare(
               'SELECT price_per_unit FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
@@ -261,13 +260,11 @@ async function updateAllPrices(db, options = {}) {
             if (lastKnown) pricePerUnit = lastKnown.price_per_unit;
             if (lastKnown) priceSource = 'LOCF';
           }
-          // Final fallback: use face_value
           if (!pricePerUnit) {
             pricePerUnit = inv.face_value || 5000;
           }
           break;
         }
-
         case 'PPF':
         case 'SSY':
         case 'PF': {
@@ -275,16 +272,13 @@ async function updateAllPrices(db, options = {}) {
             'SELECT rate FROM interest_rates WHERE rate_type = ? ORDER BY effective_from DESC LIMIT 1'
           ).get(inv.asset_type);
           pricePerUnit = rateRow ? rateRow.rate : (inv.asset_type === 'PPF' ? 7.1 : inv.asset_type === 'SSY' ? 8.2 : 8.25);
-          // Fetch full rate history for historical compounding
           const rateHistory = db.prepare(
             'SELECT rate, effective_from, effective_to FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
           ).all(inv.asset_type);
           inv._rateHistory = rateHistory.length > 0 ? rateHistory : null;
           break;
         }
-
         case 'NPS': {
-          // No external API; use latest transaction NAV as fallback price
           const latestNav = db.prepare(
             'SELECT price_per_unit FROM transactions WHERE investment_id = ? AND transaction_date <= ? AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1'
           ).get(inv.id, today);
@@ -296,17 +290,13 @@ async function updateAllPrices(db, options = {}) {
         }
       }
 
-      // Get distinct portfolios this investment belongs to
+      // ...existing code for daily_values, rollups, etc...
       const portfolioIds = getDistinctPortfolios.all(inv.id, today).map(r => r.portfolio_id);
-      // Process each portfolio + combined (null)
       const pidsToProcess = [...portfolioIds, null];
-
       for (const pid of pidsToProcess) {
         let totalUnits, investedAmount, saleProceeds, currentValue;
-
         if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF') {
-          // PPF/SSY/PF: compute value from deposits + interest rate(s)
-          const rateParam = inv._rateHistory || pricePerUnit; // use historical rates if available, else single rate
+          const rateParam = inv._rateHistory || pricePerUnit;
           const txnFilter = pid !== null ? " AND portfolio_id = ?" : "";
           const txnParams = pid !== null ? [inv.id, pid, today] : [inv.id, today];
           const txns = db.prepare(
@@ -337,15 +327,12 @@ async function updateAllPrices(db, options = {}) {
             currentValue = totalUnits * pricePerUnit;
           }
         }
-
         const reinvestedType = inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF';
         const realizedGain = reinvestedType ? 0 : saleProceeds;
         const profitLoss = reinvestedType
           ? (currentValue - investedAmount)
           : (currentValue + realizedGain - investedAmount);
         const profitLossPct = investedAmount > 0 ? (profitLoss / investedAmount) * 100 : 0;
-
-        // Day change: prefer API-sourced per-share change scaled by this portfolio's units
         let dayChange = 0;
         let dayChangePct = 0;
         if (totalUnits > 0) {
@@ -362,7 +349,6 @@ async function updateAllPrices(db, options = {}) {
             }
           }
         }
-
         const r = (v) => Math.round(v * 100) / 100;
         if (pid !== null) {
           upsertDaily.run(
@@ -381,7 +367,6 @@ async function updateAllPrices(db, options = {}) {
           );
         }
       }
-
       const combinedUnits = getTotalUnits.get(inv.id, today).total;
       const combinedValue = inv.asset_type === 'FOREIGN_STOCK'
         ? combinedUnits * pricePerUnit * usdToInr
@@ -391,10 +376,7 @@ async function updateAllPrices(db, options = {}) {
       const combinedPL = combinedValue + getSaleProceeds.get(inv.id, today).total - getInvestedAmount.get(inv.id, today).total;
       console.log(`  ✓ ${inv.name}: ₹${Math.round(combinedValue).toLocaleString()} (${combinedPL >= 0 ? '+' : ''}${Math.round(combinedPL).toLocaleString()})`);
       successCount++;
-
-      // Small delay to avoid rate limiting
       await new Promise(r => setTimeout(r, 300));
-
     } catch (e) {
       console.error(`  ✗ ${inv.name}: ${e.message}`);
       errorCount++;
@@ -409,10 +391,31 @@ async function updateAllPrices(db, options = {}) {
   db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'last_price_update'")
     .run(new Date().toISOString());
 
+  // Persist daily watermark only for fully successful, non-cancelled runs.
+  let watermarkUpdated = false;
+  if (!_cancelled && errorCount === 0) {
+    db.prepare(`
+      INSERT INTO config (key, value, updated_at)
+      VALUES ('price_update_watermark', ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = datetime('now')
+    `).run(today);
+    watermarkUpdated = true;
+  }
+
   const cancelled = _cancelled;
   _cancelled = false;
   console.log(`[${new Date().toISOString()}] Price update ${cancelled ? 'cancelled' : 'done'}. Success: ${successCount}, Errors: ${errorCount}`);
-  return { successCount, errorCount, cancelled, date: today };
+  return {
+    successCount,
+    errorCount,
+    cancelled,
+    date: today,
+    watermarkUpdated,
+    processed: successCount,
+    errors: errorCount,
+  };
 }
 
 /**
