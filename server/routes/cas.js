@@ -3,6 +3,7 @@ const multer = require('multer');
 const { parseCAS } = require('../services/casParser');
 const { parseCAMSCAS } = require('../services/camsCasParser');
 const { parseNSDLCAS } = require('../services/nsdlCasParser');
+const { logAppInfo, logAppError } = require('../services/appLogger');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
@@ -243,6 +244,11 @@ module.exports = function (db) {
       throw new Error('Could not detect CAS type. The PDF may not be a supported CAS format (CAMS/KFintech, CDSL, or NSDL).');
     } catch (e) {
       console.error('CAS parse error:', e);
+      logAppError('[CAS] Preview failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        file_name: req.file?.originalname || null,
+        error: e.message,
+      });
       if (e.message?.includes('password') || e.message?.includes('decrypt')) {
         return res.status(400).json({ error: 'Wrong password (PAN number). Cannot decrypt PDF.' });
       }
@@ -336,6 +342,13 @@ module.exports = function (db) {
 
       importTxn();
 
+      logAppInfo('[CAS] CAMS import completed', {
+        portfolio_id: portfolioId,
+        schemes: results.length,
+        imported: importedCount,
+        skipped: skippedCount,
+      });
+
       res.json({
         success: true,
         imported: importedCount,
@@ -344,6 +357,10 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('CAMS CAS import error:', e);
+      logAppError('[CAS] CAMS import failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import: ' + e.message });
     }
   });
@@ -433,6 +450,11 @@ module.exports = function (db) {
 
       importTxn();
 
+      logAppInfo('[CAS] Holdings import completed', {
+        portfolio_id: Number(portfolio_id),
+        imported: results.length,
+      });
+
       res.json({
         success: true,
         imported: results.length,
@@ -440,6 +462,10 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('CAS import error:', e);
+      logAppError('[CAS] Holdings import failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import: ' + e.message });
     }
   });

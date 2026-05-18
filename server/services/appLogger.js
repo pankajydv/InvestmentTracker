@@ -5,6 +5,10 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data'
 const LOG_DIR = process.env.APP_LOG_DIR || path.join(DATA_DIR, 'logs');
 const RETENTION_DAYS = Math.max(1, Number(process.env.APP_LOG_RETENTION_DAYS || (process.env.NODE_ENV === 'production' ? 10 : 30)));
 const IST_OFFSET_MINUTES = 330;
+const LOG_FILE_PREFIX = 'invest-tracker';
+const LOG_TO_CONSOLE = String(
+  process.env.APP_LOG_TO_CONSOLE || (process.env.NODE_ENV === 'production' ? 'false' : 'true')
+).toLowerCase() === 'true';
 
 function toIstDate(date = new Date()) {
   return new Date(date.getTime() + (IST_OFFSET_MINUTES * 60 * 1000));
@@ -50,14 +54,14 @@ function ensureLogDir() {
   fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
-function pruneOldLogs(prefix) {
+function pruneOldLogs() {
   try {
     const cutoff = Date.now() - (RETENTION_DAYS * 24 * 60 * 60 * 1000);
     const files = fs.readdirSync(LOG_DIR, { withFileTypes: true });
     for (const file of files) {
       if (!file.isFile()) continue;
       const name = file.name;
-      if (!name.startsWith(`${prefix}-`) || !name.endsWith('.log')) continue;
+      if (!name.startsWith(`${LOG_FILE_PREFIX}-`) || !name.endsWith('.log')) continue;
       const fullPath = path.join(LOG_DIR, name);
       const stat = fs.statSync(fullPath);
       if (stat.mtimeMs < cutoff) {
@@ -69,16 +73,25 @@ function pruneOldLogs(prefix) {
   }
 }
 
-function writeLog(prefix, level, message, meta = null) {
+function writeLog(_prefix, level, message, meta = null) {
   try {
     ensureLogDir();
-    const filePath = path.join(LOG_DIR, `${prefix}-${currentDateStamp()}.log`);
+    const filePath = path.join(LOG_DIR, `${LOG_FILE_PREFIX}-${currentDateStamp()}.log`);
     const ts = currentTimestampIst();
     const metaPart = meta == null ? '' : ` | ${safeStringify(meta)}`;
     const line = `[${ts}] [${level}] ${message}${metaPart}\n`;
     fs.appendFileSync(filePath, line, 'utf8');
 
-    pruneOldLogs(prefix);
+    if (LOG_TO_CONSOLE) {
+      const text = line.trimEnd();
+      if (level === 'ERROR') {
+        console.error(text);
+      } else {
+        console.log(text);
+      }
+    }
+
+    pruneOldLogs();
   } catch (_) {
     // best-effort logging only
   }
@@ -100,12 +113,16 @@ function logBackfillError(message, meta = null) {
   writeLog('backfill', 'ERROR', message, meta);
 }
 
+function getUnifiedLogPathForDate(dateStamp = currentDateStamp()) {
+  return path.join(LOG_DIR, `${LOG_FILE_PREFIX}-${dateStamp}.log`);
+}
+
 function getAppLogPathForDate(dateStamp = currentDateStamp()) {
-  return path.join(LOG_DIR, `app-${dateStamp}.log`);
+  return getUnifiedLogPathForDate(dateStamp);
 }
 
 function getBackfillLogPathForDate(dateStamp = currentDateStamp()) {
-  return path.join(LOG_DIR, `backfill-${dateStamp}.log`);
+  return getUnifiedLogPathForDate(dateStamp);
 }
 
 function getLogDir() {
@@ -117,6 +134,7 @@ module.exports = {
   logAppError,
   logBackfillInfo,
   logBackfillError,
+  getUnifiedLogPathForDate,
   getAppLogPathForDate,
   getBackfillLogPathForDate,
   getLogDir,

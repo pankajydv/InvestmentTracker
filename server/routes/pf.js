@@ -8,6 +8,7 @@
 const express = require('express');
 const multer = require('multer');
 const { parsePFStatements } = require('../services/pfStatementParser');
+const { logAppInfo, logAppError } = require('../services/appLogger');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -265,6 +266,11 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('PF preview error:', e);
+      logAppError('[PF] Preview failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to parse PF statements: ' + e.message });
     }
   });
@@ -360,6 +366,14 @@ module.exports = function (db) {
 
       const result = importTxn();
 
+      logAppInfo('[PF] Import completed', {
+        portfolio_id: portfolioId,
+        main_pf_investment_id: resolvedMainPF?.id || null,
+        eps_investment_id: resolvedEPS?.id || null,
+        imported: Number(result.importedCount || 0),
+        skipped: Number(result.skippedCount || 0),
+      });
+
       return res.json({
         success: true,
         imported: result.importedCount,
@@ -367,6 +381,10 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('PF import error:', e);
+      logAppError('[PF] Import failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import PF transactions: ' + e.message });
     }
   });
@@ -464,12 +482,25 @@ module.exports = function (db) {
 
       const count = importTxn();
 
+      logAppInfo('[PF] Manual transaction added', {
+        portfolio_id: portfolioId,
+        date,
+        type,
+        inserted: Number(count || 0),
+      });
+
       return res.json({
         success: true,
         inserted: count,
       });
     } catch (e) {
       console.error('PF manual add error:', e);
+      logAppError('[PF] Manual add failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        date: req.body?.date || null,
+        type: req.body?.type || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to add manual PF transaction: ' + e.message });
     }
   });

@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { logAppInfo, logAppError } = require('../services/appLogger');
 
 module.exports = function (db) {
   const dvCols = db.prepare("PRAGMA table_info(daily_values)").all().map(c => c.name);
@@ -63,46 +64,76 @@ module.exports = function (db) {
         ? db.prepare('INSERT INTO portfolios (name, color, pan_number, email) VALUES (?, ?, ?, ?)').run(name, color || '#f59e0b', pan_number || null, email || null)
         : db.prepare('INSERT INTO portfolios (name, color, pan_number) VALUES (?, ?, ?)').run(name, color || '#f59e0b', pan_number || null);
       const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(result.lastInsertRowid);
+      logAppInfo('[Portfolio] Created', {
+        portfolio_id: Number(portfolio?.id || result.lastInsertRowid),
+        name: portfolio?.name || name,
+      });
       res.status(201).json(portfolio);
     } catch (e) {
       if (e.message.includes('UNIQUE')) {
         return res.status(409).json({ error: 'A portfolio with this name already exists' });
       }
-      throw e;
+      logAppError('[Portfolio] Create failed', { name, error: e.message });
+      return res.status(500).json({ error: e.message || 'Failed to create portfolio' });
     }
   });
 
   // ─── Update portfolio ─────────────────────────────────────────────
   router.put('/:id', (req, res) => {
-    const { name, color, pan_number, email } = req.body;
-    if (hasEmail) {
-      db.prepare(`
-        UPDATE portfolios SET
-          name = COALESCE(?, name),
-          color = COALESCE(?, color),
-          pan_number = COALESCE(?, pan_number),
-          email = COALESCE(?, email)
-        WHERE id = ?
-      `).run(name, color, pan_number, email, req.params.id);
-    } else {
-      db.prepare(`
-        UPDATE portfolios SET
-          name = COALESCE(?, name),
-          color = COALESCE(?, color),
-          pan_number = COALESCE(?, pan_number)
-        WHERE id = ?
-      `).run(name, color, pan_number, req.params.id);
+    try {
+      const { name, color, pan_number, email } = req.body;
+      const existing = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Portfolio not found' });
+
+      if (hasEmail) {
+        db.prepare(`
+          UPDATE portfolios SET
+            name = COALESCE(?, name),
+            color = COALESCE(?, color),
+            pan_number = COALESCE(?, pan_number),
+            email = COALESCE(?, email)
+          WHERE id = ?
+        `).run(name, color, pan_number, email, req.params.id);
+      } else {
+        db.prepare(`
+          UPDATE portfolios SET
+            name = COALESCE(?, name),
+            color = COALESCE(?, color),
+            pan_number = COALESCE(?, pan_number)
+          WHERE id = ?
+        `).run(name, color, pan_number, req.params.id);
+      }
+      const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(req.params.id);
+      logAppInfo('[Portfolio] Updated', {
+        portfolio_id: Number(req.params.id),
+        name: portfolio?.name || existing.name,
+      });
+      res.json(portfolio);
+    } catch (e) {
+      logAppError('[Portfolio] Update failed', { portfolio_id: Number(req.params.id), error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to update portfolio' });
     }
-    const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(req.params.id);
-    res.json(portfolio);
   });
 
   // ─── Delete portfolio ─────────────────────────────────────────────
   router.delete('/:id', (req, res) => {
-    // Unassign transactions first (don't delete them)
-    db.prepare('UPDATE transactions SET portfolio_id = NULL WHERE portfolio_id = ?').run(req.params.id);
-    db.prepare('DELETE FROM portfolios WHERE id = ?').run(req.params.id);
-    res.json({ success: true });
+    try {
+      const existing = db.prepare('SELECT id, name FROM portfolios WHERE id = ?').get(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Portfolio not found' });
+
+      // Unassign transactions first (don't delete them)
+      const unassigned = db.prepare('UPDATE transactions SET portfolio_id = NULL WHERE portfolio_id = ?').run(req.params.id);
+      db.prepare('DELETE FROM portfolios WHERE id = ?').run(req.params.id);
+      logAppInfo('[Portfolio] Deleted', {
+        portfolio_id: Number(existing.id),
+        name: existing.name,
+        transactions_unassigned: Number(unassigned?.changes || 0),
+      });
+      res.json({ success: true });
+    } catch (e) {
+      logAppError('[Portfolio] Delete failed', { portfolio_id: Number(req.params.id), error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to delete portfolio' });
+    }
   });
 
   return router;

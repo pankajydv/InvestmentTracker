@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { fetchHistoricalUSDToINR, fetchUSDToINR } = require('../services/priceService');
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
+const { logAppInfo, logAppError } = require('../services/appLogger');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -110,55 +111,69 @@ module.exports = function (db) {
       const rate = date ? await fetchHistoricalUSDToINR(date) : await fetchUSDToINR();
       res.json({ rate, date: date || new Date().toISOString().split('T')[0] });
     } catch (e) {
+      logAppError('[Transaction] USD/INR rate fetch failed', { date: req.query?.date || null, error: e.message });
       res.status(500).json({ error: e.message });
     }
   });
 
   // --- Add transaction ---
   router.post('/', async (req, res) => {
-    const {
-      investment_id, transaction_type, transaction_date,
-      units, price_per_unit, amount, fees, notes, broker, portfolio_id,
-      exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units,
-    } = req.body;
+    try {
+      const {
+        investment_id, transaction_type, transaction_date,
+        units, price_per_unit, amount, fees, notes, broker, portfolio_id,
+        exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units,
+      } = req.body;
 
-    if (!investment_id || !portfolio_id || !transaction_type || !transaction_date || !amount) {
-      return res.status(400).json({ error: 'investment_id, portfolio_id, transaction_type, transaction_date, and amount are required' });
-    }
-
-    const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(investment_id);
-    if (!inv) return res.status(404).json({ error: 'Investment not found' });
-
-    const normalizedTransactionDate = normalizeTransactionDate(transaction_date);
-    if (!normalizedTransactionDate) {
-      return res.status(400).json({ error: 'transaction_date must be a valid date in YYYY-MM-DD format' });
-    }
-
-    // Auto-fetch RBI rate for USD investments if not provided
-    let resolvedRate = exchange_rate_used || null;
-    if (inv.currency === 'USD' && !resolvedRate) {
-      try {
-        resolvedRate = await fetchHistoricalUSDToINR(normalizedTransactionDate);
-      } catch (_) {
-        resolvedRate = null;
+      if (!investment_id || !portfolio_id || !transaction_type || !transaction_date || !amount) {
+        return res.status(400).json({ error: 'investment_id, portfolio_id, transaction_type, transaction_date, and amount are required' });
       }
+
+      const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(investment_id);
+      if (!inv) return res.status(404).json({ error: 'Investment not found' });
+
+      const normalizedTransactionDate = normalizeTransactionDate(transaction_date);
+      if (!normalizedTransactionDate) {
+        return res.status(400).json({ error: 'transaction_date must be a valid date in YYYY-MM-DD format' });
+      }
+
+      // Auto-fetch RBI rate for USD investments if not provided
+      let resolvedRate = exchange_rate_used || null;
+      if (inv.currency === 'USD' && !resolvedRate) {
+        try {
+          resolvedRate = await fetchHistoricalUSDToINR(normalizedTransactionDate);
+        } catch (_) {
+          resolvedRate = null;
+        }
+      }
+
+      const result = db.prepare(`
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(investment_id, portfolio_id, transaction_type, normalizedTransactionDate,
+        units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null,
+        resolvedRate, usd_amount || null, fmv_per_unit || null, gross_units || null, tax_withheld_units || null);
+
+      const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
+      markDirtyFromTransactions(
+        db,
+        [{ investment_id, portfolio_id, transaction_date: normalizedTransactionDate }],
+        'transaction-created',
+        `txn:${result.lastInsertRowid}`
+      );
+      logAppInfo('[Transaction] Created', {
+        transaction_id: Number(result.lastInsertRowid),
+        investment_id: Number(investment_id),
+        portfolio_id: Number(portfolio_id),
+        transaction_type,
+        transaction_date: normalizedTransactionDate,
+        amount: Number(amount || 0),
+      });
+      res.status(201).json(txn);
+    } catch (e) {
+      logAppError('[Transaction] Create failed', { error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to create transaction' });
     }
-
-    const result = db.prepare(`
-      INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(investment_id, portfolio_id, transaction_type, normalizedTransactionDate,
-      units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null,
-      resolvedRate, usd_amount || null, fmv_per_unit || null, gross_units || null, tax_withheld_units || null);
-
-    const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
-    markDirtyFromTransactions(
-      db,
-      [{ investment_id, portfolio_id, transaction_date: normalizedTransactionDate }],
-      'transaction-created',
-      `txn:${result.lastInsertRowid}`
-    );
-    res.status(201).json(txn);
   });
 
   // --- Get transactions for an investment ---
@@ -289,64 +304,89 @@ module.exports = function (db) {
 
   // --- Update transaction ---
   router.put('/:id', (req, res) => {
-    const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ error: 'Transaction not found' });
+    try {
+      const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Transaction not found' });
 
-    const {
-      transaction_date, units, price_per_unit, amount, fees, notes, broker,
-      folio_number, exchange_rate_used, usd_amount, fmv_per_unit,
-      gross_units, tax_withheld_units,
-    } = req.body;
-    const nextDate = normalizeTransactionDate(transaction_date || existing.transaction_date) || existing.transaction_date;
-    db.prepare(`
-      UPDATE transactions
-      SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?, broker = ?, folio_number = ?,
-          exchange_rate_used = ?, usd_amount = ?, fmv_per_unit = ?, gross_units = ?, tax_withheld_units = ?
-      WHERE id = ?
-    `).run(
-      nextDate,
-      units ?? existing.units,
-      price_per_unit ?? existing.price_per_unit,
-      amount ?? existing.amount,
-      fees ?? existing.fees,
-      notes !== undefined ? notes : existing.notes,
-      broker !== undefined ? broker : existing.broker,
-      folio_number !== undefined ? folio_number : existing.folio_number,
-      exchange_rate_used !== undefined ? exchange_rate_used : existing.exchange_rate_used,
-      usd_amount !== undefined ? usd_amount : existing.usd_amount,
-      fmv_per_unit !== undefined ? fmv_per_unit : existing.fmv_per_unit,
-      gross_units !== undefined ? gross_units : existing.gross_units,
-      tax_withheld_units !== undefined ? tax_withheld_units : existing.tax_withheld_units,
-      req.params.id
-    );
+      const {
+        transaction_date, units, price_per_unit, amount, fees, notes, broker,
+        folio_number, exchange_rate_used, usd_amount, fmv_per_unit,
+        gross_units, tax_withheld_units,
+      } = req.body;
+      const nextDate = normalizeTransactionDate(transaction_date || existing.transaction_date) || existing.transaction_date;
+      db.prepare(`
+        UPDATE transactions
+        SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, fees = ?, notes = ?, broker = ?, folio_number = ?,
+            exchange_rate_used = ?, usd_amount = ?, fmv_per_unit = ?, gross_units = ?, tax_withheld_units = ?
+        WHERE id = ?
+      `).run(
+        nextDate,
+        units ?? existing.units,
+        price_per_unit ?? existing.price_per_unit,
+        amount ?? existing.amount,
+        fees ?? existing.fees,
+        notes !== undefined ? notes : existing.notes,
+        broker !== undefined ? broker : existing.broker,
+        folio_number !== undefined ? folio_number : existing.folio_number,
+        exchange_rate_used !== undefined ? exchange_rate_used : existing.exchange_rate_used,
+        usd_amount !== undefined ? usd_amount : existing.usd_amount,
+        fmv_per_unit !== undefined ? fmv_per_unit : existing.fmv_per_unit,
+        gross_units !== undefined ? gross_units : existing.gross_units,
+        tax_withheld_units !== undefined ? tax_withheld_units : existing.tax_withheld_units,
+        req.params.id
+      );
 
-    const dirtyFrom = existing.transaction_date < nextDate ? existing.transaction_date : nextDate;
-    markDirtyFromTransactions(
-      db,
-      [{ investment_id: existing.investment_id, portfolio_id: existing.portfolio_id, transaction_date: dirtyFrom }],
-      'transaction-updated',
-      `txn:${existing.id}`
-    );
+      const dirtyFrom = existing.transaction_date < nextDate ? existing.transaction_date : nextDate;
+      markDirtyFromTransactions(
+        db,
+        [{ investment_id: existing.investment_id, portfolio_id: existing.portfolio_id, transaction_date: dirtyFrom }],
+        'transaction-updated',
+        `txn:${existing.id}`
+      );
 
-    const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
-    res.json(txn);
+      const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
+      logAppInfo('[Transaction] Updated', {
+        transaction_id: Number(existing.id),
+        investment_id: Number(existing.investment_id),
+        portfolio_id: Number(existing.portfolio_id),
+        transaction_type: txn?.transaction_type || existing.transaction_type,
+        transaction_date: nextDate,
+      });
+      res.json(txn);
+    } catch (e) {
+      logAppError('[Transaction] Update failed', { transaction_id: Number(req.params.id), error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to update transaction' });
+    }
   });
 
   // --- Delete transaction ---
   router.delete('/:id', (req, res) => {
-    const existing = db.prepare('SELECT id, investment_id, portfolio_id, transaction_date FROM transactions WHERE id = ?').get(req.params.id);
-    if (!existing) return res.status(404).json({ error: 'Transaction not found' });
+    try {
+      const existing = db.prepare('SELECT id, investment_id, portfolio_id, transaction_date, transaction_type, amount FROM transactions WHERE id = ?').get(req.params.id);
+      if (!existing) return res.status(404).json({ error: 'Transaction not found' });
 
-    db.prepare('DELETE FROM transactions WHERE id = ?').run(req.params.id);
+      db.prepare('DELETE FROM transactions WHERE id = ?').run(req.params.id);
 
-    markDirtyFromTransactions(
-      db,
-      [{ investment_id: existing.investment_id, portfolio_id: existing.portfolio_id, transaction_date: existing.transaction_date }],
-      'transaction-deleted',
-      `txn:${existing.id}`
-    );
+      markDirtyFromTransactions(
+        db,
+        [{ investment_id: existing.investment_id, portfolio_id: existing.portfolio_id, transaction_date: existing.transaction_date }],
+        'transaction-deleted',
+        `txn:${existing.id}`
+      );
 
-    res.json({ success: true });
+      logAppInfo('[Transaction] Deleted', {
+        transaction_id: Number(existing.id),
+        investment_id: Number(existing.investment_id),
+        portfolio_id: Number(existing.portfolio_id),
+        transaction_type: existing.transaction_type,
+        transaction_date: existing.transaction_date,
+        amount: Number(existing.amount || 0),
+      });
+      res.json({ success: true });
+    } catch (e) {
+      logAppError('[Transaction] Delete failed', { transaction_id: Number(req.params.id), error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to delete transaction' });
+    }
   });
 
   return router;

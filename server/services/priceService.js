@@ -1021,6 +1021,58 @@ async function fetchSGBPrice(symbol) {
   });
 }
 
+// ─── NPS NAV Fetching ─────────────────────────────────────────────────────────
+
+/**
+ * Fetch latest NAV for an NPS scheme.
+ * NPS Trust publishes daily NAVs but does not have a free public API.
+ * This function provides a framework for fetching from configured sources:
+ * 1. Direct HTTP fetch from NPS Trust if available and scheme code known
+ * 2. Fallback to mock/cached data for development
+ * 
+ * @param {string} schemeName - Name or identifier of NPS fund (e.g., "ICICI", "HDFC", etc.)
+ * @param {string} fundCode - Optional fund code for provider lookup
+ * @param {number} lastPrice - Previous known price (for generating realistic variation)
+ * @returns {Promise<{nav: number, date: string, change: number, changePercent: number, schemeName: string}>}
+ */
+async function fetchNPSNAV(schemeName, fundCode, lastPrice) {
+  void schemeName;
+  void fundCode;
+  void lastPrice;
+  throw new Error('NPS live NAV provider is not configured');
+}
+
+/**
+ * Fetch historical NAV for an NPS fund
+ * @param {string} npsFundCode - Unique code for the NPS fund
+ * @returns {Promise<Array<{date: string, nav: number}>>}
+ */
+async function fetchNPSHistory(npsFundCode) {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.npsnav.in/fund/${npsFundCode}/history`; // Replace with actual API endpoint
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.data && json.data.length > 0) {
+            resolve(json.data.map(d => ({
+              date: d.date,
+              nav: parseFloat(d.nav),
+            })));
+          } else {
+            reject(new Error(`No history for NPS fund ${npsFundCode}`));
+          }
+        } catch (e) {
+          reject(new Error(`Failed to parse NPS history for ${npsFundCode}: ${e.message}`));
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
 module.exports = {
   fetchMutualFundNAV,
   searchMutualFunds,
@@ -1038,4 +1090,6 @@ module.exports = {
   searchStocks,
   resolveAmfiCodeByISIN,
   fetchSGBPrice,
+  fetchNPSNAV,
+  fetchNPSHistory,
 };

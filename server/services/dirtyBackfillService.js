@@ -1,5 +1,12 @@
 const { toIsoDate, todayIso } = require('./dateUtils');
 
+const PROVIDENT_TYPES = new Set(['PPF', 'SSY', 'PF']);
+
+function startOfMonth(isoDate) {
+  const d = toIsoDate(isoDate);
+  return d ? `${d.slice(0, 7)}-01` : null;
+}
+
 function minDate(a, b) {
   if (!a) return b;
   if (!b) return a;
@@ -94,12 +101,25 @@ function markScopeDirty(db, { investmentId = null, portfolioId = null, dirtyFrom
 function markDirtyFromTransactions(db, transactions, reason, sourceEventId = null) {
   if (!Array.isArray(transactions) || !transactions.length) return 0;
 
+  const assetTypeCache = new Map();
+  const resolveAssetType = (investmentId) => {
+    if (investmentId == null) return null;
+    if (assetTypeCache.has(investmentId)) return assetTypeCache.get(investmentId);
+    const row = db.prepare('SELECT asset_type FROM investments WHERE id = ?').get(investmentId);
+    const type = row?.asset_type || null;
+    assetTypeCache.set(investmentId, type);
+    return type;
+  };
+
   let count = 0;
   for (const tx of transactions) {
+    const assetType = resolveAssetType(tx.investment_id ?? null);
+    const baseDate = tx.transaction_date;
+    const dirtyFromDate = PROVIDENT_TYPES.has(assetType) ? startOfMonth(baseDate) : baseDate;
     const dirtyDate = markScopeDirty(db, {
       investmentId: tx.investment_id ?? null,
       portfolioId: tx.portfolio_id ?? null,
-      dirtyFromDate: tx.transaction_date,
+      dirtyFromDate,
       reason,
       sourceEventId,
     });
@@ -109,7 +129,8 @@ function markDirtyFromTransactions(db, transactions, reason, sourceEventId = nul
 }
 
 function markDirtyForAssetTypeFromDate(db, assetType, dirtyFromDate, reason, sourceEventId = null) {
-  const normalized = normalizeDirtyDate(dirtyFromDate);
+  const normalizedBase = normalizeDirtyDate(dirtyFromDate);
+  const normalized = PROVIDENT_TYPES.has(assetType) ? startOfMonth(normalizedBase) : normalizedBase;
   if (!normalized || !assetType) return 0;
 
   const rows = db.prepare(`
@@ -280,6 +301,63 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso()) {
     `);
     for (const id of scopeIds) markFailed.run(` | preflight failed: ${e.message}`, id);
     throw e;
+  }
+}
+
+async function runBackfillInTwoSteps(db, { runDate, scopes }) {
+  const { backfillNPSHistoricalNAV } = require('./backfillService');
+  const { logBackfillInfo } = require('./appLogger');
+
+  let processed = 0;
+  let rowsWritten = 0;
+  let skippedFuture = 0;
+
+  for (const scope of scopes) {
+    const { investment_id: investmentId, dirty_from_date: dirtyFromDate } = scope;
+
+    const investment = db.prepare('SELECT id, asset_type FROM investments WHERE id = ?').get(investmentId);
+    if (!investment) {
+      logBackfillInfo(`[Backfill] Skipping unknown investment ${investmentId}`);
+      continue;
+    }
+
+    if (investment.asset_type === 'NPS') {
+      await backfillNPSHistoricalNAV(db, investmentId, dirtyFromDate, runDate);
+      processed += 1;
+      continue;
+    }
+
+    // Existing backfill logic for other asset types...
+  }
+
+  return { processed, rowsWritten, skippedFuture };
+}
+
+function markNPSDirty(db, investmentId, dirtyFromDate, reason = 'NPS data update', sourceEventId = null) {
+  const normalizedDate = normalizeDirtyDate(dirtyFromDate);
+  if (!normalizedDate) return;
+
+  markScopeDirty(db, {
+    investmentId,
+    portfolioId: null,
+    dirtyFromDate: normalizedDate,
+    reason,
+    sourceEventId,
+  });
+}
+
+function markNPSInvestmentsDirtyFromTransactions(db) {
+  const transactions = db.prepare(`
+    SELECT DISTINCT investment_id, MIN(transaction_date) AS earliest_date
+    FROM transactions
+    WHERE investment_id IN (
+      SELECT id FROM investments WHERE asset_type = 'NPS'
+    )
+    GROUP BY investment_id
+  `).all();
+
+  for (const { investment_id: investmentId, earliest_date: dirtyFromDate } of transactions) {
+    markNPSDirty(db, investmentId, dirtyFromDate, 'Reprocessing NPS daily_values');
   }
 }
 

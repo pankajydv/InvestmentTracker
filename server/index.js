@@ -2,10 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const session = require('express-session');
 const path = require('path');
-const { getDb, initializeDb } = require('./db/schema');
+const { getDb, initializeDb, ensureNPSFundCodeMigration } = require('./db/schema');
 const { startScheduler } = require('./services/scheduler');
 const { requireAuth } = require('./middleware/auth');
-const { logAppInfo, logAppError, getAppLogPathForDate, getBackfillLogPathForDate } = require('./services/appLogger');
+const { logAppInfo, logAppError, getUnifiedLogPathForDate } = require('./services/appLogger');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -15,6 +15,7 @@ const schedulerEnabled = process.env.ENABLE_SCHEDULER === 'true';
 // Initialize database
 const db = getDb();
 initializeDb(db);
+ensureNPSFundCodeMigration(db);
 
 // Middleware
 app.use(cors());
@@ -80,8 +81,7 @@ app.listen(PORT, () => {
     port: Number(PORT),
     nodeEnv: process.env.NODE_ENV || 'development',
     schedulerEnabled,
-    appLogFile: getAppLogPathForDate(),
-    backfillLogFile: getBackfillLogPathForDate(),
+    logFile: getUnifiedLogPathForDate(),
   });
 
   // Start scheduled price updates only when explicitly enabled.

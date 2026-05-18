@@ -27,8 +27,25 @@ const CASH_OUTFLOW_TYPES = new Set([
 ]);
 
 const CASH_INFLOW_TYPES = new Set([
-  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE'
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'TDS'
 ]);
+
+const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+
+function isInternalXirrCashflow(assetType, transactionType) {
+  const normalizedAssetType = String(assetType || '').toUpperCase();
+  const normalizedType = String(transactionType || '').toUpperCase();
+
+  if (!INTERNAL_BALANCE_XIRR_ASSET_TYPES.has(normalizedAssetType)) {
+    return false;
+  }
+
+  if (normalizedType === 'INTEREST' || normalizedType === 'TDS') {
+    return true;
+  }
+
+  return normalizedType === 'RECONCILE';
+}
 
 function getTxnTypesForInvestment(investment) {
   if (!investment) return ['BUY', 'SELL', 'DIVIDEND'];
@@ -466,10 +483,11 @@ export default function InvestmentDetail() {
     const amount = Number(txn.amount) || 0;
     const fees = Number(txn.fees) || 0;
     let cashflow = 0;
+    const treatAsInternal = isInternalXirrCashflow(data.asset_type, txn.transaction_type);
 
     if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
       cashflow = -(amount + fees);
-    } else if (CASH_INFLOW_TYPES.has(txn.transaction_type)) {
+    } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
       cashflow = amount - fees;
     }
 

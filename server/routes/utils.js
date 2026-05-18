@@ -205,7 +205,7 @@ module.exports = function (db) {
     res.json({ cancelled: true });
   });
 
-  // ─── List and download app/backfill logs ──────────────────────────────
+  // ─── List and download unified logs ───────────────────────────────────
   router.get('/log-files', (req, res) => {
     try {
       const logDir = getLogDir();
@@ -227,7 +227,7 @@ module.exports = function (db) {
             updated_at: new Date(stat.mtimeMs).toISOString(),
           };
         })
-        .filter((file) => /^(app|backfill)-\d{4}-\d{2}-\d{2}\.log$/.test(file.name))
+        .filter((file) => /^invest-tracker-\d{4}-\d{2}-\d{2}\.log$/.test(file.name))
         .sort((a, b) => b.name.localeCompare(a.name));
 
       return res.json({
@@ -243,7 +243,7 @@ module.exports = function (db) {
   router.get('/log-files/:name', (req, res) => {
     try {
       const fileName = String(req.params.name || '').trim();
-      if (!/^(app|backfill)-\d{4}-\d{2}-\d{2}\.log$/.test(fileName)) {
+      if (!/^invest-tracker-\d{4}-\d{2}-\d{2}\.log$/.test(fileName)) {
         return res.status(400).json({ error: 'Invalid log file name' });
       }
 
@@ -276,6 +276,9 @@ module.exports = function (db) {
     for (const [key, value] of Object.entries(updates)) {
       stmt.run(key, String(value));
     }
+    logAppInfo('[Config] Updated', {
+      keys: Object.keys(updates || {}),
+    });
     res.json({ success: true });
   });
 
@@ -313,8 +316,16 @@ module.exports = function (db) {
       );
 
       const created = db.prepare('SELECT * FROM interest_rates WHERE id = ?').get(result.lastInsertRowid);
+      logAppInfo('[InterestRate] Created', {
+        interest_rate_id: Number(result.lastInsertRowid),
+        rate_type: payload.rate_type,
+        rate: payload.rate,
+        effective_from: payload.effective_from,
+        effective_to: payload.effective_to,
+      });
       return res.status(201).json({ success: true, rate: created });
     } catch (e) {
+      logAppError('[InterestRate] Create failed', { error: e.message });
       return res.status(400).json({ error: e.message || 'Failed to create interest rate' });
     }
   });
@@ -355,8 +366,19 @@ module.exports = function (db) {
       );
 
       const updated = db.prepare('SELECT * FROM interest_rates WHERE id = ?').get(id);
+      logAppInfo('[InterestRate] Updated', {
+        interest_rate_id: id,
+        rate_type: payload.rate_type,
+        rate: payload.rate,
+        effective_from: payload.effective_from,
+        effective_to: payload.effective_to,
+      });
       return res.json({ success: true, rate: updated });
     } catch (e) {
+      logAppError('[InterestRate] Update failed', {
+        interest_rate_id: Number(req.params.id) || null,
+        error: e.message,
+      });
       return res.status(400).json({ error: e.message || 'Failed to update interest rate' });
     }
   });
@@ -383,8 +405,18 @@ module.exports = function (db) {
         `interest_rate:${id}`
       );
 
+      logAppInfo('[InterestRate] Deleted', {
+        interest_rate_id: id,
+        rate_type: existing.rate_type,
+        effective_from: existing.effective_from,
+      });
+
       return res.json({ success: true });
     } catch (e) {
+      logAppError('[InterestRate] Delete failed', {
+        interest_rate_id: Number(req.params.id) || null,
+        error: e.message,
+      });
       return res.status(400).json({ error: e.message || 'Failed to delete interest rate' });
     }
   });

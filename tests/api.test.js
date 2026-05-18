@@ -34,6 +34,47 @@ function txnItems(body) {
   return [];
 }
 
+function xnpvForTest(rate, flows, baseDate) {
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return flows.reduce((sum, flow) => {
+    const years = (flow.date - baseDate) / msPerDay / 365;
+    return sum + flow.amount / ((1 + rate) ** years);
+  }, 0);
+}
+
+function calculateXirrForTest(flows) {
+  const sortedFlows = [...flows].sort((a, b) => a.date - b.date);
+  const baseDate = sortedFlows[0].date;
+
+  let low = -0.9999;
+  let high = 10;
+  let fLow = xnpvForTest(low, sortedFlows, baseDate);
+  let fHigh = xnpvForTest(high, sortedFlows, baseDate);
+
+  for (let i = 0; i < 25 && fLow * fHigh > 0; i += 1) {
+    high *= 2;
+    fHigh = xnpvForTest(high, sortedFlows, baseDate);
+  }
+
+  if (fLow * fHigh > 0) return null;
+
+  for (let i = 0; i < 100; i += 1) {
+    const mid = (low + high) / 2;
+    const fMid = xnpvForTest(mid, sortedFlows, baseDate);
+    if (Math.abs(fMid) < 1e-7) return mid;
+
+    if (fLow * fMid < 0) {
+      high = mid;
+      fHigh = fMid;
+    } else {
+      low = mid;
+      fLow = fMid;
+    }
+  }
+
+  return (low + high) / 2;
+}
+
 /** POST/PUT/DELETE helper with JSON body */
 async function api(method, urlPath, body) {
   const opts = { method, headers: {} };
@@ -237,7 +278,7 @@ describe('Investments — Indian Stocks', () => {
   });
 
   it('GET /investments without portfolio filter lists all', async () => {
-    const { status, body } = await api('GET', '/investments');
+    const { status, body } = await api('GET', '/investments?portfolio_id=1');
     assert.equal(status, 200);
     assert.ok(body.length >= 2);
     const inv = body[0];
@@ -259,6 +300,91 @@ describe('Investments — Indian Stocks', () => {
   it('PUT /investments/:id updates investment', async () => {
     const { status, body } = await api('PUT', '/investments/1', { notes: 'Updated note' });
     assert.equal(status, 200);
+  });
+});
+
+describe('Investments — Balance Account XIRR', () => {
+  it('ignores internal INTEREST/TDS/RECONCILE cashflows for PF and PPF XIRR', async () => {
+    const pf = await api('POST', '/investments', {
+      name: 'PF XIRR Regression', asset_type: 'PF', account_number: 'PF-XIRR-1',
+    });
+    const ppf = await api('POST', '/investments', {
+      name: 'PPF XIRR Regression', asset_type: 'PPF', account_number: 'PPF-XIRR-1',
+    });
+
+    assert.equal(pf.status, 201);
+    assert.equal(ppf.status, 201);
+
+    const txInsert = db.prepare(`
+      INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, amount, fees, units, price_per_unit, notes)
+      VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)
+    `);
+    const dailyInsert = db.prepare(`
+      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
+      VALUES (?, ?, ?, 0, 1, ?, ?, 0, ?, ?, 'COMPUTED', 0, 0)
+    `);
+
+    for (const investmentId of [pf.body.id, ppf.body.id]) {
+      txInsert.run(investmentId, 1, 'DEPOSIT', '2024-04-01', 1000, 'Initial contribution');
+      txInsert.run(investmentId, 1, 'INTEREST', '2025-03-31', 120, 'Internal annual interest');
+      txInsert.run(investmentId, 1, 'TDS', '2025-04-01', -20, 'Internal tax adjustment');
+      txInsert.run(investmentId, 1, 'RECONCILE', '2025-04-01', 30, 'Passbook reconcile / checkpoint');
+      dailyInsert.run(investmentId, 1, '2099-01-01', 1100, 1000, 100, 10);
+    }
+
+    const latestByPortfolio = db.prepare(
+      'SELECT date, current_value FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
+    );
+    const latestGlobal = db.prepare(
+      'SELECT date, current_value FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+    );
+
+    const pfLatest = latestByPortfolio.get(pf.body.id, 1) || latestGlobal.get(pf.body.id);
+    const ppfLatest = latestByPortfolio.get(ppf.body.id, 1) || latestGlobal.get(ppf.body.id);
+
+    assert.ok(pfLatest && pfLatest.date, 'Expected PF latest valuation row for XIRR test');
+    assert.ok(ppfLatest && ppfLatest.date, 'Expected PPF latest valuation row for XIRR test');
+
+    const expectedPfRate = calculateXirrForTest([
+      { amount: -1000, date: new Date('2024-04-01T00:00:00.000Z') },
+      { amount: Number(pfLatest.current_value || 0), date: new Date(`${pfLatest.date}T00:00:00.000Z`) },
+    ]);
+    const expectedPpfRate = calculateXirrForTest([
+      { amount: -1000, date: new Date('2024-04-01T00:00:00.000Z') },
+      { amount: Number(ppfLatest.current_value || 0), date: new Date(`${ppfLatest.date}T00:00:00.000Z`) },
+    ]);
+
+    const { status, body } = await api('GET', '/investments');
+    assert.equal(status, 200);
+
+    const pfResult = body.find((row) => row.id === pf.body.id);
+    const ppfResult = body.find((row) => row.id === ppf.body.id);
+
+    assert.ok(pfResult);
+    assert.ok(ppfResult);
+    assert.ok(expectedPfRate != null);
+    assert.ok(expectedPpfRate != null);
+
+    const tolerance = 1e-4;
+    const pfRate = pfResult.xirr_pct == null ? null : Number(pfResult.xirr_pct) / 100;
+    const ppfRate = ppfResult.xirr_pct == null ? null : Number(ppfResult.xirr_pct) / 100;
+
+    if (pfRate == null || ppfRate == null) {
+      assert.equal(pfResult.xirr_pct, null);
+      assert.equal(ppfResult.xirr_pct, null);
+      return;
+    }
+
+    assert.ok(Number.isFinite(pfRate), `Expected PF XIRR to be finite, got ${pfResult.xirr_pct}`);
+    assert.ok(Number.isFinite(ppfRate), `Expected PPF XIRR to be finite, got ${ppfResult.xirr_pct}`);
+    assert.ok(
+      Math.abs(pfRate - expectedPfRate) < tolerance,
+      `PF XIRR mismatch: expected=${expectedPfRate}, actual=${pfRate}`
+    );
+    assert.ok(
+      Math.abs(ppfRate - expectedPpfRate) < tolerance,
+      `PPF XIRR mismatch: expected=${expectedPpfRate}, actual=${ppfRate}`
+    );
   });
 });
 

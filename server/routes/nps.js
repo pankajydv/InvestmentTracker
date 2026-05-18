@@ -7,6 +7,7 @@
 const express = require('express');
 const multer = require('multer');
 const { parseNPSStatements } = require('../services/npsStatementParser');
+const { logAppInfo, logAppError } = require('../services/appLogger');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -141,6 +142,11 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('NPS preview error:', e);
+      logAppError('[NPS] Preview failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to parse NPS statements: ' + e.message });
     }
   });
@@ -286,6 +292,14 @@ module.exports = function (db) {
 
       importTxn();
 
+      logAppInfo('[NPS] Import completed', {
+        portfolio_id: portfolioId,
+        pran: pran || null,
+        schemes: results.length,
+        imported: importedCount,
+        skipped: skippedCount,
+      });
+
       res.json({
         success: true,
         imported: importedCount,
@@ -294,7 +308,22 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('NPS import error:', e);
+      logAppError('[NPS] Import failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import NPS transactions: ' + e.message });
+    }
+  });
+
+  // Route to handle NPS backfill
+  router.post('/backfill-nps', async (req, res) => {
+    try {
+      await backfillNPSHistoricalNAV();
+      res.status(200).send({ message: 'NPS backfill process completed successfully.' });
+    } catch (error) {
+      console.error('Error during NPS backfill:', error);
+      res.status(500).send({ error: 'Failed to complete NPS backfill process.' });
     }
   });
 

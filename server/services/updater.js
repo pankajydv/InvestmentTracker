@@ -7,14 +7,13 @@ const {
   fetchMutualFundNAV,
   fetchStockPrice,
   fetchUSDToINR,
-  calculatePPFValue,
   toNSETicker,
   resolveAmfiCodeByISIN,
   fetchSGBPrice,
+  fetchNPSNAV,
 } = require('./priceService');
-
-
-const { isAfterStaticAssetCutoff } = require('./dateUtils');
+const { calculatePfInterestPreview, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
+const { logAppInfo, logAppError } = require('./appLogger');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ─── Cancellation support ──────────────────────────────────────────────────
@@ -22,6 +21,48 @@ let _cancelled = false;
 
 function cancelUpdate() {
   _cancelled = true;
+}
+
+function getProvidentValueAsOfDate(db, inv, date, portfolioId = null) {
+  const portfolioFilter = portfolioId != null ? ' AND portfolio_id = ?' : '';
+  const params = portfolioId != null ? [inv.id, date, portfolioId] : [inv.id, date];
+  const txns = db.prepare(`
+    SELECT date(transaction_date) AS transaction_date, transaction_type, amount
+    FROM transactions
+    WHERE investment_id = ? AND date(transaction_date) <= ?${portfolioFilter}
+    ORDER BY transaction_date ASC, id ASC
+  `).all(...params);
+
+  if (!txns.length && !(Number(inv.opening_balance) > 0)) return 0;
+
+  const fromDate = txns.length ? txns[0].transaction_date : date;
+  const rateRows = db.prepare(
+    'SELECT rate, effective_from, effective_to FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
+  ).all(inv.asset_type);
+
+  if (inv.asset_type === 'PF') {
+    const preview = calculatePfInterestPreview({
+      openingBalance: Number(inv.opening_balance || 0),
+      transactions: txns,
+      rateRows,
+      fromDate,
+      toDate: date,
+      ignoreExistingInterest: true,
+      includeTransferTransactions: true,
+    });
+    return Number(preview.closingBalance || 0);
+  }
+
+  return Number(calculateSmallSavingsValueAsOfDate({
+    openingBalance: Number(inv.opening_balance || 0),
+    transactions: txns,
+    rateRows,
+    fromDate,
+    asOfDate: date,
+    includeTransferTransactions: true,
+    interestBaseMethod: inv.asset_type === 'SSY' ? 'month_end_balance' : 'min_balance_between_5th_and_month_end',
+    annualRounding: true,
+  }) || 0);
 }
 
 /**
@@ -35,6 +76,7 @@ async function updateAllPrices(db, options = {}) {
   const today = new Date().toISOString().split('T')[0];
   const typeFilter = options.assetTypes;
   const label = typeFilter ? typeFilter.join(', ') : 'ALL';
+  const runStartedAt = Date.now();
   console.log(`[${new Date().toISOString()}] Starting price update (${label}) for ${today}...`);
 
   let investments = db.prepare('SELECT * FROM investments').all();
@@ -63,10 +105,19 @@ async function updateAllPrices(db, options = {}) {
   );
   investments = investments.filter(i => BALANCE_BASED_TYPES.has(i.asset_type) || openInvestmentIds.has(i.id));
 
+  logAppInfo('[UpdatePrices] Step 1/3 prepared investment universe', {
+    date: today,
+    assetFilter: typeFilter || null,
+    totalInvestmentsToProcess: investments.length,
+  });
+
   // Auto-resolve missing AMFI codes for mutual funds using ISIN (single download)
   const mfsWithoutAmfi = investments.filter(i => i.asset_type === 'MUTUAL_FUND' && !i.amfi_code && i.isin_code);
   if (mfsWithoutAmfi.length > 0) {
     console.log(`  Resolving AMFI codes for ${mfsWithoutAmfi.length} mutual fund(s)...`);
+    logAppInfo('[UpdatePrices] Resolving AMFI codes for missing mappings', {
+      count: mfsWithoutAmfi.length,
+    });
     try {
       const isinList = mfsWithoutAmfi.map(mf => mf.isin_code);
       const amfiMap = await resolveAmfiCodeByISIN(isinList);
@@ -83,6 +134,7 @@ async function updateAllPrices(db, options = {}) {
       }
     } catch (e) {
       console.warn(`  AMFI bulk lookup failed: ${e.message}`);
+      logAppError('[UpdatePrices] AMFI bulk lookup failed', { error: e.message });
     }
   }
 
@@ -91,8 +143,10 @@ async function updateAllPrices(db, options = {}) {
   try {
     usdToInr = await fetchUSDToINR();
     db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'usd_to_inr'").run(String(usdToInr));
+    logAppInfo('[UpdatePrices] USD/INR rate refreshed', { usdToInr });
   } catch (e) {
     console.warn('Could not update USD/INR rate, using cached value:', usdToInr);
+    logAppError('[UpdatePrices] USD/INR refresh failed, using cached value', { error: e.message, usdToInr });
   }
 
   const upsertDaily = db.prepare(`
@@ -171,24 +225,44 @@ async function updateAllPrices(db, options = {}) {
     ORDER BY date DESC LIMIT 1
   `);
 
+  const getNetFlowToday = db.prepare(`
+    SELECT COALESCE(SUM(CASE
+      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      ELSE 0
+    END), 0) AS net_flow
+    FROM transactions
+    WHERE investment_id = ? AND date(transaction_date) = ?
+  `);
+  const getNetFlowTodayPortfolio = db.prepare(`
+    SELECT COALESCE(SUM(CASE
+      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      ELSE 0
+    END), 0) AS net_flow
+    FROM transactions
+    WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
+  `);
+
   const getDistinctPortfolios = db.prepare(`
     SELECT DISTINCT portfolio_id FROM transactions WHERE investment_id = ? AND portfolio_id IS NOT NULL AND transaction_date <= ?
   `);
 
   let successCount = 0;
   let errorCount = 0;
+  let skippedCount = 0;
+  const totalCount = investments.length;
+  let heartbeatAt = Date.now();
 
 
-  const STATIC_TYPES = new Set(['PPF', 'SSY', 'PF', 'NPS', 'BOND']);
   for (const inv of investments) {
     if (_cancelled) {
       console.log('  ⏹ Update cancelled by user.');
+      logAppInfo('[UpdatePrices] Cancellation requested; stopping iteration', {
+        processed: successCount + errorCount + skippedCount,
+        total: totalCount,
+      });
       break;
-    }
-    // Only skip static assets for today’s row if before cutoff and not a backfill/dirty scope
-    if (STATIC_TYPES.has(inv.asset_type) && !isAfterStaticAssetCutoff()) {
-      console.log(`  ⏭ Skipping static asset ${inv.name} (type ${inv.asset_type}) before cutoff`);
-      continue;
     }
 
     try {
@@ -196,6 +270,8 @@ async function updateAllPrices(db, options = {}) {
       let priceSource = 'COMPUTED';
       let apiChange = null;
       let apiChangePct = null;
+      
+      console.log(`  [DEBUG] Processing ${inv.name} (id=${inv.id}, type=${inv.asset_type})`);
 
       switch (inv.asset_type) {
         case 'MUTUAL_FUND': {
@@ -279,12 +355,54 @@ async function updateAllPrices(db, options = {}) {
           break;
         }
         case 'NPS': {
-          const latestNav = db.prepare(
-            'SELECT price_per_unit FROM transactions WHERE investment_id = ? AND transaction_date <= ? AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1'
-          ).get(inv.id, today);
-          if (latestNav) {
-            pricePerUnit = latestNav.price_per_unit;
-            priceSource = 'COMPUTED';
+          try {
+            // Get last known NAV for realistic variation
+            const lastKnownPrice = db.prepare(
+              'SELECT price_per_unit FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1'
+            ).get(inv.id)?.price_per_unit;
+            
+            await delay(300); // Rate limiting for API calls
+            const npsData = await fetchNPSNAV(inv.name, inv.nps_fund_code, lastKnownPrice);
+            console.log(`  ${inv.name} (id=${inv.id}): NPS NAV fetch returned nav=${npsData.nav}, previousPrice=${lastKnownPrice}, change=${npsData.change}`);
+            pricePerUnit = npsData.nav;
+            apiChange = npsData.change;
+            apiChangePct = npsData.changePercent;
+            priceSource = 'LIVE';
+          } catch (e) {
+            console.warn(`  ${inv.name}: NPS NAV fetch failed (${e.message}), falling back to last known price`);
+            // Fallback 1: use last valid stored daily value (exclude placeholder 99.99)
+            const lastStored = db.prepare(
+              `SELECT price_per_unit
+               FROM daily_values
+               WHERE investment_id = ?
+                 AND date <= ?
+                 AND price_per_unit > 0
+                 AND ABS(price_per_unit - 99.99) > 0.000001
+               ORDER BY date DESC
+               LIMIT 1`
+            ).get(inv.id, today);
+            if (lastStored?.price_per_unit) {
+              pricePerUnit = Number(lastStored.price_per_unit);
+              priceSource = 'LOCF';
+            }
+
+            // Fallback 2: use last valid transaction price
+            if (!pricePerUnit) {
+              const lastTxn = db.prepare(
+                `SELECT price_per_unit
+                 FROM transactions
+                 WHERE investment_id = ?
+                   AND transaction_date <= ?
+                   AND price_per_unit > 0
+                   AND ABS(price_per_unit - 99.99) > 0.000001
+                 ORDER BY transaction_date DESC, id DESC
+                 LIMIT 1`
+              ).get(inv.id, today);
+              if (lastTxn?.price_per_unit) {
+                pricePerUnit = Number(lastTxn.price_per_unit);
+                priceSource = 'COMPUTED';
+              }
+            }
           }
           break;
         }
@@ -296,13 +414,7 @@ async function updateAllPrices(db, options = {}) {
       for (const pid of pidsToProcess) {
         let totalUnits, investedAmount, saleProceeds, currentValue;
         if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF') {
-          const rateParam = inv._rateHistory || pricePerUnit;
-          const txnFilter = pid !== null ? " AND portfolio_id = ?" : "";
-          const txnParams = pid !== null ? [inv.id, pid, today] : [inv.id, today];
-          const txns = db.prepare(
-            `SELECT transaction_date as date, amount FROM transactions WHERE investment_id = ? AND transaction_type IN ('DEPOSIT', 'BUY')${txnFilter} AND transaction_date <= ?`
-          ).all(...txnParams);
-          currentValue = calculatePPFValue(txns, rateParam);
+          currentValue = getProvidentValueAsOfDate(db, inv, today, pid);
           totalUnits = 1;
           if (pid !== null) {
             investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
@@ -333,22 +445,15 @@ async function updateAllPrices(db, options = {}) {
           ? (currentValue - investedAmount)
           : (currentValue + realizedGain - investedAmount);
         const profitLossPct = investedAmount > 0 ? (profitLoss / investedAmount) * 100 : 0;
-        let dayChange = 0;
-        let dayChangePct = 0;
-        if (totalUnits > 0) {
-          if (apiChange != null && apiChangePct != null) {
-            dayChange = totalUnits * apiChange;
-            dayChangePct = apiChangePct;
-          } else {
-            const prevDay = pid !== null
-              ? getPrevDayPortfolio.get(inv.id, pid, today)
-              : getPrevDay.get(inv.id, today);
-            if (prevDay && prevDay.price_per_unit > 0) {
-              dayChange = totalUnits * (pricePerUnit - prevDay.price_per_unit);
-              dayChangePct = ((pricePerUnit - prevDay.price_per_unit) / prevDay.price_per_unit) * 100;
-            }
-          }
-        }
+        const prevDay = pid !== null
+          ? getPrevDayPortfolio.get(inv.id, pid, today)
+          : getPrevDay.get(inv.id, today);
+        const prevValue = Number(prevDay?.current_value || 0);
+        const netFlowToday = pid !== null
+          ? Number(getNetFlowTodayPortfolio.get(inv.id, pid, today)?.net_flow || 0)
+          : Number(getNetFlowToday.get(inv.id, today)?.net_flow || 0);
+        const dayChange = currentValue - prevValue - netFlowToday;
+        const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
         const r = (v) => Math.round(v * 100) / 100;
         if (pid !== null) {
           upsertDaily.run(
@@ -371,19 +476,64 @@ async function updateAllPrices(db, options = {}) {
       const combinedValue = inv.asset_type === 'FOREIGN_STOCK'
         ? combinedUnits * pricePerUnit * usdToInr
         : (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF')
-          ? (() => { const txns = db.prepare("SELECT transaction_date as date, amount FROM transactions WHERE investment_id = ? AND transaction_type IN ('DEPOSIT', 'BUY') AND transaction_date <= ?").all(inv.id, today); return calculatePPFValue(txns, pricePerUnit); })()
+          ? getProvidentValueAsOfDate(db, inv, today, null)
           : combinedUnits * pricePerUnit;
       const combinedPL = combinedValue + getSaleProceeds.get(inv.id, today).total - getInvestedAmount.get(inv.id, today).total;
       console.log(`  ✓ ${inv.name}: ₹${Math.round(combinedValue).toLocaleString()} (${combinedPL >= 0 ? '+' : ''}${Math.round(combinedPL).toLocaleString()})`);
       successCount++;
+      const processed = successCount + errorCount + skippedCount;
+      logAppInfo('[UpdatePrices][Step-2] Investment updated', {
+        investmentId: inv.id,
+        investmentName: inv.name,
+        assetType: inv.asset_type,
+        processed,
+        total: totalCount,
+      });
+
+      const now = Date.now();
+      if (processed === totalCount || now - heartbeatAt >= 30000) {
+        const elapsedSec = Math.max(Math.floor((now - runStartedAt) / 1000), 1);
+        const avgSecPerItem = processed > 0 ? (elapsedSec / processed) : 0;
+        const remaining = Math.max(totalCount - processed, 0);
+        const etaSec = Math.max(Math.round(remaining * avgSecPerItem), 0);
+        const progressPct = totalCount > 0 ? Number(((processed / totalCount) * 100).toFixed(2)) : 100;
+
+        logAppInfo('[UpdatePrices][Step-2][Heartbeat] Iterating investments', {
+          processed,
+          total: totalCount,
+          remaining,
+          successCount,
+          errorCount,
+          skippedCount,
+          progressPct,
+          etaSec,
+          currentInvestmentId: inv.id,
+          currentInvestmentName: inv.name,
+        });
+        heartbeatAt = now;
+      }
       await new Promise(r => setTimeout(r, 300));
     } catch (e) {
       console.error(`  ✗ ${inv.name}: ${e.message}`);
       errorCount++;
+      const processed = successCount + errorCount + skippedCount;
+      logAppError('[UpdatePrices][Step-2] Investment update failed', {
+        investmentId: inv.id,
+        investmentName: inv.name,
+        assetType: inv.asset_type,
+        error: e.message,
+        processed,
+        total: totalCount,
+      });
     }
   }
 
   // Update portfolio daily snapshots (per-portfolio + combined)
+  logAppInfo('[UpdatePrices] Step 3/3 refreshing aggregate snapshots', {
+    date: today,
+    processed: successCount + errorCount + skippedCount,
+    total: totalCount,
+  });
   updatePortfolioDaily(db, today);
   updateAssetTypeDaily(db, today);
 
@@ -407,6 +557,17 @@ async function updateAllPrices(db, options = {}) {
   const cancelled = _cancelled;
   _cancelled = false;
   console.log(`[${new Date().toISOString()}] Price update ${cancelled ? 'cancelled' : 'done'}. Success: ${successCount}, Errors: ${errorCount}`);
+  logAppInfo('[UpdatePrices] Completed', {
+    date: today,
+    cancelled,
+    successCount,
+    errorCount,
+    skippedCount,
+    totalProcessed: successCount + errorCount + skippedCount,
+    totalCount,
+    watermarkUpdated,
+    elapsedSec: Math.max(Math.round((Date.now() - runStartedAt) / 1000), 0),
+  });
   return {
     successCount,
     errorCount,
@@ -423,27 +584,48 @@ async function updateAllPrices(db, options = {}) {
  * Creates one row per portfolio_id + one combined row (portfolio_id = NULL).
  */
 function updatePortfolioDaily(db, date) {
-  const upsertPortfolioDaily = db.prepare(`
+  const insertPortfolioDaily = db.prepare(`
     INSERT INTO portfolio_daily (portfolio_id, date, total_value, total_invested, total_profit_loss, total_profit_loss_pct, day_change, day_change_pct)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(portfolio_id, date) DO UPDATE SET
-      total_value = excluded.total_value,
-      total_invested = excluded.total_invested,
-      total_profit_loss = excluded.total_profit_loss,
-      total_profit_loss_pct = excluded.total_profit_loss_pct,
-      day_change = excluded.day_change,
-      day_change_pct = excluded.day_change_pct
   `);
+  const deleteRowsForDate = db.prepare('DELETE FROM portfolio_daily WHERE date = ?');
 
-  // For NULL portfolio_id, ON CONFLICT doesn't work (NULL != NULL in SQLite),
-  // so delete-then-insert instead.
-  const deleteCombined = db.prepare(
-    'DELETE FROM portfolio_daily WHERE portfolio_id IS NULL AND date = ?'
-  );
-  const insertCombined = db.prepare(`
-    INSERT INTO portfolio_daily (portfolio_id, date, total_value, total_invested, total_profit_loss, total_profit_loss_pct, day_change, day_change_pct)
-    VALUES (NULL, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  const totalsRows = db.prepare(`
+    SELECT
+      dv.portfolio_id,
+      COALESCE(SUM(dv.current_value), 0) as total_value,
+      COALESCE(SUM(dv.invested_amount), 0) as total_invested,
+      COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
+      COALESCE(SUM(dv.day_change), 0) as day_change
+    FROM daily_values dv
+    INNER JOIN (
+      SELECT investment_id, portfolio_id, MAX(date) as max_date
+      FROM daily_values
+      WHERE date <= ?
+      GROUP BY investment_id, portfolio_id
+    ) latest ON dv.investment_id = latest.investment_id
+      AND dv.portfolio_id IS latest.portfolio_id
+      AND dv.date = latest.max_date
+    GROUP BY dv.portfolio_id
+  `).all(date);
+
+  const previousRows = db.prepare(`
+    SELECT pd.portfolio_id, pd.total_value
+    FROM portfolio_daily pd
+    INNER JOIN (
+      SELECT portfolio_id, MAX(date) as max_date
+      FROM portfolio_daily
+      WHERE date < ?
+      GROUP BY portfolio_id
+    ) prev ON pd.portfolio_id IS prev.portfolio_id
+      AND pd.date = prev.max_date
+  `).all(date);
+
+  const keyOf = (portfolioId) => (portfolioId == null ? '__NULL__' : String(portfolioId));
+  const totalsByPortfolio = new Map();
+  for (const row of totalsRows) totalsByPortfolio.set(keyOf(row.portfolio_id), row);
+  const prevByPortfolio = new Map();
+  for (const row of previousRows) prevByPortfolio.set(keyOf(row.portfolio_id), Number(row.total_value || 0));
 
   // Get all distinct portfolio_ids from transactions
   const portfolioIds = db.prepare(`
@@ -455,85 +637,35 @@ function updatePortfolioDaily(db, date) {
   // Always include combined (null) snapshot
   const allIds = [null, ...portfolioIds];
 
+  // Rebuild rows for this date in one pass.
+  deleteRowsForDate.run(date);
+
   for (const pid of allIds) {
-    let totals;
-    if (pid === null) {
-      // Combined: use latest available row per investment (handles partial intraday runs where
-      // only stocks are updated — non-stock types carry forward from their most recent row).
-      totals = db.prepare(`
-        SELECT
-          COALESCE(SUM(dv.current_value), 0) as total_value,
-          COALESCE(SUM(dv.invested_amount), 0) as total_invested,
-          COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
-          COALESCE(SUM(dv.day_change), 0) as day_change
-        FROM daily_values dv
-        INNER JOIN (
-          SELECT investment_id, MAX(date) as max_date
-          FROM daily_values
-          WHERE portfolio_id IS NULL AND date <= ?
-          GROUP BY investment_id
-        ) latest ON dv.investment_id = latest.investment_id AND dv.date = latest.max_date
-        WHERE dv.portfolio_id IS NULL
-      `).get(date);
-    } else {
-      // Per-portfolio: use latest available row per investment (same carry-forward logic).
-      totals = db.prepare(`
-        SELECT
-          COALESCE(SUM(dv.current_value), 0) as total_value,
-          COALESCE(SUM(dv.invested_amount), 0) as total_invested,
-          COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
-          COALESCE(SUM(dv.day_change), 0) as day_change
-        FROM daily_values dv
-        INNER JOIN (
-          SELECT investment_id, MAX(date) as max_date
-          FROM daily_values
-          WHERE portfolio_id = ? AND date <= ?
-          GROUP BY investment_id
-        ) latest ON dv.investment_id = latest.investment_id AND dv.date = latest.max_date
-        WHERE dv.portfolio_id = ?
-      `).get(pid, date, pid);
-    }
+    const totals = totalsByPortfolio.get(keyOf(pid)) || {
+      total_value: 0,
+      total_invested: 0,
+      total_profit_loss: 0,
+      day_change: 0,
+    };
 
     const profitPct = totals.total_invested > 0
       ? (totals.total_profit_loss / totals.total_invested) * 100 : 0;
 
-    let prevPortfolio;
-    if (pid === null) {
-      prevPortfolio = db.prepare(
-        'SELECT total_value FROM portfolio_daily WHERE portfolio_id IS NULL AND date < ? ORDER BY date DESC LIMIT 1'
-      ).get(date);
-    } else {
-      prevPortfolio = db.prepare(
-        'SELECT total_value FROM portfolio_daily WHERE portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
-      ).get(pid, date);
-    }
-
-    const prevValue = prevPortfolio ? prevPortfolio.total_value : totals.total_value;
+    const prevValue = prevByPortfolio.has(keyOf(pid))
+      ? prevByPortfolio.get(keyOf(pid))
+      : Number(totals.total_value || 0);
     const dayChangePct = prevValue > 0 ? (totals.day_change / prevValue) * 100 : 0;
 
-    if (pid === null) {
-      deleteCombined.run(date);
-      insertCombined.run(
-        date,
-        Math.round(totals.total_value * 100) / 100,
-        Math.round(totals.total_invested * 100) / 100,
-        Math.round(totals.total_profit_loss * 100) / 100,
-        Math.round(profitPct * 100) / 100,
-        Math.round(totals.day_change * 100) / 100,
-        Math.round(dayChangePct * 100) / 100
-      );
-    } else {
-      upsertPortfolioDaily.run(
-        pid,
-        date,
-        Math.round(totals.total_value * 100) / 100,
-        Math.round(totals.total_invested * 100) / 100,
-        Math.round(totals.total_profit_loss * 100) / 100,
-        Math.round(profitPct * 100) / 100,
-        Math.round(totals.day_change * 100) / 100,
-        Math.round(dayChangePct * 100) / 100
-      );
-    }
+    insertPortfolioDaily.run(
+      pid,
+      date,
+      Math.round(Number(totals.total_value || 0) * 100) / 100,
+      Math.round(Number(totals.total_invested || 0) * 100) / 100,
+      Math.round(Number(totals.total_profit_loss || 0) * 100) / 100,
+      Math.round(profitPct * 100) / 100,
+      Math.round(Number(totals.day_change || 0) * 100) / 100,
+      Math.round(dayChangePct * 100) / 100
+    );
   }
 }
 
@@ -585,15 +717,24 @@ function updateAssetTypeDaily(db, date) {
     GROUP BY dv.portfolio_id, i.asset_type
   `);
 
-  const previousTotals = db.prepare(`
-    SELECT total_value
-    FROM asset_type_daily
-    WHERE date < ?
-      AND asset_type = ?
-      AND ((portfolio_id IS NULL AND ? IS NULL) OR portfolio_id = ?)
-    ORDER BY date DESC
-    LIMIT 1
-  `);
+  const previousRows = db.prepare(`
+    SELECT atd.portfolio_id, atd.asset_type, atd.total_value
+    FROM asset_type_daily atd
+    INNER JOIN (
+      SELECT portfolio_id, asset_type, MAX(date) AS max_date
+      FROM asset_type_daily
+      WHERE date < ?
+      GROUP BY portfolio_id, asset_type
+    ) prev ON atd.portfolio_id IS prev.portfolio_id
+      AND atd.asset_type = prev.asset_type
+      AND atd.date = prev.max_date
+  `).all(date);
+
+  const prevKey = (portfolioId, assetType) => `${portfolioId == null ? '__NULL__' : String(portfolioId)}::${assetType}`;
+  const previousTotals = new Map();
+  for (const row of previousRows) {
+    previousTotals.set(prevKey(row.portfolio_id, row.asset_type), Number(row.total_value || 0));
+  }
 
   deleteRows.run(date);
   const rows = aggregateRows.all(date);
@@ -608,8 +749,7 @@ function updateAssetTypeDaily(db, date) {
       ? (totalProfitLoss / totalInvested) * 100
       : 0;
 
-    const prev = previousTotals.get(date, row.asset_type, row.portfolio_id, row.portfolio_id);
-    const prevValue = Number(prev?.total_value || 0);
+    const prevValue = previousTotals.get(prevKey(row.portfolio_id, row.asset_type)) || 0;
     const dayChangePct = prevValue > 0
       ? (dayChange / prevValue) * 100
       : 0;

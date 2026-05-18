@@ -7,7 +7,7 @@
 const cron = require('node-cron');
 const { updateAllPrices } = require('./updater');
 const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate } = require('./dirtyBackfillService');
-const { todayIso } = require('./backfillService');
+const { todayIso } = require('./dateUtils');
 const { logAppInfo, logAppError } = require('./appLogger');
 
 function addDays(isoDate, days) {
@@ -83,24 +83,71 @@ function ensureSchedulerCatchUpScopes(db, runDate, label) {
  */
 async function runSchedulerCycle(db, label, options = {}) {
   const runDate = todayIso();
-  console.log(`[Scheduler] ${label}: preflight dirty backfill check for ${runDate}...`);
-  logAppInfo(`[Scheduler] ${label}: started`, { runDate, options });
+  logAppInfo(`[Scheduler] ${label}: Step 1/4 scheduler cycle started`, {
+    runDate,
+    options,
+  });
+  const preflightRunDate = runDate;
 
-  const catchUp = ensureSchedulerCatchUpScopes(db, runDate, label);
-  const preflight = await runDirtyBackfillPreflight(db, runDate);
+  const dirtyInvestments = db.prepare(`
+    SELECT id, name, asset_type, dirty_from_date
+    FROM investments
+    WHERE is_dirty_daily_values = 1
+    ORDER BY dirty_from_date ASC, id ASC
+    LIMIT 50
+  `).all();
+
+  const pendingScopes = db.prepare(`
+    SELECT id, investment_id, portfolio_id, dirty_from_date, status, dirty_reason
+    FROM dirty_backfill_scope
+    WHERE status IN ('pending', 'running', 'failed')
+      AND dirty_from_date <= ?
+    ORDER BY dirty_from_date ASC, id ASC
+    LIMIT 100
+  `).all(preflightRunDate);
+
+  logAppInfo(`[Scheduler] ${label}: Step 2/4 dirty scope snapshot`, {
+    preflightRunDate,
+    dirtyInvestmentCount: dirtyInvestments.length,
+    pendingScopeCount: pendingScopes.length,
+    dirtyInvestments,
+    pendingScopes,
+  });
+
+  console.log(`[Scheduler] ${label}: preflight dirty backfill check for ${preflightRunDate}...`);
+  logAppInfo(`[Scheduler] ${label}: started`, {
+    runDate,
+    preflightRunDate,
+    options,
+  });
+
+  logAppInfo(`[Scheduler] ${label}: Step 3/4 running catch-up + dirty preflight`, {
+    preflightRunDate,
+  });
+  const catchUp = ensureSchedulerCatchUpScopes(db, preflightRunDate, label);
+  const preflight = await runDirtyBackfillPreflight(db, preflightRunDate);
+  logAppInfo(`[Scheduler] ${label}: Step 3/4 completed`, {
+    catchUp,
+    preflight,
+  });
 
   if (options.skipPriceUpdate) {
-    logAppInfo(`[Scheduler] ${label}: completed (preflight-only)`, {
+    logAppInfo(`[Scheduler] ${label}: Step 4/4 skipped price update (preflight-only)`, {
       runDate,
+      preflightRunDate,
       catchUp,
       preflight,
     });
     return { preflightOnly: true, catchUp, preflight };
   }
 
+  logAppInfo(`[Scheduler] ${label}: Step 4/4 running updateAllPrices`, {
+    assetTypes: options.assetTypes || null,
+  });
   const result = await updateAllPrices(db, options);
-  logAppInfo(`[Scheduler] ${label}: completed`, {
+  logAppInfo(`[Scheduler] ${label}: Step 4/4 completed`, {
     runDate,
+    preflightRunDate,
     catchUp,
     preflight,
     processed: result?.processed || 0,
@@ -176,3 +223,4 @@ function startScheduler(db) {
 }
 
 module.exports = { startScheduler, runSchedulerCycle };
+

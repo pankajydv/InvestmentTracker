@@ -1,10 +1,15 @@
 const https = require('https');
 const { fetchCorporateActions, fetchHistoricalStockPrice, fetchHistoricalOHLC, fetchHistoricalUSDToINR, fetchMutualFundHistory } = require('./priceService');
-const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = require('./pfInterestCalculator');
+const { fetchNPSHistory } = require('./priceService');
+const {
+  calculatePfInterestPreview,
+  calculateSmallSavingsInterestPreview,
+  calculateSmallSavingsValueAsOfDate,
+} = require('./pfInterestCalculator');
 const { updateAssetTypeDaily, updatePortfolioDaily } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
 const { toIsoDate, todayIso } = require('./dateUtils');
-const { logBackfillInfo } = require('./appLogger');
+const { logBackfillInfo, logBackfillError } = require('./appLogger');
 
 function clampEndDateToToday(endDate) {
   const end = toIsoDate(endDate) || todayIso();
@@ -29,6 +34,42 @@ function addDays(dateIso, days) {
   return d.toISOString().split('T')[0];
 }
 
+const AGGREGATE_RESUME_KEY = 'backfill_aggregate_resume_v1';
+
+function readAggregateResumeState(db) {
+  const row = db.prepare('SELECT value FROM config WHERE key = ? LIMIT 1').get(AGGREGATE_RESUME_KEY);
+  if (!row?.value) return null;
+
+  try {
+    const parsed = JSON.parse(String(row.value));
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (!toIsoDate(parsed.runDate) || !toIsoDate(parsed.rangeStart) || !toIsoDate(parsed.rangeEnd)) return null;
+    if (parsed.nextDate != null && !toIsoDate(parsed.nextDate)) return null;
+    return {
+      runDate: toIsoDate(parsed.runDate),
+      rangeStart: toIsoDate(parsed.rangeStart),
+      rangeEnd: toIsoDate(parsed.rangeEnd),
+      nextDate: parsed.nextDate ? toIsoDate(parsed.nextDate) : null,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeAggregateResumeState(db, payload) {
+  db.prepare(`
+    INSERT INTO config (key, value, updated_at)
+    VALUES (?, ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET
+      value = excluded.value,
+      updated_at = excluded.updated_at
+  `).run(AGGREGATE_RESUME_KEY, JSON.stringify(payload));
+}
+
+function clearAggregateResumeState(db) {
+  db.prepare('DELETE FROM config WHERE key = ?').run(AGGREGATE_RESUME_KEY);
+}
+
 function progressLogStride(total, maxSteps = 10) {
   const t = Number(total || 0);
   if (t <= 0) return 1;
@@ -45,6 +86,14 @@ function normalizeMfDate(dateValue) {
   const m = value.match(/^(\d{2})-(\d{2})-(\d{4})$/);
   if (m) return `${m[3]}-${m[2]}-${m[1]}`;
   return null;
+}
+
+function isValidNpsNav(nav) {
+  const n = Number(nav);
+  if (!Number.isFinite(n) || n <= 0) return false;
+  // Guard against placeholder/test NAV pollution.
+  if (Math.abs(n - 99.99) < 1e-6) return false;
+  return true;
 }
 
 function nearestOnOrBefore(seriesMap, date) {
@@ -138,7 +187,50 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     return { price: 0, source: 'COMPUTED' };
   }
 
-  if (inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'FOREIGN_STOCK' || inv.asset_type === 'SGB') {
+  if (inv.asset_type === 'SGB') {
+    // SGB: Use NSE bhavcopy for historical, fallback to NSE quote for today
+    const symbol = inv.ticker_symbol;
+    if (!symbol) return { price: 0, source: 'COMPUTED' };
+    if (!cache.sgb) cache.sgb = new Map();
+    if (!cache.sgb.has(symbol)) {
+      try {
+        const { getSGBHistoricalPrices } = require('./sgbBhavcopy');
+        // Use cache.rangeStart/rangeEnd if available, else date
+        const from = cache.rangeStart || date;
+        const to = cache.rangeEnd || date;
+        logBackfillInfo(`[SGB][Bhavcopy] Fetching ${symbol} from ${from} to ${to} (this may take several minutes)`);
+        const hist = await getSGBHistoricalPrices(symbol, from, to);
+        logBackfillInfo(`[SGB][Bhavcopy] Fetched ${hist.size} price points for ${symbol}`);
+        cache.sgb.set(symbol, hist);
+      } catch (e) {
+        logBackfillError(`[SGB][Bhavcopy] Failed to fetch prices for ${symbol}: ${e.message}`);
+        cache.sgb.set(symbol, new Map());
+      }
+    }
+    const hist = cache.sgb.get(symbol);
+    if (hist && hist.has(date)) {
+      return { price: Number(hist.get(date)), source: 'NSE_BHAVCOPY' };
+    }
+    // fallback: try latest NSE quote for today
+    if (date === todayIso()) {
+      try {
+        const { fetchSGBPrice } = require('./priceService');
+        const live = await fetchSGBPrice(symbol);
+        if (live && live.price > 0) return { price: Number(live.price), source: 'NSE_QUOTE' };
+      } catch (e) {}
+    }
+    // fallback: LOCF from hist
+    if (hist && hist.size > 0) {
+      // find nearest on or before
+      const keys = Array.from(hist.keys()).filter(k => k <= date).sort();
+      if (keys.length > 0) return { price: Number(hist.get(keys[keys.length-1])), source: 'NSE_BHAVCOPY_LOCF' };
+    }
+    // fallback: stored
+    const stored = getStoredPriceOnOrBefore(db, inv.id, portfolioId, date);
+    if (stored && stored.price > 0) return stored;
+    return { price: 0, source: 'COMPUTED' };
+  }
+  if (inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'FOREIGN_STOCK') {
     const symbol = inv.ticker_symbol;
     if (!symbol) return { price: 0, source: 'COMPUTED' };
     if (!cache.stock.has(symbol)) {
@@ -169,15 +261,38 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
   }
 
   if (inv.asset_type === 'NPS') {
+    if (inv.nps_fund_code) {
+      if (!cache.nps.has(inv.nps_fund_code)) {
+        const history = await fetchNPSHistory(inv.nps_fund_code).catch(() => []);
+        const map = new Map();
+        for (const row of history) {
+          const d = normalizeMfDate(row.date);
+          if (!d) continue;
+          if (!isValidNpsNav(row.nav)) continue;
+          map.set(d, Number(row.nav));
+        }
+        cache.nps.set(inv.nps_fund_code, map);
+      }
+
+      const map = cache.nps.get(inv.nps_fund_code);
+      const exact = map.get(date);
+      if (isValidNpsNav(exact)) return { price: Number(exact), source: 'LIVE' };
+      const nearest = nearestOnOrBefore(map, date);
+      if (isValidNpsNav(nearest)) return { price: Number(nearest), source: 'LOCF' };
+    }
+
     const row = db.prepare(`
       SELECT price_per_unit FROM transactions
-      WHERE investment_id = ? AND transaction_date <= ? AND price_per_unit > 0
+      WHERE investment_id = ?
+        AND transaction_date <= ?
+        AND price_per_unit > 0
+        AND ABS(price_per_unit - 99.99) > 0.000001
       ORDER BY transaction_date DESC, id DESC
       LIMIT 1
     `).get(inv.id, date);
-    if (row?.price_per_unit) return { price: Number(row.price_per_unit), source: 'COMPUTED' };
+    if (isValidNpsNav(row?.price_per_unit)) return { price: Number(row.price_per_unit), source: 'COMPUTED' };
     const stored = getStoredPriceOnOrBefore(db, inv.id, portfolioId, date);
-    if (stored && stored.price > 0) return stored;
+    if (stored && isValidNpsNav(stored.price)) return stored;
     return { price: 0, source: 'COMPUTED' };
   }
 
@@ -212,10 +327,26 @@ function getProvidentValue(db, inv, date, portfolioId) {
       rateRows,
       fromDate,
       toDate: date,
-      ignoreExistingInterest: false,
+      // Existing INTEREST rows in PF statements are year-end credits that are
+      // already represented in historical postings. Recomputing interest while
+      // also including those rows double-counts and inflates daily values.
+      ignoreExistingInterest: true,
       includeTransferTransactions: true,
     });
     return Number(preview.closingBalance || 0);
+  }
+
+  if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY') {
+    return Number(calculateSmallSavingsValueAsOfDate({
+      openingBalance: Number(inv.opening_balance || 0),
+      transactions: txns,
+      rateRows,
+      fromDate,
+      asOfDate: date,
+      includeTransferTransactions: true,
+      interestBaseMethod: inv.asset_type === 'SSY' ? 'month_end_balance' : 'min_balance_between_5th_and_month_end',
+      annualRounding: true,
+    }) || 0);
   }
 
   const preview = calculateSmallSavingsInterestPreview({
@@ -313,6 +444,32 @@ function computeRealizedProceeds(db, inv, date, portfolioId) {
   return Number(row?.total || 0);
 }
 
+function computeNetFlowForDate(db, inv, date, portfolioId, statements = null) {
+  const getNetFlow = statements?.getNetFlow || db.prepare(`
+    SELECT COALESCE(SUM(CASE
+      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      ELSE 0
+    END), 0) AS net_flow
+    FROM transactions
+    WHERE investment_id = ? AND date(transaction_date) = ?
+  `);
+  const getNetFlowPortfolio = statements?.getNetFlowPortfolio || db.prepare(`
+    SELECT COALESCE(SUM(CASE
+      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      ELSE 0
+    END), 0) AS net_flow
+    FROM transactions
+    WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
+  `);
+
+  const row = portfolioId != null
+    ? getNetFlowPortfolio.get(inv.id, portfolioId, date)
+    : getNetFlow.get(inv.id, date);
+  return Number(row?.net_flow || 0);
+}
+
 async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache, onProgress = null) {
     const dailyStatements = {
       upsertScoped: db.prepare(`
@@ -373,6 +530,24 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   const getPrev = db.prepare(portfolioId != null
     ? 'SELECT current_value FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
     : 'SELECT current_value FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL AND date < ? ORDER BY date DESC LIMIT 1');
+  const getNetFlow = db.prepare(`
+    SELECT COALESCE(SUM(CASE
+      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      ELSE 0
+    END), 0) AS net_flow
+    FROM transactions
+    WHERE investment_id = ? AND date(transaction_date) = ?
+  `);
+  const getNetFlowPortfolio = db.prepare(`
+    SELECT COALESCE(SUM(CASE
+      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      ELSE 0
+    END), 0) AS net_flow
+    FROM transactions
+    WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
+  `);
 
   let written = 0;
   let lastNonZeroDate = null;
@@ -383,8 +558,9 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     const units = Number(unitsRow?.total || 0);
     const invested = Number(getInvested.get(...baseParams, date)?.total || 0);
 
-    // Stop writing trailing zero-unit rows after the investment has exited in this scope.
-    if (latestTxnDate && date > latestTxnDate && units <= 0) {
+    // Stop writing trailing zero-unit rows after exit for unit-based assets.
+    // NPS must continue through runDate so full dirty windows are rebuilt.
+    if (latestTxnDate && date > latestTxnDate && units <= 0 && inv.asset_type !== 'NPS') {
       break;
     }
 
@@ -433,7 +609,11 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       ? getPrev.get(inv.id, portfolioId, date)
       : getPrev.get(inv.id, date);
     const prevValue = Number(prev?.current_value || 0);
-    const dayChange = currentValue - prevValue;
+    const netFlow = computeNetFlowForDate(db, inv, date, portfolioId, {
+      getNetFlow,
+      getNetFlowPortfolio,
+    });
+    const dayChange = currentValue - prevValue - netFlow;
     const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
 
     upsertDailyRow(db, {
@@ -1100,13 +1280,35 @@ async function updateDailyValues(db, options = {}) {
     }
   }
 
-  const aggregateDates = eachDate(earliestTouchedDate, runDate);
+  const previousResume = readAggregateResumeState(db);
+  const canResume = previousResume
+    && previousResume.runDate === runDate
+    && previousResume.rangeStart === earliestTouchedDate
+    && previousResume.rangeEnd === runDate
+    && previousResume.nextDate
+    && previousResume.nextDate >= earliestTouchedDate
+    && previousResume.nextDate <= runDate;
+
+  const aggregateStartDate = canResume ? previousResume.nextDate : earliestTouchedDate;
+  const aggregateDates = eachDate(aggregateStartDate, runDate);
   const aggregateTotal = aggregateDates.length;
   const aggregateStride = progressLogStride(aggregateTotal, 20);
   let lastAggregateHeartbeatAt = Date.now();
   const aggregateStartedAtMs = Date.now();
 
-  logBackfillInfo(`[Backfill][Step-2] Refreshing aggregate tables from ${earliestTouchedDate} to ${runDate}...`);
+  if (canResume) {
+    logBackfillInfo(`[Backfill][Step-2] Resuming aggregate refresh from ${aggregateStartDate} (range ${earliestTouchedDate} to ${runDate})...`);
+  } else {
+    logBackfillInfo(`[Backfill][Step-2] Refreshing aggregate tables from ${earliestTouchedDate} to ${runDate}...`);
+  }
+
+  writeAggregateResumeState(db, {
+    runDate,
+    rangeStart: earliestTouchedDate,
+    rangeEnd: runDate,
+    nextDate: aggregateStartDate,
+  });
+
   setBackfillProgress(db, {
     phase: 'finalizing',
     total: scopeList.length,
@@ -1119,10 +1321,31 @@ async function updateDailyValues(db, options = {}) {
 
   for (let i = 0; i < aggregateDates.length; i += 1) {
     const d = aggregateDates[i];
-    updatePortfolioDaily(db, d);
-    updateAssetTypeDaily(db, d);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      updatePortfolioDaily(db, d);
+      updateAssetTypeDaily(db, d);
+      db.exec('COMMIT');
+    } catch (e) {
+      try {
+        db.exec('ROLLBACK');
+      } catch (_) {
+        // best-effort rollback
+      }
+      throw e;
+    }
 
     const done = i + 1;
+    const nextDate = done < aggregateTotal ? addDays(d, 1) : null;
+    if (nextDate) {
+      writeAggregateResumeState(db, {
+        runDate,
+        rangeStart: earliestTouchedDate,
+        rangeEnd: runDate,
+        nextDate,
+      });
+    }
+
     const shouldLog = done === aggregateTotal || (done % aggregateStride === 0) || shouldHeartbeat(lastAggregateHeartbeatAt, 60_000);
     if (shouldLog) {
       lastAggregateHeartbeatAt = Date.now();
@@ -1149,6 +1372,8 @@ async function updateDailyValues(db, options = {}) {
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
+
+  clearAggregateResumeState(db);
 
   setBackfillProgress(db, {
     phase: 'finalizing',
@@ -1199,6 +1424,7 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
   const startByInvestment = getImpactedInvestmentStartDates(db, scopeList, runDate);
   const cache = {
     mf: new Map(),
+    nps: new Map(),
     stock: new Map(),
     fx: new Map(),
     actions: new Map(),
@@ -1259,6 +1485,67 @@ async function runBackfillInTwoSteps(db, options = {}) {
   return result;
 }
 
+async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
+  const { fetchNPSHistory } = require('./priceService');
+  const { logBackfillInfo, logBackfillError } = require('./appLogger');
+
+  try {
+    logBackfillInfo(`[NPS Backfill] Starting backfill for investment ${investmentId} from ${startDate} to ${endDate}`);
+
+    const inv = db.prepare('SELECT id, nps_fund_code FROM investments WHERE id = ?').get(investmentId);
+    if (!inv?.nps_fund_code) {
+      logBackfillInfo(`[NPS Backfill] Skipping ${investmentId}: nps_fund_code is missing`);
+      return;
+    }
+
+    // Fetch historical NAV data
+    const history = await fetchNPSHistory(inv.nps_fund_code);
+    if (!history || history.length === 0) {
+      logBackfillInfo(`[NPS Backfill] No historical data found for investment ${investmentId}`);
+      return;
+    }
+
+    const from = toIsoDate(startDate);
+    const to = toIsoDate(endDate);
+    const filtered = [];
+    const seen = new Set();
+    for (const row of history) {
+      const d = normalizeMfDate(row?.date);
+      if (!d) continue;
+      if (from && d < from) continue;
+      if (to && d > to) continue;
+      if (!isValidNpsNav(row?.nav)) continue;
+      const key = `${investmentId}|${d}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      filtered.push({ date: d, nav: Number(row.nav) });
+    }
+    if (filtered.length === 0) {
+      logBackfillInfo(`[NPS Backfill] No valid NAV rows for investment ${investmentId} in requested date range`);
+      return;
+    }
+
+    // Insert or update daily values in the database
+    const upsertStmt = db.prepare(`
+      INSERT INTO daily_values (investment_id, date, price_per_unit, price_source)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(investment_id, date) DO UPDATE SET
+        price_per_unit = excluded.price_per_unit,
+        price_source = excluded.price_source
+    `);
+
+    db.transaction(() => {
+      for (const { date, nav } of filtered) {
+        upsertStmt.run(investmentId, date, nav, 'BACKFILL');
+      }
+    })();
+
+    logBackfillInfo(`[NPS Backfill] Successfully backfilled ${filtered.length} records for investment ${investmentId}`);
+  } catch (error) {
+    logBackfillError(`[NPS Backfill] Failed to backfill for investment ${investmentId}: ${error.message}`);
+  }
+}
+
 module.exports = {
   backfillDirtyScopes,
   clampEndDateToToday,
@@ -1267,4 +1554,5 @@ module.exports = {
   runBackfillInTwoSteps,
   processAutoBackfillCAEntries,
   updateDailyValues,
+  backfillNPSHistoricalNAV,
 };

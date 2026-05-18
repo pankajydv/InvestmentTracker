@@ -226,6 +226,9 @@ function initializeDb(db) {
 
     -- Indexes for faster queries
     CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
     CREATE INDEX IF NOT EXISTS idx_portfolio_daily_date ON portfolio_daily(date);
@@ -1222,6 +1225,8 @@ function initializeDb(db) {
           exchange_rate_used REAL,
           usd_amount REAL,
           fmv_per_unit REAL,
+          gross_units REAL,
+          tax_withheld_units REAL,
           created_at TEXT DEFAULT (datetime('now')),
           FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
         )
@@ -1294,7 +1299,7 @@ function initializeDb(db) {
           investment_id INTEGER NOT NULL,
           portfolio_id INTEGER NOT NULL,
           transaction_type TEXT NOT NULL CHECK(transaction_type IN (
-            'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST',
+            'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'RECONCILE',
             'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
             'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
             'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
@@ -1324,7 +1329,7 @@ function initializeDb(db) {
         'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
         'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
         'locked', 'folio_number', 'exchange_rate_used', 'usd_amount', 'fmv_per_unit',
-        'created_at',
+        'gross_units', 'tax_withheld_units', 'created_at',
       ];
       const colsToCopy = knownCols.filter((c) => existingCols.includes(c));
       db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
@@ -1384,7 +1389,7 @@ function initializeDb(db) {
           investment_id INTEGER NOT NULL,
           portfolio_id INTEGER NOT NULL,
           transaction_type TEXT NOT NULL CHECK(transaction_type IN (
-            'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST',
+            'BUY', 'SELL', 'DEPOSIT', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST', 'RECONCILE',
             'SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'IPO',
             'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT',
             'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'CHARGES', 'AMC',
@@ -1851,4 +1856,35 @@ function inferMFCategory(name) {
   return 'Equity';
 }
 
-module.exports = { getDb, initializeDb };
+// ── Migration: add nps_fund_code column for external NPS NAV fetching
+function ensureNPSFundCodeMigration(db) {
+  const migrationId = '20260518-add-investments-nps-fund-code';
+  const invCols = db.prepare("PRAGMA table_info(investments)").all().map(c => c.name);
+  
+  const migrationsEnabled = process.env.NODE_ENV !== 'production' || process.env.ALLOW_DB_MIGRATIONS === 'true';
+  const hasMigration = db.prepare('SELECT id FROM schema_migrations WHERE id = ?').get(migrationId);
+  
+  if (!hasMigration && !invCols.includes('nps_fund_code')) {
+    if (!migrationsEnabled) {
+      throw new Error(`Pending migration ${migrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+    }
+    db.exec("ALTER TABLE investments ADD COLUMN nps_fund_code TEXT");
+    assertDbIntegrity(db, migrationId);
+    db.prepare(`
+      INSERT OR REPLACE INTO schema_migrations (id, status, notes, applied_at)
+      VALUES (?, ?, ?, datetime('now'))
+    `).run(migrationId, 'applied', null);
+    console.log(`[Migration] Applied ${migrationId}`);
+  } else if (!hasMigration && invCols.includes('nps_fund_code')) {
+    db.prepare(`
+      INSERT OR REPLACE INTO schema_migrations (id, status, notes, applied_at)
+      VALUES (?, ?, ?, datetime('now'))
+    `).run(migrationId, 'skipped', 'already present');
+  }
+}
+
+module.exports = {
+  getDb,
+  initializeDb,
+  ensureNPSFundCodeMigration,
+};

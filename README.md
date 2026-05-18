@@ -261,10 +261,39 @@ Scheduled jobs (IST):
 - Intraday weekdays: 9:25 AM to 4:25 PM (stocks only)
 - Final weekday run: 10:25 PM (all asset types)
 
+Scheduler behavior note:
+
+- There is no asset cutoff gate during updates anymore.
+- If a run is triggered, all eligible assets in that run scope are processed based on asset type and available data.
+- This avoids time-of-day suppression of valuation rows for non-stock assets.
+
 Manual triggers via API:
 
 - `POST /api/utils/update-prices`
 - `POST /api/utils/cancel-update`
+
+## Dashboard 1D Change and Debugging
+
+`GET /api/dashboard/summary` computes per-investment 1-day change using policy-based anchor rules:
+
+- `MARKET_SESSION`: `INDIAN_STOCK`, `FOREIGN_STOCK`, `SGB`, `NPS`
+- `NAV_SNAPSHOT`: `MUTUAL_FUND`
+- `ACCRUAL_SNAPSHOT`: `PF`, `PPF`, `SSY`
+- `SNAPSHOT`: fallback for other asset types
+
+For market-session assets, the API prefers the latest non-LOCF valuation row as the anchor, then compares against the previous row and adjusts for same-day net flows.
+
+Optional debug output:
+
+- Add query parameter `one_day_debug=true` (also accepts `1` or `yes`)
+- Per investment, includes `one_day_debug` with chosen policy, anchor dates, source, net flow, and computed values
+- Response root includes `oneDayDebug` summary counters
+
+Example:
+
+```bash
+curl "http://localhost:4000/api/dashboard/summary?one_day_debug=true"
+```
 
 ## Dirty Backfill Model
 

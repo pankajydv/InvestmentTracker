@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { ONE_DAY_CHANGE_POLICY, getOneDayChangePolicy } = require('../services/assetPolicy');
 
 const CASH_OUTFLOW_TYPES = new Set([
   'BUY', 'VEST', 'ESPP_CONTRIBUTION', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
@@ -8,6 +9,23 @@ const CASH_OUTFLOW_TYPES = new Set([
 const CASH_INFLOW_TYPES = new Set([
   'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'TDS'
 ]);
+
+const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+
+function isInternalXirrCashflow(assetType, transactionType) {
+  const normalizedAssetType = String(assetType || '').toUpperCase();
+  const normalizedType = String(transactionType || '').toUpperCase();
+
+  if (!INTERNAL_BALANCE_XIRR_ASSET_TYPES.has(normalizedAssetType)) {
+    return false;
+  }
+
+  if (normalizedType === 'INTEREST' || normalizedType === 'TDS') {
+    return true;
+  }
+
+  return normalizedType === 'RECONCILE';
+}
 
 function xnpv(rate, flows, baseDate) {
   const msPerDay = 24 * 60 * 60 * 1000;
@@ -61,11 +79,45 @@ function calculateXirr(flows) {
   return (low + high) / 2;
 }
 
+function diffIsoDays(startIso, endIso) {
+  if (!startIso || !endIso) return 1;
+  const startMs = new Date(`${startIso}T00:00:00.000Z`).getTime();
+  const endMs = new Date(`${endIso}T00:00:00.000Z`).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return 1;
+  return Math.max(Math.floor((endMs - startMs) / 86400000), 1);
+}
+
+function parseMarketHolidaySet(raw) {
+  if (!raw) return new Set();
+  try {
+    const parsed = JSON.parse(String(raw));
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d))).map(String));
+  } catch {
+    return new Set();
+  }
+}
+
+function isWeekendIso(isoDate) {
+  const dt = new Date(`${isoDate}T00:00:00.000Z`);
+  const day = dt.getUTCDay();
+  return day === 0 || day === 6;
+}
+
+function isMarketSessionDate(isoDate, marketHolidaySet) {
+  if (!isoDate) return false;
+  if (isWeekendIso(isoDate)) return false;
+  if (marketHolidaySet?.has(isoDate)) return false;
+  return true;
+}
+
 module.exports = function (db) {
 
   // ─── Portfolio Summary (Dashboard) ────────────────────────────────────
   router.get('/summary', (req, res) => {
     const { portfolio_id, hide_sold } = req.query;
+    const oneDayDebugRaw = String(req.query.one_day_debug || '').trim().toLowerCase();
+    const includeOneDayDebug = oneDayDebugRaw === 'true' || oneDayDebugRaw === '1' || oneDayDebugRaw === 'yes';
 
     // Get latest portfolio snapshot
     let latest;
@@ -126,6 +178,192 @@ module.exports = function (db) {
       WHERE 1=1${portfolioFilter}${soldFilter} AND i.exclude_from_tracking = 0
       ORDER BY i.asset_type, i.name
     `).all(...dvParams, ...dvParams, ...portfolioParams, ...soldParams);
+
+    const oneDayDebugSummary = includeOneDayDebug
+      ? {
+          enabled: true,
+          requestedWith: req.query.one_day_debug,
+          policyCounts: {
+            MARKET_SESSION: 0,
+            NAV_SNAPSHOT: 0,
+            ACCRUAL_SNAPSHOT: 0,
+            SNAPSHOT: 0,
+          },
+          noDailyValueCount: 0,
+          noPreviousRowCount: 0,
+          marketAnchoredCount: 0,
+          marketLatestFallbackCount: 0,
+        }
+      : null;
+
+    const marketHolidayConfig = db.prepare(`
+      SELECT value
+      FROM config
+      WHERE key IN ('market_holidays_nse', 'market_holidays')
+      ORDER BY CASE key WHEN 'market_holidays_nse' THEN 0 ELSE 1 END
+      LIMIT 1
+    `).get();
+    const marketHolidaySet = parseMarketHolidaySet(marketHolidayConfig?.value);
+
+    const latestDvForInvestment = db.prepare(`
+      SELECT date, current_value, price_source
+      FROM daily_values
+      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL'}
+      ORDER BY date DESC
+      LIMIT 1
+    `);
+    const latestMarketDvForInvestment = db.prepare(`
+      SELECT date, current_value, price_source
+      FROM daily_values
+      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL'}
+        AND COALESCE(price_source, '') NOT IN ('LOCF', 'NSE_BHAVCOPY_LOCF')
+      ORDER BY date DESC
+      LIMIT 90
+    `);
+    const previousDvForAnchorDate = db.prepare(`
+      SELECT date, current_value
+      FROM daily_values
+      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL'}
+        AND date < ?
+      ORDER BY date DESC
+      LIMIT 1
+    `);
+    const netFlowOnAnchorDate = db.prepare(`
+      SELECT COALESCE(SUM(CASE
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+        ELSE 0
+      END), 0) AS net_flow
+      FROM transactions
+      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : ''}
+        AND date(transaction_date) = ?
+    `);
+    const netFlowInRange = db.prepare(`
+      SELECT COALESCE(SUM(CASE
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+        ELSE 0
+      END), 0) AS net_flow
+      FROM transactions
+      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : ''}
+        AND date(transaction_date) > ?
+        AND date(transaction_date) <= ?
+    `);
+
+    for (const inv of investments) {
+      const policy = getOneDayChangePolicy(inv.asset_type);
+      if (includeOneDayDebug) {
+        oneDayDebugSummary.policyCounts[policy] = (oneDayDebugSummary.policyCounts[policy] || 0) + 1;
+      }
+      const latestRow = portfolio_id
+        ? latestDvForInvestment.get(inv.id, portfolio_id)
+        : latestDvForInvestment.get(inv.id);
+
+      if (!latestRow) {
+        inv.day_change = 0;
+        inv.day_change_pct = 0;
+        if (includeOneDayDebug) {
+          oneDayDebugSummary.noDailyValueCount += 1;
+          inv.one_day_debug = {
+            policy,
+            reason: 'NO_DAILY_VALUE',
+          };
+        }
+        continue;
+      }
+
+      const useSessionAnchoring = policy === ONE_DAY_CHANGE_POLICY.MARKET_SESSION
+        || policy === ONE_DAY_CHANGE_POLICY.NAV_SNAPSHOT;
+      let anchorRow = latestRow;
+      let anchoredToMarketSession = false;
+      let marketSessionRows = null;
+      if (useSessionAnchoring) {
+        const marketCandidatesRaw = portfolio_id
+          ? latestMarketDvForInvestment.all(inv.id, portfolio_id)
+          : latestMarketDvForInvestment.all(inv.id);
+        const marketCandidates = marketCandidatesRaw;
+        marketSessionRows = marketCandidates.filter((row) =>
+          isMarketSessionDate(row.date, marketHolidaySet)
+        );
+
+        if (marketSessionRows.length > 0) {
+          anchorRow = marketSessionRows[0];
+          anchoredToMarketSession = true;
+        }
+        if (includeOneDayDebug && policy === ONE_DAY_CHANGE_POLICY.MARKET_SESSION) {
+          if (anchoredToMarketSession) {
+            oneDayDebugSummary.marketAnchoredCount += 1;
+          } else {
+            oneDayDebugSummary.marketLatestFallbackCount += 1;
+          }
+        }
+      }
+
+      const previousRow = useSessionAnchoring
+        ? ((marketSessionRows || []).find((row) => row.date < anchorRow.date)
+          || (portfolio_id
+            ? previousDvForAnchorDate.get(inv.id, portfolio_id, anchorRow.date)
+            : previousDvForAnchorDate.get(inv.id, anchorRow.date)))
+        : (portfolio_id
+          ? previousDvForAnchorDate.get(inv.id, portfolio_id, anchorRow.date)
+          : previousDvForAnchorDate.get(inv.id, anchorRow.date));
+
+      if (!previousRow) {
+        inv.day_change = 0;
+        inv.day_change_pct = 0;
+        if (includeOneDayDebug) {
+          oneDayDebugSummary.noPreviousRowCount += 1;
+          inv.one_day_debug = {
+            policy,
+            latestDate: latestRow.date,
+            anchorDate: anchorRow.date,
+            anchorPriceSource: anchorRow.price_source || null,
+            anchoredToMarketSession,
+            marketHolidayCount: marketHolidaySet.size,
+            reason: 'NO_PREVIOUS_ROW',
+          };
+        }
+        continue;
+      }
+
+      const netFlow = portfolio_id
+        ? Number(netFlowOnAnchorDate.get(inv.id, portfolio_id, anchorRow.date)?.net_flow || 0)
+        : Number(netFlowOnAnchorDate.get(inv.id, anchorRow.date)?.net_flow || 0);
+      const netFlowRange = portfolio_id
+        ? Number(netFlowInRange.get(inv.id, portfolio_id, previousRow.date, anchorRow.date)?.net_flow || 0)
+        : Number(netFlowInRange.get(inv.id, previousRow.date, anchorRow.date)?.net_flow || 0);
+
+      const prevValue = Number(previousRow.current_value || 0);
+      const anchorValue = Number(anchorRow.current_value || 0);
+      const rawDayChange = policy === ONE_DAY_CHANGE_POLICY.ACCRUAL_SNAPSHOT
+        ? (anchorValue - prevValue - netFlowRange)
+        : (anchorValue - prevValue - netFlow);
+      const daySpan = diffIsoDays(previousRow.date, anchorRow.date);
+      const dayChange = policy === ONE_DAY_CHANGE_POLICY.ACCRUAL_SNAPSHOT
+        ? (rawDayChange / daySpan)
+        : rawDayChange;
+      const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
+
+      inv.day_change = dayChange;
+      inv.day_change_pct = dayChangePct;
+      if (includeOneDayDebug) {
+        inv.one_day_debug = {
+          policy,
+          latestDate: latestRow.date,
+          anchorDate: anchorRow.date,
+          previousDate: previousRow.date,
+          anchorPriceSource: anchorRow.price_source || null,
+          anchoredToMarketSession,
+          marketHolidayCount: marketHolidaySet.size,
+          daySpan,
+          netFlow,
+          netFlowRange,
+          rawDayChange,
+          computedDayChange: dayChange,
+          computedDayChangePct: dayChangePct,
+        };
+      }
+    }
 
     // Add folio information for MF investments
     for (const inv of investments) {
@@ -214,9 +452,10 @@ module.exports = function (db) {
     const txnFilter = portfolio_id ? 'WHERE portfolio_id = ?' : '';
     const txnParams = portfolio_id ? [portfolio_id] : [];
     const transactionRows = db.prepare(`
-      SELECT transaction_type, transaction_date, COALESCE(amount, 0) as amount, COALESCE(fees, 0) as fees
-      FROM transactions
-      ${txnFilter}
+      SELECT t.transaction_type, t.transaction_date, COALESCE(t.amount, 0) as amount, COALESCE(t.fees, 0) as fees, i.asset_type
+      FROM transactions t
+      JOIN investments i ON i.id = t.investment_id
+      ${portfolio_id ? 'WHERE t.portfolio_id = ?' : ''}
     `).all(...txnParams);
 
     const xirrCashflows = [];
@@ -227,10 +466,11 @@ module.exports = function (db) {
       const amount = Number(txn.amount) || 0;
       const fees = Number(txn.fees) || 0;
       let cashflow = 0;
+      const treatAsInternal = isInternalXirrCashflow(txn.asset_type, txn.transaction_type);
 
       if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
         cashflow = -(amount + fees);
-      } else if (CASH_INFLOW_TYPES.has(txn.transaction_type)) {
+      } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
         cashflow = amount - fees;
       }
 
@@ -277,6 +517,13 @@ module.exports = function (db) {
       portfolioCount,
       totalExpenses: expenseTotals.total_expenses,
       lastUpdate: db.prepare("SELECT value FROM config WHERE key = 'last_price_update'").get()?.value,
+      oneDayDebug: includeOneDayDebug
+        ? {
+            ...oneDayDebugSummary,
+            marketHolidayCount: marketHolidaySet.size,
+            totalInvestments: investments.length,
+          }
+        : undefined,
     });
   });
 

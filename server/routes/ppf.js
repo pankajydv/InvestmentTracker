@@ -7,6 +7,7 @@
 const express = require('express');
 const multer = require('multer');
 const { parsePPFStatements } = require('../services/ppfStatementParser');
+const { logAppInfo, logAppError } = require('../services/appLogger');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -125,6 +126,11 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('PPF preview error:', e);
+      logAppError('[PPF/SSY] Preview failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to parse PPF/SSY statements: ' + e.message });
     }
   });
@@ -222,6 +228,14 @@ module.exports = function (db) {
 
       const investmentId = importTxn();
 
+      logAppInfo('[PPF/SSY] Import completed', {
+        portfolio_id: portfolioId,
+        investment_id: Number(investmentId || 0) || null,
+        account_type: assetType,
+        imported: importedCount,
+        skipped: skippedCount,
+      });
+
       res.json({
         success: true,
         investmentId,
@@ -230,6 +244,11 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('PPF import error:', e);
+      logAppError('[PPF/SSY] Import failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        account_type: req.body?.accountType || 'PPF',
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import PPF/SSY transactions: ' + e.message });
     }
   });

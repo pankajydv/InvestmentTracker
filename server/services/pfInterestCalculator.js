@@ -426,4 +426,138 @@ function calculateSmallSavingsInterestPreview({
   };
 }
 
-module.exports = { calculatePfInterestPreview, calculateSmallSavingsInterestPreview };
+/**
+ * Compute PPF/SSY value as-of a specific date using monthly-rule interest base,
+ * with daily pro-rata accrual inside the month and annual credit at FY end.
+ *
+ * Daily accrual is informational for valuation and does NOT compound daily.
+ * Principal is increased only on 31-Mar via FY-end credit.
+ */
+function calculateSmallSavingsValueAsOfDate({
+  openingBalance = 0,
+  transactions = [],
+  rateRows = [],
+  fromDate,
+  asOfDate,
+  includeTransferTransactions = false,
+  interestBaseMethod = 'min_balance_between_5th_and_month_end',
+  annualRounding = true,
+}) {
+  const targetDate = toDateOnly(asOfDate);
+  const startYm = toYearMonth(fromDate);
+  const endYm = toYearMonth(targetDate);
+  if (!startYm || !endYm || startYm > endYm) {
+    throw new Error('Invalid from/as-of range for small-savings as-of value calculation.');
+  }
+
+  const creditTypes = new Set(['DEPOSIT', 'BUY']);
+  const debitTypes = new Set(['WITHDRAWAL']);
+  if (includeTransferTransactions) {
+    creditTypes.add('TRANSFER_IN');
+    debitTypes.add('TRANSFER_OUT');
+  }
+
+  const parsedRates = parseRateEntries(rateRows);
+  let principal = roundTo(Number(openingBalance || 0), 2);
+  let runningFyInterest = 0;
+
+  const postingsByMonth = new Map();
+  for (const t of transactions) {
+    const dateStr = toDateOnly(t.transaction_date);
+    if (!dateStr || dateStr < fromDate || dateStr > targetDate) continue;
+
+    const type = String(t.transaction_type || '');
+    let signed = null;
+    if (creditTypes.has(type)) signed = Number(t.amount || 0);
+    else if (debitTypes.has(type)) signed = -Math.abs(Number(t.amount || 0));
+    else if (type === 'RECONCILE') signed = Number(t.amount || 0);
+    else if (type === 'INTEREST') continue;
+    if (signed == null) continue;
+
+    const ym = toYearMonth(dateStr);
+    if (ym < startYm || ym > endYm) continue;
+    if (!postingsByMonth.has(ym)) postingsByMonth.set(ym, []);
+    postingsByMonth.get(ym).push({ date: dateStr, amount: signed });
+  }
+  for (const arr of postingsByMonth.values()) {
+    arr.sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  for (const ym of yearMonthRange(startYm, endYm)) {
+    const { y: yy, m: mm } = safeDateFromYm(ym);
+    const monthStart = fmtDate(yy, mm, 1);
+    const monthEnd = fmtDate(yy, mm, lastDayOfMonth(yy, mm));
+    const evalEnd = targetDate < monthEnd ? targetDate : monthEnd;
+    const fifthDate = fmtDate(yy, mm, 5);
+    const monthPostings = (postingsByMonth.get(ym) || []).filter((p) => p.date <= evalEnd);
+
+    // Compute principal at close of day 5 (or evalEnd if earlier).
+    let baseAtFifthClose = principal;
+    for (const p of monthPostings) {
+      if (p.date <= fifthDate || p.date <= evalEnd && evalEnd < fifthDate) {
+        baseAtFifthClose = roundTo(baseAtFifthClose + p.amount, 2);
+      }
+    }
+
+    // Compute running principal through evalEnd.
+    let endPrincipal = principal;
+    for (const p of monthPostings) {
+      endPrincipal = roundTo(endPrincipal + p.amount, 2);
+    }
+
+    // Eligible base according to scheme rule.
+    let eligibleBalance;
+    if (interestBaseMethod === 'month_end_balance') {
+      eligibleBalance = roundTo(Math.max(endPrincipal, 0), 2);
+    } else {
+      let minBalance = baseAtFifthClose;
+      let rolling = baseAtFifthClose;
+      for (const p of monthPostings) {
+        if (p.date > fifthDate) {
+          rolling = roundTo(rolling + p.amount, 2);
+          if (rolling < minBalance) minBalance = rolling;
+        }
+      }
+      eligibleBalance = roundTo(Math.max(minBalance, 0), 2);
+    }
+
+    const rate = getRateForDate(parsedRates, monthEnd);
+    if (rate == null) {
+      throw new Error(`No interest rate configured for month ${ym}.`);
+    }
+
+    const rawMonthInterest = eligibleBalance * (Number(rate) / 1200);
+    const monthDays = lastDayOfMonth(yy, mm);
+    const elapsedDays = Number(evalEnd.slice(8, 10));
+    const prorataAccrued = rawMonthInterest * (elapsedDays / monthDays);
+
+    const isMonthComplete = evalEnd === monthEnd;
+    if (isMonthComplete) {
+      principal = endPrincipal;
+      runningFyInterest = annualRounding
+        ? roundTo(runningFyInterest + rawMonthInterest, 8)
+        : roundTo(runningFyInterest + roundTo(rawMonthInterest, 2), 2);
+
+      if (mm === 3) {
+        const fyCredit = annualRounding ? Math.round(runningFyInterest) : roundTo(runningFyInterest, 2);
+        principal = roundTo(principal + fyCredit, 2);
+        runningFyInterest = 0;
+      }
+      continue;
+    }
+
+    // Partial current month: principal excludes current-month interest;
+    // add only prorata accrued interest to valuation.
+    return roundTo(endPrincipal + runningFyInterest + prorataAccrued, 2);
+  }
+
+  // asOfDate is month-end (or after loop completion): include accrued FY interest
+  // that is not yet credited until Mar-31.
+  return roundTo(principal + runningFyInterest, 2);
+}
+
+module.exports = {
+  calculatePfInterestPreview,
+  calculateSmallSavingsInterestPreview,
+  calculateSmallSavingsValueAsOfDate,
+};

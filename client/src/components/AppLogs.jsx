@@ -47,9 +47,7 @@ export default function AppLogs() {
   }, []);
 
   const stats = useMemo(() => {
-    const appCount = files.filter((f) => String(f.name || '').startsWith('app-')).length;
-    const backfillCount = files.filter((f) => String(f.name || '').startsWith('backfill-')).length;
-    return { appCount, backfillCount, total: files.length };
+    return { total: files.length };
   }, [files]);
 
   const handleDownload = async (name) => {
@@ -79,7 +77,7 @@ export default function AppLogs() {
       <div className="d-flex align-items-center justify-content-between flex-wrap gap-2">
         <div>
           <h4 className="mb-1">App Logs</h4>
-          <div className="text-muted small">Daily rotated app and backfill logs</div>
+          <div className="text-muted small">Daily rotated unified logs</div>
         </div>
         <Button variant="outline-secondary" size="sm" onClick={() => load(true)} disabled={refreshing}>
           <RefreshCw size={14} className={`me-1 ${refreshing ? 'spinner-rotate' : ''}`} />
@@ -92,8 +90,7 @@ export default function AppLogs() {
       <Card className="shadow-sm border-0">
         <Card.Body className="d-flex flex-wrap gap-2 align-items-center">
           <Badge bg="primary">Total: {stats.total}</Badge>
-          <Badge bg="info">App: {stats.appCount}</Badge>
-          <Badge bg="warning" text="dark">Backfill: {stats.backfillCount}</Badge>
+          <Badge bg="info">Unified: {stats.total}</Badge>
           {logDir ? <span className="small text-muted ms-auto">{logDir}</span> : null}
         </Card.Body>
       </Card>
@@ -116,12 +113,11 @@ export default function AppLogs() {
                   <td colSpan={5} className="text-center text-muted py-4">No log files found.</td>
                 </tr>
               ) : files.map((file) => {
-                const isApp = String(file.name || '').startsWith('app-');
                 const isBusy = downloading === file.name;
                 return (
                   <tr key={file.name}>
                     <td className="fw-semibold">{file.name}</td>
-                    <td>{isApp ? 'App' : 'Backfill'}</td>
+                    <td>Unified</td>
                     <td>{formatBytes(file.size_bytes)}</td>
                     <td>{formatDateTime(file.updated_at)}</td>
                     <td className="text-end">

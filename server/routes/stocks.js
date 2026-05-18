@@ -9,6 +9,7 @@ const { OFFERINGS, generateEsppSchedule } = require('../services/esppGrantServic
 const { parseOpenLots, parseClosedLots, reconcileVestTransactions } = require('../services/fidelityVestReconciler');
 const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisitionImportService');
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
+const { logAppInfo, logAppError } = require('../services/appLogger');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -315,6 +316,11 @@ module.exports = function (db) {
       });
     } catch (e) {
       console.error('Contract note preview error:', e);
+      logAppError('[Stocks] Contract notes preview failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to parse contract notes: ' + e.message });
     }
   });
@@ -464,8 +470,21 @@ module.exports = function (db) {
         transactionsSkipped,
         errors: errors.length > 0 ? errors : undefined,
       });
+      logAppInfo('[Stocks] Contract notes import completed', {
+        portfolio_id: portfolioId,
+        broker: broker || null,
+        investments_created: investmentsCreated,
+        transactions_created: transactionsCreated,
+        transactions_updated: transactionsUpdated,
+        transactions_skipped: transactionsSkipped,
+        errors: errors.length,
+      });
     } catch (e) {
       console.error('Contract note import error:', e);
+      logAppError('[Stocks] Contract notes import failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import trades: ' + e.message });
     }
   });
@@ -596,8 +615,21 @@ module.exports = function (db) {
         totalTrades: allTrades.length,
         errors: errors.length > 0 ? errors : undefined,
       });
+      logAppInfo('[Stocks] P&L import completed', {
+        portfolio_id: portfolioId,
+        broker,
+        investments_created: investmentsCreated,
+        transactions_created: transactionsCreated,
+        total_trades: allTrades.length,
+        errors: errors.length,
+      });
     } catch (e) {
       console.error('P&L import error:', e);
+      logAppError('[Stocks] P&L import failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        broker: req.body?.broker || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to process P&L statement: ' + e.message });
     }
   });
@@ -624,9 +656,20 @@ module.exports = function (db) {
         'INSERT INTO portfolio_expenses (portfolio_id, expense_type, expense_date, amount, broker, notes) VALUES (?, ?, ?, ?, ?, ?)'
       ).run(portfolio_id, type, date, parseFloat(amount), broker || null, notes || 'AMC/Maintenance charge');
 
+      logAppInfo('[Stocks] Portfolio expense recorded', {
+        expense_id: Number(result.lastInsertRowid),
+        portfolio_id: Number(portfolio_id),
+        expense_type: type,
+        expense_date: date,
+        amount: Number(amount),
+      });
       res.json({ success: true, expense_id: result.lastInsertRowid });
     } catch (e) {
       console.error('AMC charge error:', e);
+      logAppError('[Stocks] Portfolio expense failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to record charge: ' + e.message });
     }
   });
@@ -682,6 +725,11 @@ module.exports = function (db) {
         rows,
       });
     } catch (e) {
+      logAppError('[Stocks] ESPP grants preview failed', {
+        investment_id: Number(req.query?.investment_id || 0) || null,
+        portfolio_id: Number(req.query?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to preview ESPP grants: ' + e.message });
     }
   });
@@ -800,6 +848,15 @@ module.exports = function (db) {
 
       runAll();
 
+      logAppInfo('[Stocks] ESPP grants import completed', {
+        investment_id: investmentId,
+        portfolio_id: portfolioId,
+        created,
+        skipped,
+        removed_existing: removedExisting,
+        total_rows: rows.length,
+      });
+
       res.json({
         created,
         skipped,
@@ -809,6 +866,11 @@ module.exports = function (db) {
         include_future: schedule.include_future,
       });
     } catch (e) {
+      logAppError('[Stocks] ESPP grants import failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import ESPP grants: ' + e.message });
     }
   });
@@ -857,6 +919,12 @@ module.exports = function (db) {
         rows: previewRows,
       });
     } catch (e) {
+      logAppError('[Stocks] ESPP contributions preview failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to preview ESPP contributions: ' + e.message });
     }
   });
@@ -953,6 +1021,15 @@ module.exports = function (db) {
 
       runAll();
 
+      logAppInfo('[Stocks] ESPP contributions import completed', {
+        investment_id: investmentId,
+        portfolio_id: portfolioId,
+        created,
+        skipped,
+        removed_existing: removedExisting,
+        total_rows: rows.length,
+      });
+
       res.json({
         created,
         skipped,
@@ -960,6 +1037,11 @@ module.exports = function (db) {
         total_rows: rows.length,
       });
     } catch (e) {
+      logAppError('[Stocks] ESPP contributions import failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import ESPP contributions: ' + e.message });
     }
   });
@@ -1000,6 +1082,11 @@ module.exports = function (db) {
         rows: previewRows,
       });
     } catch (e) {
+      logAppError('[Stocks] ESPP acquisitions preview failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to preview ESPP acquisitions: ' + e.message });
     }
   });
@@ -1084,6 +1171,15 @@ module.exports = function (db) {
 
       runAll();
 
+      logAppInfo('[Stocks] ESPP acquisitions import completed', {
+        investment_id: investmentId,
+        portfolio_id: portfolioId,
+        created,
+        skipped,
+        removed_existing: removedExisting,
+        total_rows: previewRows.length,
+      });
+
       res.json({
         created,
         skipped,
@@ -1091,6 +1187,11 @@ module.exports = function (db) {
         total_rows: previewRows.length,
       });
     } catch (e) {
+      logAppError('[Stocks] ESPP acquisitions import failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import ESPP acquisitions: ' + e.message });
     }
   });
@@ -1146,6 +1247,11 @@ module.exports = function (db) {
         rows,
       });
     } catch (e) {
+      logAppError('[Stocks] RSU grants preview failed', {
+        investment_id: Number(req.query?.investment_id || 0) || null,
+        portfolio_id: Number(req.query?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to preview RSU grants: ' + e.message });
     }
   });
@@ -1234,6 +1340,10 @@ module.exports = function (db) {
         file_summaries: fileSummaries,
       });
     } catch (e) {
+      logAppError('[Stocks] RSU documents preview failed', {
+        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to parse stock grant documents: ' + e.message });
     }
   });
@@ -1357,6 +1467,15 @@ module.exports = function (db) {
 
       runAll();
 
+      logAppInfo('[Stocks] RSU grants import completed', {
+        investment_id: investmentId,
+        portfolio_id: portfolioId,
+        created,
+        skipped,
+        removed_existing: removedExisting,
+        total_rows: rows.length,
+      });
+
       res.json({
         created,
         skipped,
@@ -1366,6 +1485,11 @@ module.exports = function (db) {
         include_future: schedule.include_future,
       });
     } catch (e) {
+      logAppError('[Stocks] RSU grants import failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import RSU grants: ' + e.message });
     }
   });
@@ -1507,6 +1631,15 @@ module.exports = function (db) {
 
       runAll();
 
+      logAppInfo('[Stocks] RSU reconcile completed', {
+        investment_id: investmentId,
+        portfolio_id: portfolioId,
+        updated,
+        matched_txns: reconciliation.matched_txns,
+        matched_dates: reconciliation.matched_dates,
+        dry_run: false,
+      });
+
       res.json({
         updated,
         matched_txns: reconciliation.matched_txns,
@@ -1518,6 +1651,11 @@ module.exports = function (db) {
         dry_run: false,
       });
     } catch (e) {
+      logAppError('[Stocks] RSU reconcile failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to reconcile RSU fidelity lots: ' + e.message });
     }
   });
@@ -1887,6 +2025,12 @@ module.exports = function (db) {
 
       res.json({ suggestions, corrections, deletions, errors, year: yearNum });
     } catch (e) {
+      logAppError('[Stocks] Corporate actions preview failed', {
+        portfolio_id: Number(req.query?.portfolio_id || 0) || null,
+        year: Number(req.query?.year || 0) || null,
+        asset_type: req.query?.asset_type || null,
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to fetch corporate actions: ' + e.message });
     }
   });
@@ -2011,8 +2155,18 @@ module.exports = function (db) {
 
       runAll();
       markDirtyFromTransactions(db, dirtyCandidates, 'corporate-actions-import');
+      logAppInfo('[Stocks] Corporate actions import completed', {
+        created,
+        skipped,
+        corrected,
+        deleted,
+        dirty_candidates: dirtyCandidates.length,
+      });
       res.json({ created, skipped, corrected, deleted });
     } catch (e) {
+      logAppError('[Stocks] Corporate actions import failed', {
+        error: e.message,
+      });
       res.status(500).json({ error: 'Failed to import corporate actions: ' + e.message });
     }
   });

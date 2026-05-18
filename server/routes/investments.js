@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = require('../services/pfInterestCalculator');
+const { logAppInfo, logAppError } = require('../services/appLogger');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -32,6 +33,24 @@ const CASH_OUTFLOW_TYPES = new Set([
 const CASH_INFLOW_TYPES = new Set([
   'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'TDS'
 ]);
+
+const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+
+function isInternalXirrCashflow(assetType, transactionType) {
+  const normalizedAssetType = String(assetType || '').toUpperCase();
+  const normalizedType = String(transactionType || '').toUpperCase();
+
+  if (!INTERNAL_BALANCE_XIRR_ASSET_TYPES.has(normalizedAssetType)) {
+    return false;
+  }
+
+  if (normalizedType === 'INTEREST' || normalizedType === 'TDS') {
+    return true;
+  }
+
+  // Reconcile rows on balance-based accounts are statement/passbook corrections.
+  return normalizedType === 'RECONCILE';
+}
 
 function xnpv(rate, flows, baseDate) {
   const msPerDay = 24 * 60 * 60 * 1000;
@@ -159,10 +178,11 @@ module.exports = function (db) {
         const amount = Number(txn.amount) || 0;
         const fees = Number(txn.fees) || 0;
         let cashflow = 0;
+        const treatAsInternal = isInternalXirrCashflow(inv.asset_type, txn.transaction_type);
 
         if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
           cashflow = -(amount + fees);
-        } else if (CASH_INFLOW_TYPES.has(txn.transaction_type)) {
+        } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
           cashflow = amount - fees;
         }
 
@@ -281,68 +301,109 @@ module.exports = function (db) {
 
   // ─── Create investment ────────────────────────────────────────────────
   router.post('/', (req, res) => {
-    const {
-      name, asset_type, ticker_symbol, amfi_code,
-      account_number, currency, notes,
-      face_value, coupon_frequency, maturity_date,
-    } = req.body;
+    try {
+      const {
+        name, asset_type, ticker_symbol, amfi_code,
+        account_number, currency, notes,
+        face_value, coupon_frequency, maturity_date,
+      } = req.body;
 
-    if (!name || !asset_type) {
-      return res.status(400).json({ error: 'name and asset_type are required' });
+      if (!name || !asset_type) {
+        return res.status(400).json({ error: 'name and asset_type are required' });
+      }
+
+      const result = db.prepare(`
+        INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_frequency, maturity_date, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(name, asset_type, ticker_symbol || null, amfi_code || null,
+        account_number || null,
+        currency || 'INR', face_value || null,
+        coupon_frequency || null, maturity_date || null,
+        notes || null);
+
+      const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(result.lastInsertRowid);
+      logAppInfo('[Investment] Created', {
+        investment_id: Number(inv?.id || result.lastInsertRowid),
+        name: inv?.name || name,
+        asset_type: inv?.asset_type || asset_type,
+        ticker_symbol: inv?.ticker_symbol || null,
+      });
+      res.status(201).json(inv);
+    } catch (e) {
+      logAppError('[Investment] Create failed', { error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to create investment' });
     }
-
-    const result = db.prepare(`
-      INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_frequency, maturity_date, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(name, asset_type, ticker_symbol || null, amfi_code || null,
-      account_number || null,
-      currency || 'INR', face_value || null,
-      coupon_frequency || null, maturity_date || null,
-      notes || null);
-
-    const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(result.lastInsertRowid);
-    res.status(201).json(inv);
   });
 
   // ─── Update investment ────────────────────────────────────────────────
   router.put('/:id', (req, res) => {
-    const {
-      name, ticker_symbol, amfi_code,
-      account_number, currency, notes, portfolio_id,
-      face_value, coupon_frequency, maturity_date,
-      display_name, isin_code,
-    } = req.body;
+    try {
+      const {
+        name, ticker_symbol, amfi_code,
+        account_number, currency, notes, portfolio_id,
+        face_value, coupon_frequency, maturity_date,
+        display_name, isin_code,
+      } = req.body;
 
-    // Build dynamic SET clauses — COALESCE for legacy fields, direct set for new fields
-    const sets = [];
-    const params = [];
+      const existing = db.prepare('SELECT * FROM investments WHERE id = ?').get(req.params.id);
+      if (!existing) {
+        return res.status(404).json({ error: 'Investment not found' });
+      }
 
-    // Legacy fields: only update if provided (COALESCE pattern)
-    const coalesceFields = { name, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_frequency, maturity_date, notes };
-    for (const [col, val] of Object.entries(coalesceFields)) {
-      sets.push(`${col} = COALESCE(?, ${col})`);
-      params.push(val !== undefined ? val : null);
+      // Build dynamic SET clauses — COALESCE for legacy fields, direct set for new fields
+      const sets = [];
+      const params = [];
+
+      // Legacy fields: only update if provided (COALESCE pattern)
+      const coalesceFields = { name, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_frequency, maturity_date, notes };
+      for (const [col, val] of Object.entries(coalesceFields)) {
+        sets.push(`${col} = COALESCE(?, ${col})`);
+        params.push(val !== undefined ? val : null);
+      }
+
+      // New fields: only update if explicitly present in body
+      if (display_name !== undefined) { sets.push('display_name = ?'); params.push(display_name || null); }
+      if (isin_code !== undefined) { sets.push('isin_code = ?'); params.push(isin_code || null); }
+      if (req.body.is_active !== undefined) { sets.push('is_active = ?'); params.push(req.body.is_active ? 1 : 0); }
+      if (req.body.exclude_from_tracking !== undefined) { sets.push('exclude_from_tracking = ?'); params.push(req.body.exclude_from_tracking ? 1 : 0); }
+
+      sets.push("updated_at = datetime('now')");
+      params.push(req.params.id);
+
+      db.prepare(`UPDATE investments SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+
+      const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(req.params.id);
+      logAppInfo('[Investment] Updated', {
+        investment_id: Number(req.params.id),
+        name: inv?.name || existing.name,
+        asset_type: inv?.asset_type || existing.asset_type,
+        portfolio_id: portfolio_id ?? null,
+      });
+      res.json(inv);
+    } catch (e) {
+      logAppError('[Investment] Update failed', { investment_id: Number(req.params.id), error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to update investment' });
     }
-
-    // New fields: only update if explicitly present in body
-    if (display_name !== undefined) { sets.push('display_name = ?'); params.push(display_name || null); }
-    if (isin_code !== undefined) { sets.push('isin_code = ?'); params.push(isin_code || null); }
-    if (req.body.is_active !== undefined) { sets.push('is_active = ?'); params.push(req.body.is_active ? 1 : 0); }
-    if (req.body.exclude_from_tracking !== undefined) { sets.push('exclude_from_tracking = ?'); params.push(req.body.exclude_from_tracking ? 1 : 0); }
-
-    sets.push("updated_at = datetime('now')");
-    params.push(req.params.id);
-
-    db.prepare(`UPDATE investments SET ${sets.join(', ')} WHERE id = ?`).run(...params);
-
-    const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(req.params.id);
-    res.json(inv);
   });
 
   // ─── Delete investment ────────────────────────────────────────────────
   router.delete('/:id', (req, res) => {
-    db.prepare('DELETE FROM investments WHERE id = ?').run(req.params.id);
-    res.json({ success: true });
+    try {
+      const existing = db.prepare('SELECT id, name, asset_type FROM investments WHERE id = ?').get(req.params.id);
+      if (!existing) {
+        return res.status(404).json({ error: 'Investment not found' });
+      }
+      db.prepare('DELETE FROM investments WHERE id = ?').run(req.params.id);
+      logAppInfo('[Investment] Deleted', {
+        investment_id: Number(existing.id),
+        name: existing.name,
+        asset_type: existing.asset_type,
+      });
+      res.json({ success: true });
+    } catch (e) {
+      logAppError('[Investment] Delete failed', { investment_id: Number(req.params.id), error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to delete investment' });
+    }
   });
 
   function parseBool(v, defaultVal = false) {
@@ -766,6 +827,17 @@ module.exports = function (db) {
 
       runApply();
 
+      logAppInfo('[Interest] Applied', {
+        investment_id: Number(inv.id),
+        asset_type: inv.asset_type,
+        target_portfolio_id: targetPortfolioId,
+        dry_run: dryRun,
+        replace_existing: replaceExisting,
+        inserted,
+        updated,
+        skipped,
+      });
+
       res.json({
         success: true,
         dry_run: dryRun,
@@ -776,6 +848,7 @@ module.exports = function (db) {
         applied_entries: appliedEntries,
       });
     } catch (e) {
+      logAppError('[Interest] Apply failed', { investment_id: Number(req.params.id), error: e.message });
       res.status(500).json({ error: 'Failed interest apply: ' + e.message });
     }
   });
@@ -841,8 +914,14 @@ module.exports = function (db) {
       });
 
       runAll();
+      logAppInfo('[InterestRateSync] Imported changes', {
+        created,
+        corrected,
+        deleted,
+      });
       res.json({ created, corrected, deleted });
     } catch (e) {
+      logAppError('[InterestRateSync] Import failed', { error: e.message });
       res.status(500).json({ error: 'Failed to import interest rate changes: ' + e.message });
     }
   });
