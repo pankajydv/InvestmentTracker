@@ -185,6 +185,7 @@ module.exports = function (db) {
           COALESCE(dv.invested_amount,
             (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
              WHERE investment_id = i.id AND portfolio_id = ? AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_CONTRIBUTION'))) as invested_amount,
+          COALESCE(dv.realized_gain, 0) as realized_gain,
           COALESCE(dv.profit_loss, 0) as profit_loss,
           COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
           COALESCE(dv.day_change, 0) as day_change,
@@ -209,6 +210,7 @@ module.exports = function (db) {
             MAX(dv.price_per_unit) AS price_per_unit,
             SUM(COALESCE(dv.current_value, 0)) AS current_value,
             SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
+            SUM(COALESCE(dv.realized_gain, 0)) AS realized_gain,
             SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
             SUM(COALESCE(dv.day_change, 0)) AS day_change
           FROM daily_values dv
@@ -232,6 +234,7 @@ module.exports = function (db) {
           COALESCE(la.invested_amount,
             (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
              WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_CONTRIBUTION'))) as invested_amount,
+          COALESCE(la.realized_gain, 0) as realized_gain,
           COALESCE(la.profit_loss, 0) as profit_loss,
           CASE WHEN COALESCE(la.invested_amount, 0) > 0 THEN (COALESCE(la.profit_loss, 0) / COALESCE(la.invested_amount, 0)) * 100 ELSE 0 END as profit_loss_pct,
           COALESCE(la.day_change, 0) as day_change,
@@ -241,6 +244,45 @@ module.exports = function (db) {
         WHERE 1=1${soldFilter} AND i.exclude_from_tracking = 0
         ORDER BY i.asset_type, i.name
       `).all(...soldParams);
+    }
+
+    const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+    const activeInterestRateForDate = db.prepare(`
+      SELECT rate
+      FROM interest_rates
+      WHERE rate_type = ?
+        AND effective_from <= ?
+        AND (effective_to IS NULL OR effective_to >= ?)
+      ORDER BY effective_from DESC
+      LIMIT 1
+    `);
+    const latestInterestRateByDate = db.prepare(`
+      SELECT rate
+      FROM interest_rates
+      WHERE rate_type = ?
+        AND effective_from <= ?
+      ORDER BY effective_from DESC
+      LIMIT 1
+    `);
+    const latestInterestRateAny = db.prepare(`
+      SELECT rate
+      FROM interest_rates
+      WHERE rate_type = ?
+      ORDER BY effective_from DESC
+      LIMIT 1
+    `);
+
+    for (const inv of investments) {
+      if (!INTEREST_RATE_ASSET_TYPES.has(inv.asset_type)) continue;
+      if (Number(inv.price_per_unit || 0) > 0) continue;
+
+      const asOfDate = inv.date || latest?.date || new Date().toISOString().split('T')[0];
+      const rateRow = activeInterestRateForDate.get(inv.asset_type, asOfDate, asOfDate)
+        || latestInterestRateByDate.get(inv.asset_type, asOfDate)
+        || latestInterestRateAny.get(inv.asset_type);
+      if (rateRow?.rate != null) {
+        inv.price_per_unit = Number(rateRow.rate);
+      }
     }
 
     const oneDayDebugSummary = includeOneDayDebug

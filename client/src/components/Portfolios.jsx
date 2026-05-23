@@ -380,7 +380,7 @@ export default function Portfolios() {
             <div className="d-flex gap-3 overflow-auto pb-1" style={{ scrollbarWidth: 'thin' }}>
               <Card className="shadow-sm flex-shrink-0" style={{ minWidth: 220, flex: '1 1 220px' }}>
                 <Card.Body className="text-center">
-                  <div className="text-muted small mb-1">TOTAL CHARGES</div>
+                  <div className="text-muted small mb-1">Total Charges</div>
                   <div className="fs-4 fw-bold text-danger">{formatINR(summary.total_expenses)}</div>
                 </Card.Body>
               </Card>
@@ -399,7 +399,7 @@ export default function Portfolios() {
           {/* Filters */}
           <div className="d-flex flex-wrap align-items-center gap-3">
             <div className="d-flex align-items-center gap-2">
-              <label className="small fw-semibold text-muted text-uppercase">Type</label>
+              <label className="small fw-semibold text-muted">Type</label>
               <Form.Select size="sm" value={filterType} onChange={(e) => setFilterType(e.target.value)} style={{ width: 180 }}>
                 <option value="">All Types</option>
                 {EXPENSE_TYPES.map((t) => (

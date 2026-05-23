@@ -522,7 +522,7 @@ export default function Transactions() {
       {/* Filter bar */}
       <div className="d-flex flex-wrap align-items-center gap-2">
         <div className="d-flex align-items-center gap-2 position-relative" ref={typeDropdownRef}>
-          <label className="small fw-semibold text-muted text-uppercase">Type</label>
+          <label className="small fw-semibold text-muted">Type</label>
           <button
             onClick={() => setTypeDropdownOpen(!typeDropdownOpen)}
             className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1"
@@ -598,7 +598,7 @@ export default function Transactions() {
         </div>
 
         <div className="d-flex align-items-center gap-2">
-          <label className="small fw-semibold text-muted text-uppercase">Investment</label>
+          <label className="small fw-semibold text-muted">Investment</label>
           <Form.Select
             size="sm"
             value={filterInvestment}
@@ -614,7 +614,7 @@ export default function Transactions() {
 
         {brokers.length > 0 && (
           <div className="d-flex align-items-center gap-2">
-            <label className="small fw-semibold text-muted text-uppercase">Broker</label>
+            <label className="small fw-semibold text-muted">Broker</label>
             <Form.Select
               size="sm"
               value={filterBroker}
@@ -630,7 +630,7 @@ export default function Transactions() {
         )}
 
         <div className="d-flex align-items-center gap-2" style={{ whiteSpace: 'nowrap' }}>
-          <label className="small fw-semibold text-muted text-uppercase">Duration</label>
+          <label className="small fw-semibold text-muted">Duration</label>
           <Form.Select
             size="sm"
             value={filterDuration}
@@ -689,7 +689,7 @@ export default function Transactions() {
 
       {!loading && groupedAssetTypes.length > 1 && (
         <div className="d-flex align-items-center gap-2 flex-nowrap overflow-auto pb-1">
-          <span className="small fw-semibold text-muted text-uppercase flex-shrink-0">Navigate</span>
+          <span className="small fw-semibold text-muted flex-shrink-0">Navigate</span>
           {groupedAssetTypes.map((type) => (
             <button
               key={type}

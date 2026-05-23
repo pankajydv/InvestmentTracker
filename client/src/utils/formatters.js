@@ -88,15 +88,15 @@ export const ASSET_TYPE_LABELS = {
  * Asset type full names for tooltips
  */
 export const ASSET_TYPE_FULL_NAMES = {
-  MUTUAL_FUND: 'Mutual Fund',
-  INDIAN_STOCK: 'Indian Stock',
+  MUTUAL_FUND: 'Mutual Funds',
+  INDIAN_STOCK: 'Indian Stocks',
   FOREIGN_STOCK: 'Foreign Stocks',
-  PPF: 'Public Provident Fund',
+  PPF: 'Public Provident Funds',
   SSY: 'Sukanya Samriddhi Yojana',
   PF: 'Provident Fund',
   BOND: 'Bonds',
   NPS: 'National Pension Scheme',
-  SGB: 'Sovereign Gold Bond',
+  SGB: 'Sovereign Gold Bonds',
 };
 
 /**

@@ -20,6 +20,8 @@ const ASSET_TYPE_DISPLAY_ORDER = {
   FOREIGN_STOCK: 9,
 };
 
+const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+
 function sortAssetTypeEntries(byType) {
   return Object.entries(byType || {}).sort(([typeA], [typeB]) => {
     const orderA = ASSET_TYPE_DISPLAY_ORDER[typeA] ?? 999;
@@ -39,6 +41,7 @@ function combineDashboardSummaries(results, selectedIds) {
     total_value: 0,
     total_invested: 0,
     total_profit_loss: 0,
+    total_realized_gain: 0,
     day_change: 0,
     xirr_pct: null,
   };
@@ -48,6 +51,7 @@ function combineDashboardSummaries(results, selectedIds) {
     portfolio.total_value += Number(p.total_value) || 0;
     portfolio.total_invested += Number(p.total_invested) || 0;
     portfolio.total_profit_loss += Number(p.total_profit_loss) || 0;
+    portfolio.total_realized_gain += Number(p.total_realized_gain) || 0;
     portfolio.day_change += Number(p.day_change) || 0;
     totalExpenses += Number(result?.totalExpenses) || 0;
 
@@ -57,6 +61,7 @@ function combineDashboardSummaries(results, selectedIds) {
           ...inv,
           current_value: 0,
           invested_amount: 0,
+          realized_gain: 0,
           profit_loss: 0,
           day_change: 0,
           total_units: 0,
@@ -66,6 +71,7 @@ function combineDashboardSummaries(results, selectedIds) {
       const target = mergedInvestments.get(inv.id);
       target.current_value += Number(inv.current_value) || 0;
       target.invested_amount += Number(inv.invested_amount) || 0;
+      target.realized_gain += Number(inv.realized_gain) || 0;
       target.profit_loss += Number(inv.profit_loss) || 0;
       target.day_change += Number(inv.day_change) || 0;
       target.total_units += Number(inv.total_units) || 0;
@@ -340,6 +346,8 @@ export default function Dashboard() {
   const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses } = data;
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
+  const totalRealizedCashflows = investments.reduce((sum, inv) => sum + (Number(inv.realized_gain) || 0), 0);
+  const realizedAfterExpenses = totalRealizedCashflows - (totalExpenses || 0);
   const formatINRExact = (amount) => {
     if (amount == null || Number.isNaN(Number(amount))) return '₹0';
     const value = Number(amount);
@@ -383,15 +391,27 @@ export default function Dashboard() {
     });
   };
 
-  const sortColumns = [
-    { key: 'name', label: 'Name' },
-    { key: 'price', label: 'Last Price', end: true },
-    { key: 'dayChange', label: '1 Day Change', end: true },
-    { key: 'totalCost', label: 'Total Cost', end: true },
-    { key: 'currentValue', label: 'Current Value', end: true },
-    { key: 'portfolioPct', label: '% Portfolio', end: true },
-    { key: 'totalReturn', label: 'Total Return', end: true },
+  const baseSortColumns = [
+    { key: 'name', label: 'Name', subLabel: 'Folios / Identifier' },
+    { key: 'price', label: 'Last Price', subLabel: 'As of Date', end: true },
+    { key: 'dayChange', label: '1 Day Change', subLabel: '% Change', end: true },
+    { key: 'totalCost', label: 'Total Cost', subLabel: 'Avg Cost / Unit', end: true },
+    { key: 'currentValue', label: 'Current Value', subLabel: 'Units Held', end: true },
+    { key: 'portfolioPct', label: '% Portfolio', subLabel: 'Weight', end: true },
+    { key: 'totalReturn', label: 'Total Return', subLabel: 'Return %', end: true },
   ];
+
+  const getSortColumnsForType = (type) => {
+    if (!INTEREST_RATE_ASSET_TYPES.has(type)) return baseSortColumns;
+    return baseSortColumns.map((col) => {
+      if (col.key !== 'price') return col;
+      return {
+        ...col,
+        label: 'Interest Rate',
+        subLabel: 'As Of Date',
+      };
+    });
+  };
 
   const handleAllocationClick = (event, type) => {
     event.preventDefault();
@@ -517,19 +537,19 @@ export default function Dashboard() {
 
       {/* Portfolio Summary Cards */}
       <Row className="g-3 mb-4">
-        <Col md={4}>
-          <Card className="shadow-sm">
+        <Col md={6} lg={3}>
+          <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
-                <Wallet size={16} /> CURRENT VALUE
+                <Wallet size={16} /> Current Value
               </div>
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINRExact(portfolio.total_value)}</div>
               <div className="text-muted small">{formatINRExact(portfolio.total_invested)} Invested</div>
             </Card.Body>
           </Card>
         </Col>
-        <Col md={4}>
-          <Card className="shadow-sm">
+        <Col md={6} lg={3}>
+          <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 {portfolio.day_change >= 0 ? (
@@ -537,7 +557,7 @@ export default function Dashboard() {
                 ) : (
                   <TrendingDown size={16} className="text-danger" />
                 )}
-                1 DAY CHANGE
+                1 Day Change
               </div>
               <div className={`fs-3 fw-bold ${profitColor(portfolio.day_change)}`}>
                 {formatINR(portfolio.day_change)}
@@ -548,11 +568,11 @@ export default function Dashboard() {
             </Card.Body>
           </Card>
         </Col>
-        <Col md={4}>
-          <Card className="shadow-sm">
+        <Col md={6} lg={3}>
+          <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
-                <PiggyBank size={16} /> NET RETURNS
+                <PiggyBank size={16} /> Total P&L
               </div>
               <div className={`fw-bold ${profitColor(netProfitLoss)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
                 {netProfitLoss >= 0 ? '+' : ''}{formatINRExact(netProfitLoss)}
@@ -561,6 +581,21 @@ export default function Dashboard() {
                 <span>Abs: {formatPct(netReturnPct)}</span>
                 <span className="mx-2 text-muted">|</span>
                 <span>XIRR: {portfolio.xirr_pct == null ? 'N/A' : formatPct(portfolio.xirr_pct)}</span>
+              </div>
+            </Card.Body>
+          </Card>
+        </Col>
+        <Col md={6} lg={3}>
+          <Card className="shadow-sm h-100">
+            <Card.Body className="py-3">
+              <div className="d-flex align-items-center gap-2 text-muted small mb-1">
+                <PiggyBank size={16} /> Realized Cashflows
+              </div>
+              <div className={`fw-bold ${profitColor(realizedAfterExpenses)}`} style={{ fontSize: '1.55rem', lineHeight: 1.1 }}>
+                {realizedAfterExpenses >= 0 ? '+' : ''}{formatINRExact(realizedAfterExpenses)}
+              </div>
+              <div className="text-muted small">
+                Sell, withdrawal, dividend, interest (net)
               </div>
             </Card.Body>
           </Card>
@@ -603,7 +638,7 @@ export default function Dashboard() {
         <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
           <Card.Header className="bg-white d-flex justify-content-between align-items-center">
             <h2 className="h6 fw-semibold mb-0" title={ASSET_TYPE_FULL_NAMES[type]}>
-              {ASSET_TYPE_LABELS[type]} ({info.investments.length})
+              {(ASSET_TYPE_FULL_NAMES[type] || ASSET_TYPE_LABELS[type])} ({info.investments.length})
             </h2>
             <div className="d-flex align-items-center gap-2">
               <Link to={`/investments?type=${type}`} className="small text-decoration-none d-flex align-items-center gap-1">
@@ -615,20 +650,26 @@ export default function Dashboard() {
             <Table hover size="sm" className="mb-0 small">
               <thead className="table-light">
                 <tr>
-                  {sortColumns.map(col => {
+                  {getSortColumnsForType(type).map(col => {
                     const sc = sortConfigs[type];
                     return (
                       <th
                         key={col.key}
                         className={`px-3${col.end ? ' text-end' : ''}`}
-                        style={{ cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}
+                        style={{ cursor: 'pointer', userSelect: 'none' }}
                         onClick={() => handleSort(type, col.key)}
                       >
-                        {col.label}
+                        <div>{col.label}
                         {sc?.key === col.key && (
                           <span className="ms-1" style={{ fontSize: '0.6rem' }}>
                             {sc.direction === 'desc' ? '▼' : '▲'}
                           </span>
+                        )}
+                        </div>
+                        {col.subLabel && (
+                          <div className="text-muted fw-normal" style={{ fontSize: '0.68rem', lineHeight: 1.15 }}>
+                            {col.subLabel}
+                          </div>
                         )}
                       </th>
                     );
@@ -651,8 +692,19 @@ export default function Dashboard() {
                       </div>
                     </td>
                     <td className="px-3 text-end">
-                      <div className="fw-medium">{formatNumber(inv.price_per_unit, 2)}</div>
-                      <div className="text-muted" style={{ fontSize: '0.7rem' }}>{formatDate(inv.date)}</div>
+                      {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type) ? (
+                        <>
+                          <div className="fw-medium">
+                            {Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-'}
+                          </div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>{formatDate(inv.date)}</div>
+                        </>
+                      ) : (
+                        <>
+                          <div className="fw-medium">{formatNumber(inv.price_per_unit, 2)}</div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>{formatDate(inv.date)}</div>
+                        </>
+                      )}
                     </td>
                     <td className="px-3 text-end">
                       <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>

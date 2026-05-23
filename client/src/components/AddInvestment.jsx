@@ -2355,7 +2355,7 @@ export default function AddInvestment() {
                   {/* Scheme Name + Folio */}
                   <Row className="g-3 mb-3">
                     <Col md={8}>
-                      <Form.Label className="small text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>Scheme Name</Form.Label>
+                      <Form.Label className="small text-muted" style={{ fontSize: '0.7rem' }}>Scheme Name</Form.Label>
                       <div className="position-relative">
                         <div className="d-flex gap-2">
                           <div className="position-relative flex-grow-1">
@@ -2397,7 +2397,7 @@ export default function AddInvestment() {
                       </div>
                     </Col>
                     <Col md={4}>
-                      <Form.Label className="small text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>Folio No.</Form.Label>
+                      <Form.Label className="small text-muted" style={{ fontSize: '0.7rem' }}>Folio No.</Form.Label>
                       <Form.Control
                         size="sm"
                         type="text"
@@ -2411,7 +2411,7 @@ export default function AddInvestment() {
                   {/* Date + Amount */}
                   <Row className="g-3 mb-3">
                     <Col md={6}>
-                      <Form.Label className="small text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>Date of Investment</Form.Label>
+                      <Form.Label className="small text-muted" style={{ fontSize: '0.7rem' }}>Date of Investment</Form.Label>
                       <Form.Control
                         size="sm"
                         type="date"
@@ -2420,7 +2420,7 @@ export default function AddInvestment() {
                       />
                     </Col>
                     <Col md={6}>
-                      <Form.Label className="small text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>
+                      <Form.Label className="small text-muted" style={{ fontSize: '0.7rem' }}>
                         {mfAmountMode === 'rupees' ? 'Amount in \u20b9' : 'Units'}
                       </Form.Label>
                       <Form.Control
@@ -2454,7 +2454,7 @@ export default function AddInvestment() {
                   {/* NAV + Broker */}
                   <Row className="g-3 mb-3">
                     <Col md={6}>
-                      <Form.Label className="small text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>NAV (Price)</Form.Label>
+                      <Form.Label className="small text-muted" style={{ fontSize: '0.7rem' }}>NAV (Price)</Form.Label>
                       <Form.Control
                         size="sm"
                         type="number"
@@ -2465,7 +2465,7 @@ export default function AddInvestment() {
                       />
                     </Col>
                     <Col md={6}>
-                      <Form.Label className="small text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>Broker / Platform</Form.Label>
+                      <Form.Label className="small text-muted" style={{ fontSize: '0.7rem' }}>Broker / Platform</Form.Label>
                       <Form.Select
                         size="sm"
                         value={mfBroker}
@@ -2490,7 +2490,7 @@ export default function AddInvestment() {
                   {/* Notes */}
                   <Row className="g-3 mb-3">
                     <Col md={12}>
-                      <Form.Label className="small text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>Notes / Remarks</Form.Label>
+                      <Form.Label className="small text-muted" style={{ fontSize: '0.7rem' }}>Notes / Remarks</Form.Label>
                       <Form.Control
                         size="sm"
                         type="text"
@@ -3452,11 +3452,11 @@ function CASHoldingTable({ title, emoji, items, selected, setSelected, open, tog
                     />
                   </th>
                   {columns.map((col, i) => (
-                    <th key={i} className="px-2 py-1 text-muted text-uppercase" style={{ fontSize: '0.65rem' }}>
+                    <th key={i} className="px-2 py-1 text-muted" style={{ fontSize: '0.65rem' }}>
                       {col}
                     </th>
                   ))}
-                  <th className="px-2 py-1 text-muted text-uppercase" style={{ fontSize: '0.65rem' }}>Status</th>
+                  <th className="px-2 py-1 text-muted" style={{ fontSize: '0.65rem' }}>Status</th>
                 </tr>
               </thead>
               <tbody>

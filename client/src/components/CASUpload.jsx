@@ -314,11 +314,11 @@ function HoldingSection({ title, emoji, items, selected, setSelected, open, togg
                     />
                   </th>
                   {columns.map((col, i) => (
-                    <th key={i} className="px-3 py-2 text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>
+                    <th key={i} className="px-3 py-2 text-muted" style={{ fontSize: '0.7rem' }}>
                       {col}
                     </th>
                   ))}
-                  <th className="px-3 py-2 text-muted text-uppercase" style={{ fontSize: '0.7rem' }}>Status</th>
+                  <th className="px-3 py-2 text-muted" style={{ fontSize: '0.7rem' }}>Status</th>
                 </tr>
               </thead>
               <tbody>
