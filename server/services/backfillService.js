@@ -6,6 +6,7 @@ const {
   calculateSmallSavingsInterestPreview,
   calculateSmallSavingsValueAsOfDate,
 } = require('./pfInterestCalculator');
+const { getSeries, upsertPriceSeries } = require('./marketPriceCache');
 const { updateAssetTypeDaily, updatePortfolioDaily } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
 const { toIsoDate, todayIso } = require('./dateUtils');
@@ -32,6 +33,10 @@ function addDays(dateIso, days) {
   const d = new Date(`${dateIso}T00:00:00.000Z`);
   d.setUTCDate(d.getUTCDate() + Number(days || 0));
   return d.toISOString().split('T')[0];
+}
+
+function inferStockInstrumentType(symbol) {
+  return /\.(NS|BO)$/i.test(String(symbol || '')) ? 'INDIAN_STOCK' : 'FOREIGN_STOCK';
 }
 
 const AGGREGATE_RESUME_KEY = 'backfill_aggregate_resume_v1';
@@ -110,6 +115,21 @@ function nearestOnOrBefore(seriesMap, date) {
 }
 
 function fetchStockSeries(symbol, startDate, endDate) {
+  const instrumentType = inferStockInstrumentType(symbol);
+  const cacheStart = addDays(startDate, -7);
+  const cacheRows = getSeries(instrumentType, symbol, cacheStart, endDate);
+  const cached = new Map();
+  for (const row of cacheRows) {
+    if (row.close != null) cached.set(row.date, Number(row.close));
+  }
+
+  if (cached.size > 0) {
+    const latestCached = Array.from(cached.keys()).sort().pop();
+    if (latestCached && latestCached >= addDays(endDate, -1)) {
+      return Promise.resolve(cached);
+    }
+  }
+
   const from = new Date(`${startDate}T00:00:00.000Z`);
   from.setUTCDate(from.getUTCDate() - 7);
   const to = new Date(`${endDate}T00:00:00.000Z`);
@@ -134,11 +154,16 @@ function fetchStockSeries(symbol, startDate, endDate) {
           const timestamps = result.timestamp || [];
           const closes = result.indicators?.quote?.[0]?.close || [];
           const series = new Map();
+          const rowsForCache = [];
           for (let i = 0; i < timestamps.length; i += 1) {
             const close = closes[i];
             if (close == null) continue;
             const d = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
             series.set(d, Number(close));
+            rowsForCache.push({ date: d, close: Number(close), source: 'YAHOO' });
+          }
+          if (rowsForCache.length > 0) {
+            upsertPriceSeries(instrumentType, symbol, rowsForCache, 'YAHOO');
           }
           resolve(series);
         } catch (e) {
@@ -151,12 +176,10 @@ function fetchStockSeries(symbol, startDate, endDate) {
 }
 
 function getStoredPriceOnOrBefore(db, investmentId, portfolioId, date) {
-  const sql = portfolioId == null
-    ? 'SELECT date, price_per_unit FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL AND date <= ? ORDER BY date DESC LIMIT 1'
-    : 'SELECT date, price_per_unit FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date <= ? ORDER BY date DESC LIMIT 1';
-  const row = portfolioId == null
-    ? db.prepare(sql).get(investmentId, date)
-    : db.prepare(sql).get(investmentId, portfolioId, date);
+  if (portfolioId == null) return null;
+  const row = db.prepare(
+    'SELECT date, price_per_unit FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date <= ? ORDER BY date DESC LIMIT 1'
+  ).get(investmentId, portfolioId, date);
   return row ? { price: Number(row.price_per_unit || 0), source: row.date === date ? 'LIVE' : 'LOCF' } : null;
 }
 
@@ -195,8 +218,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     if (!cache.sgb.has(symbol)) {
       try {
         const { getSGBHistoricalPrices } = require('./sgbBhavcopy');
-        // Use cache.rangeStart/rangeEnd if available, else date
-        const from = cache.rangeStart || date;
+        const from = cache.sgbRangeBySymbol?.get(symbol) || cache.rangeStart || date;
         const to = cache.rangeEnd || date;
         logBackfillInfo(`[SGB][Bhavcopy] Fetching ${symbol} from ${from} to ${to} (this may take several minutes)`);
         const hist = await getSGBHistoricalPrices(symbol, from, to);
@@ -364,6 +386,9 @@ function getProvidentValue(db, inv, date, portfolioId) {
 }
 
 function upsertDailyRow(db, row, statements = null) {
+  // Only write portfolio-scoped rows (portfolio_id NOT NULL)
+  if (row.portfolio_id == null) return;
+
   const upsertScoped = statements?.upsertScoped || db.prepare(`
     INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -379,30 +404,6 @@ function upsertDailyRow(db, row, statements = null) {
       day_change = excluded.day_change,
       day_change_pct = excluded.day_change_pct
   `);
-  const deleteCombined = statements?.deleteCombined || db.prepare('DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL AND date = ?');
-  const insertCombined = statements?.insertCombined || db.prepare(`
-    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
-    VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  if (row.portfolio_id == null) {
-    deleteCombined.run(row.investment_id, row.date);
-    insertCombined.run(
-      row.investment_id,
-      row.date,
-      row.price_per_unit,
-      row.total_units,
-      row.current_value,
-      row.invested_amount,
-      row.realized_gain,
-      row.profit_loss,
-      row.profit_loss_pct,
-      row.price_source,
-      row.day_change,
-      row.day_change_pct
-    );
-    return;
-  }
 
   upsertScoped.run(
     row.investment_id,
@@ -471,6 +472,9 @@ function computeNetFlowForDate(db, inv, date, portfolioId, statements = null) {
 }
 
 async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache, onProgress = null) {
+    // Only handle portfolio-scoped rows (portfolio_id NOT NULL)
+    if (portfolioId == null) return 0;
+
     const dailyStatements = {
       upsertScoped: db.prepare(`
         INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
@@ -487,11 +491,6 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
           day_change = excluded.day_change,
           day_change_pct = excluded.day_change_pct
       `),
-      deleteCombined: db.prepare('DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL AND date = ?'),
-      insertCombined: db.prepare(`
-        INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
-        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `),
     };
 
   const dates = eachDate(fromDate, toDate);
@@ -506,10 +505,9 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   `).get(...baseParams, toDate);
   const latestTxnDate = latestTxnDateRow?.latest_date || null;
 
-  const deleteSql = portfolioId != null
-    ? 'DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date >= ? AND date <= ?'
-    : 'DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL AND date >= ? AND date <= ?';
-  const deleteParams = portfolioId != null ? [inv.id, portfolioId, fromDate, toDate] : [inv.id, fromDate, toDate];
+  // Only delete portfolio-scoped rows
+  const deleteSql = 'DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date >= ? AND date <= ?';
+  const deleteParams = [inv.id, portfolioId, fromDate, toDate];
   db.prepare(deleteSql).run(...deleteParams);
 
   const getUnits = db.prepare(`
@@ -527,9 +525,10 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     WHERE investment_id = ?${portfolioFilter} AND transaction_date <= ?
       AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','ESPP_CONTRIBUTION')
   `);
-  const getPrev = db.prepare(portfolioId != null
-    ? 'SELECT current_value FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
-    : 'SELECT current_value FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL AND date < ? ORDER BY date DESC LIMIT 1');
+  // Only query portfolio-scoped rows
+  const getPrev = db.prepare(
+    'SELECT current_value FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
+  );
   const getNetFlow = db.prepare(`
     SELECT COALESCE(SUM(CASE
       WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
@@ -553,6 +552,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   let lastNonZeroDate = null;
   let exitDate = null;
   const dayStride = progressLogStride(dates.length, 20);
+  const isProvidentAsset = inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY';
   for (const date of dates) {
     const unitsRow = getUnits.get(...baseParams, date);
     const units = Number(unitsRow?.total || 0);
@@ -560,7 +560,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
 
     // Stop writing trailing zero-unit rows after exit for unit-based assets.
     // NPS must continue through runDate so full dirty windows are rebuilt.
-    if (latestTxnDate && date > latestTxnDate && units <= 0 && inv.asset_type !== 'NPS') {
+    if (latestTxnDate && date > latestTxnDate && units <= 0 && inv.asset_type !== 'NPS' && !isProvidentAsset) {
       break;
     }
 
@@ -570,7 +570,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     let currentValue = 0;
     let totalUnits = units;
 
-    if (inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY') {
+    if (isProvidentAsset) {
       currentValue = getProvidentValue(db, inv, date, portfolioId);
       totalUnits = 1;
       if (!price) {
@@ -605,9 +605,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       exitDate = date;
     }
 
-    const prev = portfolioId != null
-      ? getPrev.get(inv.id, portfolioId, date)
-      : getPrev.get(inv.id, date);
+    // Query portfolio-scoped rows
+    const prev = getPrev.get(inv.id, portfolioId, date);
     const prevValue = Number(prev?.current_value || 0);
     const netFlow = computeNetFlowForDate(db, inv, date, portfolioId, {
       getNetFlow,
@@ -621,7 +620,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       portfolio_id: portfolioId,
       date,
       price_per_unit: round2(price),
-      total_units: inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY'
+      total_units: isProvidentAsset
         ? 1
         : Math.round(units * 1000) / 1000,
       current_value: round2(currentValue),
@@ -954,33 +953,54 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
   };
 }
 
-function normalizeScopesForRun(scopes, runDate) {
+function normalizeScopesForRun(db, scopes, runDate) {
   const eligible = (scopes || []).filter((s) => String(s.dirty_from_date) <= runDate);
   const grouped = new Map();
+  const portfolioIdsByInvestment = new Map();
 
-  for (const s of eligible) {
-    const invId = s.investment_id == null ? 'null' : String(s.investment_id);
-    const pid = s.portfolio_id == null ? 'null' : String(s.portfolio_id);
+  const addScope = (investmentId, portfolioId, dirtyFromDate) => {
+    const invId = investmentId == null ? 'null' : String(investmentId);
+    const pid = String(portfolioId);
     const key = `${invId}:${pid}`;
     const existing = grouped.get(key);
-    if (!existing || s.dirty_from_date < existing.dirty_from_date) {
+    if (!existing || dirtyFromDate < existing.dirty_from_date) {
       grouped.set(key, {
-        investment_id: s.investment_id,
-        portfolio_id: s.portfolio_id,
-        dirty_from_date: s.dirty_from_date,
+        investment_id: investmentId,
+        portfolio_id: portfolioId,
+        dirty_from_date: dirtyFromDate,
       });
     }
+  };
 
-    if (s.investment_id != null && s.portfolio_id != null) {
-      const combinedKey = `${invId}:null`;
-      const combinedExisting = grouped.get(combinedKey);
-      if (!combinedExisting || s.dirty_from_date < combinedExisting.dirty_from_date) {
-        grouped.set(combinedKey, {
-          investment_id: s.investment_id,
-          portfolio_id: null,
-          dirty_from_date: s.dirty_from_date,
-        });
-      }
+  for (const s of eligible) {
+    if (s.investment_id == null) continue;
+
+    if (s.portfolio_id != null) {
+      addScope(s.investment_id, s.portfolio_id, s.dirty_from_date);
+      continue;
+    }
+
+    // Legacy/global scopes can still be present (for example scheduler catch-up).
+    // Expand them to concrete transaction portfolios so recompute is not skipped.
+    if (!portfolioIdsByInvestment.has(s.investment_id)) {
+      const portfolioRows = db.prepare(`
+        SELECT DISTINCT portfolio_id
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id IS NOT NULL
+          AND date(transaction_date) <= ?
+      `).all(s.investment_id, runDate);
+      portfolioIdsByInvestment.set(
+        s.investment_id,
+        portfolioRows
+          .map((row) => row.portfolio_id)
+          .filter((pid) => pid != null)
+      );
+    }
+
+    const portfolioIds = portfolioIdsByInvestment.get(s.investment_id) || [];
+    for (const pid of portfolioIds) {
+      addScope(s.investment_id, pid, s.dirty_from_date);
     }
   }
 
@@ -1061,21 +1081,76 @@ function getImpactedInvestmentStartDates(db, scopeList, runDate) {
   return startByInvestment;
 }
 
-async function preloadStockHistoryForRun(invMap, scopeList, runDate, startByInvestment, cache) {
+function getMarketHistoryFetchStartDates(db, scopeList, invMap, runDate) {
+  const marketInvIds = Array.from(new Set(
+    scopeList
+      .map((s) => s.investment_id)
+      .filter((id) => {
+        const inv = invMap.get(id);
+        return inv && ['INDIAN_STOCK', 'FOREIGN_STOCK', 'SGB'].includes(inv.asset_type);
+      })
+  ));
+
+  const startByInvestment = new Map();
+  if (!marketInvIds.length) return startByInvestment;
+
+  const placeholders = marketInvIds.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT investment_id, MIN(date(transaction_date)) AS min_txn_date
+    FROM transactions
+    WHERE investment_id IN (${placeholders})
+    GROUP BY investment_id
+  `).all(...marketInvIds);
+
+  const minScopeDateByInvestment = new Map();
+  for (const s of scopeList) {
+    const inv = invMap.get(s.investment_id);
+    if (!inv || !['INDIAN_STOCK', 'FOREIGN_STOCK', 'SGB'].includes(inv.asset_type)) continue;
+    const current = minScopeDateByInvestment.get(s.investment_id);
+    if (!current || s.dirty_from_date < current) {
+      minScopeDateByInvestment.set(s.investment_id, s.dirty_from_date);
+    }
+  }
+
+  for (const invId of marketInvIds) {
+    const row = rows.find((r) => r.investment_id === invId);
+    const minTxnDate = row?.min_txn_date || null;
+    const minDirtyDate = minScopeDateByInvestment.get(invId) || null;
+
+    const txnStart = minTxnDate ? addDays(minTxnDate, -1) : null;
+    const dirtyStart = minDirtyDate ? addDays(minDirtyDate, -1) : null;
+
+    let startDate = null;
+    if (txnStart && dirtyStart) {
+      startDate = txnStart >= dirtyStart ? txnStart : dirtyStart;
+    } else {
+      startDate = txnStart || dirtyStart || runDate;
+    }
+
+    startByInvestment.set(invId, startDate);
+  }
+
+  return startByInvestment;
+}
+
+async function preloadStockHistoryForRun(invMap, scopeList, runDate, fetchStartByInvestment, cache) {
   const symbolStart = new Map();
+  const sgbSymbolStart = new Map();
   for (const s of scopeList) {
     const inv = invMap.get(s.investment_id);
     if (!inv) continue;
     if (!['INDIAN_STOCK', 'FOREIGN_STOCK', 'SGB'].includes(inv.asset_type)) continue;
     if (!inv.ticker_symbol) continue;
-    const startDate = startByInvestment.get(inv.id) || s.dirty_from_date;
-    const existing = symbolStart.get(inv.ticker_symbol);
+    const startDate = fetchStartByInvestment.get(inv.id) || s.dirty_from_date;
+    const targetMap = inv.asset_type === 'SGB' ? sgbSymbolStart : symbolStart;
+    const existing = targetMap.get(inv.ticker_symbol);
     if (!existing || startDate < existing) {
-      symbolStart.set(inv.ticker_symbol, startDate);
+      targetMap.set(inv.ticker_symbol, startDate);
     }
   }
 
   cache.stockRangeBySymbol = symbolStart;
+  cache.sgbRangeBySymbol = sgbSymbolStart;
   const totalSymbols = symbolStart.size;
   if (totalSymbols > 0) {
     logBackfillInfo(`[Backfill][Step-1] Prefetching historical prices for ${totalSymbols} symbol(s)...`);
@@ -1400,7 +1475,7 @@ async function updateDailyValues(db, options = {}) {
  */
 async function backfillDirtyScopes(db, scopes, options = {}) {
   const runDate = clampEndDateToToday(options.runDate || todayIso());
-  const { eligible, scopeList } = normalizeScopesForRun(scopes, runDate);
+  const { eligible, scopeList } = normalizeScopesForRun(db, scopes, runDate);
 
   logBackfillInfo(`[Backfill] Eligible scopes for ${runDate}: ${eligible.length}/${(scopes || []).length}`);
 
@@ -1422,6 +1497,7 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
   }
 
   const startByInvestment = getImpactedInvestmentStartDates(db, scopeList, runDate);
+  const fetchStartByInvestment = getMarketHistoryFetchStartDates(db, scopeList, invMap, runDate);
   const cache = {
     mf: new Map(),
     nps: new Map(),
@@ -1430,13 +1506,13 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
     actions: new Map(),
     stockRangeBySymbol: new Map(),
     allowNetworkFallback: false,
-    rangeStart: Array.from(startByInvestment.values()).reduce((m, s) => (m == null || s < m ? s : m), null)
+    rangeStart: Array.from(fetchStartByInvestment.values()).reduce((m, s) => (m == null || s < m ? s : m), null)
       || scopeList.reduce((m, s) => (m == null || s.dirty_from_date < m ? s.dirty_from_date : m), null)
       || runDate,
     rangeEnd: runDate,
   };
 
-  await preloadStockHistoryForRun(invMap, scopeList, runDate, startByInvestment, cache);
+  await preloadStockHistoryForRun(invMap, scopeList, runDate, fetchStartByInvestment, cache);
 
   const step1Result = await processAutoBackfillCAEntries(db, {
     scopeList,
@@ -1525,22 +1601,51 @@ async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
       return;
     }
 
-    // Insert or update daily values in the database
+    const portfolioIds = db.prepare(`
+      SELECT DISTINCT portfolio_id
+      FROM transactions
+      WHERE investment_id = ?
+        AND portfolio_id IS NOT NULL
+        AND date(transaction_date) <= ?
+    `).all(investmentId, to).map((r) => r.portfolio_id);
+
+    if (!portfolioIds.length) {
+      logBackfillInfo(`[NPS Backfill] Skipping ${investmentId}: no portfolio-scoped transactions found`);
+      return;
+    }
+
+    // Insert or update daily values for each concrete portfolio scope.
     const upsertStmt = db.prepare(`
-      INSERT INTO daily_values (investment_id, date, price_per_unit, price_source)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(investment_id, date) DO UPDATE SET
+      INSERT INTO daily_values (
+        investment_id,
+        portfolio_id,
+        date,
+        price_per_unit,
+        total_units,
+        current_value,
+        invested_amount,
+        realized_gain,
+        profit_loss,
+        profit_loss_pct,
+        price_source,
+        day_change,
+        day_change_pct
+      )
+      VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, 0, 0)
+      ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
         price_per_unit = excluded.price_per_unit,
         price_source = excluded.price_source
     `);
 
     db.transaction(() => {
       for (const { date, nav } of filtered) {
-        upsertStmt.run(investmentId, date, nav, 'BACKFILL');
+        for (const pid of portfolioIds) {
+          upsertStmt.run(investmentId, pid, date, nav, 'BACKFILL');
+        }
       }
     })();
 
-    logBackfillInfo(`[NPS Backfill] Successfully backfilled ${filtered.length} records for investment ${investmentId}`);
+    logBackfillInfo(`[NPS Backfill] Successfully backfilled ${filtered.length * portfolioIds.length} rows for investment ${investmentId}`);
   } catch (error) {
     logBackfillError(`[NPS Backfill] Failed to backfill for investment ${investmentId}: ${error.message}`);
   }

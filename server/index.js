@@ -1,21 +1,26 @@
+const { applyEnvDefaults } = require('./config/envDefaults');
+applyEnvDefaults();
+
 const express = require('express');
 const cors = require('cors');
 const session = require('express-session');
 const path = require('path');
-const { getDb, initializeDb, ensureNPSFundCodeMigration } = require('./db/schema');
+const { getDb, initializeDb, ensureNPSFundCodeMigration, ensureRemoveCombinedAggregatesMigration } = require('./db/schema');
 const { startScheduler } = require('./services/scheduler');
 const { requireAuth } = require('./middleware/auth');
 const { logAppInfo, logAppError, getUnifiedLogPathForDate } = require('./services/appLogger');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const isProduction = process.env.NODE_ENV === 'production';
+const appMode = String(process.env.APP_MODE || 'production').toLowerCase();
+const isProduction = appMode !== 'dev' && appMode !== 'development' && appMode !== 'test';
 const schedulerEnabled = process.env.ENABLE_SCHEDULER === 'true';
 
 // Initialize database
 const db = getDb();
 initializeDb(db);
 ensureNPSFundCodeMigration(db);
+ensureRemoveCombinedAggregatesMigration(db);
 
 // Middleware
 app.use(cors());
@@ -54,9 +59,13 @@ app.use('/api/ppf', require('./routes/ppf')(db));
 app.use('/api/pf', require('./routes/pf')(db));
 app.use('/api/expenses', require('./routes/expenses')(db));
 app.use('/api/tax', require('./routes/tax')(db));
+// Compliance API (gap detection and repair tracking)
+app.use('/api/compliance', require('./routes/compliance'));
+// Holidays API (no auth required for listing holidays/weekends)
+app.use('/api/holidays', require('./routes/holidays'));
 
-// Serve static files in production
-if (process.env.NODE_ENV === 'production') {
+// Serve static files in production mode
+if (isProduction) {
   app.use(express.static(path.join(__dirname, '..', 'client', 'dist')));
   app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, '..', 'client', 'dist', 'index.html'));
@@ -79,7 +88,7 @@ app.listen(PORT, () => {
   console.log(`Investment Tracker API running on http://localhost:${PORT}`);
   logAppInfo('Investment Tracker API started', {
     port: Number(PORT),
-    nodeEnv: process.env.NODE_ENV || 'development',
+    appMode,
     schedulerEnabled,
     logFile: getUnifiedLogPathForDate(),
   });

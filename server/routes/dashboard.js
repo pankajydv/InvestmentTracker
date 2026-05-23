@@ -87,13 +87,20 @@ function diffIsoDays(startIso, endIso) {
   return Math.max(Math.floor((endMs - startMs) / 86400000), 1);
 }
 
-function parseMarketHolidaySet(raw) {
-  if (!raw) return new Set();
+function loadMarketHolidaySet(db, runDate) {
   try {
-    const parsed = JSON.parse(String(raw));
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d))).map(String));
-  } catch {
+    const hasTable = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_holidays'").get();
+    if (!hasTable) return new Set();
+
+    const rows = runDate
+      ? db.prepare('SELECT date FROM market_holidays WHERE date <= ? ORDER BY date ASC').all(runDate)
+      : db.prepare('SELECT date FROM market_holidays ORDER BY date ASC').all();
+    return new Set(
+      rows
+        .map((row) => String(row.date || ''))
+        .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date))
+    );
+  } catch (_e) {
     return new Set();
   }
 }
@@ -126,9 +133,18 @@ module.exports = function (db) {
         'SELECT * FROM portfolio_daily WHERE portfolio_id = ? ORDER BY date DESC LIMIT 1'
       ).get(portfolio_id);
     } else {
-      latest = db.prepare(
-        'SELECT * FROM portfolio_daily WHERE portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
-      ).get();
+      // Aggregate from all portfolio-scoped rows for combined view
+      latest = db.prepare(`
+        SELECT
+          MAX(date) as date,
+          SUM(total_value) as total_value,
+          SUM(total_invested) as total_invested,
+          SUM(total_profit_loss) as total_profit_loss,
+          CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
+          SUM(day_change) as day_change,
+          CASE WHEN (SELECT SUM(total_value) FROM portfolio_daily pd2 WHERE pd2.date = (SELECT MAX(date) FROM portfolio_daily pd3 WHERE pd3.date < (SELECT MAX(date) FROM portfolio_daily))) > 0 THEN (SUM(day_change) / (SELECT SUM(total_value) FROM portfolio_daily pd2 WHERE pd2.date = (SELECT MAX(date) FROM portfolio_daily pd3 WHERE pd3.date < (SELECT MAX(date) FROM portfolio_daily)))) * 100 ELSE 0 END as day_change_pct
+        FROM portfolio_daily
+      `).get();
     }
 
     // Build WHERE clause for portfolio filter
@@ -144,40 +160,88 @@ module.exports = function (db) {
     // Build daily_values portfolio filter
     const dvPortfolioJoin = portfolio_id
       ? 'AND dv.portfolio_id = ?'
-      : 'AND dv.portfolio_id IS NULL';
+      : '';
     const dvPortfolioSub = portfolio_id
       ? 'AND portfolio_id = ?'
-      : 'AND portfolio_id IS NULL';
+      : '';
     const dvParams = portfolio_id ? [portfolio_id] : [];
 
     // Get individual investment summaries
-    const investments = db.prepare(`
-      SELECT
-        i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency,
-        i.isin_code, i.display_name,
-        dv.date,
-        COALESCE(dv.price_per_unit,
-          (SELECT price_per_unit FROM transactions WHERE investment_id = i.id AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1),
-          0) as price_per_unit,
-        (SELECT COALESCE(SUM(CASE
-          WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','SWITCH_IN','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_PURCHASE') THEN COALESCE(units,0)
-          WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(units,0)
-          ELSE 0 END), 0) FROM transactions WHERE investment_id = i.id) as total_units,
-        COALESCE(dv.current_value, 0) as current_value,
-        COALESCE(dv.invested_amount,
-          (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
-           WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_CONTRIBUTION'))) as invested_amount,
-        COALESCE(dv.profit_loss, 0) as profit_loss,
-        COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
-        COALESCE(dv.day_change, 0) as day_change,
-        COALESCE(dv.day_change_pct, 0) as day_change_pct
-      FROM investments i
-      LEFT JOIN daily_values dv ON i.id = dv.investment_id
-        ${dvPortfolioJoin}
-        AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id ${dvPortfolioSub})
-      WHERE 1=1${portfolioFilter}${soldFilter} AND i.exclude_from_tracking = 0
-      ORDER BY i.asset_type, i.name
-    `).all(...dvParams, ...dvParams, ...portfolioParams, ...soldParams);
+    if (portfolio_id) {
+      // Portfolio-scoped query: get latest daily_values for each investment in that portfolio
+      var investments = db.prepare(`
+        SELECT
+          i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency,
+          i.isin_code, i.display_name,
+          dv.date,
+          COALESCE(dv.price_per_unit,
+            (SELECT price_per_unit FROM transactions WHERE investment_id = i.id AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1),
+            0) as price_per_unit,
+          (SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','SWITCH_IN','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_PURCHASE') THEN COALESCE(units,0)
+            WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(units,0)
+            ELSE 0 END), 0) FROM transactions WHERE investment_id = i.id AND portfolio_id = ?) as total_units,
+          COALESCE(dv.current_value, 0) as current_value,
+          COALESCE(dv.invested_amount,
+            (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
+             WHERE investment_id = i.id AND portfolio_id = ? AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_CONTRIBUTION'))) as invested_amount,
+          COALESCE(dv.profit_loss, 0) as profit_loss,
+          COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
+          COALESCE(dv.day_change, 0) as day_change,
+          COALESCE(dv.day_change_pct, 0) as day_change_pct
+        FROM investments i
+        LEFT JOIN daily_values dv ON i.id = dv.investment_id AND dv.portfolio_id = ? AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+        WHERE 1=1 AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)${soldFilter} AND i.exclude_from_tracking = 0
+        ORDER BY i.asset_type, i.name
+      `).all(portfolio_id, portfolio_id, portfolio_id, portfolio_id, portfolio_id, ...soldParams);
+    } else {
+      // Combined view: aggregate latest daily_values for each investment across all portfolios
+      var investments = db.prepare(`
+        WITH latest_by_scope AS (
+          SELECT investment_id, portfolio_id, MAX(date) AS max_date
+          FROM daily_values
+          GROUP BY investment_id, portfolio_id
+        ),
+        latest_agg AS (
+          SELECT
+            dv.investment_id,
+            MAX(dv.date) AS date,
+            MAX(dv.price_per_unit) AS price_per_unit,
+            SUM(COALESCE(dv.current_value, 0)) AS current_value,
+            SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
+            SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
+            SUM(COALESCE(dv.day_change, 0)) AS day_change
+          FROM daily_values dv
+          INNER JOIN latest_by_scope lbs ON dv.investment_id = lbs.investment_id
+            AND dv.portfolio_id = lbs.portfolio_id
+            AND dv.date = lbs.max_date
+          GROUP BY dv.investment_id
+        )
+        SELECT
+          i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency,
+          i.isin_code, i.display_name,
+          la.date as date,
+          COALESCE(la.price_per_unit,
+            (SELECT price_per_unit FROM transactions WHERE investment_id = i.id AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1),
+            0) as price_per_unit,
+          (SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','SWITCH_IN','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_PURCHASE') THEN COALESCE(units,0)
+            WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(units,0)
+            ELSE 0 END), 0) FROM transactions WHERE investment_id = i.id) as total_units,
+          COALESCE(la.current_value, 0) as current_value,
+          COALESCE(la.invested_amount,
+            (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
+             WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_CONTRIBUTION'))) as invested_amount,
+          COALESCE(la.profit_loss, 0) as profit_loss,
+          CASE WHEN COALESCE(la.invested_amount, 0) > 0 THEN (COALESCE(la.profit_loss, 0) / COALESCE(la.invested_amount, 0)) * 100 ELSE 0 END as profit_loss_pct,
+          COALESCE(la.day_change, 0) as day_change,
+          0 as day_change_pct
+        FROM investments i
+        LEFT JOIN latest_agg la ON la.investment_id = i.id
+        WHERE 1=1${soldFilter} AND i.exclude_from_tracking = 0
+        ORDER BY i.asset_type, i.name
+      `).all(...soldParams);
+    }
 
     const oneDayDebugSummary = includeOneDayDebug
       ? {
@@ -196,58 +260,94 @@ module.exports = function (db) {
         }
       : null;
 
-    const marketHolidayConfig = db.prepare(`
-      SELECT value
-      FROM config
-      WHERE key IN ('market_holidays_nse', 'market_holidays')
-      ORDER BY CASE key WHEN 'market_holidays_nse' THEN 0 ELSE 1 END
-      LIMIT 1
-    `).get();
-    const marketHolidaySet = parseMarketHolidaySet(marketHolidayConfig?.value);
+    const marketHolidaySet = loadMarketHolidaySet(db, latest?.date || null);
 
-    const latestDvForInvestment = db.prepare(`
-      SELECT date, current_value, price_source
-      FROM daily_values
-      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL'}
-      ORDER BY date DESC
-      LIMIT 1
-    `);
-    const latestMarketDvForInvestment = db.prepare(`
-      SELECT date, current_value, price_source
-      FROM daily_values
-      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL'}
-        AND COALESCE(price_source, '') NOT IN ('LOCF', 'NSE_BHAVCOPY_LOCF')
-      ORDER BY date DESC
-      LIMIT 90
-    `);
-    const previousDvForAnchorDate = db.prepare(`
-      SELECT date, current_value
-      FROM daily_values
-      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL'}
-        AND date < ?
-      ORDER BY date DESC
-      LIMIT 1
-    `);
-    const netFlowOnAnchorDate = db.prepare(`
-      SELECT COALESCE(SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
-        ELSE 0
-      END), 0) AS net_flow
-      FROM transactions
-      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : ''}
-        AND date(transaction_date) = ?
-    `);
-    const netFlowInRange = db.prepare(`
-      SELECT COALESCE(SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
-        ELSE 0
-      END), 0) AS net_flow
-      FROM transactions
-      WHERE investment_id = ? ${portfolio_id ? 'AND portfolio_id = ?' : ''}
-        AND date(transaction_date) > ?
-        AND date(transaction_date) <= ?
+    const latestDvForInvestment = portfolio_id
+      ? db.prepare(`
+          SELECT date, current_value, price_source
+          FROM daily_values
+          WHERE investment_id = ? AND portfolio_id = ?
+          ORDER BY date DESC
+          LIMIT 1
+        `)
+      : db.prepare(`
+          SELECT date, SUM(current_value) as current_value, MAX(price_source) as price_source
+          FROM daily_values
+          WHERE investment_id = ?
+          GROUP BY date
+          ORDER BY date DESC
+          LIMIT 1
+        `);
+    const latestMarketDvForInvestment = portfolio_id
+      ? db.prepare(`
+          SELECT date, current_value, price_source
+          FROM daily_values
+          WHERE investment_id = ? AND portfolio_id = ?
+            AND COALESCE(price_source, '') NOT IN ('LOCF', 'NSE_BHAVCOPY_LOCF')
+          ORDER BY date DESC
+          LIMIT 90
+        `)
+      : db.prepare(`
+          SELECT date, SUM(current_value) as current_value, MAX(price_source) as price_source
+          FROM daily_values
+          WHERE investment_id = ?
+            AND COALESCE(price_source, '') NOT IN ('LOCF', 'NSE_BHAVCOPY_LOCF')
+          GROUP BY date
+          ORDER BY date DESC
+          LIMIT 90
+        `);
+    const previousDvForAnchorDate = portfolio_id
+      ? db.prepare(`
+          SELECT date, current_value
+          FROM daily_values
+          WHERE investment_id = ? AND portfolio_id = ? AND date < ?
+          ORDER BY date DESC
+          LIMIT 1
+        `)
+      : db.prepare(`
+          SELECT date, SUM(current_value) as current_value
+          FROM daily_values
+          WHERE investment_id = ? AND date < ?
+          GROUP BY date
+          ORDER BY date DESC
+          LIMIT 1
+        `);
+    const netFlowOnAnchorDate = portfolio_id
+      ? db.prepare(`
+          SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+            ELSE 0
+          END), 0) AS net_flow
+          FROM transactions
+          WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
+        `)
+      : db.prepare(`
+          SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+            ELSE 0
+          END), 0) AS net_flow
+          FROM transactions
+          WHERE investment_id = ? AND date(transaction_date) = ?
+        `);
+    const netFlowInRange = portfolio_id
+      ? db.prepare(`
+          SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+            ELSE 0
+          END), 0) AS net_flow
+          FROM transactions
+          WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) > ? AND date(transaction_date) <= ?`)
+      : db.prepare(`
+          SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+            ELSE 0
+          END), 0) AS net_flow
+          FROM transactions
+          WHERE investment_id = ? AND date(transaction_date) > ? AND date(transaction_date) <= ?
     `);
 
     for (const inv of investments) {
@@ -426,7 +526,7 @@ module.exports = function (db) {
           'SELECT total_value FROM portfolio_daily WHERE portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
         ).get(portfolio_id, derivedPortfolio.date || '9999-12-31')
       : db.prepare(
-          'SELECT total_value FROM portfolio_daily WHERE portfolio_id IS NULL AND date < ? ORDER BY date DESC LIMIT 1'
+          'SELECT SUM(total_value) as total_value FROM portfolio_daily WHERE date = (SELECT MAX(date) FROM portfolio_daily WHERE date < ?)'
         ).get(derivedPortfolio.date || '9999-12-31');
     const previousPortfolioValue = Number(previousPortfolioSnapshot?.total_value || 0);
     derivedPortfolio.day_change_pct = previousPortfolioValue > 0
@@ -530,7 +630,6 @@ module.exports = function (db) {
   // ─── Performance over time periods ─────────────────────────────────────
   router.get('/performance', (req, res) => {
     const { period, from, to, portfolio_id, asset_type } = req.query;
-
     let startDate, endDate;
     const now = new Date();
     endDate = now.toISOString().split('T')[0];
@@ -563,39 +662,82 @@ module.exports = function (db) {
       `).all(portfolio_id, startDate, endDate);
     } else {
       portfolioData = db.prepare(`
-        SELECT * FROM portfolio_daily
-        WHERE portfolio_id IS NULL AND date BETWEEN ? AND ?
+        SELECT
+          MAX(date) as date,
+          SUM(total_value) as total_value,
+          SUM(total_invested) as total_invested,
+          SUM(total_profit_loss) as total_profit_loss,
+          CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
+          SUM(day_change) as day_change,
+          0 as day_change_pct
+        FROM portfolio_daily
+        WHERE date BETWEEN ? AND ?
+        GROUP BY date
         ORDER BY date ASC
       `).all(startDate, endDate);
     }
 
     // Per-investment performance (portfolio-scoped daily_values)
-    const dvFilter = portfolio_id ? 'AND dv.portfolio_id = ?' : 'AND dv.portfolio_id IS NULL';
-    const investmentFilter = portfolio_id ? ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)' : '';
-    const investmentParams = portfolio_id
-      ? [startDate, endDate, portfolio_id, portfolio_id]
-      : [startDate, endDate];
+    if (portfolio_id) {
+      var investmentData = db.prepare(`
+        SELECT dv.*, COALESCE(i.display_name, i.name) as name, i.asset_type
+        FROM daily_values dv
+        JOIN investments i ON dv.investment_id = i.id
+        WHERE dv.date BETWEEN ? AND ? AND dv.portfolio_id = ? AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)
+        ORDER BY dv.date ASC, i.name ASC
+      `).all(startDate, endDate, portfolio_id, portfolio_id);
+    } else {
+      var investmentData = db.prepare(`
+        SELECT
+          i.id as investment_id,
+          dv.date,
+          MAX(dv.price_per_unit) as price_per_unit,
+          SUM(dv.total_units) as total_units,
+          SUM(dv.current_value) as current_value,
+          SUM(dv.invested_amount) as invested_amount,
+          SUM(dv.realized_gain) as realized_gain,
+          SUM(dv.profit_loss) as profit_loss,
+          CASE WHEN SUM(dv.invested_amount) > 0 THEN (SUM(dv.profit_loss) / SUM(dv.invested_amount)) * 100 ELSE 0 END as profit_loss_pct,
+          MAX(dv.price_source) as price_source,
+          SUM(dv.day_change) as day_change,
+          0 as day_change_pct,
+          COALESCE(i.display_name, i.name) as name,
+          i.asset_type
+        FROM daily_values dv
+        JOIN investments i ON dv.investment_id = i.id
+        WHERE dv.date BETWEEN ? AND ?
+        GROUP BY i.id, dv.date
+        ORDER BY dv.date ASC, i.name ASC
+      `).all(startDate, endDate);
+    }
 
-    const investmentData = db.prepare(`
-      SELECT dv.*, COALESCE(i.display_name, i.name) as name, i.asset_type
-      FROM daily_values dv
-      JOIN investments i ON dv.investment_id = i.id
-      WHERE dv.date BETWEEN ? AND ? ${dvFilter}${investmentFilter}
-      ORDER BY dv.date ASC, i.name ASC
-    `).all(...investmentParams);
-
-    const typeFilterClause = asset_type ? 'AND atd.asset_type = ?' : '';
-    const typeParams = portfolio_id
-      ? [startDate, endDate, portfolio_id, ...(asset_type ? [asset_type] : [])]
-      : [startDate, endDate, ...(asset_type ? [asset_type] : [])];
-    const typeRows = db.prepare(`
-      SELECT atd.*
-      FROM asset_type_daily atd
-      WHERE atd.date BETWEEN ? AND ?
-        ${portfolio_id ? 'AND atd.portfolio_id = ?' : 'AND atd.portfolio_id IS NULL'}
-        ${typeFilterClause}
-      ORDER BY atd.date ASC, atd.asset_type ASC
-    `).all(...typeParams);
+    const typeFilterClause = asset_type ? 'AND asset_type = ?' : '';
+    if (portfolio_id) {
+      var typeRows = db.prepare(`
+        SELECT *
+        FROM asset_type_daily
+        WHERE date BETWEEN ? AND ? AND portfolio_id = ? ${typeFilterClause}
+        ORDER BY date ASC, asset_type ASC
+      `).all(startDate, endDate, portfolio_id, ...(asset_type ? [asset_type] : []));
+    } else {
+      var typeRows = db.prepare(`
+        SELECT
+          asset_type,
+          date,
+          SUM(total_value) as total_value,
+          SUM(total_invested) as total_invested,
+          SUM(total_profit_loss) as total_profit_loss,
+          SUM(total_realized_gain) as total_realized_gain,
+          SUM(total_unrealized_gain) as total_unrealized_gain,
+          CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
+          SUM(day_change) as day_change,
+          0 as day_change_pct
+        FROM asset_type_daily
+        WHERE date BETWEEN ? AND ? ${typeFilterClause}
+        GROUP BY asset_type, date
+        ORDER BY date ASC, asset_type ASC
+      `).all(startDate, endDate, ...(asset_type ? [asset_type] : []));
+    }
 
     const performanceByAssetType = {};
     for (const row of typeRows) {
@@ -663,15 +805,30 @@ module.exports = function (db) {
     }
 
     const rows = db.prepare(`
-      SELECT *
-      FROM asset_type_daily
-      WHERE asset_type = ?
-        ${portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL'}
-        AND date BETWEEN ? AND ?
-      ORDER BY date ASC
-    `).all(
-      ...(portfolio_id ? [asset_type, portfolio_id, startDate, endDate] : [asset_type, startDate, endDate])
-    );
+      ${portfolio_id
+        ? `SELECT *
+           FROM asset_type_daily
+           WHERE asset_type = ?
+             AND portfolio_id = ?
+             AND date BETWEEN ? AND ?
+           ORDER BY date ASC`
+        : `SELECT
+             asset_type,
+             date,
+             SUM(total_value) as total_value,
+             SUM(total_invested) as total_invested,
+             SUM(total_profit_loss) as total_profit_loss,
+             SUM(total_realized_gain) as total_realized_gain,
+             SUM(total_unrealized_gain) as total_unrealized_gain,
+             CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
+             SUM(day_change) as day_change,
+             0 as day_change_pct
+           FROM asset_type_daily
+           WHERE asset_type = ?
+             AND date BETWEEN ? AND ?
+           GROUP BY asset_type, date
+           ORDER BY date ASC`}
+    `).all(...(portfolio_id ? [asset_type, portfolio_id, startDate, endDate] : [asset_type, startDate, endDate]));
 
     return res.json({
       asset_type,
@@ -700,14 +857,31 @@ module.exports = function (db) {
       default: { const d = new Date(now); d.setFullYear(d.getFullYear() - 1); startDate = d.toISOString().split('T')[0]; }
     }
 
-    const dvPidFilter = portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL';
-    const dvPidParams = portfolio_id ? [portfolio_id] : [];
-
-    const data = db.prepare(`
-      SELECT * FROM daily_values
-      WHERE investment_id = ? ${dvPidFilter} AND date >= ?
-      ORDER BY date ASC
-    `).all(req.params.investmentId, ...dvPidParams, startDate);
+    const data = portfolio_id
+      ? db.prepare(`
+          SELECT * FROM daily_values
+          WHERE investment_id = ? AND portfolio_id = ? AND date >= ?
+          ORDER BY date ASC
+        `).all(req.params.investmentId, portfolio_id, startDate)
+      : db.prepare(`
+          SELECT
+            investment_id,
+            date,
+            MAX(price_per_unit) as price_per_unit,
+            SUM(total_units) as total_units,
+            SUM(current_value) as current_value,
+            SUM(invested_amount) as invested_amount,
+            SUM(realized_gain) as realized_gain,
+            SUM(profit_loss) as profit_loss,
+            CASE WHEN SUM(invested_amount) > 0 THEN (SUM(profit_loss) / SUM(invested_amount)) * 100 ELSE 0 END as profit_loss_pct,
+            MAX(price_source) as price_source,
+            SUM(day_change) as day_change,
+            0 as day_change_pct
+          FROM daily_values
+          WHERE investment_id = ? AND date >= ?
+          GROUP BY investment_id, date
+          ORDER BY date ASC
+        `).all(req.params.investmentId, startDate);
 
     res.json(data);
   });
@@ -716,25 +890,51 @@ module.exports = function (db) {
   router.get('/allocation', (req, res) => {
     const { portfolio_id } = req.query;
     const portfolioFilter = portfolio_id ? ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)' : '';
-    const dvJoin = portfolio_id ? 'AND dv.portfolio_id = ?' : 'AND dv.portfolio_id IS NULL';
-    const dvSub = portfolio_id ? 'AND portfolio_id = ?' : 'AND portfolio_id IS NULL';
-    const dvParams = portfolio_id ? [portfolio_id] : [];
     const pfParams = portfolio_id ? [portfolio_id] : [];
-
-    const allocation = db.prepare(`
-      SELECT
-        i.asset_type,
-        COUNT(*) as count,
-        COALESCE(SUM(dv.current_value), 0) as total_value,
-        COALESCE(SUM(dv.invested_amount), 0) as total_invested,
-        COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
-      FROM investments i
-      LEFT JOIN daily_values dv ON i.id = dv.investment_id
-        ${dvJoin}
-        AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id ${dvSub})
-      WHERE 1=1${portfolioFilter}
-      GROUP BY i.asset_type
-    `).all(...dvParams, ...dvParams, ...pfParams);
+    const allocation = portfolio_id
+      ? db.prepare(`
+          SELECT
+            i.asset_type,
+            COUNT(*) as count,
+            COALESCE(SUM(dv.current_value), 0) as total_value,
+            COALESCE(SUM(dv.invested_amount), 0) as total_invested,
+            COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
+          FROM investments i
+          LEFT JOIN daily_values dv ON i.id = dv.investment_id
+            AND dv.portfolio_id = ?
+            AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+          WHERE 1=1${portfolioFilter}
+          GROUP BY i.asset_type
+        `).all(portfolio_id, portfolio_id, ...pfParams)
+      : db.prepare(`
+          WITH latest_by_scope AS (
+            SELECT investment_id, portfolio_id, MAX(date) AS max_date
+            FROM daily_values
+            GROUP BY investment_id, portfolio_id
+          ),
+          latest_agg AS (
+            SELECT
+              dv.investment_id,
+              SUM(COALESCE(dv.current_value, 0)) AS current_value,
+              SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
+              SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss
+            FROM daily_values dv
+            INNER JOIN latest_by_scope lbs ON dv.investment_id = lbs.investment_id
+              AND dv.portfolio_id = lbs.portfolio_id
+              AND dv.date = lbs.max_date
+            GROUP BY dv.investment_id
+          )
+          SELECT
+            i.asset_type,
+            COUNT(*) as count,
+            COALESCE(SUM(la.current_value), 0) as total_value,
+            COALESCE(SUM(la.invested_amount), 0) as total_invested,
+            COALESCE(SUM(la.profit_loss), 0) as total_profit_loss
+          FROM investments i
+          LEFT JOIN latest_agg la ON la.investment_id = i.id
+          WHERE 1=1${portfolioFilter}
+          GROUP BY i.asset_type
+        `).all(...pfParams);
 
     res.json(allocation);
   });

@@ -149,26 +149,23 @@ module.exports = function (db) {
     const portfolioIdNum = portfolio_id ? parseInt(portfolio_id, 10) : null;
 
     const latestValueByPortfolioStmt = db.prepare('SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1');
-    const latestValueGlobalStmt = db.prepare('SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1');
-
     const txnsByPortfolioStmt = db.prepare('SELECT transaction_type, transaction_date, amount, fees FROM transactions WHERE investment_id = ? AND portfolio_id = ?');
-    const txnsGlobalStmt = db.prepare('SELECT transaction_type, transaction_date, amount, fees FROM transactions WHERE investment_id = ? AND portfolio_id IS NULL');
 
     const enriched = investments.map((inv) => {
-      let latestValue;
-      if (portfolioIdNum) {
-        latestValue = latestValueByPortfolioStmt.get(inv.id, portfolioIdNum) || latestValueGlobalStmt.get(inv.id);
-      } else {
-        latestValue = latestValueGlobalStmt.get(inv.id);
+      // For portfolio-scoped queries or combined: aggregate from all portfolio-scoped rows
+      const latestValues = portfolioIdNum
+        ? latestValueByPortfolioStmt.all(inv.id, portfolioIdNum)
+        : db.prepare('SELECT * FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1').all(inv.id);
+      let latestValue = latestValues[0] || null;
+      
+      // If portfolio-specific row not found and portfolio_id was specified, try combined
+      if (!latestValue && portfolioIdNum) {
+        latestValue = db.prepare('SELECT * FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1').get(inv.id);
       }
 
-      let txns;
-      if (portfolioIdNum) {
-        txns = txnsByPortfolioStmt.all(inv.id, portfolioIdNum);
-        if (txns.length === 0) txns = txnsGlobalStmt.all(inv.id);
-      } else {
-        txns = txnsGlobalStmt.all(inv.id);
-      }
+      const txns = portfolioIdNum
+        ? txnsByPortfolioStmt.all(inv.id, portfolioIdNum)
+        : db.prepare('SELECT transaction_type, transaction_date, amount, fees FROM transactions WHERE investment_id = ?').all(inv.id);
       const xirrCashflows = [];
 
       for (const txn of txns) {
@@ -222,21 +219,18 @@ module.exports = function (db) {
 
     // Get latest daily value (portfolio-scoped or combined)
     const portfolioId = req.query.portfolio_id;
+    const portfolioFilter = portfolioId ? ' AND portfolio_id = ?' : '';
+    const portfolioParams = portfolioId ? [parseInt(portfolioId, 10)] : [];
     let latestValue;
     if (portfolioId) {
       latestValue = db.prepare(
         'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
-      ).get(inv.id, parseInt(portfolioId));
+      ).get(inv.id, parseInt(portfolioId, 10));
     } else {
       latestValue = db.prepare(
-        'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+          'SELECT * FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1'
       ).get(inv.id);
     }
-
-    // Get total units and invested amount
-    const portfolioFilter = portfolioId ? ' AND portfolio_id = ?' : '';
-    const portfolioParams = portfolioId ? [parseInt(portfolioId)] : [];
-
     const totals = db.prepare(`
       SELECT
         COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,

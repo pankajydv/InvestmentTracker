@@ -1,10 +1,33 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
-import { getDashboardSummary } from '../services/api';
+import { getDashboardSummary, getDailyValuesHealthStatus } from '../services/api';
+import { getOpenGaps, getComplianceStatus } from '../services/compliance';
+import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, EyeOff, Eye } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, EyeOff, Eye, AlertTriangle } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
+
+const ASSET_TYPE_DISPLAY_ORDER = {
+  INDIAN_STOCK: 1,
+  MUTUAL_FUND: 2,
+  NPS: 3,
+  SGB: 4,
+  BOND: 5,
+  PF: 6,
+  PPF: 7,
+  SSY: 8,
+  FOREIGN_STOCK: 9,
+};
+
+function sortAssetTypeEntries(byType) {
+  return Object.entries(byType || {}).sort(([typeA], [typeB]) => {
+    const orderA = ASSET_TYPE_DISPLAY_ORDER[typeA] ?? 999;
+    const orderB = ASSET_TYPE_DISPLAY_ORDER[typeB] ?? 999;
+    if (orderA !== orderB) return orderA - orderB;
+    return String(typeA).localeCompare(String(typeB));
+  });
+}
 
 function combineDashboardSummaries(results, selectedIds) {
   if (!Array.isArray(results) || !results.length) return null;
@@ -12,7 +35,6 @@ function combineDashboardSummaries(results, selectedIds) {
   const mergedInvestments = new Map();
   const byType = {};
   let totalExpenses = 0;
-
   const portfolio = {
     total_value: 0,
     total_invested: 0,
@@ -99,13 +121,109 @@ function combineDashboardSummaries(results, selectedIds) {
   };
 }
 
+function combineHealthStatuses(results) {
+  if (!Array.isArray(results) || !results.length) return null;
+
+  const merged = {
+    run_date: results.map((r) => r?.run_date).filter(Boolean).sort().at(-1) || null,
+    status: 'ok',
+    counts: {
+      scopes_checked: 0,
+      issue_scopes: 0,
+      missing_rows: 0,
+      unexpected_locf: 0,
+      stale_scopes: 0,
+    },
+    compliance: {
+      runDate: null,
+      watermark: null,
+      invalidFrom: null,
+      dirtyFrom: null,
+      openGapCount: 0,
+      hasBacklog: false,
+      lastScan: {
+        mode: null,
+        runDate: null,
+        gapsDetected: 0,
+        repairsEnqueued: 0,
+      },
+    },
+    issues: [],
+  };
+
+  for (const result of results) {
+    if (!result) continue;
+    const counts = result.counts || {};
+    merged.counts.scopes_checked += Number(counts.scopes_checked || 0);
+    merged.counts.issue_scopes += Number(counts.issue_scopes || 0);
+    merged.counts.missing_rows += Number(counts.missing_rows || 0);
+    merged.counts.unexpected_locf += Number(counts.unexpected_locf || 0);
+    merged.counts.stale_scopes += Number(counts.stale_scopes || 0);
+
+    const compliance = result.compliance || {};
+    merged.compliance.runDate = [merged.compliance.runDate, compliance.runDate]
+      .filter(Boolean)
+      .sort()
+      .at(-1) || merged.compliance.runDate;
+    merged.compliance.openGapCount = Math.max(
+      Number(merged.compliance.openGapCount || 0),
+      Number(compliance.openGapCount || 0)
+    );
+    merged.compliance.hasBacklog = merged.compliance.hasBacklog || !!compliance.hasBacklog;
+
+    if (compliance.watermark && (!merged.compliance.watermark || compliance.watermark > merged.compliance.watermark)) {
+      merged.compliance.watermark = compliance.watermark;
+    }
+    if (compliance.invalidFrom && (!merged.compliance.invalidFrom || compliance.invalidFrom < merged.compliance.invalidFrom)) {
+      merged.compliance.invalidFrom = compliance.invalidFrom;
+    }
+    if (compliance.dirtyFrom && (!merged.compliance.dirtyFrom || compliance.dirtyFrom < merged.compliance.dirtyFrom)) {
+      merged.compliance.dirtyFrom = compliance.dirtyFrom;
+    }
+
+    const resultLastScan = compliance.lastScan || {};
+    const mergedLastScan = merged.compliance.lastScan || {};
+    const mergedLastRun = mergedLastScan.runDate || '';
+    const resultLastRun = resultLastScan.runDate || '';
+    if (resultLastRun >= mergedLastRun) {
+      merged.compliance.lastScan = {
+        mode: resultLastScan.mode || null,
+        runDate: resultLastRun || null,
+        gapsDetected: Number(resultLastScan.gapsDetected || 0),
+        repairsEnqueued: Number(resultLastScan.repairsEnqueued || 0),
+      };
+    }
+
+    if (Array.isArray(result.issues)) merged.issues.push(...result.issues);
+  }
+
+  if (merged.counts.missing_rows > 0) merged.status = 'error';
+  else if (merged.counts.unexpected_locf > 0 || merged.counts.stale_scopes > 0) merged.status = 'warning';
+
+  merged.issues.sort((a, b) => {
+    if ((b.missing_count || 0) !== (a.missing_count || 0)) {
+      return (b.missing_count || 0) - (a.missing_count || 0);
+    }
+    return (b.unexpected_locf_count || 0) - (a.unexpected_locf_count || 0);
+  });
+
+  return merged;
+}
+
 export default function Dashboard() {
   const { selectedId, selectedIds, selectedPortfolio } = usePortfolio();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
   const [hideSold, setHideSold] = useState(() => localStorage.getItem('hideSoldInvestments') !== 'false');
   const [sortConfigs, setSortConfigs] = useState({});
+  const [dailyHealth, setDailyHealth] = useState(null);
+  const [showHealthDetails, setShowHealthDetails] = useState(false);
+  const [complianceGaps, setComplianceGaps] = useState([]);
+  const [complianceStatus, setComplianceStatus] = useState(null);
+  const [complianceLoading, setComplianceLoading] = useState(false);
+  const loadRunRef = useRef(0);
 
   const scrollToSection = useCallback((sectionId, { smooth = true, updateHash = true } = {}) => {
     const el = document.getElementById(sectionId);
@@ -135,6 +253,10 @@ export default function Dashboard() {
   }, [selectedId, selectedIds, hideSold]);
 
   useEffect(() => {
+    loadDailyHealth();
+  }, [selectedId, selectedIds]);
+
+  useEffect(() => {
     const hash = window.location.hash;
     if (!hash || !hash.startsWith('#section-')) return;
     const sectionId = hash.slice(1);
@@ -144,20 +266,70 @@ export default function Dashboard() {
     return () => window.cancelAnimationFrame(raf);
   }, [data, scrollToSection]);
 
-  const loadData = async () => {
+  useEffect(() => {
+    loadComplianceStatus();
+  }, [selectedId, selectedIds]);
+
+  const loadComplianceStatus = async () => {
     try {
-      setLoading(true);
+      setComplianceLoading(true);
+      const [gapsResult, statusResult] = await Promise.all([
+        getOpenGaps().catch(() => ({ gaps: [] })),
+        getComplianceStatus().catch(() => null),
+      ]);
+      setComplianceGaps(gapsResult?.gaps || []);
+      setComplianceStatus(statusResult);
+    } catch (e) {
+      console.error('Compliance check failed:', e);
+    } finally {
+      setComplianceLoading(false);
+    }
+  };
+
+  const loadData = async () => {
+    const runId = ++loadRunRef.current;
+    const showBlockingLoader = !data;
+    try {
+      if (showBlockingLoader) setLoading(true);
+      else setRefreshing(true);
+      setShowHealthDetails(false);
+
       if (selectedIds.length > 1) {
-        const results = await Promise.all(selectedIds.map((id) => getDashboardSummary(id, { hideSold })));
-        setData(combineDashboardSummaries(results, selectedIds));
+        const summaryResults = await Promise.all(selectedIds.map((id) => getDashboardSummary(id, { hideSold })));
+        if (runId !== loadRunRef.current) return;
+        setData(combineDashboardSummaries(summaryResults, selectedIds));
+        setError(null);
       } else {
         const result = await getDashboardSummary(selectedId, { hideSold });
+        if (runId !== loadRunRef.current) return;
         setData(result);
+        setError(null);
       }
     } catch (e) {
+      if (runId !== loadRunRef.current) return;
       setError(e.message);
     } finally {
+      if (runId !== loadRunRef.current) return;
       setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
+  const loadDailyHealth = async () => {
+    const runId = loadRunRef.current;
+    try {
+      if (selectedIds.length > 1) {
+        const healthResults = await Promise.all(selectedIds.map((id) => getDailyValuesHealthStatus(id).catch(() => null)));
+        if (runId !== loadRunRef.current) return;
+        setDailyHealth(combineHealthStatuses(healthResults.filter(Boolean)));
+      } else {
+        const health = await getDailyValuesHealthStatus(selectedId).catch(() => null);
+        if (runId !== loadRunRef.current) return;
+        setDailyHealth(health);
+      }
+    } catch {
+      if (runId !== loadRunRef.current) return;
+      setDailyHealth(null);
     }
   };
 
@@ -226,6 +398,15 @@ export default function Dashboard() {
     scrollToSection(`section-${type}`);
   };
 
+  const complianceSnapshot = dailyHealth?.compliance || complianceStatus?.compliance || null;
+  const sortedAssetEntries = sortAssetTypeEntries(byType);
+  const hasRecordedComplianceScan = !!(
+    complianceSnapshot?.lastScan?.mode
+    || complianceSnapshot?.lastScan?.runDate
+    || complianceSnapshot?.watermark
+    || complianceSnapshot?.invalidFrom
+  );
+
   return (
     <div>
       {/* Portfolio Header */}
@@ -251,6 +432,88 @@ export default function Dashboard() {
           {hideSold ? 'Sold hidden' : 'Showing all'}
         </Button>
       </div>
+
+      {refreshing && (
+        <div className="text-muted small mb-2 d-flex align-items-center gap-2">
+          <Spinner animation="border" size="sm" />
+          Refreshing dashboard...
+        </div>
+      )}
+
+      <ComplianceWarning gaps={complianceGaps} loading={complianceLoading} />
+
+      {dailyHealth && dailyHealth.status !== 'ok' && (
+        <Alert variant={dailyHealth.status === 'error' ? 'danger' : 'warning'} className="py-2 mb-4">
+          <div className="d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <div className="d-flex align-items-center gap-2">
+              <AlertTriangle size={16} />
+              <span className="fw-semibold">Daily values health warning</span>
+              <span className="small">
+                Missing: {dailyHealth.counts?.missing_rows || 0} | Unexpected LOCF: {dailyHealth.counts?.unexpected_locf || 0} | Stale scopes: {dailyHealth.counts?.stale_scopes || 0}
+              </span>
+            </div>
+            <Button
+              size="sm"
+              variant={dailyHealth.status === 'error' ? 'outline-danger' : 'outline-warning'}
+              onClick={() => setShowHealthDetails((prev) => !prev)}
+            >
+              {showHealthDetails ? 'Hide details' : 'Show details'}
+            </Button>
+          </div>
+          <div className="small mt-2">
+            <span className="fw-semibold">Compliance:</span>{' '}
+            {hasRecordedComplianceScan ? (
+              <>
+                Run {complianceSnapshot?.lastScan?.mode || '-'} on {complianceSnapshot?.lastScan?.runDate || '-'} |{' '}
+                Watermark {complianceSnapshot?.watermark || '-'} |{' '}
+                Invalid from {complianceSnapshot?.invalidFrom || '-'} |{' '}
+                Dirty from {complianceSnapshot?.dirtyFrom || '-'} |{' '}
+                Open gaps {complianceSnapshot?.openGapCount || 0} |{' '}
+                Backlog {complianceSnapshot?.hasBacklog ? 'yes' : 'no'}
+              </>
+            ) : (
+              <>
+                No compliance scan recorded yet |{' '}
+                Dirty from {complianceSnapshot?.dirtyFrom || '-'} |{' '}
+                Open gaps {complianceSnapshot?.openGapCount || 0} |{' '}
+                Backlog {complianceSnapshot?.hasBacklog ? 'yes' : 'no'}
+              </>
+            )}
+          </div>
+          {showHealthDetails && (
+            <div className="mt-2 responsive-table">
+              <Table size="sm" className="mb-0">
+                <thead>
+                  <tr>
+                    <th>Investment</th>
+                    <th>Portfolio</th>
+                    <th>First Missing</th>
+                    <th className="text-end">Missing</th>
+                    <th className="text-end">Unexpected LOCF</th>
+                    <th>Last Row</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(dailyHealth.issues || []).slice(0, 12).map((issue) => (
+                    <tr key={`${issue.investment_id}-${issue.portfolio_id}`}>
+                      <td>
+                        <Link to={`/investments/${issue.investment_id}`} className="text-decoration-none">
+                          {issue.investment_name}
+                        </Link>
+                      </td>
+                      <td>{issue.portfolio_name || '-'}</td>
+                      <td>{issue.first_missing_date || '-'}</td>
+                      <td className="text-end">{issue.missing_count || 0}</td>
+                      <td className="text-end">{issue.unexpected_locf_count || 0}</td>
+                      <td>{issue.last_row_date || '-'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
+          )}
+        </Alert>
+      )}
 
       {/* Portfolio Summary Cards */}
       <Row className="g-3 mb-4">
@@ -309,7 +572,7 @@ export default function Dashboard() {
         <Card.Body>
           <h2 className="h6 fw-semibold mb-3">Asset Allocation</h2>
           <Row className="g-3">
-            {Object.entries(byType).map(([type, info]) => (
+            {sortedAssetEntries.map(([type, info]) => (
               <Col xs={6} md key={type}>
                 <div
                   className="rounded p-3 border"
@@ -336,7 +599,7 @@ export default function Dashboard() {
       </Card>
 
       {/* Investment-wise Breakdown Tables */}
-      {Object.entries(byType).map(([type, info]) => (
+      {sortedAssetEntries.map(([type, info]) => (
         <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
           <Card.Header className="bg-white d-flex justify-content-between align-items-center">
             <h2 className="h6 fw-semibold mb-0" title={ASSET_TYPE_FULL_NAMES[type]}>

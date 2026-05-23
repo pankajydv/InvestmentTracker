@@ -7,10 +7,143 @@ const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = requir
 const { updateAllPrices, cancelUpdate } = require('../services/updater');
 const { runSchedulerCycle } = require('../services/scheduler');
 const { getPendingDirtyScopes, markDirtyForAssetTypeFromDate, markDirtyFromTransactions, runDirtyBackfillPreflight } = require('../services/dirtyBackfillService');
+const { ONE_DAY_CHANGE_POLICY, getOneDayChangePolicy, getUnexpectedLocfPolicy } = require('../services/assetPolicy');
+const { getComplianceScanState, scanAndRepairComplianceGaps } = require('../services/compliance/complianceScanService');
 const { todayIso } = require('../services/backfillService');
 const { logAppInfo, logAppError, getLogDir } = require('../services/appLogger');
 
 const VALID_RATE_TYPES = new Set(['PPF', 'SSY', 'PF']);
+const UNIT_INFLOW_TYPES = new Set([
+  'BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS',
+  'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE',
+]);
+const UNIT_OUTFLOW_TYPES = new Set([
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC',
+]);
+const LOCF_SOURCES = new Set(['LOCF', 'NSE_BHAVCOPY_LOCF']);
+
+const complianceJobStore = new Map();
+let complianceJobSeq = 0;
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function normalizeComplianceMode(value, fallback = 'none') {
+  const raw = String(value || fallback).toLowerCase();
+  if (raw === 'full' || raw === 'deep') return 'full';
+  if (raw === 'incremental' || raw === 'fast') return 'incremental';
+  return fallback;
+}
+
+function parseBooleanLike(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  if (value == null) return fallback;
+  const raw = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(raw)) return false;
+  return fallback;
+}
+
+function pruneComplianceJobs(limit = 200) {
+  if (complianceJobStore.size <= limit) return;
+  const rows = Array.from(complianceJobStore.values())
+    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  const removeCount = complianceJobStore.size - limit;
+  for (let i = 0; i < removeCount; i += 1) {
+    complianceJobStore.delete(rows[i].id);
+  }
+}
+
+function jobView(job) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    type: 'compliance_scan',
+    mode: job.mode,
+    status: job.status,
+    phase: job.phase,
+    progressPct: job.progressPct,
+    trigger: job.trigger,
+    runDate: job.runDate,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    error: job.error,
+    result: job.result,
+    window: job.window,
+  };
+}
+
+function createComplianceJob(mode, metadata = {}) {
+  const id = `cmp-${Date.now()}-${++complianceJobSeq}`;
+  const job = {
+    id,
+    mode,
+    status: 'queued',
+    phase: 'queued',
+    progressPct: 0,
+    trigger: metadata.trigger || 'manual',
+    runDate: parseDateOnly(metadata.runDate) || todayIso(),
+    createdAt: nowIso(),
+    startedAt: null,
+    finishedAt: null,
+    error: null,
+    result: null,
+    window: null,
+  };
+  complianceJobStore.set(id, job);
+  pruneComplianceJobs();
+  return job;
+}
+
+function runComplianceJobAsync(job) {
+  setImmediate(() => {
+    try {
+      job.status = 'running';
+      job.phase = 'starting';
+      job.progressPct = 1;
+      job.startedAt = nowIso();
+
+      const result = scanAndRepairComplianceGaps({
+        mode: job.mode,
+        runDate: job.runDate,
+        db,
+        onProgress: (progress) => {
+          if (progress?.phase) job.phase = String(progress.phase);
+          if (Number.isFinite(Number(progress?.percent))) {
+            const pct = Math.max(0, Math.min(100, Number(progress.percent)));
+            job.progressPct = pct;
+          }
+          if (progress?.window) job.window = progress.window;
+        },
+      });
+
+      job.status = 'completed';
+      job.phase = 'completed';
+      job.progressPct = 100;
+      job.finishedAt = nowIso();
+      job.result = {
+        mode: result.mode,
+        runDate: result.runDate,
+        gapsDetected: result.gapsDetected,
+        repairsEnqueued: result.repairsEnqueued,
+      };
+      job.window = result.window || job.window;
+      logAppInfo('[ComplianceJob] Completed', jobView(job));
+    } catch (e) {
+      job.status = 'failed';
+      job.phase = 'failed';
+      job.finishedAt = nowIso();
+      job.error = e.message || 'Compliance job failed';
+      logAppError('[ComplianceJob] Failed', {
+        id: job.id,
+        mode: job.mode,
+        error: job.error,
+      });
+    }
+  });
+}
 
 function parseDateOnly(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
@@ -64,7 +197,259 @@ function findOverlappingRate(db, payload, excludeId = null) {
   }) || null;
 }
 
+function loadMarketHolidaySet(db, runDate) {
+  const rows = runDate
+    ? db.prepare('SELECT date FROM market_holidays WHERE date <= ? ORDER BY date ASC').all(runDate)
+    : db.prepare('SELECT date FROM market_holidays ORDER BY date ASC').all();
+  return new Set(
+    rows
+      .map((row) => String(row.date || ''))
+      .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date))
+  );
+}
+
+function isWeekendIso(isoDate) {
+  const dt = new Date(`${isoDate}T00:00:00.000Z`);
+  const day = dt.getUTCDay();
+  return day === 0 || day === 6;
+}
+
+function isMarketSessionDate(isoDate, marketHolidaySet) {
+  if (!isoDate) return false;
+  if (isWeekendIso(isoDate)) return false;
+  if (marketHolidaySet?.has(isoDate)) return false;
+  return true;
+}
+
+function eachDate(fromDate, toDate) {
+  const out = [];
+  let d = new Date(`${fromDate}T00:00:00.000Z`);
+  const end = new Date(`${toDate}T00:00:00.000Z`);
+  while (d <= end) {
+    out.push(d.toISOString().split('T')[0]);
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return out;
+}
+
+function addDaysIso(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().split('T')[0];
+}
+
+function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
+  const txns = db.prepare(`
+    SELECT
+      date(transaction_date) AS date,
+      transaction_type,
+      COALESCE(units, 0) AS units
+    FROM transactions
+    WHERE investment_id = ?
+      AND portfolio_id = ?
+      AND date(transaction_date) <= ?
+    ORDER BY date(transaction_date) ASC, id ASC
+  `).all(scope.investment_id, scope.portfolio_id, runDate);
+
+  const firstTxnDate = txns[0]?.date || null;
+  if (!firstTxnDate) {
+    return {
+      ...scope,
+      first_txn_date: null,
+      latest_expected_date: null,
+      last_row_date: null,
+      first_missing_date: null,
+      missing_count: 0,
+      unexpected_locf_count: 0,
+      stale: false,
+    };
+  }
+
+  const needsMarketSessions = (() => {
+    const policy = getOneDayChangePolicy(scope.asset_type);
+    return policy === ONE_DAY_CHANGE_POLICY.MARKET_SESSION || policy === ONE_DAY_CHANGE_POLICY.NAV_SNAPSHOT;
+  })();
+  const unexpectedLocfPolicy = getUnexpectedLocfPolicy(scope.asset_type);
+
+  const isBalanceBased = scope.asset_type === 'PF' || scope.asset_type === 'PPF' || scope.asset_type === 'SSY';
+  const dateDeltas = new Map();
+  const txnDateSet = new Set();
+
+  for (const txn of txns) {
+    txnDateSet.add(txn.date);
+    if (!isBalanceBased) {
+      const t = String(txn.transaction_type || '').toUpperCase();
+      let delta = 0;
+      if (UNIT_INFLOW_TYPES.has(t)) delta = Number(txn.units || 0);
+      else if (UNIT_OUTFLOW_TYPES.has(t)) delta = -Number(txn.units || 0);
+      if (delta !== 0) {
+        dateDeltas.set(txn.date, Number(dateDeltas.get(txn.date) || 0) + delta);
+      }
+    }
+  }
+
+  const expectedDates = [];
+  let runningUnits = 0;
+  for (const date of eachDate(firstTxnDate, runDate)) {
+    const delta = Number(dateDeltas.get(date) || 0);
+    const hasTxn = txnDateSet.has(date);
+    const unitsAfter = runningUnits + delta;
+
+    let expected = false;
+    if (isBalanceBased) {
+      expected = true;
+    } else {
+      expected = runningUnits > 0.000001 || hasTxn || unitsAfter > 0.000001;
+    }
+
+    if (expected && (!needsMarketSessions || isMarketSessionDate(date, marketHolidaySet))) {
+      expectedDates.push(date);
+    }
+
+    runningUnits = unitsAfter;
+  }
+
+  if (!expectedDates.length) {
+    return {
+      ...scope,
+      first_txn_date: firstTxnDate,
+      latest_expected_date: null,
+      last_row_date: null,
+      first_missing_date: null,
+      missing_count: 0,
+      unexpected_locf_count: 0,
+      stale: false,
+    };
+  }
+
+  const dailyRows = db.prepare(`
+    SELECT date, price_source
+    FROM daily_values
+    WHERE investment_id = ?
+      AND portfolio_id = ?
+      AND date >= ?
+      AND date <= ?
+  `).all(scope.investment_id, scope.portfolio_id, firstTxnDate, runDate);
+
+  const rowByDate = new Map();
+  let lastRowDate = null;
+  for (const row of dailyRows) {
+    rowByDate.set(row.date, row);
+    if (!lastRowDate || row.date > lastRowDate) lastRowDate = row.date;
+  }
+
+  let missingCount = 0;
+  let unexpectedLocfCount = 0;
+  let firstMissingDate = null;
+  let locfStreak = 0;
+  const latestExpectedDate = expectedDates[expectedDates.length - 1] || null;
+  const unexpectedLocfStartDate = latestExpectedDate
+    ? addDaysIso(latestExpectedDate, -(Math.max(1, Number(unexpectedLocfPolicy.recentWindowDays) || 180) - 1))
+    : null;
+
+  for (const date of expectedDates) {
+    const row = rowByDate.get(date);
+    if (!row) {
+      missingCount += 1;
+      if (!firstMissingDate) firstMissingDate = date;
+      locfStreak = 0;
+      continue;
+    }
+
+    const isUnexpectedWindowDate = !unexpectedLocfStartDate || date >= unexpectedLocfStartDate;
+    const isUnexpectedLocfCandidate = isUnexpectedWindowDate
+      && LOCF_SOURCES.has(String(row.price_source || ''))
+      && isMarketSessionDate(date, marketHolidaySet);
+
+    if (isUnexpectedLocfCandidate) {
+      locfStreak += 1;
+      if (locfStreak > Math.max(0, Number(unexpectedLocfPolicy.thresholdSessions) || 0)) {
+        unexpectedLocfCount += 1;
+      }
+    } else {
+      locfStreak = 0;
+    }
+  }
+
+  return {
+    ...scope,
+    first_txn_date: firstTxnDate,
+    latest_expected_date: latestExpectedDate,
+    last_row_date: lastRowDate,
+    first_missing_date: firstMissingDate,
+    missing_count: missingCount,
+    unexpected_locf_count: unexpectedLocfCount,
+    stale: !!latestExpectedDate && (!lastRowDate || lastRowDate < latestExpectedDate),
+  };
+}
+
 module.exports = function (db) {
+
+  router.get('/daily-values-health', (req, res) => {
+    try {
+      const runDate = parseDateOnly(req.query.run_date) || todayIso();
+      const portfolioId = req.query.portfolio_id ? Number(req.query.portfolio_id) : null;
+
+      if (portfolioId != null && (!Number.isInteger(portfolioId) || portfolioId <= 0)) {
+        return res.status(400).json({ error: 'portfolio_id must be a positive integer' });
+      }
+
+      const marketHolidaySet = loadMarketHolidaySet(db, runDate);
+
+      const scopes = db.prepare(`
+        SELECT
+          i.id AS investment_id,
+          i.name AS investment_name,
+          i.asset_type,
+          t.portfolio_id,
+          p.name AS portfolio_name
+        FROM investments i
+        INNER JOIN transactions t ON t.investment_id = i.id
+        LEFT JOIN portfolios p ON p.id = t.portfolio_id
+        WHERE t.portfolio_id IS NOT NULL
+          AND i.is_active != 0
+          AND COALESCE(i.exclude_from_tracking, 0) != 1
+          ${portfolioId != null ? 'AND t.portfolio_id = ?' : ''}
+        GROUP BY i.id, t.portfolio_id
+        ORDER BY i.id ASC, t.portfolio_id ASC
+      `).all(...(portfolioId != null ? [portfolioId] : []));
+
+      const details = scopes.map((scope) => buildScopeHealth(db, scope, runDate, marketHolidaySet));
+
+      const issues = details
+        .filter((row) => row.missing_count > 0 || row.unexpected_locf_count > 0 || row.stale)
+        .sort((a, b) => {
+          if (b.missing_count !== a.missing_count) return b.missing_count - a.missing_count;
+          if (b.unexpected_locf_count !== a.unexpected_locf_count) return b.unexpected_locf_count - a.unexpected_locf_count;
+          return String(a.first_missing_date || '').localeCompare(String(b.first_missing_date || ''));
+        });
+
+      const counts = {
+        scopes_checked: details.length,
+        issue_scopes: issues.length,
+        missing_rows: details.reduce((sum, row) => sum + Number(row.missing_count || 0), 0),
+        unexpected_locf: details.reduce((sum, row) => sum + Number(row.unexpected_locf_count || 0), 0),
+        stale_scopes: details.filter((row) => row.stale).length,
+      };
+
+      const status = counts.missing_rows > 0
+        ? 'error'
+        : (counts.unexpected_locf > 0 || counts.stale_scopes > 0 ? 'warning' : 'ok');
+
+      const compliance = getComplianceScanState(runDate, db);
+
+      res.json({
+        run_date: runDate,
+        status,
+        counts,
+        compliance,
+        issues,
+      });
+    } catch (e) {
+      logAppError('[Health] daily-values-health failed', { error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to compute daily values health' });
+    }
+  });
 
   // ─── Export all data to XLSX ──────────────────────────────────────────
   router.get('/export', (req, res) => {
@@ -184,18 +569,140 @@ module.exports = function (db) {
   // even when triggered manually from the UI.
   router.post('/update-prices', async (req, res) => {
     try {
-      logAppInfo('[UI] Manual update-prices (scheduler cycle) requested');
+      const complianceMode = normalizeComplianceMode(
+        req.body?.compliance_mode || req.query?.compliance_mode,
+        'none'
+      );
+      const complianceAsync = parseBooleanLike(
+        req.body?.compliance_async ?? req.query?.compliance_async,
+        complianceMode !== 'none'
+      );
+
+      logAppInfo('[UI] Manual update-prices (scheduler cycle) requested', {
+        complianceMode,
+        complianceAsync,
+      });
       const cycleResult = await runSchedulerCycle(db, '[UI] Manual trigger');
+
+      let complianceResult = null;
+      if (complianceMode !== 'none') {
+        if (complianceAsync) {
+          const job = createComplianceJob(complianceMode, {
+            trigger: 'manual-update-prices',
+            runDate: todayIso(),
+          });
+          runComplianceJobAsync(job);
+          complianceResult = {
+            async: true,
+            job: jobView(job),
+          };
+        } else {
+          const syncResult = scanAndRepairComplianceGaps({ mode: complianceMode, db });
+          complianceResult = {
+            async: false,
+            mode: syncResult.mode,
+            runDate: syncResult.runDate,
+            window: syncResult.window,
+            gapsDetected: syncResult.gapsDetected,
+            repairsEnqueued: syncResult.repairsEnqueued,
+          };
+        }
+      }
+
       logAppInfo('[UI] Manual update-prices (scheduler cycle) completed', {
         processed: cycleResult?.result?.processed || 0,
         errors: cycleResult?.result?.errors || 0,
         catchUpEnqueued: cycleResult?.catchUp?.enqueued || 0,
         preflightRan: cycleResult?.preflight?.ran || false,
+        complianceMode,
+        complianceAsync,
+        complianceGapsDetected: complianceResult?.gapsDetected || 0,
+        complianceRepairsEnqueued: complianceResult?.repairsEnqueued || 0,
+        complianceJobId: complianceResult?.job?.id || null,
       });
-      res.json(cycleResult);
+      res.json({
+        ...cycleResult,
+        compliance: complianceResult || null,
+      });
     } catch (e) {
       logAppError('[UI] Manual update-prices failed', { error: e.message });
       res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ─── Compliance jobs: async trigger + list/status ──────────────────────
+  router.post('/compliance-jobs', (req, res) => {
+    try {
+      const mode = normalizeComplianceMode(req.body?.mode || req.query?.mode, 'incremental');
+      const runDate = parseDateOnly(req.body?.run_date || req.query?.run_date) || todayIso();
+      const job = createComplianceJob(mode, {
+        trigger: 'manual-compliance-job',
+        runDate,
+      });
+      runComplianceJobAsync(job);
+      res.status(202).json({
+        success: true,
+        job: jobView(job),
+      });
+    } catch (e) {
+      logAppError('[ComplianceJob] Create failed', { error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to create compliance job' });
+    }
+  });
+
+  router.get('/compliance-jobs', (req, res) => {
+    try {
+      const onlyActive = parseBooleanLike(req.query.active, false);
+      const limitRaw = Number(req.query.limit);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0
+        ? Math.min(Math.floor(limitRaw), 500)
+        : 100;
+
+      const rows = Array.from(complianceJobStore.values())
+        .filter((job) => !onlyActive || job.status === 'queued' || job.status === 'running')
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+        .slice(0, limit)
+        .map(jobView);
+
+      res.json({
+        total: rows.length,
+        active_only: onlyActive,
+        jobs: rows,
+      });
+    } catch (e) {
+      logAppError('[ComplianceJob] List failed', { error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to list compliance jobs' });
+    }
+  });
+
+  router.get('/compliance-jobs/:id', (req, res) => {
+    try {
+      const id = String(req.params.id || '').trim();
+      const job = complianceJobStore.get(id);
+      if (!job) return res.status(404).json({ error: 'Compliance job not found' });
+      res.json({ job: jobView(job) });
+    } catch (e) {
+      logAppError('[ComplianceJob] Fetch failed', { error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to fetch compliance job' });
+    }
+  });
+
+  // ─── Lightweight compliance status ─────────────────────────────────────
+  router.get('/compliance-status', (req, res) => {
+    try {
+      const runDate = parseDateOnly(req.query.run_date) || todayIso();
+      const compliance = getComplianceScanState(runDate, db);
+      const status = compliance.openGapCount > 0
+        ? 'warning'
+        : (compliance.hasBacklog ? 'pending' : 'ok');
+      res.json({
+        run_date: runDate,
+        status,
+        compliance,
+      });
+    } catch (e) {
+      logAppError('[Health] compliance-status failed', { error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to fetch compliance status' });
     }
   });
 

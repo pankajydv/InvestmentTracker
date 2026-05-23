@@ -19,7 +19,7 @@ jobs:
       - name: Load deployment config
         id: config
         run: |
-          config=$(cat configs/investtrack.config.json)
+          config=$(cat configs/investtrack-prod.json)
           echo "oracle_host=$(echo $config | jq -r '.oracle.host')" >> $GITHUB_OUTPUT
           echo "oracle_user=$(echo $config | jq -r '.oracle.user')" >> $GITHUB_OUTPUT
           echo "oracle_port=$(echo $config | jq -r '.oracle.port')" >> $GITHUB_OUTPUT

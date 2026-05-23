@@ -1,6 +1,14 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const { applyEnvDefaults } = require('../config/envDefaults');
+
+applyEnvDefaults();
+
+function isProductionMode() {
+  const appMode = String(process.env.APP_MODE || 'production').toLowerCase();
+  return appMode !== 'dev' && appMode !== 'development' && appMode !== 'test';
+}
 
 // Use DATA_DIR env var (for Docker persistent volume) or local ./data
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
@@ -202,6 +210,26 @@ function initializeDb(db) {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- Market holidays used by compliance scans and market-session policies
+    CREATE TABLE IF NOT EXISTS market_holidays (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL UNIQUE,
+      description TEXT,
+      year INTEGER NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- Compliance gap tracker for missing derived daily rows
+    CREATE TABLE IF NOT EXISTS daily_data_gaps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      table_name TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      gap_start_date TEXT NOT NULL,
+      gap_end_date TEXT NOT NULL,
+      detected_at TEXT DEFAULT (datetime('now')),
+      resolved_at TEXT
+    );
+
     -- Dirty backfill scopes: track impacted ranges that must be recomputed.
     CREATE TABLE IF NOT EXISTS dirty_backfill_scope (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,6 +242,24 @@ function initializeDb(db) {
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+    );
+
+    -- Historical price repair scopes: targeted market price cache repair queue.
+    CREATE TABLE IF NOT EXISTS historical_price_repair_scope (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      instrument_type TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      from_date TEXT NOT NULL,
+      to_date TEXT NOT NULL,
+      reason TEXT,
+      priority INTEGER NOT NULL DEFAULT 100,
+      source_event_id TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      completed_at TEXT
     );
 
     -- Applied schema migrations (audit + idempotency)
@@ -238,6 +284,10 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_status_date ON dirty_backfill_scope(status, dirty_from_date);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_investment_portfolio ON dirty_backfill_scope(investment_id, portfolio_id, status);
+    CREATE INDEX IF NOT EXISTS idx_hist_price_repair_status_priority ON historical_price_repair_scope(status, priority, created_at);
+    CREATE INDEX IF NOT EXISTS idx_hist_price_repair_lookup ON historical_price_repair_scope(instrument_type, symbol, from_date, to_date, status);
+    CREATE INDEX IF NOT EXISTS idx_market_holidays_year ON market_holidays(year);
+    CREATE INDEX IF NOT EXISTS idx_daily_data_gaps_entity ON daily_data_gaps(table_name, entity_id);
 
     -- Portfolio-level expenses (AMC, platform fees, CDSL charges, etc.)
     CREATE TABLE IF NOT EXISTS portfolio_expenses (
@@ -256,7 +306,7 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_portfolio_expenses_date ON portfolio_expenses(expense_date);
   `);
 
-  const migrationsEnabled = process.env.NODE_ENV !== 'production' || process.env.ALLOW_DB_MIGRATIONS === 'true';
+  const migrationsEnabled = !isProductionMode() || process.env.ALLOW_DB_MIGRATIONS === 'true';
 
   // Safety net: if a previous failed migration left investments_old populated and
   // investments empty, recover immediately to prevent apparent data loss on restart.
@@ -272,6 +322,15 @@ function initializeDb(db) {
         const recoverSql = `INSERT OR REPLACE INTO investments (${common.join(', ')}) SELECT ${common.join(', ')} FROM investments_old`;
         db.prepare(recoverSql).run();
       }
+    }
+    // Drop stale investments_old once investments has data and the migration is recorded.
+    // This handles the case where the migration was skipped (column already absent) but the
+    // backup table from a prior crashed run was never cleaned up.
+    const migrationRecorded = hasMigrationRecord(db, '20260412-drop-investment-interest-rate');
+    const invCountNow = db.prepare('SELECT COUNT(*) as c FROM investments').get().c;
+    if (migrationRecorded && invCountNow > 0) {
+      db.exec('DROP TABLE IF EXISTS investments_old');
+      console.log('[schema] Dropped stale investments_old backup table.');
     }
   }
 
@@ -1825,6 +1884,47 @@ function initializeDb(db) {
     recordMigration(db, assetTypeDailyMigrationId, 'skipped', 'already present');
   }
 
+  // ── Migration: add historical_price_repair_scope table ───────────────────
+  const hasHistoricalPriceRepairScope = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='historical_price_repair_scope'").get();
+  const historicalPriceRepairScopeMigrationId = '20260524-add-historical-price-repair-scope-table';
+  if (requireMigrationsEnabled(
+    historicalPriceRepairScopeMigrationId,
+    !hasHistoricalPriceRepairScope,
+    'historical_price_repair_scope missing'
+  )) {
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS historical_price_repair_scope (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          instrument_type TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          from_date TEXT NOT NULL,
+          to_date TEXT NOT NULL,
+          reason TEXT,
+          priority INTEGER NOT NULL DEFAULT 100,
+          source_event_id TEXT,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now')),
+          completed_at TEXT
+        )
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_hist_price_repair_status_priority ON historical_price_repair_scope(status, priority, created_at)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_hist_price_repair_lookup ON historical_price_repair_scope(instrument_type, symbol, from_date, to_date, status)');
+      db.exec('COMMIT');
+      assertDbIntegrity(db, historicalPriceRepairScopeMigrationId);
+      recordMigration(db, historicalPriceRepairScopeMigrationId, 'applied');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, historicalPriceRepairScopeMigrationId) && hasHistoricalPriceRepairScope) {
+    recordMigration(db, historicalPriceRepairScopeMigrationId, 'skipped', 'already present');
+  }
+
   // Ensure backfill watermark key exists even on upgraded DBs.
   db.prepare("INSERT OR IGNORE INTO config (key, value, updated_at) VALUES ('backfill_watermark', '', datetime('now'))").run();
 }
@@ -1861,7 +1961,7 @@ function ensureNPSFundCodeMigration(db) {
   const migrationId = '20260518-add-investments-nps-fund-code';
   const invCols = db.prepare("PRAGMA table_info(investments)").all().map(c => c.name);
   
-  const migrationsEnabled = process.env.NODE_ENV !== 'production' || process.env.ALLOW_DB_MIGRATIONS === 'true';
+  const migrationsEnabled = !isProductionMode() || process.env.ALLOW_DB_MIGRATIONS === 'true';
   const hasMigration = db.prepare('SELECT id FROM schema_migrations WHERE id = ?').get(migrationId);
   
   if (!hasMigration && !invCols.includes('nps_fund_code')) {
@@ -1883,8 +1983,88 @@ function ensureNPSFundCodeMigration(db) {
   }
 }
 
+function ensureRemoveCombinedAggregatesMigration(db) {
+  const migrationId = '20260522-remove-combined-aggregates-enforce-scoped-rows';
+  const hasMigration = db.prepare('SELECT id FROM schema_migrations WHERE id = ?').get(migrationId);
+
+  if (!hasMigration) {
+    db.exec('BEGIN');
+    try {
+      const deletedDaily = db.prepare('DELETE FROM daily_values WHERE portfolio_id IS NULL').run().changes;
+      const deletedPortfolio = db.prepare('DELETE FROM portfolio_daily WHERE portfolio_id IS NULL').run().changes;
+      const deletedAssetType = db.prepare('DELETE FROM asset_type_daily WHERE portfolio_id IS NULL').run().changes;
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_insert
+        BEFORE INSERT ON daily_values
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_update
+        BEFORE UPDATE OF portfolio_id ON daily_values
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_portfolio_daily_portfolio_not_null_insert
+        BEFORE INSERT ON portfolio_daily
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'portfolio_daily.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_portfolio_daily_portfolio_not_null_update
+        BEFORE UPDATE OF portfolio_id ON portfolio_daily
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'portfolio_daily.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_asset_type_daily_portfolio_not_null_insert
+        BEFORE INSERT ON asset_type_daily
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'asset_type_daily.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_asset_type_daily_portfolio_not_null_update
+        BEFORE UPDATE OF portfolio_id ON asset_type_daily
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'asset_type_daily.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec('COMMIT');
+      assertDbIntegrity(db, migrationId);
+      const notes = `removed NULL rows daily_values=${deletedDaily}, portfolio_daily=${deletedPortfolio}, asset_type_daily=${deletedAssetType}`;
+      db.prepare(`
+        INSERT OR REPLACE INTO schema_migrations (id, status, notes, applied_at)
+        VALUES (?, ?, ?, datetime('now'))
+      `).run(migrationId, 'applied', notes);
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+}
+
 module.exports = {
   getDb,
   initializeDb,
   ensureNPSFundCodeMigration,
+  ensureRemoveCombinedAggregatesMigration,
 };

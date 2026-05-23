@@ -112,11 +112,21 @@ export const searchStockByName = (q, market) =>
   fetchJSON(`/utils/search-stock-name?q=${encodeURIComponent(q)}&market=${market || ''}`);
 export const searchStock = (symbol, market) =>
   fetchJSON(`/utils/search-stock?symbol=${encodeURIComponent(symbol)}&market=${market || ''}`);
-export const triggerPriceUpdate = (assetTypes) =>
-  fetchJSON('/utils/update-prices', {
+export const triggerPriceUpdate = (options) => {
+  const payload = {};
+
+  if (Array.isArray(options)) {
+    payload.assetTypes = options;
+  } else if (options && typeof options === 'object') {
+    if (Array.isArray(options.assetTypes)) payload.assetTypes = options.assetTypes;
+    if (options.complianceMode) payload.compliance_mode = String(options.complianceMode);
+  }
+
+  return fetchJSON('/utils/update-prices', {
     method: 'POST',
-    body: assetTypes ? JSON.stringify({ assetTypes }) : undefined,
+    body: Object.keys(payload).length > 0 ? JSON.stringify(payload) : undefined,
   });
+};
 export const cancelPriceUpdate = () =>
   fetchJSON('/utils/cancel-update', { method: 'POST' });
 export const getLogFiles = () => fetchJSON('/utils/log-files');
@@ -142,6 +152,33 @@ export const downloadLogFile = async (name) => {
 export const getConfig = () => fetchJSON('/utils/config');
 export const updateConfig = (data) =>
   fetchJSON('/utils/config', { method: 'PUT', body: JSON.stringify(data) });
+export const getDailyValuesHealthStatus = (portfolioId, runDate) => {
+  const params = new URLSearchParams();
+  if (portfolioId) params.set('portfolio_id', String(portfolioId));
+  if (runDate) params.set('run_date', runDate);
+  return fetchJSON(`/utils/daily-values-health${params.toString() ? `?${params.toString()}` : ''}`);
+};
+export const getComplianceStatus = (runDate) => {
+  const params = new URLSearchParams();
+  if (runDate) params.set('run_date', runDate);
+  return fetchJSON(`/utils/compliance-status${params.toString() ? `?${params.toString()}` : ''}`);
+};
+export const createComplianceJob = ({ mode = 'incremental', runDate } = {}) => {
+  const payload = { mode };
+  if (runDate) payload.run_date = runDate;
+  return fetchJSON('/utils/compliance-jobs', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+};
+export const getComplianceJobs = ({ active = false, limit } = {}) => {
+  const params = new URLSearchParams();
+  if (active) params.set('active', 'true');
+  if (Number.isFinite(Number(limit)) && Number(limit) > 0) params.set('limit', String(Math.floor(Number(limit))));
+  return fetchJSON(`/utils/compliance-jobs${params.toString() ? `?${params.toString()}` : ''}`);
+};
+export const getComplianceJob = (jobId) =>
+  fetchJSON(`/utils/compliance-jobs/${encodeURIComponent(String(jobId || '').trim())}`);
 export const getInterestRates = () => fetchJSON('/utils/interest-rates');
 export const createInterestRate = (data) =>
   fetchJSON('/utils/interest-rates', { method: 'POST', body: JSON.stringify(data) });
@@ -429,3 +466,29 @@ export const exportData = async () => {
   a.remove();
   URL.revokeObjectURL(url);
 };
+
+// Compatibility default export for modules that still use axios-style api.get/api.post.
+const api = {
+  get: async (url, options = {}) => ({
+    data: await fetchJSON(url, { method: 'GET', ...options }),
+  }),
+  post: async (url, body, options = {}) => ({
+    data: await fetchJSON(url, {
+      method: 'POST',
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      ...options,
+    }),
+  }),
+  put: async (url, body, options = {}) => ({
+    data: await fetchJSON(url, {
+      method: 'PUT',
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      ...options,
+    }),
+  }),
+  delete: async (url, options = {}) => ({
+    data: await fetchJSON(url, { method: 'DELETE', ...options }),
+  }),
+};
+
+export default api;

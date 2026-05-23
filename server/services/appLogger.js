@@ -1,13 +1,18 @@
 const fs = require('fs');
 const path = require('path');
+const { applyEnvDefaults } = require('../config/envDefaults');
+
+applyEnvDefaults();
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const LOG_DIR = process.env.APP_LOG_DIR || path.join(DATA_DIR, 'logs');
-const RETENTION_DAYS = Math.max(1, Number(process.env.APP_LOG_RETENTION_DAYS || (process.env.NODE_ENV === 'production' ? 10 : 30)));
+const APP_MODE = String(process.env.APP_MODE || 'production').toLowerCase();
+const IS_PRODUCTION_MODE = APP_MODE !== 'dev' && APP_MODE !== 'development' && APP_MODE !== 'test';
+const RETENTION_DAYS = Math.max(1, Number(process.env.APP_LOG_RETENTION_DAYS || (IS_PRODUCTION_MODE ? 10 : 30)));
 const IST_OFFSET_MINUTES = 330;
 const LOG_FILE_PREFIX = 'invest-tracker';
 const LOG_TO_CONSOLE = String(
-  process.env.APP_LOG_TO_CONSOLE || (process.env.NODE_ENV === 'production' ? 'false' : 'true')
+  process.env.APP_LOG_TO_CONSOLE || (IS_PRODUCTION_MODE ? 'false' : 'true')
 ).toLowerCase() === 'true';
 
 function toIstDate(date = new Date()) {

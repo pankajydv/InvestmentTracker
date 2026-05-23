@@ -55,7 +55,7 @@ GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
 ALLOWED_EMAILS=${ALLOWED_EMAILS}
 ENABLE_SCHEDULER=${ENABLE_SCHEDULER}
 ALLOW_DB_MIGRATIONS=${ALLOW_DB_MIGRATIONS}
-NODE_ENV=production
+APP_MODE=production
 PORT=8080
 DATA_DIR=/data
 EOF
@@ -63,7 +63,7 @@ log "Environment file created"
 
 # Step 4: Copy deployment configuration
 log "Setting up deployment config..."
-cp configs/investtrack.config.json . || error "Failed to copy deployment config"
+cp configs/investtrack-prod.json . || error "Failed to copy deployment config"
 
 # Step 5: Verify Docker is available
 log "Checking Docker availability..."

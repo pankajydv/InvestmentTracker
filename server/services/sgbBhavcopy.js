@@ -8,6 +8,7 @@
 
 const https = require('https');
 const AdmZip = require('adm-zip');
+const { getSeries, upsertPricePoint } = require('./marketPriceCache');
 
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
@@ -106,6 +107,14 @@ const delay = ms => new Promise(r => setTimeout(r, ms));
 
 async function getSGBHistoricalPrices(symbol, fromDate, toDate) {
   const out = new Map();
+
+  const cached = getSeries('SGB', symbol, fromDate, toDate);
+  for (const row of cached) {
+    if (row.close != null) {
+      out.set(row.date, Number(row.close));
+    }
+  }
+
   let d = new Date(`${fromDate}T00:00:00.000Z`);
   const end = new Date(`${toDate}T00:00:00.000Z`);
   let consecutiveErrors = 0;
@@ -118,6 +127,10 @@ async function getSGBHistoricalPrices(symbol, fromDate, toDate) {
       const m = pad(d.getUTCMonth() + 1);
       const day = pad(d.getUTCDate());
       const dateStr = `${y}-${m}-${day}`;
+      if (out.has(dateStr)) {
+        d.setUTCDate(d.getUTCDate() + 1);
+        continue;
+      }
       try {
         const { url, format } = getBhavcopyUrlInfo(dateStr);
         const zipBuf = await fetchBuffer(url);
@@ -125,6 +138,13 @@ async function getSGBHistoricalPrices(symbol, fromDate, toDate) {
         const price = parseBhavcopyCSV(csv, symbol, format);
         if (price != null) {
           out.set(dateStr, price);
+          upsertPricePoint({
+            instrumentType: 'SGB',
+            symbol,
+            date: dateStr,
+            close: price,
+            source: 'NSE_BHAVCOPY',
+          });
           consecutiveErrors = 0;
         }
         await delay(150);

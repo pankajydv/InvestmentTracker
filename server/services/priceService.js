@@ -9,6 +9,27 @@
 
 const https = require('https');
 const http = require('http');
+const {
+  upsertPricePoint,
+  upsertPriceSeries,
+  getSeries,
+  getNearestOnOrBefore,
+} = require('./marketPriceCache');
+
+function isoDate(date) {
+  return new Date(date).toISOString().split('T')[0];
+}
+
+function addDaysIso(dateIso, days) {
+  const d = new Date(`${dateIso}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().split('T')[0];
+}
+
+function inferStockInstrumentType(symbol) {
+  if (/\.(NS|BO)$/i.test(String(symbol || ''))) return 'INDIAN_STOCK';
+  return 'FOREIGN_STOCK';
+}
 
 // ─── Mutual Fund NAV from AMFI ────────────────────────────────────────────────
 
@@ -90,6 +111,18 @@ async function searchMutualFunds(query) {
  * @returns {Promise<Array<{date: string, nav: number}>>}
  */
 async function fetchMutualFundHistory(amfiCode) {
+  const today = isoDate(new Date());
+  const cached = getSeries('MUTUAL_FUND', amfiCode, '1900-01-01', today);
+  if (cached.length > 0) {
+    const latestCachedDate = cached[cached.length - 1].date;
+    if (latestCachedDate >= addDaysIso(today, -2)) {
+      return cached.map((d) => ({
+        date: d.date,
+        nav: Number(d.close),
+      }));
+    }
+  }
+
   return new Promise((resolve, reject) => {
     const url = `https://api.mfapi.in/mf/${amfiCode}`;
     https.get(url, (res) => {
@@ -99,10 +132,17 @@ async function fetchMutualFundHistory(amfiCode) {
         try {
           const json = JSON.parse(data);
           if (json.data && json.data.length > 0) {
-            resolve(json.data.map(d => ({
+            const rows = json.data.map(d => ({
               date: d.date,
               nav: parseFloat(d.nav),
-            })));
+            }));
+            upsertPriceSeries(
+              'MUTUAL_FUND',
+              amfiCode,
+              rows.map((r) => ({ date: r.date, close: r.nav, source: 'MFAPI' })),
+              'MFAPI'
+            );
+            resolve(rows);
           } else {
             reject(new Error(`No history for scheme ${amfiCode}`));
           }
@@ -199,16 +239,36 @@ function fetchStockPriceDirect(symbol) {
  * @param {string} period - '1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', 'max'
  */
 async function fetchStockHistory(symbol, period = '1y') {
+  const instrumentType = inferStockInstrumentType(symbol);
+  const periodStart = isoDate(getStartDate(period));
+  const today = isoDate(new Date());
+  const cached = getSeries(instrumentType, symbol, periodStart, today);
+  if (cached.length > 0) {
+    const latestCachedDate = cached[cached.length - 1].date;
+    if (latestCachedDate >= addDaysIso(today, -1)) {
+      return cached
+        .filter((q) => q.close != null)
+        .map((q) => ({ date: q.date, price: Number(q.close) }));
+    }
+  }
+
   try {
     const yf = await getYahooFinance();
     const result = await yf.chart(symbol, { period1: getStartDate(period), period2: new Date() });
     if (result.quotes) {
-      return result.quotes
+      const rows = result.quotes
         .filter(q => q.close != null)
         .map(q => ({
           date: new Date(q.date).toISOString().split('T')[0],
           price: q.close,
         }));
+      upsertPriceSeries(
+        instrumentType,
+        symbol,
+        rows.map((r) => ({ date: r.date, close: r.price, source: 'YAHOO' })),
+        'YAHOO'
+      );
+      return rows;
     }
     return [];
   } catch (e) {
@@ -225,6 +285,10 @@ async function fetchStockHistory(symbol, period = '1y') {
  */
 async function fetchHistoricalStockPrice(symbol, date) {
   if (!symbol || !date) throw new Error('symbol and date are required');
+
+  const instrumentType = inferStockInstrumentType(symbol);
+  const cached = getNearestOnOrBefore(instrumentType, symbol, date);
+  if (cached && cached.close != null) return Number(cached.close);
 
   const target = new Date(date);
   const from = new Date(target);
@@ -255,14 +319,20 @@ async function fetchHistoricalStockPrice(symbol, date) {
 
           let bestPrice = null;
           let bestDate = null;
+          const parsedRows = [];
           for (let i = 0; i < timestamps.length; i += 1) {
             const close = closes[i];
             if (close == null) continue;
             const pointDate = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            parsedRows.push({ date: pointDate, close, source: 'YAHOO' });
             if (pointDate <= isoTarget && (!bestDate || pointDate > bestDate)) {
               bestDate = pointDate;
               bestPrice = close;
             }
+          }
+
+          if (parsedRows.length > 0) {
+            upsertPriceSeries(instrumentType, symbol, parsedRows, 'YAHOO');
           }
 
           if (bestPrice != null) resolve(bestPrice);
@@ -285,6 +355,17 @@ async function fetchHistoricalStockPrice(symbol, date) {
  */
 async function fetchHistoricalOHLC(symbol, date) {
   if (!symbol || !date) throw new Error('symbol and date are required');
+
+  const instrumentType = inferStockInstrumentType(symbol);
+  const cached = getNearestOnOrBefore(instrumentType, symbol, date);
+  if (cached && cached.open != null && cached.high != null && cached.low != null && cached.close != null) {
+    return {
+      open: Number(cached.open),
+      high: Number(cached.high),
+      low: Number(cached.low),
+      close: Number(cached.close),
+    };
+  }
 
   const target = new Date(date);
   const from = new Date(target);
@@ -319,6 +400,7 @@ async function fetchHistoricalOHLC(symbol, date) {
 
           let bestOHLC = null;
           let bestDate = null;
+          const parsedRows = [];
           for (let i = 0; i < timestamps.length; i += 1) {
             const o = opens[i];
             const h = highs[i];
@@ -327,10 +409,15 @@ async function fetchHistoricalOHLC(symbol, date) {
             if (o == null || h == null || l == null || c == null) continue;
 
             const pointDate = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            parsedRows.push({ date: pointDate, open: o, high: h, low: l, close: c, source: 'YAHOO' });
             if (pointDate <= isoTarget && (!bestDate || pointDate > bestDate)) {
               bestDate = pointDate;
               bestOHLC = { open: o, high: h, low: l, close: c };
             }
+          }
+
+          if (parsedRows.length > 0) {
+            upsertPriceSeries(instrumentType, symbol, parsedRows, 'YAHOO');
           }
 
           if (bestOHLC) resolve(bestOHLC);
@@ -379,21 +466,175 @@ async function fetchUSDToINR() {
 async function fetchHistoricalUSDToINR(date) {
   if (!date) return fetchUSDToINR();
 
+  const cached = getNearestOnOrBefore('FX', 'USDINR=X', date);
+  if (cached && cached.close != null) return Number(cached.close);
+
   // ── 1. FBIL reference rate ────────────────────────────────────────────────
   try {
     const rate = await _fetchFBILRate(date);
-    if (rate && rate > 0) return rate;
+    if (rate && rate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rate, source: 'FBIL' });
+      return rate;
+    }
   } catch (_) { /* fall through */ }
 
   // ── 2. Yahoo Finance historical USDINR=X ──────────────────────────────────
   try {
     const rate = await _fetchYahooHistoricalUSDINR(date);
-    if (rate && rate > 0) return rate;
+    if (rate && rate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rate, source: 'YAHOO' });
+      return rate;
+    }
   } catch (_) { /* fall through */ }
 
   // ── 3. Current rate as fallback ───────────────────────────────────────────
   console.warn(`fetchHistoricalUSDToINR: could not get rate for ${date}, using current rate`);
   return fetchUSDToINR();
+}
+
+const fbilMonthlyCache = new Map();
+
+function getYearMonth(dateIso) {
+  const [year, month] = String(dateIso).split('-');
+  return `${year}-${month}`;
+}
+
+function nextMonth(ym) {
+  const [yearStr, monthStr] = ym.split('-');
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const d = new Date(Date.UTC(year, month - 1, 1));
+  d.setUTCMonth(d.getUTCMonth() + 1);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function listYearMonths(fromDate, toDate) {
+  const out = [];
+  let ym = getYearMonth(fromDate);
+  const endYm = getYearMonth(toDate);
+  while (ym <= endYm) {
+    out.push(ym);
+    ym = nextMonth(ym);
+  }
+  return out;
+}
+
+function parseFBILMonthlyCsv(csvText) {
+  const byDate = new Map();
+  const lines = String(csvText || '').trim().split('\n').slice(1);
+  for (const line of lines) {
+    const parts = line.split(',');
+    if (parts.length < 2) continue;
+    const parsedDate = _parseFBILDate((parts[0] || '').trim());
+    const rate = parseFloat((parts[1] || '').trim());
+    if (!parsedDate || !Number.isFinite(rate) || rate <= 0) continue;
+    byDate.set(parsedDate, rate);
+  }
+  return byDate;
+}
+
+async function fetchFBILMonthlyRates(yearMonth) {
+  if (fbilMonthlyCache.has(yearMonth)) {
+    return fbilMonthlyCache.get(yearMonth);
+  }
+
+  const [year, month] = yearMonth.split('-');
+  const url = `https://fbil.org.in/FBIL_Data/upload/Historical_Data/FBIL-USD-INR-${year}-${month}.csv`;
+
+  const promise = new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`FBIL returned ${res.statusCode} for ${yearMonth}`));
+        return;
+      }
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(parseFBILMonthlyCsv(data));
+        } catch (e) {
+          reject(e);
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+
+  fbilMonthlyCache.set(yearMonth, promise);
+  return promise;
+}
+
+async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
+  const start = String(fromDate || '').split('T')[0];
+  const end = String(toDate || '').split('T')[0];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    throw new Error(`Invalid FX date range ${fromDate}..${toDate}`);
+  }
+  if (start > end) {
+    throw new Error(`Invalid FX date range ordering ${start}..${end}`);
+  }
+
+  const dates = [];
+  let d = start;
+  while (d <= end) {
+    dates.push(d);
+    d = addDaysIso(d, 1);
+  }
+
+  const monthRates = new Map();
+  const months = listYearMonths(start, end);
+  for (const ym of months) {
+    try {
+      const m = await fetchFBILMonthlyRates(ym);
+      monthRates.set(ym, m);
+    } catch (_) {
+      // If monthly FBIL fails, we will rely on fallback path for missing days.
+    }
+  }
+
+  let successfulDays = 0;
+  let fallbackDays = 0;
+
+  for (const day of dates) {
+    const cached = getNearestOnOrBefore('FX', 'USDINR=X', day);
+    if (cached && cached.close != null) {
+      successfulDays += 1;
+      continue;
+    }
+
+    const ym = getYearMonth(day);
+    const rates = monthRates.get(ym);
+    if (rates && rates.size > 0) {
+      let bestDate = null;
+      let bestRate = null;
+      for (const [rateDate, rate] of rates.entries()) {
+        if (rateDate <= day && (!bestDate || rateDate > bestDate)) {
+          bestDate = rateDate;
+          bestRate = rate;
+        }
+      }
+      if (bestRate && bestRate > 0) {
+        upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date: day, close: bestRate, source: 'FBIL' });
+        successfulDays += 1;
+        continue;
+      }
+    }
+
+    try {
+      await fetchHistoricalUSDToINR(day);
+      successfulDays += 1;
+      fallbackDays += 1;
+    } catch (_) {
+      // best effort for range fill
+    }
+  }
+
+  return {
+    attemptedDays: dates.length,
+    successfulDays,
+    fallbackDays,
+    monthCalls: months.length,
+  };
 }
 
 /**
@@ -1084,6 +1325,7 @@ module.exports = {
   fetchCorporateActions,
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
+  fetchHistoricalUSDToINRRange,
   calculatePPFValue,
   toNSETicker,
   lookupTickerByISIN,

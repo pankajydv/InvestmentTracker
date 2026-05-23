@@ -165,44 +165,16 @@ async function updateAllPrices(db, options = {}) {
       day_change_pct = excluded.day_change_pct
   `);
 
-  // For combined (NULL portfolio_id) rows, ON CONFLICT doesn't work
-  // (SQLite treats NULLs as distinct), so delete-then-insert.
-  const deleteDailyCombined = db.prepare(
-    'DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL AND date = ?'
-  );
-  const insertDailyCombined = db.prepare(`
-    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
-    VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const getInvestedAmount = db.prepare(`
-    SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND transaction_date <= ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION')
-  `);
   const getInvestedAmountPortfolio = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
     FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION')
   `);
 
-  const getSaleProceeds = db.prepare(`
-    SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND transaction_date <= ? AND transaction_type IN ('SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST')
-  `);
   const getSaleProceedsPortfolio = db.prepare(`
     SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) as total
     FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ? AND transaction_type IN ('SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST')
   `);
 
-  const getTotalUnits = db.prepare(`
-    SELECT COALESCE(
-      SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
-        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
-        ELSE 0
-      END), 0
-    ) as total
-    FROM transactions WHERE investment_id = ? AND transaction_date <= ?
-  `);
   const getTotalUnitsPortfolio = db.prepare(`
     SELECT COALESCE(
       SUM(CASE
@@ -214,26 +186,12 @@ async function updateAllPrices(db, options = {}) {
     FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ?
   `);
 
-  const getPrevDay = db.prepare(`
-    SELECT price_per_unit, current_value FROM daily_values
-    WHERE investment_id = ? AND portfolio_id IS NULL AND date < ?
-    ORDER BY date DESC LIMIT 1
-  `);
   const getPrevDayPortfolio = db.prepare(`
     SELECT price_per_unit, current_value FROM daily_values
     WHERE investment_id = ? AND portfolio_id = ? AND date < ?
     ORDER BY date DESC LIMIT 1
   `);
 
-  const getNetFlowToday = db.prepare(`
-    SELECT COALESCE(SUM(CASE
-      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
-      ELSE 0
-    END), 0) AS net_flow
-    FROM transactions
-    WHERE investment_id = ? AND date(transaction_date) = ?
-  `);
   const getNetFlowTodayPortfolio = db.prepare(`
     SELECT COALESCE(SUM(CASE
       WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
@@ -331,7 +289,7 @@ async function updateAllPrices(db, options = {}) {
           }
           if (!pricePerUnit) {
             const lastKnown = db.prepare(
-              'SELECT price_per_unit FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+              'SELECT price_per_unit FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1'
             ).get(inv.id);
             if (lastKnown) pricePerUnit = lastKnown.price_per_unit;
             if (lastKnown) priceSource = 'LOCF';
@@ -410,29 +368,17 @@ async function updateAllPrices(db, options = {}) {
 
       // ...existing code for daily_values, rollups, etc...
       const portfolioIds = getDistinctPortfolios.all(inv.id, today).map(r => r.portfolio_id);
-      const pidsToProcess = [...portfolioIds, null];
-      for (const pid of pidsToProcess) {
+      for (const pid of portfolioIds) {
         let totalUnits, investedAmount, saleProceeds, currentValue;
         if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF') {
           currentValue = getProvidentValueAsOfDate(db, inv, today, pid);
           totalUnits = 1;
-          if (pid !== null) {
-            investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
-            saleProceeds = getSaleProceedsPortfolio.get(inv.id, pid, today).total;
-          } else {
-            investedAmount = getInvestedAmount.get(inv.id, today).total;
-            saleProceeds = getSaleProceeds.get(inv.id, today).total;
-          }
+          investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
+          saleProceeds = getSaleProceedsPortfolio.get(inv.id, pid, today).total;
         } else {
-          if (pid !== null) {
-            totalUnits = getTotalUnitsPortfolio.get(inv.id, pid, today).total;
-            investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
-            saleProceeds = getSaleProceedsPortfolio.get(inv.id, pid, today).total;
-          } else {
-            totalUnits = getTotalUnits.get(inv.id, today).total;
-            investedAmount = getInvestedAmount.get(inv.id, today).total;
-            saleProceeds = getSaleProceeds.get(inv.id, today).total;
-          }
+          totalUnits = getTotalUnitsPortfolio.get(inv.id, pid, today).total;
+          investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
+          saleProceeds = getSaleProceedsPortfolio.get(inv.id, pid, today).total;
           if (inv.asset_type === 'FOREIGN_STOCK') {
             currentValue = totalUnits * pricePerUnit * usdToInr;
           } else {
@@ -445,40 +391,28 @@ async function updateAllPrices(db, options = {}) {
           ? (currentValue - investedAmount)
           : (currentValue + realizedGain - investedAmount);
         const profitLossPct = investedAmount > 0 ? (profitLoss / investedAmount) * 100 : 0;
-        const prevDay = pid !== null
-          ? getPrevDayPortfolio.get(inv.id, pid, today)
-          : getPrevDay.get(inv.id, today);
+        const prevDay = getPrevDayPortfolio.get(inv.id, pid, today);
         const prevValue = Number(prevDay?.current_value || 0);
-        const netFlowToday = pid !== null
-          ? Number(getNetFlowTodayPortfolio.get(inv.id, pid, today)?.net_flow || 0)
-          : Number(getNetFlowToday.get(inv.id, today)?.net_flow || 0);
+        const netFlowToday = Number(getNetFlowTodayPortfolio.get(inv.id, pid, today)?.net_flow || 0);
         const dayChange = currentValue - prevValue - netFlowToday;
         const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
         const r = (v) => Math.round(v * 100) / 100;
-        if (pid !== null) {
-          upsertDaily.run(
-            inv.id, pid, today,
-            r(pricePerUnit), Math.round(totalUnits * 1000) / 1000,
-            r(currentValue), r(investedAmount), r(realizedGain), r(profitLoss), r(profitLossPct), priceSource,
-            r(dayChange), r(dayChangePct)
-          );
-        } else {
-          deleteDailyCombined.run(inv.id, today);
-          insertDailyCombined.run(
-            inv.id, today,
-            r(pricePerUnit), Math.round(totalUnits * 1000) / 1000,
-            r(currentValue), r(investedAmount), r(realizedGain), r(profitLoss), r(profitLossPct), priceSource,
-            r(dayChange), r(dayChangePct)
-          );
-        }
+        upsertDaily.run(
+          inv.id, pid, today,
+          r(pricePerUnit), Math.round(totalUnits * 1000) / 1000,
+          r(currentValue), r(investedAmount), r(realizedGain), r(profitLoss), r(profitLossPct), priceSource,
+          r(dayChange), r(dayChangePct)
+        );
       }
-      const combinedUnits = getTotalUnits.get(inv.id, today).total;
-      const combinedValue = inv.asset_type === 'FOREIGN_STOCK'
-        ? combinedUnits * pricePerUnit * usdToInr
-        : (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF')
-          ? getProvidentValueAsOfDate(db, inv, today, null)
-          : combinedUnits * pricePerUnit;
-      const combinedPL = combinedValue + getSaleProceeds.get(inv.id, today).total - getInvestedAmount.get(inv.id, today).total;
+      const combinedSnapshot = db.prepare(`
+        SELECT
+          COALESCE(SUM(current_value), 0) AS total_value,
+          COALESCE(SUM(profit_loss), 0) AS total_profit_loss
+        FROM daily_values
+        WHERE investment_id = ? AND date = ?
+      `).get(inv.id, today);
+      const combinedValue = Number(combinedSnapshot?.total_value || 0);
+      const combinedPL = Number(combinedSnapshot?.total_profit_loss || 0);
       console.log(`  ✓ ${inv.name}: ₹${Math.round(combinedValue).toLocaleString()} (${combinedPL >= 0 ? '+' : ''}${Math.round(combinedPL).toLocaleString()})`);
       successCount++;
       const processed = successCount + errorCount + skippedCount;
@@ -580,8 +514,7 @@ async function updateAllPrices(db, options = {}) {
 }
 
 /**
- * Update portfolio-level daily snapshots.
- * Creates one row per portfolio_id + one combined row (portfolio_id = NULL).
+ * Update portfolio-level daily snapshots (portfolio-scoped only).
  */
 function updatePortfolioDaily(db, date) {
   const insertPortfolioDaily = db.prepare(`
@@ -601,10 +534,10 @@ function updatePortfolioDaily(db, date) {
     INNER JOIN (
       SELECT investment_id, portfolio_id, MAX(date) as max_date
       FROM daily_values
-      WHERE date <= ?
+      WHERE date <= ? AND portfolio_id IS NOT NULL
       GROUP BY investment_id, portfolio_id
     ) latest ON dv.investment_id = latest.investment_id
-      AND dv.portfolio_id IS latest.portfolio_id
+      AND dv.portfolio_id = latest.portfolio_id
       AND dv.date = latest.max_date
     GROUP BY dv.portfolio_id
   `).all(date);
@@ -617,11 +550,11 @@ function updatePortfolioDaily(db, date) {
       FROM portfolio_daily
       WHERE date < ?
       GROUP BY portfolio_id
-    ) prev ON pd.portfolio_id IS prev.portfolio_id
+    ) prev ON pd.portfolio_id = prev.portfolio_id
       AND pd.date = prev.max_date
   `).all(date);
 
-  const keyOf = (portfolioId) => (portfolioId == null ? '__NULL__' : String(portfolioId));
+  const keyOf = (portfolioId) => String(portfolioId);
   const totalsByPortfolio = new Map();
   for (const row of totalsRows) totalsByPortfolio.set(keyOf(row.portfolio_id), row);
   const prevByPortfolio = new Map();
@@ -634,13 +567,10 @@ function updatePortfolioDaily(db, date) {
     WHERE t.portfolio_id IS NOT NULL
   `).all().map(r => r.portfolio_id);
 
-  // Always include combined (null) snapshot
-  const allIds = [null, ...portfolioIds];
-
-  // Rebuild rows for this date in one pass.
+  // Rebuild rows for this date in one pass (portfolio-scoped only, no combined/NULL)
   deleteRowsForDate.run(date);
 
-  for (const pid of allIds) {
+  for (const pid of portfolioIds) {
     const totals = totalsByPortfolio.get(keyOf(pid)) || {
       total_value: 0,
       total_invested: 0,
@@ -670,7 +600,7 @@ function updatePortfolioDaily(db, date) {
 }
 
 /**
- * Update asset-type level daily snapshots for each portfolio + combined (NULL portfolio_id).
+ * Update asset-type level daily snapshots for each portfolio (no combined/NULL rows).
  */
 function updateAssetTypeDaily(db, date) {
   const deleteRows = db.prepare('DELETE FROM asset_type_daily WHERE date = ?');
@@ -708,10 +638,10 @@ function updateAssetTypeDaily(db, date) {
     INNER JOIN (
       SELECT investment_id, portfolio_id, MAX(date) as max_date
       FROM daily_values
-      WHERE date <= ?
+      WHERE date <= ? AND portfolio_id IS NOT NULL
       GROUP BY investment_id, portfolio_id
     ) latest ON dv.investment_id = latest.investment_id
-      AND dv.portfolio_id IS latest.portfolio_id
+      AND dv.portfolio_id = latest.portfolio_id
       AND dv.date = latest.max_date
     WHERE i.exclude_from_tracking != 1
     GROUP BY dv.portfolio_id, i.asset_type
@@ -725,12 +655,12 @@ function updateAssetTypeDaily(db, date) {
       FROM asset_type_daily
       WHERE date < ?
       GROUP BY portfolio_id, asset_type
-    ) prev ON atd.portfolio_id IS prev.portfolio_id
+    ) prev ON atd.portfolio_id = prev.portfolio_id
       AND atd.asset_type = prev.asset_type
       AND atd.date = prev.max_date
   `).all(date);
 
-  const prevKey = (portfolioId, assetType) => `${portfolioId == null ? '__NULL__' : String(portfolioId)}::${assetType}`;
+  const prevKey = (portfolioId, assetType) => `${String(portfolioId)}::${assetType}`;
   const previousTotals = new Map();
   for (const row of previousRows) {
     previousTotals.set(prevKey(row.portfolio_id, row.asset_type), Number(row.total_value || 0));

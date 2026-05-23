@@ -148,17 +148,19 @@ function markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourc
   if (!normalized) return 0;
 
   const rows = db.prepare(`
-    SELECT id
-    FROM investments
-    WHERE is_active != 0
-      AND COALESCE(exclude_from_tracking, 0) != 1
+    SELECT DISTINCT i.id AS investment_id, t.portfolio_id
+    FROM investments i
+    LEFT JOIN transactions t ON t.investment_id = i.id
+    WHERE i.is_active != 0
+      AND COALESCE(i.exclude_from_tracking, 0) != 1
+      AND t.portfolio_id IS NOT NULL
   `).all();
 
   let count = 0;
   for (const row of rows) {
     const dirtyDate = markScopeDirty(db, {
-      investmentId: row.id,
-      portfolioId: null,
+      investmentId: row.investment_id,
+      portfolioId: row.portfolio_id,
       dirtyFromDate: normalized,
       reason,
       sourceEventId,
@@ -169,24 +171,40 @@ function markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourc
   return count;
 }
 
-function getPendingDirtyScopes(db, runDate = todayIso()) {
+function getPendingDirtyScopes(db, runDate = todayIso(), options = {}) {
   const effectiveRunDate = normalizeDirtyDate(runDate) || todayIso();
-  return db.prepare(`
+  const maxScopes = Number.isFinite(Number(options.maxScopes))
+    ? Math.max(0, Math.floor(Number(options.maxScopes)))
+    : 0;
+
+  const query = `
     SELECT id, investment_id, portfolio_id, dirty_from_date, dirty_reason, source_event_id, status, created_at, updated_at
     FROM dirty_backfill_scope
     WHERE status IN ('pending', 'running', 'failed')
       AND dirty_from_date <= ?
     ORDER BY dirty_from_date ASC, id ASC
-  `).all(effectiveRunDate);
+    ${maxScopes > 0 ? `LIMIT ${maxScopes}` : ''}
+  `;
+
+  return db.prepare(query).all(effectiveRunDate);
 }
 
-async function runDirtyBackfillPreflight(db, runDate = todayIso()) {
+async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {}) {
   const { runBackfillInTwoSteps } = require('./backfillService');
   const effectiveRunDate = normalizeDirtyDate(runDate) || todayIso();
-  const scopes = getPendingDirtyScopes(db, effectiveRunDate);
+  const maxScopes = Number.isFinite(Number(options.maxScopes))
+    ? Math.max(0, Math.floor(Number(options.maxScopes)))
+    : 0;
+  const scopes = getPendingDirtyScopes(db, effectiveRunDate, { maxScopes });
   if (!scopes.length) {
     clearBackfillProgress(db);
-    return { runDate: effectiveRunDate, pending: 0, processed: 0, skippedFuture: 0 };
+    return {
+      runDate: effectiveRunDate,
+      pending: 0,
+      processed: 0,
+      skippedFuture: 0,
+      scopeLimitApplied: maxScopes > 0 ? maxScopes : null,
+    };
   }
 
   const scopeIds = scopes.map((s) => s.id);
@@ -274,6 +292,7 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso()) {
       pending: scopes.length,
       processed: result.processed || 0,
       skippedFuture: result.skippedFuture || 0,
+      scopeLimitApplied: maxScopes > 0 ? maxScopes : null,
     };
   } catch (e) {
     setBackfillProgress(db, {

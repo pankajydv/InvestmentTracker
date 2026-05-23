@@ -1,5 +1,6 @@
 function authBypassed() {
-  return process.env.AUTH_DISABLED === 'true' || process.env.NODE_ENV === 'test' || !process.env.GOOGLE_CLIENT_ID;
+  const appMode = String(process.env.APP_MODE || 'production').toLowerCase();
+  return process.env.AUTH_DISABLED === 'true' || appMode === 'test' || !process.env.GOOGLE_CLIENT_ID;
 }
 
 function requireAuth(req, res, next) {

@@ -4,11 +4,57 @@
  * Final run (10:25 PM) updates all asset types after MF NAVs settle.
  */
 
+const { applyEnvDefaults } = require('../config/envDefaults');
+applyEnvDefaults();
+
 const cron = require('node-cron');
 const { updateAllPrices } = require('./updater');
 const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate } = require('./dirtyBackfillService');
+const {
+  fetchMutualFundHistory,
+  fetchHistoricalOHLC,
+  fetchHistoricalUSDToINR,
+} = require('./priceService');
+const { getSGBHistoricalPrices } = require('./sgbBhavcopy');
 const { todayIso } = require('./dateUtils');
 const { logAppInfo, logAppError } = require('./appLogger');
+const { scanAndRepairComplianceGaps } = require('./compliance/complianceScanService');
+const { auditHistoricalPriceCoverage } = require('./historicalPriceAuditService');
+const { runHistoricalPriceRepairWorker } = require('./historicalPriceRepairWorkerService');
+
+function parsePositiveIntEnv(name, fallback) {
+  const parsed = Number(process.env[name]);
+  if (!Number.isFinite(parsed)) return fallback;
+  const rounded = Math.floor(parsed);
+  return rounded > 0 ? rounded : fallback;
+}
+
+function parseNonNegativeIntEnv(name, fallback) {
+  const parsed = Number(process.env[name]);
+  if (!Number.isFinite(parsed)) return fallback;
+  const rounded = Math.floor(parsed);
+  return rounded >= 0 ? rounded : fallback;
+}
+
+function parseBooleanEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === '') return fallback;
+  return String(raw).toLowerCase() === 'true';
+}
+
+const INTRADAY_BACKFILL_MAX_SCOPES = parsePositiveIntEnv('INTRADAY_BACKFILL_MAX_SCOPES', 25);
+const ENABLE_INTRADAY_COMPLIANCE = String(process.env.ENABLE_INTRADAY_COMPLIANCE || 'false').toLowerCase() === 'true';
+const ENABLE_STARTUP_COMPLIANCE = String(process.env.ENABLE_STARTUP_COMPLIANCE || 'false').toLowerCase() === 'true';
+const ENABLE_STARTUP_PREFLIGHT = String(process.env.ENABLE_STARTUP_PREFLIGHT || 'false').toLowerCase() === 'true';
+const NIGHTLY_MARKET_CACHE_WARM_DAYS = parseNonNegativeIntEnv('NIGHTLY_MARKET_CACHE_WARM_DAYS', 5);
+const ENABLE_HISTORICAL_PRICE_AUDIT = parseBooleanEnv('ENABLE_HISTORICAL_PRICE_AUDIT', true);
+const HISTORICAL_PRICE_AUDIT_DRY_RUN = parseBooleanEnv('HISTORICAL_PRICE_AUDIT_DRY_RUN', true);
+const HISTORICAL_PRICE_AUDIT_WINDOW_DAYS = parsePositiveIntEnv('HISTORICAL_PRICE_AUDIT_WINDOW_DAYS', 5);
+const ENABLE_HISTORICAL_PRICE_REPAIR_WORKER = parseBooleanEnv('ENABLE_HISTORICAL_PRICE_REPAIR_WORKER', true);
+const HISTORICAL_PRICE_REPAIR_BATCH_SIZE = parsePositiveIntEnv('HISTORICAL_PRICE_REPAIR_BATCH_SIZE', 10);
+const HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS = parsePositiveIntEnv('HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS', 3);
+
+let isHistoricalPriceRepairWorkerRunning = false;
 
 function addDays(isoDate, days) {
   const d = new Date(`${isoDate}T00:00:00.000Z`);
@@ -20,6 +66,141 @@ function diffDays(startIso, endIso) {
   const startMs = new Date(`${startIso}T00:00:00.000Z`).getTime();
   const endMs = new Date(`${endIso}T00:00:00.000Z`).getTime();
   return Math.max(Math.floor((endMs - startMs) / 86400000), 0);
+}
+
+function eachDate(fromDate, toDate) {
+  const out = [];
+  let d = new Date(`${fromDate}T00:00:00.000Z`);
+  const end = new Date(`${toDate}T00:00:00.000Z`);
+  while (d <= end) {
+    out.push(d.toISOString().split('T')[0]);
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return out;
+}
+
+async function warmRecentMarketCache(db, runDate, refreshDays, label) {
+  if (!Number.isFinite(refreshDays) || refreshDays <= 0) {
+    return { skipped: true, reason: 'disabled', refreshDays: Number(refreshDays || 0) };
+  }
+
+  const fromDate = addDays(runDate, -(refreshDays - 1));
+  const dateRange = eachDate(fromDate, runDate);
+  const activeRows = db.prepare(`
+    SELECT
+      i.id,
+      i.asset_type,
+      i.ticker_symbol AS symbol,
+      i.amfi_code,
+      SUM(
+        CASE
+          WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(t.units, 0)
+          WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(t.units, 0)
+          ELSE 0
+        END
+      ) AS net_units
+    FROM investments i
+    JOIN transactions t ON t.investment_id = i.id
+    WHERE date(t.transaction_date) <= ?
+      AND i.asset_type IN ('INDIAN_STOCK', 'FOREIGN_STOCK', 'SGB', 'MUTUAL_FUND')
+    GROUP BY i.id, i.asset_type, i.ticker_symbol, i.amfi_code
+    HAVING net_units > 0
+    ORDER BY i.id ASC
+  `).all(runDate);
+
+  const stockSymbols = [...new Set(
+    activeRows
+      .filter((r) => ['INDIAN_STOCK', 'FOREIGN_STOCK'].includes(r.asset_type) && r.symbol)
+      .map((r) => String(r.symbol).trim())
+      .filter(Boolean)
+  )];
+  const sgbSymbols = [...new Set(
+    activeRows
+      .filter((r) => r.asset_type === 'SGB' && r.symbol)
+      .map((r) => String(r.symbol).trim())
+      .filter(Boolean)
+  )];
+  const amfiCodes = [...new Set(
+    activeRows
+      .filter((r) => r.asset_type === 'MUTUAL_FUND' && r.amfi_code)
+      .map((r) => String(r.amfi_code).trim())
+      .filter(Boolean)
+  )];
+  const hasForeign = activeRows.some((r) => r.asset_type === 'FOREIGN_STOCK');
+
+  logAppInfo(`[Scheduler] ${label}: Nightly cache warm started`, {
+    runDate,
+    refreshDays,
+    fromDate,
+    stockSymbols: stockSymbols.length,
+    sgbSymbols: sgbSymbols.length,
+    mutualFunds: amfiCodes.length,
+    foreignHoldings: hasForeign,
+  });
+
+  let stockCalls = 0;
+  let sgbCalls = 0;
+  let mfCalls = 0;
+  let fxCalls = 0;
+  let errors = 0;
+
+  for (const symbol of stockSymbols) {
+    for (const d of dateRange) {
+      try {
+        await fetchHistoricalOHLC(symbol, d);
+      } catch (_e) {
+        errors += 1;
+      }
+      stockCalls += 1;
+    }
+  }
+
+  for (const symbol of sgbSymbols) {
+    try {
+      await getSGBHistoricalPrices(symbol, fromDate, runDate);
+    } catch (_e) {
+      errors += 1;
+    }
+    sgbCalls += 1;
+  }
+
+  for (const amfiCode of amfiCodes) {
+    try {
+      await fetchMutualFundHistory(amfiCode);
+    } catch (_e) {
+      errors += 1;
+    }
+    mfCalls += 1;
+  }
+
+  if (hasForeign) {
+    for (const d of dateRange) {
+      try {
+        await fetchHistoricalUSDToINR(d);
+      } catch (_e) {
+        errors += 1;
+      }
+      fxCalls += 1;
+    }
+  }
+
+  const summary = {
+    runDate,
+    refreshDays,
+    fromDate,
+    activeInstruments: activeRows.length,
+    stockSymbols: stockSymbols.length,
+    sgbSymbols: sgbSymbols.length,
+    mutualFunds: amfiCodes.length,
+    stockCalls,
+    sgbCalls,
+    mfCalls,
+    fxCalls,
+    errors,
+  };
+
+  logAppInfo(`[Scheduler] ${label}: Nightly cache warm completed`, summary);
+  return summary;
 }
 
 function resolvePriceWatermark(db) {
@@ -125,7 +306,9 @@ async function runSchedulerCycle(db, label, options = {}) {
     preflightRunDate,
   });
   const catchUp = ensureSchedulerCatchUpScopes(db, preflightRunDate, label);
-  const preflight = await runDirtyBackfillPreflight(db, preflightRunDate);
+  const preflight = await runDirtyBackfillPreflight(db, preflightRunDate, {
+    maxScopes: options.backfillMaxScopes,
+  });
   logAppInfo(`[Scheduler] ${label}: Step 3/4 completed`, {
     catchUp,
     preflight,
@@ -141,8 +324,63 @@ async function runSchedulerCycle(db, label, options = {}) {
     return { preflightOnly: true, catchUp, preflight };
   }
 
+  const warmRecentCacheDays = Number(options.warmRecentCacheDays || 0);
+  let cacheWarm = null;
+  let historicalPriceAudit = null;
+  let historicalPriceRepair = null;
+
+  const runHistoricalPriceAudit = options.enableHistoricalPriceAudit !== false;
+  if (runHistoricalPriceAudit && ENABLE_HISTORICAL_PRICE_AUDIT) {
+    try {
+      historicalPriceAudit = await auditHistoricalPriceCoverage(db, {
+        runDate,
+        recentWindowDays: Number(options.historicalPriceAuditWindowDays || HISTORICAL_PRICE_AUDIT_WINDOW_DAYS),
+        dryRun: options.historicalPriceAuditDryRun !== false ? HISTORICAL_PRICE_AUDIT_DRY_RUN : false,
+        sourceEventId: `scheduler-audit:${runDate}:${label}`,
+      });
+      logAppInfo(`[Scheduler] ${label}: Historical price audit completed`, historicalPriceAudit);
+    } catch (auditError) {
+      logAppError(`[Scheduler] ${label}: Historical price audit failed`, {
+        error: auditError?.message || String(auditError),
+      });
+    }
+  }
+
+  const runHistoricalPriceRepairWorkerNow = options.enableHistoricalPriceRepairWorker !== false;
+  if (runHistoricalPriceRepairWorkerNow && ENABLE_HISTORICAL_PRICE_REPAIR_WORKER) {
+    if (isHistoricalPriceRepairWorkerRunning) {
+      logAppInfo(`[Scheduler] ${label}: Historical price repair worker already running, skipping this cycle`, {
+        batchSize: Number(options.historicalPriceRepairBatchSize || HISTORICAL_PRICE_REPAIR_BATCH_SIZE),
+      });
+    } else {
+      isHistoricalPriceRepairWorkerRunning = true;
+      try {
+        historicalPriceRepair = await runHistoricalPriceRepairWorker(db, {
+          batchSize: Number(options.historicalPriceRepairBatchSize || HISTORICAL_PRICE_REPAIR_BATCH_SIZE),
+          maxAttempts: Number(options.historicalPriceRepairMaxAttempts || HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS),
+          label,
+        });
+      } catch (repairError) {
+        logAppError(`[Scheduler] ${label}: Historical price repair worker failed`, {
+          error: repairError?.message || String(repairError),
+        });
+      } finally {
+        isHistoricalPriceRepairWorkerRunning = false;
+      }
+    }
+  }
+
+  if (warmRecentCacheDays > 0) {
+    cacheWarm = await warmRecentMarketCache(db, runDate, warmRecentCacheDays, label);
+  }
+
   logAppInfo(`[Scheduler] ${label}: Step 4/4 running updateAllPrices`, {
     assetTypes: options.assetTypes || null,
+    warmRecentCacheDays: warmRecentCacheDays > 0 ? warmRecentCacheDays : null,
+    historicalPriceAuditEnabled: runHistoricalPriceAudit && ENABLE_HISTORICAL_PRICE_AUDIT,
+    historicalPriceAuditDryRun: HISTORICAL_PRICE_AUDIT_DRY_RUN,
+    historicalPriceRepairWorkerEnabled: runHistoricalPriceRepairWorkerNow && ENABLE_HISTORICAL_PRICE_REPAIR_WORKER,
+    historicalPriceRepairBatchSize: HISTORICAL_PRICE_REPAIR_BATCH_SIZE,
   });
   const result = await updateAllPrices(db, options);
   logAppInfo(`[Scheduler] ${label}: Step 4/4 completed`, {
@@ -150,24 +388,58 @@ async function runSchedulerCycle(db, label, options = {}) {
     preflightRunDate,
     catchUp,
     preflight,
+    historicalPriceAudit,
+    historicalPriceRepair,
+    cacheWarm,
     processed: result?.processed || 0,
     errors: result?.errors || 0,
     watermarkUpdated: !!result?.watermarkUpdated,
   });
-  return { catchUp, preflight, result };
+  return { catchUp, preflight, historicalPriceAudit, historicalPriceRepair, result };
+}
+
+async function runComplianceScan(db, label, options = {}) {
+  try {
+    const mode = options.mode || 'full';
+    logAppInfo(`[Scheduler] ${label}: Running compliance scan`, { mode });
+    const result = scanAndRepairComplianceGaps({ mode, db });
+
+    logAppInfo(`[Scheduler] ${label}: Compliance scan completed`, {
+      mode: result.mode,
+      runDate: result.runDate,
+      gapsDetected: result.gapsDetected,
+      repairsEnqueued: result.repairsEnqueued,
+      window: result.window,
+    });
+    return result;
+  } catch (e) {
+    console.error(`[Scheduler] ${label}: Compliance scan failed:`, e.message);
+    logAppError(`[Scheduler] ${label}: Compliance scan failed`, { error: e.message });
+    return null;
+  }
 }
 
 function startScheduler(db) {
-  // Startup catch-up: ensure pending dirty scopes are reconciled even before first cron tick.
-  setTimeout(async () => {
-    try {
-      await runSchedulerCycle(db, 'Startup catch-up', { skipPriceUpdate: true });
-      logAppInfo('[Scheduler] Startup preflight completed');
-    } catch (e) {
-      console.error('[Scheduler] Startup preflight failed:', e.message);
-      logAppError('[Scheduler] Startup preflight failed', { error: e.message });
-    }
-  }, 0);
+  // Startup should be lightweight by default. Preflight/compliance are opt-in only.
+  if (ENABLE_STARTUP_PREFLIGHT) {
+    setTimeout(async () => {
+      try {
+        await runSchedulerCycle(db, 'Startup catch-up', { skipPriceUpdate: true });
+        if (ENABLE_STARTUP_COMPLIANCE) {
+          await runComplianceScan(db, 'Startup catch-up', { mode: 'incremental' });
+        }
+        logAppInfo('[Scheduler] Startup preflight completed');
+      } catch (e) {
+        console.error('[Scheduler] Startup preflight failed:', e.message);
+        logAppError('[Scheduler] Startup preflight failed', { error: e.message });
+      }
+    }, 0);
+  } else {
+    logAppInfo('[Scheduler] Startup preflight skipped by configuration', {
+      enableStartupPreflight: ENABLE_STARTUP_PREFLIGHT,
+      enableStartupCompliance: ENABLE_STARTUP_COMPLIANCE,
+    });
+  }
 
   // Hourly intraday runs (9:25 AM–4:25 PM IST, weekdays) - stocks only
   // These capture intraday stock price movements while MF NAVs are still static
@@ -189,7 +461,11 @@ function startScheduler(db) {
       try {
         await runSchedulerCycle(db, `Intraday run ${hour}:25`, {
           assetTypes: ['INDIAN_STOCK', 'FOREIGN_STOCK'],
+          backfillMaxScopes: INTRADAY_BACKFILL_MAX_SCOPES,
         });
+        if (ENABLE_INTRADAY_COMPLIANCE) {
+          await runComplianceScan(db, `Intraday run ${hour}:25`, { mode: 'incremental' });
+        }
       } catch (e) {
         console.error(`[Scheduler] ${hour}:25 update failed:`, e.message);
         logAppError(`[Scheduler] Intraday run ${hour}:25 failed`, { error: e.message });
@@ -203,7 +479,10 @@ function startScheduler(db) {
   cron.schedule('25 22 * * 1-5', async () => {
     console.log('[Scheduler] Running 10:25 PM final price update (all asset types)...');
     try {
-      await runSchedulerCycle(db, 'Final nightly run (all types)');
+      await runSchedulerCycle(db, 'Final nightly run (all types)', {
+        warmRecentCacheDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
+      });
+      await runComplianceScan(db, 'Final nightly run (all types)', { mode: 'full' });
     } catch (e) {
       console.error('[Scheduler] Final nightly update failed:', e.message);
       logAppError('[Scheduler] Final nightly run failed', { error: e.message });
@@ -219,6 +498,17 @@ function startScheduler(db) {
     timezone: 'Asia/Kolkata',
     intradayRuns: 8,
     nightlyRun: '22:25',
+    intradayBackfillMaxScopes: INTRADAY_BACKFILL_MAX_SCOPES,
+    nightlyMarketCacheWarmDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
+    historicalPriceAuditEnabled: ENABLE_HISTORICAL_PRICE_AUDIT,
+    historicalPriceAuditWindowDays: HISTORICAL_PRICE_AUDIT_WINDOW_DAYS,
+    historicalPriceAuditDryRun: HISTORICAL_PRICE_AUDIT_DRY_RUN,
+    historicalPriceRepairWorkerEnabled: ENABLE_HISTORICAL_PRICE_REPAIR_WORKER,
+    historicalPriceRepairBatchSize: HISTORICAL_PRICE_REPAIR_BATCH_SIZE,
+    historicalPriceRepairMaxAttempts: HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS,
+    intradayComplianceEnabled: ENABLE_INTRADAY_COMPLIANCE,
+    startupPreflightEnabled: ENABLE_STARTUP_PREFLIGHT,
+    startupComplianceEnabled: ENABLE_STARTUP_COMPLIANCE,
   });
 }
 
