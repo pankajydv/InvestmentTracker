@@ -413,6 +413,8 @@ export default function Dashboard() {
     });
   };
 
+  const tableColumnWidths = ['30%', '12%', '12%', '12%', '14%', '8%', '12%'];
+
   const handleAllocationClick = (event, type) => {
     event.preventDefault();
     scrollToSection(`section-${type}`);
@@ -591,7 +593,7 @@ export default function Dashboard() {
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 <PiggyBank size={16} /> Realized Cashflows
               </div>
-              <div className={`fw-bold ${profitColor(realizedAfterExpenses)}`} style={{ fontSize: '1.55rem', lineHeight: 1.1 }}>
+              <div className={`fw-bold ${profitColor(realizedAfterExpenses)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
                 {realizedAfterExpenses >= 0 ? '+' : ''}{formatINRExact(realizedAfterExpenses)}
               </div>
               <div className="text-muted small">
@@ -647,7 +649,12 @@ export default function Dashboard() {
             </div>
           </Card.Header>
           <div className="responsive-table">
-            <Table hover size="sm" className="mb-0 small">
+            <Table hover size="sm" className="mb-0 small" style={{ tableLayout: 'fixed' }}>
+              <colgroup>
+                {tableColumnWidths.map((width, idx) => (
+                  <col key={`${type}-col-${idx}`} style={{ width }} />
+                ))}
+              </colgroup>
               <thead className="table-light">
                 <tr>
                   {getSortColumnsForType(type).map(col => {

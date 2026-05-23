@@ -12,7 +12,7 @@ const {
   fetchSGBPrice,
   fetchNPSNAV,
 } = require('./priceService');
-const { calculatePfInterestPreview, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
+const { calculatePfInterestPreview, calculatePfValueAsOfDate, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
 const { logAppInfo, logAppError } = require('./appLogger');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -41,16 +41,15 @@ function getProvidentValueAsOfDate(db, inv, date, portfolioId = null) {
   ).all(inv.asset_type);
 
   if (inv.asset_type === 'PF') {
-    const preview = calculatePfInterestPreview({
+    return Number(calculatePfValueAsOfDate({
       openingBalance: Number(inv.opening_balance || 0),
       transactions: txns,
       rateRows,
       fromDate,
-      toDate: date,
+      asOfDate: date,
       ignoreExistingInterest: true,
       includeTransferTransactions: true,
-    });
-    return Number(preview.closingBalance || 0);
+    }) || 0);
   }
 
   return Number(calculateSmallSavingsValueAsOfDate({
@@ -170,10 +169,22 @@ async function updateAllPrices(db, options = {}) {
     FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION')
   `);
 
-  const getSaleProceedsPortfolio = db.prepare(`
-    SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ? AND transaction_type IN ('SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST')
-  `);
+  function getRealizedCashflowPortfolio(investment, portfolioId, asOfDate) {
+    let types = ['SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST'];
+    if (investment.asset_type === 'PF' || investment.asset_type === 'PPF' || investment.asset_type === 'SSY') {
+      // Provident interest/reconcile are internal accrual adjustments, not external cashflow.
+      types = ['SELL', 'WITHDRAWAL', 'DIVIDEND'];
+    }
+
+    const placeholders = types.map(() => '?').join(',');
+    const row = db.prepare(`
+      SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) as total
+      FROM transactions
+      WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ?
+        AND transaction_type IN (${placeholders})
+    `).get(investment.id, portfolioId, asOfDate, ...types);
+    return Number(row?.total || 0);
+  }
 
   const getTotalUnitsPortfolio = db.prepare(`
     SELECT COALESCE(
@@ -195,7 +206,8 @@ async function updateAllPrices(db, options = {}) {
   const getNetFlowTodayPortfolio = db.prepare(`
     SELECT COALESCE(SUM(CASE
       WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
       ELSE 0
     END), 0) AS net_flow
     FROM transactions
@@ -369,16 +381,16 @@ async function updateAllPrices(db, options = {}) {
       // ...existing code for daily_values, rollups, etc...
       const portfolioIds = getDistinctPortfolios.all(inv.id, today).map(r => r.portfolio_id);
       for (const pid of portfolioIds) {
-        let totalUnits, investedAmount, saleProceeds, currentValue;
+        let totalUnits, investedAmount, realizedCashflow, currentValue;
         if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF') {
           currentValue = getProvidentValueAsOfDate(db, inv, today, pid);
           totalUnits = 1;
           investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
-          saleProceeds = getSaleProceedsPortfolio.get(inv.id, pid, today).total;
+          realizedCashflow = getRealizedCashflowPortfolio(inv, pid, today);
         } else {
           totalUnits = getTotalUnitsPortfolio.get(inv.id, pid, today).total;
           investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
-          saleProceeds = getSaleProceedsPortfolio.get(inv.id, pid, today).total;
+          realizedCashflow = getRealizedCashflowPortfolio(inv, pid, today);
           if (inv.asset_type === 'FOREIGN_STOCK') {
             currentValue = totalUnits * pricePerUnit * usdToInr;
           } else {
@@ -386,7 +398,9 @@ async function updateAllPrices(db, options = {}) {
           }
         }
         const reinvestedType = inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF';
-        const realizedGain = reinvestedType ? 0 : saleProceeds;
+        const realizedGain = inv.asset_type === 'PF'
+          ? realizedCashflow
+          : (reinvestedType ? 0 : realizedCashflow);
         const profitLoss = reinvestedType
           ? (currentValue - investedAmount)
           : (currentValue + realizedGain - investedAmount);

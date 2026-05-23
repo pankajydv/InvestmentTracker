@@ -3,6 +3,7 @@ const { fetchCorporateActions, fetchHistoricalStockPrice, fetchHistoricalOHLC, f
 const { fetchNPSHistory } = require('./priceService');
 const {
   calculatePfInterestPreview,
+  calculatePfValueAsOfDate,
   calculateSmallSavingsInterestPreview,
   calculateSmallSavingsValueAsOfDate,
 } = require('./pfInterestCalculator');
@@ -343,19 +344,18 @@ function getProvidentValue(db, inv, date, portfolioId) {
   const rateRows = getRateRows(db, inv.asset_type);
 
   if (inv.asset_type === 'PF') {
-    const preview = calculatePfInterestPreview({
+    return Number(calculatePfValueAsOfDate({
       openingBalance: Number(inv.opening_balance || 0),
       transactions: txns,
       rateRows,
       fromDate,
-      toDate: date,
+      asOfDate: date,
       // Existing INTEREST rows in PF statements are year-end credits that are
       // already represented in historical postings. Recomputing interest while
       // also including those rows double-counts and inflates daily values.
       ignoreExistingInterest: true,
       includeTransferTransactions: true,
-    });
-    return Number(preview.closingBalance || 0);
+    }) || 0);
   }
 
   if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY') {
@@ -449,7 +449,8 @@ function computeNetFlowForDate(db, inv, date, portfolioId, statements = null) {
   const getNetFlow = statements?.getNetFlow || db.prepare(`
     SELECT COALESCE(SUM(CASE
       WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
       ELSE 0
     END), 0) AS net_flow
     FROM transactions
@@ -458,7 +459,8 @@ function computeNetFlowForDate(db, inv, date, portfolioId, statements = null) {
   const getNetFlowPortfolio = statements?.getNetFlowPortfolio || db.prepare(`
     SELECT COALESCE(SUM(CASE
       WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
       ELSE 0
     END), 0) AS net_flow
     FROM transactions
@@ -532,7 +534,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   const getNetFlow = db.prepare(`
     SELECT COALESCE(SUM(CASE
       WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
       ELSE 0
     END), 0) AS net_flow
     FROM transactions
@@ -541,7 +544,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   const getNetFlowPortfolio = db.prepare(`
     SELECT COALESCE(SUM(CASE
       WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC', 'TDS') THEN -COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
       ELSE 0
     END), 0) AS net_flow
     FROM transactions
@@ -594,6 +598,9 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
 
     const realized = computeRealizedProceeds(db, inv, date, portfolioId);
     const reinvestType = inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY';
+    const realizedGain = inv.asset_type === 'PF'
+      ? realized
+      : (reinvestType ? 0 : realized);
     const profitLoss = reinvestType
       ? currentValue - invested
       : currentValue + realized - invested;
@@ -625,7 +632,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
         : Math.round(units * 1000) / 1000,
       current_value: round2(currentValue),
       invested_amount: round2(invested),
-      realized_gain: round2(reinvestType ? 0 : realized),
+      realized_gain: round2(realizedGain),
       profit_loss: round2(profitLoss),
       profit_loss_pct: round2(profitLossPct),
       price_source: priceSource,

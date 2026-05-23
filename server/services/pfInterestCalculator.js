@@ -84,7 +84,7 @@ function calculatePfInterestPreview({
 }) {
   // Define which transaction types increase (credit) or decrease (debit) the balance
   const creditTypes = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'TRANSFER_IN', 'INTEREST', 'RECONCILE', 'DIVIDEND', 'BONUS', 'RIGHTS', 'MERGER']);
-  const debitTypes = new Set(['WITHDRAWAL', 'TRANSFER_OUT', 'CHARGES', 'AMC', 'CONSOLIDATION']);
+  const debitTypes = new Set(['WITHDRAWAL', 'TRANSFER_OUT', 'CHARGES', 'AMC', 'CONSOLIDATION', 'TDS']);
   const deferredContributionTypes = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION']);
   if (!includeTransferTransactions) {
     debitTypes.delete('TRANSFER_OUT');
@@ -556,8 +556,125 @@ function calculateSmallSavingsValueAsOfDate({
   return roundTo(principal + runningFyInterest, 2);
 }
 
+/**
+ * Compute PF value as-of a specific date using EPFO-style monthly base,
+ * with daily pro-rata accrual for the current month and FY-end crediting.
+ *
+ * Daily accrual is valuation-only and does NOT compound daily. Principal is
+ * increased only on FY-end credit (March close).
+ */
+function calculatePfValueAsOfDate({
+  openingBalance = 0,
+  transactions = [],
+  rateRows = [],
+  fromDate,
+  asOfDate,
+  includeTransferTransactions = false,
+  ignoreExistingInterest = true,
+}) {
+  const targetDate = toDateOnly(asOfDate);
+  const startYm = toYearMonth(fromDate);
+  const endYm = toYearMonth(targetDate);
+  if (!startYm || !endYm || startYm > endYm) {
+    throw new Error('Invalid from/as-of range for PF as-of value calculation.');
+  }
+
+  const creditTypes = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'TRANSFER_IN', 'INTEREST', 'RECONCILE', 'DIVIDEND', 'BONUS', 'RIGHTS', 'MERGER']);
+  const debitTypes = new Set(['WITHDRAWAL', 'TRANSFER_OUT', 'CHARGES', 'AMC', 'CONSOLIDATION', 'TDS']);
+  const deferredContributionTypes = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION']);
+  if (!includeTransferTransactions) {
+    debitTypes.delete('TRANSFER_OUT');
+    creditTypes.delete('TRANSFER_IN');
+  }
+
+  const parsedRates = parseRateEntries(rateRows);
+  let principal = roundTo(Number(openingBalance || 0), 2);
+  let runningFyInterest = 0;
+
+  const postingsByMonth = new Map();
+  for (const t of transactions) {
+    const dateStr = toDateOnly(t.transaction_date);
+    if (!dateStr || dateStr < fromDate || dateStr > targetDate) continue;
+
+    const type = String(t.transaction_type || '');
+    let signed = 0;
+    if (type === 'INTEREST' && ignoreExistingInterest) {
+      continue;
+    } else if (creditTypes.has(type)) {
+      signed = Number(t.amount || 0);
+    } else if (debitTypes.has(type)) {
+      signed = -Math.abs(Number(t.amount || 0));
+    } else {
+      signed = Number(t.amount || 0);
+    }
+
+    const ym = toYearMonth(dateStr);
+    if (ym < startYm || ym > endYm) continue;
+    if (!postingsByMonth.has(ym)) postingsByMonth.set(ym, []);
+    postingsByMonth.get(ym).push({
+      date: dateStr,
+      amount: signed,
+      isDeferredContribution: deferredContributionTypes.has(type),
+    });
+  }
+  for (const arr of postingsByMonth.values()) {
+    arr.sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  for (const ym of yearMonthRange(startYm, endYm)) {
+    const { y: yy, m: mm } = safeDateFromYm(ym);
+    const monthEnd = fmtDate(yy, mm, lastDayOfMonth(yy, mm));
+    const evalEnd = targetDate < monthEnd ? targetDate : monthEnd;
+    const monthPostings = (postingsByMonth.get(ym) || []).filter((p) => p.date <= evalEnd);
+
+    let endPrincipal = principal;
+    let deferredContributionDelta = 0;
+    for (const p of monthPostings) {
+      endPrincipal = roundTo(endPrincipal + p.amount, 2);
+      if (p.isDeferredContribution) {
+        deferredContributionDelta = roundTo(deferredContributionDelta + p.amount, 2);
+      }
+    }
+
+    const rate = getRateForDate(parsedRates, monthEnd);
+    if (rate == null) {
+      throw new Error(`No PF interest rate configured for month ${ym}.`);
+    }
+
+    // EPFO-style: same-month PF contributions start earning from next month.
+    const interestBase = roundTo(Math.max(endPrincipal - deferredContributionDelta, 0), 2);
+    const rawMonthInterest = interestBase * (Number(rate) / 1200);
+
+    const monthDays = lastDayOfMonth(yy, mm);
+    const elapsedDays = Number(evalEnd.slice(8, 10));
+    const prorataAccrued = rawMonthInterest * (elapsedDays / monthDays);
+
+    const isMonthComplete = evalEnd === monthEnd;
+    if (isMonthComplete) {
+      principal = endPrincipal;
+      runningFyInterest = roundTo(runningFyInterest + rawMonthInterest, 8);
+
+      if (mm === 3) {
+        const fyCredit = Math.round(runningFyInterest);
+        principal = roundTo(principal + fyCredit, 2);
+        runningFyInterest = 0;
+      }
+      continue;
+    }
+
+    // Partial current month: principal excludes current-month interest;
+    // add only prorata accrued interest to valuation.
+    return roundTo(endPrincipal + runningFyInterest + prorataAccrued, 2);
+  }
+
+  // asOfDate is month-end (or after loop completion): include accrued FY
+  // interest that is not yet credited until Mar-31.
+  return roundTo(principal + runningFyInterest, 2);
+}
+
 module.exports = {
   calculatePfInterestPreview,
+  calculatePfValueAsOfDate,
   calculateSmallSavingsInterestPreview,
   calculateSmallSavingsValueAsOfDate,
 };
