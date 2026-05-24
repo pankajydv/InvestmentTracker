@@ -149,7 +149,7 @@ function initializeDb(db) {
       total_units REAL,            -- Total units held on that day
       current_value REAL NOT NULL, -- total_units * price_per_unit
       invested_amount REAL NOT NULL, -- Total amount invested till date
-      realized_gain REAL DEFAULT 0, -- Cumulative realized gain (cash-out types)
+      realized_proceeds REAL DEFAULT 0, -- Cumulative cash out (realized proceeds)
       profit_loss REAL NOT NULL,   -- current_value - invested_amount
       profit_loss_pct REAL,        -- Percentage gain/loss
       price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED')),
@@ -184,7 +184,7 @@ function initializeDb(db) {
       total_value REAL NOT NULL,
       total_invested REAL NOT NULL,
       total_profit_loss REAL NOT NULL,
-      total_realized_gain REAL DEFAULT 0,
+      total_realized_proceeds REAL DEFAULT 0,
       total_unrealized_gain REAL DEFAULT 0,
       total_profit_loss_pct REAL,
       day_change REAL DEFAULT 0,
@@ -1809,21 +1809,23 @@ function initializeDb(db) {
     recordMigration(db, '20260510-add-dirty-backfill-scope-table', 'skipped', 'already present');
   }
 
-  // ── Migration: add daily_values price_source + realized_gain columns ─────
+  // ── Migration: ensure daily_values price_source + realized_proceeds columns ─────
   const dvColsNow = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
-  const dailyValuesEnhancementId = '20260510-add-daily-values-price-source-realized-gain';
+  const dailyValuesEnhancementId = '20260524-daily-values-price-source-realized-proceeds';
   if (requireMigrationsEnabled(
     dailyValuesEnhancementId,
-    !dvColsNow.has('price_source') || !dvColsNow.has('realized_gain'),
-    'daily_values price_source/realized_gain missing'
+    !dvColsNow.has('price_source') || !dvColsNow.has('realized_proceeds'),
+    'daily_values price_source/realized_proceeds missing'
   )) {
     db.exec('BEGIN');
     try {
       if (!dvColsNow.has('price_source')) {
         db.exec("ALTER TABLE daily_values ADD COLUMN price_source TEXT DEFAULT 'LIVE'");
       }
-      if (!dvColsNow.has('realized_gain')) {
-        db.exec('ALTER TABLE daily_values ADD COLUMN realized_gain REAL DEFAULT 0');
+      if (dvColsNow.has('realized_gain') && !dvColsNow.has('realized_proceeds')) {
+        db.exec('ALTER TABLE daily_values RENAME COLUMN realized_gain TO realized_proceeds');
+      } else if (!dvColsNow.has('realized_proceeds')) {
+        db.exec('ALTER TABLE daily_values ADD COLUMN realized_proceeds REAL DEFAULT 0');
       }
       db.exec('COMMIT');
       assertDbIntegrity(db, dailyValuesEnhancementId);
@@ -1832,7 +1834,7 @@ function initializeDb(db) {
       db.exec('ROLLBACK');
       throw e;
     }
-  } else if (!hasMigrationRecord(db, dailyValuesEnhancementId) && dvColsNow.has('price_source') && dvColsNow.has('realized_gain')) {
+  } else if (!hasMigrationRecord(db, dailyValuesEnhancementId) && dvColsNow.has('price_source') && dvColsNow.has('realized_proceeds')) {
     recordMigration(db, dailyValuesEnhancementId, 'skipped', 'already present');
   }
 
@@ -1862,7 +1864,7 @@ function initializeDb(db) {
           total_value REAL NOT NULL,
           total_invested REAL NOT NULL,
           total_profit_loss REAL NOT NULL,
-          total_realized_gain REAL DEFAULT 0,
+          total_realized_proceeds REAL DEFAULT 0,
           total_unrealized_gain REAL DEFAULT 0,
           total_profit_loss_pct REAL,
           day_change REAL DEFAULT 0,
@@ -1882,6 +1884,21 @@ function initializeDb(db) {
     }
   } else if (!hasMigrationRecord(db, assetTypeDailyMigrationId) && hasAssetTypeDaily) {
     recordMigration(db, assetTypeDailyMigrationId, 'skipped', 'already present');
+  }
+
+  // ── Migration: rename asset_type_daily total_realized_gain -> total_realized_proceeds ──
+  const assetTypeDailyCols = new Set(db.prepare('PRAGMA table_info(asset_type_daily)').all().map((c) => c.name));
+  const assetTypeDailyRenameMigrationId = '20260524-asset-type-daily-total-realized-proceeds';
+  if (requireMigrationsEnabled(
+    assetTypeDailyRenameMigrationId,
+    assetTypeDailyCols.has('total_realized_gain') && !assetTypeDailyCols.has('total_realized_proceeds'),
+    'asset_type_daily total_realized_proceeds missing'
+  )) {
+    db.exec('ALTER TABLE asset_type_daily RENAME COLUMN total_realized_gain TO total_realized_proceeds');
+    assertDbIntegrity(db, assetTypeDailyRenameMigrationId);
+    recordMigration(db, assetTypeDailyRenameMigrationId, 'applied');
+  } else if (!hasMigrationRecord(db, assetTypeDailyRenameMigrationId) && assetTypeDailyCols.has('total_realized_proceeds')) {
+    recordMigration(db, assetTypeDailyRenameMigrationId, 'skipped', 'already present');
   }
 
   // ── Migration: add historical_price_repair_scope table ───────────────────

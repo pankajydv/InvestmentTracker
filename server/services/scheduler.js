@@ -475,6 +475,21 @@ function startScheduler(db) {
     });
   });
 
+  // Early-morning accrual run at 4:25 AM IST (all days) - PF/PPF/SSY only
+  cron.schedule('25 4 * * *', async () => {
+    console.log('[Scheduler] Running 4:25 AM accrual update (PF/PPF/SSY only)...');
+    try {
+      await runSchedulerCycle(db, 'Early morning accrual run (PF/PPF/SSY)', {
+        assetTypes: ['PF', 'PPF', 'SSY'],
+      });
+    } catch (e) {
+      console.error('[Scheduler] 4:25 AM accrual update failed:', e.message);
+      logAppError('[Scheduler] Early morning accrual run failed', { error: e.message });
+    }
+  }, {
+    timezone: 'Asia/Kolkata',
+  });
+
   // Final run at 10:25 PM IST (after MF NAVs settle) - all asset types
   cron.schedule('25 22 * * 1-5', async () => {
     console.log('[Scheduler] Running 10:25 PM final price update (all asset types)...');
@@ -492,10 +507,12 @@ function startScheduler(db) {
   });
 
   console.log('[Scheduler] Daily price updates scheduled:');
+  console.log('  - 4:25 AM IST (PF/PPF/SSY only, daily)');
   console.log('  - 9:25 AM–4:25 PM IST (hourly, stocks only, weekdays)');
   console.log('  - 10:25 PM IST (all asset types, weekdays)');
   logAppInfo('[Scheduler] Scheduled jobs initialized', {
     timezone: 'Asia/Kolkata',
+    earlyMorningAccrualRun: '04:25',
     intradayRuns: 8,
     nightlyRun: '22:25',
     intradayBackfillMaxScopes: INTRADAY_BACKFILL_MAX_SCOPES,

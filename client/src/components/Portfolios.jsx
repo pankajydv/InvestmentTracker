@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Card, Form, Button, Modal, Row, Col, Spinner, Alert, Nav, Table } from 'react-bootstrap';
 import { getPortfolios, updatePortfolio, deletePortfolio, createPortfolio, getExpenses, getExpensesSummary, addAmcCharge, deleteExpense } from '../services/api';
-import { formatINR, formatDate } from '../utils/formatters';
+import { formatINR, formatDate, profitColor } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 import { Users, Pencil, Trash2, Plus, Check, X, Receipt } from 'lucide-react';
 
@@ -352,7 +352,7 @@ export default function Portfolios() {
                           <div>Current Value</div>
                         </div>
                         <div>
-                          <div className={`fw-semibold ${p.total_profit_loss >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                          <div className={`fw-semibold ${profitColor(p.total_profit_loss)}`}>
                             {p.total_profit_loss >= 0 ? '+' : ''}{formatINR(p.total_profit_loss)}
                           </div>
                           <div>Returns</div>

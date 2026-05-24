@@ -164,8 +164,13 @@ function getHolidayAndWeekendSet(year, db) {
  * Determine if an investment is market-linked based on asset_type
  */
 function isMarketLinkedAsset(assetType) {
-  const marketLinkedTypes = ['Stock', 'Mutual Fund', 'ETF', 'SGB', 'Bond'];
-  return marketLinkedTypes.includes(assetType);
+  const normalized = String(assetType || '').toUpperCase();
+  return normalized === 'INDIAN_STOCK'
+    || normalized === 'FOREIGN_STOCK'
+    || normalized === 'MUTUAL_FUND'
+    || normalized === 'SGB'
+    || normalized === 'NPS'
+    || normalized === 'BOND';
 }
 
 /**

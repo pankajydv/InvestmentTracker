@@ -509,7 +509,7 @@ export default function InvestmentDetail() {
   const xirrRate = calculateXirr(xirrCashflows);
   const xirrPct = xirrRate == null ? null : xirrRate * 100;
   const cumulativeValue = (Number(data.latestValue?.current_value) || 0) + (Number(data.saleProceeds) || 0);
-  const realizedGain = Number(data.latestValue?.realized_gain ?? data.saleProceeds ?? 0);
+  const realizedGain = Number(data.latestValue?.realized_proceeds ?? data.saleProceeds ?? 0);
   const todayIso = new Date().toISOString().split('T')[0];
   const placeholderVestCount = isForeignUSD
     ? (data.transactions || []).filter((txn) => txn.transaction_type === 'VEST'
@@ -780,7 +780,7 @@ export default function InvestmentDetail() {
         </Col>
         <Col xs={6} md={4} lg={2}>
           <SummaryCard
-            label="Realized Proceeds"
+            label="Cash Out (Realized Proceeds)"
             value={`${realizedGain >= 0 ? '+' : ''}${formatINR(realizedGain)}`}
             color={profitColor(realizedGain)}
           />

@@ -3,30 +3,24 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { Row, Col, Card, Spinner, Form, Button } from 'react-bootstrap';
 import { getInvestments } from '../services/api';
 import { formatINR, formatPct, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
-import { PlusCircle, Filter, EyeOff, Eye, RefreshCw, Percent } from 'lucide-react';
+import { PlusCircle, Filter, RefreshCw, Percent } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
+import { useAppSettings } from '../context/AppSettingsContext';
 
 const ASSET_TYPES = ['', 'MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND', 'SGB'];
 
 export default function Investments() {
   const { selectedId, selectedIds } = usePortfolio();
+  const { settings } = useAppSettings();
   const [searchParams, setSearchParams] = useSearchParams();
   const [investments, setInvestments] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [hideSold, setHideSold] = useState(() => localStorage.getItem('hideSoldInvestments') !== 'false');
   const typeFilter = searchParams.get('type') || '';
+  const hideSold = settings.hideSoldInvestments;
 
   useEffect(() => {
     loadInvestments();
   }, [typeFilter, selectedId, selectedIds, hideSold]);
-
-  const toggleHideSold = () => {
-    setHideSold(prev => {
-      const next = !prev;
-      localStorage.setItem('hideSoldInvestments', String(next));
-      return next;
-    });
-  };
 
   const loadInvestments = async () => {
     try {
@@ -73,16 +67,9 @@ export default function Investments() {
               ))}
             </Form.Select>
           </div>
-          <Button
-            variant={hideSold ? 'outline-warning' : 'outline-secondary'}
-            size="sm"
-            onClick={toggleHideSold}
-            className="d-flex align-items-center gap-1"
-            title={hideSold ? 'Showing active holdings only' : 'Showing all investments'}
-          >
-            {hideSold ? <EyeOff size={16} /> : <Eye size={16} />}
-            {hideSold ? 'Sold hidden' : 'Showing all'}
-          </Button>
+          <span className="small text-muted">
+            {hideSold ? 'Sold investments hidden' : 'Showing sold investments'}
+          </span>
           <Link to="/interest-rates" className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
             <Percent size={16} /> Interest Rates
           </Link>

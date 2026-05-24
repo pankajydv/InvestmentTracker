@@ -2,6 +2,12 @@ html, body, #root {
   height: 100%;
 }
 
+:root {
+  --color-gain-text: #0f6a35;
+  --color-loss-text: #b42318;
+  --color-neutral-text: #4b5563;
+}
+
 body {
   margin: 0;
   font-family: 'Roboto', system-ui, -apple-system, sans-serif;
@@ -18,9 +24,14 @@ body {
 /* Indian Rupee formatting */
 .rupee::before { content: '₹'; }
 
-/* Profit/Loss colors */
-.text-profit { color: #16a34a !important; }
-.text-loss { color: #dc2626 !important; }
+/* Utility-style text classes used by return/change rendering */
+.text-green-600 { color: var(--color-gain-text) !important; }
+.text-red-600 { color: var(--color-loss-text) !important; }
+.text-gray-600 { color: var(--color-neutral-text) !important; }
+
+/* Keep semantic aliases aligned with the same contrast-safe palette */
+.text-profit { color: var(--color-gain-text) !important; }
+.text-loss { color: var(--color-loss-text) !important; }
 
 /* Mobile-first responsive table */
 @media (max-width: 768px) {

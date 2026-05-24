@@ -320,7 +320,7 @@ describe('Investments — Balance Account XIRR', () => {
       VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)
     `);
     const dailyInsert = db.prepare(`
-      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
+      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
       VALUES (?, ?, ?, 0, 1, ?, ?, 0, ?, ?, 'COMPUTED', 0, 0)
     `);
 

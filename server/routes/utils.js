@@ -302,6 +302,12 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
       expected = runningUnits > 0.000001 || hasTxn || unitsAfter > 0.000001;
     }
 
+    // Keep daily health strict for historical dates, but avoid flagging same-day
+    // PF/PPF/SSY as missing before the accrual valuation run writes today's row.
+    if (isBalanceBased && date === runDate) {
+      expected = false;
+    }
+
     if (expected && (!needsMarketSessions || isMarketSessionDate(date, marketHolidaySet))) {
       expectedDates.push(date);
     }

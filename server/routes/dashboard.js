@@ -2,14 +2,21 @@ const express = require('express');
 const router = express.Router();
 const { ONE_DAY_CHANGE_POLICY, getOneDayChangePolicy } = require('../services/assetPolicy');
 const {
-  XIRR_CASH_OUTFLOW_TYPES,
-  XIRR_CASH_INFLOW_TYPES,
+  ACQUIRED_UNITS_INFLOW_TYPES_SQL,
+  DASHBOARD_RETURNS_INVESTED_TYPES_SQL,
+  DASHBOARD_RETURNS_INVESTED_TYPES,
+  COST_BASIS_RECEIVED_TYPES,
+  COST_BASIS_INVESTED_TYPES_SQL,
+  COST_BASIS_RECEIVED_TYPES_SQL,
+  COST_BASIS_RECEIVED_TYPES_NO_INTEREST_SQL,
   INVESTED_AMOUNT_INFLOW_TYPES_SQL,
 } = require('../constants/transactionTypes');
 
-const CASH_OUTFLOW_TYPES = new Set(XIRR_CASH_OUTFLOW_TYPES);
+const CASH_OUTFLOW_TYPES = new Set(DASHBOARD_RETURNS_INVESTED_TYPES);
 
-const CASH_INFLOW_TYPES = new Set(XIRR_CASH_INFLOW_TYPES);
+const CASH_INFLOW_TYPES = new Set(COST_BASIS_RECEIVED_TYPES);
+
+const INTERNAL_BALANCE_ASSET_TYPES_SQL = "'PF','PPF','SSY'";
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 
@@ -124,6 +131,10 @@ module.exports = function (db) {
   // ─── Portfolio Summary (Dashboard) ────────────────────────────────────
   router.get('/summary', (req, res) => {
     const { portfolio_id, hide_sold } = req.query;
+    const includeSoldInReturnsRaw = String(req.query.include_sold_in_returns || '').trim().toLowerCase();
+    const includeSoldInReturnsRequested = includeSoldInReturnsRaw === 'true' || includeSoldInReturnsRaw === '1' || includeSoldInReturnsRaw === 'yes';
+    const hideSold = hide_sold === 'true';
+    const includeSoldInReturns = hideSold ? includeSoldInReturnsRequested : true;
     const oneDayDebugRaw = String(req.query.one_day_debug || '').trim().toLowerCase();
     const includeOneDayDebug = oneDayDebugRaw === 'true' || oneDayDebugRaw === '1' || oneDayDebugRaw === 'yes';
 
@@ -153,10 +164,10 @@ module.exports = function (db) {
     const portfolioParams = portfolio_id ? [portfolio_id] : [];
 
     // Build hide-sold filter
-    const soldFilter = hide_sold === 'true'
+    const soldFilter = hideSold
       ? ` AND (i.asset_type IN ('PPF','SSY','PF') OR NOT EXISTS (SELECT 1 FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}) OR COALESCE((SELECT SUM(CASE WHEN t2.transaction_type IN ('BUY','DEPOSIT','BONUS','RIGHTS','IPO','TRANSFER_IN','SWITCH_IN','SPLIT','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_PURCHASE') THEN COALESCE(t2.units,0) WHEN t2.transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(t2.units,0) ELSE 0 END) FROM transactions t2 WHERE t2.investment_id = i.id${portfolio_id ? ' AND t2.portfolio_id = ?' : ''}),0) > 0.001)`
       : '';
-    const soldParams = (hide_sold === 'true' && portfolio_id) ? [portfolio_id, portfolio_id] : [];
+    const soldParams = (hideSold && portfolio_id) ? [portfolio_id, portfolio_id] : [];
 
     // Build daily_values portfolio filter
     const dvPortfolioJoin = portfolio_id
@@ -179,6 +190,9 @@ module.exports = function (db) {
             (SELECT price_per_unit FROM transactions WHERE investment_id = i.id AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1),
             0) as price_per_unit,
           (SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN (${ACQUIRED_UNITS_INFLOW_TYPES_SQL}) THEN COALESCE(units,0)
+            ELSE 0 END), 0) FROM transactions WHERE investment_id = i.id AND portfolio_id = ?) as acquired_units,
+          (SELECT COALESCE(SUM(CASE
             WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','SWITCH_IN','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_PURCHASE') THEN COALESCE(units,0)
             WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(units,0)
             ELSE 0 END), 0) FROM transactions WHERE investment_id = i.id AND portfolio_id = ?) as total_units,
@@ -186,7 +200,7 @@ module.exports = function (db) {
           COALESCE(dv.invested_amount,
             (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
              WHERE investment_id = i.id AND portfolio_id = ? AND transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}))) as invested_amount,
-          COALESCE(dv.realized_gain, 0) as realized_gain,
+          COALESCE(dv.realized_proceeds, 0) as realized_proceeds,
           COALESCE(dv.profit_loss, 0) as profit_loss,
           COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
           COALESCE(dv.day_change, 0) as day_change,
@@ -195,7 +209,7 @@ module.exports = function (db) {
         LEFT JOIN daily_values dv ON i.id = dv.investment_id AND dv.portfolio_id = ? AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
         WHERE 1=1 AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)${soldFilter} AND i.exclude_from_tracking = 0
         ORDER BY i.asset_type, i.name
-      `).all(portfolio_id, portfolio_id, portfolio_id, portfolio_id, portfolio_id, ...soldParams);
+      `).all(portfolio_id, portfolio_id, portfolio_id, portfolio_id, portfolio_id, portfolio_id, ...soldParams);
     } else {
       // Combined view: aggregate latest daily_values for each investment across all portfolios
       var investments = db.prepare(`
@@ -211,7 +225,7 @@ module.exports = function (db) {
             MAX(dv.price_per_unit) AS price_per_unit,
             SUM(COALESCE(dv.current_value, 0)) AS current_value,
             SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
-            SUM(COALESCE(dv.realized_gain, 0)) AS realized_gain,
+            SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
             SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
             SUM(COALESCE(dv.day_change, 0)) AS day_change
           FROM daily_values dv
@@ -228,6 +242,9 @@ module.exports = function (db) {
             (SELECT price_per_unit FROM transactions WHERE investment_id = i.id AND price_per_unit > 0 ORDER BY transaction_date DESC LIMIT 1),
             0) as price_per_unit,
           (SELECT COALESCE(SUM(CASE
+            WHEN transaction_type IN (${ACQUIRED_UNITS_INFLOW_TYPES_SQL}) THEN COALESCE(units,0)
+            ELSE 0 END), 0) FROM transactions WHERE investment_id = i.id) as acquired_units,
+          (SELECT COALESCE(SUM(CASE
             WHEN transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','SWITCH_IN','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_PURCHASE') THEN COALESCE(units,0)
             WHEN transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(units,0)
             ELSE 0 END), 0) FROM transactions WHERE investment_id = i.id) as total_units,
@@ -235,7 +252,7 @@ module.exports = function (db) {
           COALESCE(la.invested_amount,
             (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
              WHERE investment_id = i.id AND transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}))) as invested_amount,
-          COALESCE(la.realized_gain, 0) as realized_gain,
+          COALESCE(la.realized_proceeds, 0) as realized_proceeds,
           COALESCE(la.profit_loss, 0) as profit_loss,
           CASE WHEN COALESCE(la.invested_amount, 0) > 0 THEN (COALESCE(la.profit_loss, 0) / COALESCE(la.invested_amount, 0)) * 100 ELSE 0 END as profit_loss_pct,
           COALESCE(la.day_change, 0) as day_change,
@@ -245,6 +262,65 @@ module.exports = function (db) {
         WHERE 1=1${soldFilter} AND i.exclude_from_tracking = 0
         ORDER BY i.asset_type, i.name
       `).all(...soldParams);
+    }
+
+    const usdCostBasisByInvestment = new Map(
+      db.prepare(`
+        SELECT
+          t.investment_id,
+          SUM(CASE
+            WHEN t.transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL})
+              THEN COALESCE(t.amount, 0) + COALESCE(t.fees, 0)
+            ELSE 0 END
+          ) AS invested_inr_basis,
+          SUM(CASE
+            WHEN t.transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL})
+              THEN COALESCE(
+                t.usd_amount,
+                CASE WHEN COALESCE(t.exchange_rate_used, 0) > 0
+                  THEN (COALESCE(t.amount, 0) + COALESCE(t.fees, 0)) / t.exchange_rate_used
+                  ELSE NULL
+                END,
+                0
+              )
+            ELSE 0 END
+          ) AS invested_usd_basis
+        FROM transactions t
+        JOIN investments i ON i.id = t.investment_id
+        WHERE i.currency = 'USD' ${portfolio_id ? 'AND t.portfolio_id = ?' : ''}
+        GROUP BY t.investment_id
+      `).all(...(portfolio_id ? [portfolio_id] : [])).map((row) => [
+        Number(row.investment_id),
+        {
+          investedInrBasis: Number(row.invested_inr_basis) || 0,
+          investedUsdBasis: Number(row.invested_usd_basis) || 0,
+        },
+      ])
+    );
+
+    for (const inv of investments) {
+      const acquiredUnits = Number(inv.acquired_units) || 0;
+      const currencyCode = String(inv.currency || 'INR').toUpperCase();
+      if (currencyCode === 'USD') {
+        const usdCostBasis = usdCostBasisByInvestment.get(Number(inv.id)) || {
+          investedInrBasis: 0,
+          investedUsdBasis: 0,
+        };
+        const weightedFxRate = usdCostBasis.investedUsdBasis > 0
+          ? usdCostBasis.investedInrBasis / usdCostBasis.investedUsdBasis
+          : null;
+        inv.weighted_fx_rate = weightedFxRate;
+        inv.invested_amount_native = usdCostBasis.investedUsdBasis;
+        inv.avg_cost_per_unit_native = acquiredUnits > 0 && usdCostBasis.investedUsdBasis > 0
+          ? usdCostBasis.investedUsdBasis / acquiredUnits
+          : null;
+      } else {
+        inv.weighted_fx_rate = null;
+        inv.invested_amount_native = Number(inv.invested_amount) || 0;
+        inv.avg_cost_per_unit_native = acquiredUnits > 0
+          ? (Number(inv.invested_amount) || 0) / acquiredUnits
+          : null;
+      }
     }
 
     const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
@@ -538,32 +614,139 @@ module.exports = function (db) {
       return !maxDate || inv.date > maxDate ? inv.date : maxDate;
     }, null);
 
-    // Group by asset type
+    const totalsSoldFilter = hideSold && !includeSoldInReturns
+      ? soldFilter
+      : '';
+    const totalsSoldParams = (hideSold && !includeSoldInReturns && portfolio_id)
+      ? [portfolio_id, portfolio_id]
+      : [];
+
+    const byTypeTotals = portfolio_id
+      ? db.prepare(`
+          SELECT
+            i.asset_type,
+            SUM(COALESCE(dv.current_value, 0)) as totalValue,
+            SUM(COALESCE((SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0)
+               FROM transactions
+              WHERE investment_id = i.id AND portfolio_id = ? AND transaction_type IN (${DASHBOARD_RETURNS_INVESTED_TYPES_SQL})), 0)) as totalInvested,
+            SUM(COALESCE((SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0)
+               FROM transactions
+               WHERE investment_id = i.id AND portfolio_id = ? AND (
+                 (i.asset_type IN (${INTERNAL_BALANCE_ASSET_TYPES_SQL}) AND transaction_type IN (${COST_BASIS_RECEIVED_TYPES_NO_INTEREST_SQL}))
+                 OR
+                 (i.asset_type NOT IN (${INTERNAL_BALANCE_ASSET_TYPES_SQL}) AND transaction_type IN (${COST_BASIS_RECEIVED_TYPES_SQL}))
+               )), 0)) as totalRealizedGain,
+            SUM(
+              COALESCE(dv.current_value, 0)
+              + COALESCE((SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0)
+                   FROM transactions
+                   WHERE investment_id = i.id AND portfolio_id = ? AND (
+                     (i.asset_type IN (${INTERNAL_BALANCE_ASSET_TYPES_SQL}) AND transaction_type IN (${COST_BASIS_RECEIVED_TYPES_NO_INTEREST_SQL}))
+                     OR
+                     (i.asset_type NOT IN (${INTERNAL_BALANCE_ASSET_TYPES_SQL}) AND transaction_type IN (${COST_BASIS_RECEIVED_TYPES_SQL}))
+                   )), 0)
+              - COALESCE((SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0)
+                   FROM transactions
+                    WHERE investment_id = i.id AND portfolio_id = ? AND transaction_type IN (${DASHBOARD_RETURNS_INVESTED_TYPES_SQL})), 0)
+            ) as totalProfitLoss
+          FROM investments i
+          LEFT JOIN daily_values dv ON i.id = dv.investment_id
+            AND dv.portfolio_id = ?
+            AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+          WHERE EXISTS (
+            SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?
+          )${totalsSoldFilter} AND i.exclude_from_tracking = 0
+          GROUP BY i.asset_type
+        `).all(
+          portfolio_id,
+          portfolio_id,
+          portfolio_id,
+          portfolio_id,
+          portfolio_id,
+          portfolio_id,
+          portfolio_id,
+          ...totalsSoldParams
+        )
+      : db.prepare(`
+          WITH latest_by_scope AS (
+            SELECT investment_id, portfolio_id, MAX(date) AS max_date
+            FROM daily_values
+            GROUP BY investment_id, portfolio_id
+          ),
+          latest_agg AS (
+            SELECT
+              dv.investment_id,
+              SUM(COALESCE(dv.current_value, 0)) AS current_value
+            FROM daily_values dv
+            INNER JOIN latest_by_scope lbs ON dv.investment_id = lbs.investment_id
+              AND dv.portfolio_id = lbs.portfolio_id
+              AND dv.date = lbs.max_date
+            GROUP BY dv.investment_id
+          )
+          SELECT
+            i.asset_type,
+            SUM(COALESCE(la.current_value, 0)) as totalValue,
+            SUM(COALESCE((SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0)
+               FROM transactions
+              WHERE investment_id = i.id AND transaction_type IN (${DASHBOARD_RETURNS_INVESTED_TYPES_SQL})), 0)) as totalInvested,
+            SUM(COALESCE((SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0)
+               FROM transactions
+                 WHERE investment_id = i.id AND (
+                   (i.asset_type IN (${INTERNAL_BALANCE_ASSET_TYPES_SQL}) AND transaction_type IN (${COST_BASIS_RECEIVED_TYPES_NO_INTEREST_SQL}))
+                   OR
+                   (i.asset_type NOT IN (${INTERNAL_BALANCE_ASSET_TYPES_SQL}) AND transaction_type IN (${COST_BASIS_RECEIVED_TYPES_SQL}))
+                 )), 0)) as totalRealizedGain,
+            SUM(
+              COALESCE(la.current_value, 0)
+              + COALESCE((SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0)
+                   FROM transactions
+                     WHERE investment_id = i.id AND (
+                       (i.asset_type IN (${INTERNAL_BALANCE_ASSET_TYPES_SQL}) AND transaction_type IN (${COST_BASIS_RECEIVED_TYPES_NO_INTEREST_SQL}))
+                       OR
+                       (i.asset_type NOT IN (${INTERNAL_BALANCE_ASSET_TYPES_SQL}) AND transaction_type IN (${COST_BASIS_RECEIVED_TYPES_SQL}))
+                     )), 0)
+              - COALESCE((SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0)
+                   FROM transactions
+                    WHERE investment_id = i.id AND transaction_type IN (${DASHBOARD_RETURNS_INVESTED_TYPES_SQL})), 0)
+            ) as totalProfitLoss
+          FROM investments i
+          LEFT JOIN latest_agg la ON la.investment_id = i.id
+          WHERE i.exclude_from_tracking = 0${totalsSoldFilter}
+          GROUP BY i.asset_type
+        `).all(...totalsSoldParams);
+
+    const byTypeTotalsMap = new Map(byTypeTotals.map((row) => [row.asset_type, row]));
+
+    // Group visible rows by asset type while assigning totals from the configured return scope.
     const byType = {};
     for (const inv of investments) {
       if (!byType[inv.asset_type]) {
-        byType[inv.asset_type] = { 
-          investments: [], 
-          totalValue: 0, 
-          totalInvested: 0, 
-          totalProfitLoss: 0,
-          dayChange: 0 
+        const totals = byTypeTotalsMap.get(inv.asset_type);
+        byType[inv.asset_type] = {
+          investments: [],
+          totalValue: Number(totals?.totalValue) || 0,
+          totalInvested: Number(totals?.totalInvested) || 0,
+          totalProfitLoss: Number(totals?.totalProfitLoss) || 0,
+          totalRealizedGain: Number(totals?.totalRealizedGain) || 0,
+          dayChange: 0,
         };
       }
       byType[inv.asset_type].investments.push(inv);
-      byType[inv.asset_type].totalValue += inv.current_value || 0;
-      byType[inv.asset_type].totalInvested += inv.invested_amount || 0;
-      byType[inv.asset_type].totalProfitLoss += inv.profit_loss || 0;
-      byType[inv.asset_type].dayChange += inv.day_change || 0;
+      byType[inv.asset_type].dayChange += Number(inv.day_change) || 0;
     }
+
+    const totalInvestedByScope = byTypeTotals.reduce((sum, row) => sum + (Number(row.totalInvested) || 0), 0);
+    const totalProfitLossByScope = byTypeTotals.reduce((sum, row) => sum + (Number(row.totalProfitLoss) || 0), 0);
+    const totalRealizedGainByScope = byTypeTotals.reduce((sum, row) => sum + (Number(row.totalRealizedGain) || 0), 0);
 
     const derivedPortfolio = {
       date: latestSnapshotDate || latest?.date || null,
       total_value: investments.reduce((sum, inv) => sum + (Number(inv.current_value) || 0), 0),
-      total_invested: investments.reduce((sum, inv) => sum + (Number(inv.invested_amount) || 0), 0),
-      total_profit_loss: investments.reduce((sum, inv) => sum + (Number(inv.profit_loss) || 0), 0),
+      total_invested: totalInvestedByScope,
+      total_profit_loss: totalProfitLossByScope,
+      total_realized_proceeds: totalRealizedGainByScope,
       day_change: investments.reduce((sum, inv) => sum + (Number(inv.day_change) || 0), 0),
-    };
+    }
     derivedPortfolio.total_profit_loss_pct = derivedPortfolio.total_invested > 0
       ? (derivedPortfolio.total_profit_loss / derivedPortfolio.total_invested) * 100
       : 0;
@@ -599,13 +782,15 @@ module.exports = function (db) {
     const txnFilter = portfolio_id ? 'WHERE portfolio_id = ?' : '';
     const txnParams = portfolio_id ? [portfolio_id] : [];
     const transactionRows = db.prepare(`
-      SELECT t.transaction_type, t.transaction_date, COALESCE(t.amount, 0) as amount, COALESCE(t.fees, 0) as fees, i.asset_type
+      SELECT t.investment_id, t.transaction_type, t.transaction_date, COALESCE(t.amount, 0) as amount, COALESCE(t.fees, 0) as fees, i.asset_type
       FROM transactions t
       JOIN investments i ON i.id = t.investment_id
       ${portfolio_id ? 'WHERE t.portfolio_id = ?' : ''}
     `).all(...txnParams);
 
     const xirrCashflows = [];
+    const xirrCashflowsByAssetType = new Map();
+    const xirrCashflowsByInvestmentId = new Map();
     for (const txn of transactionRows) {
       const txnDate = new Date(txn.transaction_date);
       if (Number.isNaN(txnDate.getTime())) continue;
@@ -614,6 +799,15 @@ module.exports = function (db) {
       const fees = Number(txn.fees) || 0;
       let cashflow = 0;
       const treatAsInternal = isInternalXirrCashflow(txn.asset_type, txn.transaction_type);
+      const assetTypeKey = String(txn.asset_type || '').toUpperCase();
+      const investmentId = Number(txn.investment_id);
+
+      if (!xirrCashflowsByAssetType.has(assetTypeKey)) {
+        xirrCashflowsByAssetType.set(assetTypeKey, []);
+      }
+      if (!xirrCashflowsByInvestmentId.has(investmentId)) {
+        xirrCashflowsByInvestmentId.set(investmentId, []);
+      }
 
       if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
         cashflow = -(amount + fees);
@@ -623,6 +817,8 @@ module.exports = function (db) {
 
       if (Math.abs(cashflow) > 1e-9) {
         xirrCashflows.push({ amount: cashflow, date: txnDate });
+        xirrCashflowsByAssetType.get(assetTypeKey).push({ amount: cashflow, date: txnDate });
+        xirrCashflowsByInvestmentId.get(investmentId).push({ amount: cashflow, date: txnDate });
       }
     }
 
@@ -647,6 +843,39 @@ module.exports = function (db) {
       if (!Number.isNaN(valuationDate.getTime())) {
         xirrCashflows.push({ amount: terminalValue, date: valuationDate });
       }
+    }
+
+    for (const inv of investments) {
+      const investmentFlows = [...(xirrCashflowsByInvestmentId.get(Number(inv.id)) || [])];
+      const investmentTerminalValue = Number(inv.current_value) || 0;
+      if (investmentTerminalValue > 0 && inv.date) {
+        const investmentValuationDate = new Date(`${inv.date}T00:00:00.000Z`);
+        if (!Number.isNaN(investmentValuationDate.getTime())) {
+          investmentFlows.push({ amount: investmentTerminalValue, date: investmentValuationDate });
+        }
+      }
+
+      const investmentXirrRate = calculateXirr(investmentFlows);
+      inv.xirr_pct = investmentXirrRate == null ? null : investmentXirrRate * 100;
+    }
+
+    for (const [assetTypeKey, info] of Object.entries(byType)) {
+      const latestAssetDate = info.investments.reduce((maxDate, inv) => {
+        if (!inv.date) return maxDate;
+        return !maxDate || inv.date > maxDate ? inv.date : maxDate;
+      }, null);
+
+      const assetFlows = [...(xirrCashflowsByAssetType.get(assetTypeKey) || [])];
+      const assetTerminalValue = Number(info.totalValue) || 0;
+      if (assetTerminalValue > 0 && latestAssetDate) {
+        const assetValuationDate = new Date(`${latestAssetDate}T00:00:00.000Z`);
+        if (!Number.isNaN(assetValuationDate.getTime())) {
+          assetFlows.push({ amount: assetTerminalValue, date: assetValuationDate });
+        }
+      }
+
+      const assetXirrRate = calculateXirr(assetFlows);
+      info.xirrPct = assetXirrRate == null ? null : assetXirrRate * 100;
     }
 
     const xirrRate = calculateXirr(xirrCashflows);
@@ -742,7 +971,7 @@ module.exports = function (db) {
           SUM(dv.total_units) as total_units,
           SUM(dv.current_value) as current_value,
           SUM(dv.invested_amount) as invested_amount,
-          SUM(dv.realized_gain) as realized_gain,
+          SUM(dv.realized_proceeds) as realized_proceeds,
           SUM(dv.profit_loss) as profit_loss,
           CASE WHEN SUM(dv.invested_amount) > 0 THEN (SUM(dv.profit_loss) / SUM(dv.invested_amount)) * 100 ELSE 0 END as profit_loss_pct,
           MAX(dv.price_source) as price_source,
@@ -774,7 +1003,7 @@ module.exports = function (db) {
           SUM(total_value) as total_value,
           SUM(total_invested) as total_invested,
           SUM(total_profit_loss) as total_profit_loss,
-          SUM(total_realized_gain) as total_realized_gain,
+          SUM(total_realized_proceeds) as total_realized_proceeds,
           SUM(total_unrealized_gain) as total_unrealized_gain,
           CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
           SUM(day_change) as day_change,
@@ -865,7 +1094,7 @@ module.exports = function (db) {
              SUM(total_value) as total_value,
              SUM(total_invested) as total_invested,
              SUM(total_profit_loss) as total_profit_loss,
-             SUM(total_realized_gain) as total_realized_gain,
+             SUM(total_realized_proceeds) as total_realized_proceeds,
              SUM(total_unrealized_gain) as total_unrealized_gain,
              CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
              SUM(day_change) as day_change,
@@ -918,7 +1147,7 @@ module.exports = function (db) {
             SUM(total_units) as total_units,
             SUM(current_value) as current_value,
             SUM(invested_amount) as invested_amount,
-            SUM(realized_gain) as realized_gain,
+            SUM(realized_proceeds) as realized_proceeds,
             SUM(profit_loss) as profit_loss,
             CASE WHEN SUM(invested_amount) > 0 THEN (SUM(profit_loss) / SUM(invested_amount)) * 100 ELSE 0 END as profit_loss_pct,
             MAX(price_source) as price_source,

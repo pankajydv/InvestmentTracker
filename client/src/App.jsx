@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Spinner, Container, Alert } from 'react-bootstrap';
 import { PortfolioProvider } from './context/PortfolioContext';
+import { AppSettingsProvider } from './context/AppSettingsContext';
 import Navbar from './components/Navbar';
 import Login from './components/Login';
 import Dashboard from './components/Dashboard';
@@ -17,6 +18,7 @@ import InvestmentSettings from './components/InvestmentSettings';
 import InterestRates from './components/InterestRates';
 import TaxReport from './components/TaxReport';
 import AppLogs from './components/AppLogs';
+import MetricsFaq from './components/MetricsFaq';
 import BackToTopButton from './components/BackToTopButton';
 import { getAuthConfig, getCurrentUser, loginWithGoogle, logout } from './services/api';
 
@@ -109,30 +111,33 @@ export default function App() {
   return (
     <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <PortfolioProvider>
-        <div style={{ minHeight: '100%', backgroundColor: '#f8f9fa' }}>
-          <Navbar user={user} onLogout={handleLogout} />
-          <main className="container py-4">
-            <Routes>
-              <Route path="/" element={<Dashboard />} />
-              <Route path="/investments" element={<Investments />} />
-              <Route path="/investments/add" element={<AddInvestment />} />
-              <Route path="/investments/import-cas" element={<CASUpload />} />
-              <Route path="/investments/import-nps" element={<NPSUpload />} />
-              <Route path="/investments/:id" element={<InvestmentDetail />} />
-              <Route path="/investments/:id/settings" element={<InvestmentSettings />} />
-              <Route path="/performance" element={<Performance />} />
-              <Route path="/transactions" element={<Transactions />} />
-              <Route path="/tax" element={<TaxReport />} />
-              <Route path="/logs" element={<AppLogs />} />
-              <Route path="/interest-rates" element={<InterestRates />} />
-  
-              <Route path="/portfolios" element={<Portfolios />} />
-              <Route path="/corporate-actions" element={<CorporateActions />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
-          </main>
-          <BackToTopButton />
-        </div>
+        <AppSettingsProvider>
+          <div style={{ minHeight: '100%', backgroundColor: '#f8f9fa' }}>
+            <Navbar user={user} onLogout={handleLogout} />
+            <main className="container py-4">
+              <Routes>
+                <Route path="/" element={<Dashboard />} />
+                <Route path="/investments" element={<Investments />} />
+                <Route path="/investments/add" element={<AddInvestment />} />
+                <Route path="/investments/import-cas" element={<CASUpload />} />
+                <Route path="/investments/import-nps" element={<NPSUpload />} />
+                <Route path="/investments/:id" element={<InvestmentDetail />} />
+                <Route path="/investments/:id/settings" element={<InvestmentSettings />} />
+                <Route path="/performance" element={<Performance />} />
+                <Route path="/transactions" element={<Transactions />} />
+                <Route path="/tax" element={<TaxReport />} />
+                <Route path="/logs" element={<AppLogs />} />
+                <Route path="/faq" element={<MetricsFaq />} />
+                <Route path="/interest-rates" element={<InterestRates />} />
+
+                <Route path="/portfolios" element={<Portfolios />} />
+                <Route path="/corporate-actions" element={<CorporateActions />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Routes>
+            </main>
+            <BackToTopButton />
+          </div>
+        </AppSettingsProvider>
       </PortfolioProvider>
     </BrowserRouter>
   );

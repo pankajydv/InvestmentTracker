@@ -44,7 +44,7 @@ function combinePerformanceResults(results, startDate, endDate, periodLabel = 'c
             total_value: 0,
             total_invested: 0,
             total_profit_loss: 0,
-            total_realized_gain: 0,
+            total_realized_proceeds: 0,
             total_unrealized_gain: 0,
             day_change: 0,
           });
@@ -53,7 +53,7 @@ function combinePerformanceResults(results, startDate, endDate, periodLabel = 'c
         target.total_value += Number(row.total_value) || 0;
         target.total_invested += Number(row.total_invested) || 0;
         target.total_profit_loss += Number(row.total_profit_loss) || 0;
-        target.total_realized_gain += Number(row.total_realized_gain) || 0;
+        target.total_realized_proceeds += Number(row.total_realized_proceeds) || 0;
         target.total_unrealized_gain += Number(row.total_unrealized_gain) || 0;
         target.day_change += Number(row.day_change) || 0;
       }

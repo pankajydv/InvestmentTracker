@@ -21,10 +21,11 @@ export const getCurrentUser = () => fetchJSON('/auth/me');
 export const logout = () => fetchJSON('/auth/logout', { method: 'POST' });
 
 // Dashboard
-export const getDashboardSummary = (portfolioId, { hideSold } = {}) => {
+export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInReturns } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);
   if (hideSold) params.set('hide_sold', 'true');
+  if (includeFullySoldInReturns) params.set('include_sold_in_returns', 'true');
   return fetchJSON(`/dashboard/summary?${params}`);
 };
 export const getPerformance = (period, from, to, portfolioId) => {

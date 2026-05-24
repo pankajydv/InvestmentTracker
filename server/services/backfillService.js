@@ -395,14 +395,14 @@ function upsertDailyRow(db, row, statements = null) {
   if (row.portfolio_id == null) return;
 
   const upsertScoped = statements?.upsertScoped || db.prepare(`
-    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
+    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
       price_per_unit = excluded.price_per_unit,
       total_units = excluded.total_units,
       current_value = excluded.current_value,
       invested_amount = excluded.invested_amount,
-      realized_gain = excluded.realized_gain,
+      realized_proceeds = excluded.realized_proceeds,
       profit_loss = excluded.profit_loss,
       profit_loss_pct = excluded.profit_loss_pct,
       price_source = excluded.price_source,
@@ -418,7 +418,7 @@ function upsertDailyRow(db, row, statements = null) {
     row.total_units,
     row.current_value,
     row.invested_amount,
-    row.realized_gain,
+    row.realized_proceeds,
     row.profit_loss,
     row.profit_loss_pct,
     row.price_source,
@@ -484,14 +484,14 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
 
     const dailyStatements = {
       upsertScoped: db.prepare(`
-        INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
+        INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
           price_per_unit = excluded.price_per_unit,
           total_units = excluded.total_units,
           current_value = excluded.current_value,
           invested_amount = excluded.invested_amount,
-          realized_gain = excluded.realized_gain,
+          realized_proceeds = excluded.realized_proceeds,
           profit_loss = excluded.profit_loss,
           profit_loss_pct = excluded.profit_loss_pct,
           price_source = excluded.price_source,
@@ -637,7 +637,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
         : Math.round(units * 1000) / 1000,
       current_value: round2(currentValue),
       invested_amount: round2(invested),
-      realized_gain: round2(realizedGain),
+      realized_proceeds: round2(realizedGain),
       profit_loss: round2(profitLoss),
       profit_loss_pct: round2(profitLossPct),
       price_source: priceSource,
@@ -1636,7 +1636,7 @@ async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
         total_units,
         current_value,
         invested_amount,
-        realized_gain,
+        realized_proceeds,
         profit_loss,
         profit_loss_pct,
         price_source,

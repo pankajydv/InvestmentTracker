@@ -154,14 +154,14 @@ async function updateAllPrices(db, options = {}) {
   }
 
   const upsertDaily = db.prepare(`
-    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_gain, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
+    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
       price_per_unit = excluded.price_per_unit,
       total_units = excluded.total_units,
       current_value = excluded.current_value,
       invested_amount = excluded.invested_amount,
-      realized_gain = excluded.realized_gain,
+      realized_proceeds = excluded.realized_proceeds,
       profit_loss = excluded.profit_loss,
       profit_loss_pct = excluded.profit_loss_pct,
       price_source = excluded.price_source,
@@ -631,7 +631,7 @@ function updateAssetTypeDaily(db, date) {
       total_value,
       total_invested,
       total_profit_loss,
-      total_realized_gain,
+      total_realized_proceeds,
       total_unrealized_gain,
       total_profit_loss_pct,
       day_change,
@@ -649,8 +649,8 @@ function updateAssetTypeDaily(db, date) {
       COALESCE(SUM(dv.current_value), 0) AS total_value,
       COALESCE(SUM(dv.invested_amount), 0) AS total_invested,
       COALESCE(SUM(dv.profit_loss), 0) AS total_profit_loss,
-      COALESCE(SUM(dv.realized_gain), 0) AS total_realized_gain,
-      COALESCE(SUM(dv.current_value - (dv.invested_amount - dv.realized_gain)), 0) AS total_unrealized_gain,
+      COALESCE(SUM(dv.realized_proceeds), 0) AS total_realized_proceeds,
+      COALESCE(SUM(dv.current_value - (dv.invested_amount - dv.realized_proceeds)), 0) AS total_unrealized_gain,
       COALESCE(SUM(dv.day_change), 0) AS day_change
     FROM daily_values dv
     JOIN investments i ON i.id = dv.investment_id
@@ -710,7 +710,7 @@ function updateAssetTypeDaily(db, date) {
       Math.round(totalValue * 100) / 100,
       Math.round(totalInvested * 100) / 100,
       Math.round(totalProfitLoss * 100) / 100,
-      Math.round(Number(row.total_realized_gain || 0) * 100) / 100,
+      Math.round(Number(row.total_realized_proceeds || 0) * 100) / 100,
       Math.round(Number(row.total_unrealized_gain || 0) * 100) / 100,
       Math.round(totalProfitLossPct * 100) / 100,
       Math.round(dayChange * 100) / 100,

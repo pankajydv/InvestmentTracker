@@ -32,7 +32,7 @@ export function formatNumber(num, decimals = 0) {
 /**
  * Format percentage
  */
-export function formatPct(pct, decimals = 1) {
+export function formatPct(pct, decimals = 2) {
   if (pct == null || isNaN(pct)) return '0%';
   const sign = pct > 0 ? '+' : '';
   return `${sign}${Number(pct).toFixed(decimals)}%`;

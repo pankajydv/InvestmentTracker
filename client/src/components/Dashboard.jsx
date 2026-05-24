@@ -5,8 +5,9 @@ import { getDashboardSummary, getDailyValuesHealthStatus } from '../services/api
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, EyeOff, Eye, AlertTriangle } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
+import { useAppSettings } from '../context/AppSettingsContext';
 
 const ASSET_TYPE_DISPLAY_ORDER = {
   INDIAN_STOCK: 1,
@@ -36,12 +37,16 @@ function combineDashboardSummaries(results, selectedIds) {
 
   const mergedInvestments = new Map();
   const byType = {};
+  const byTypeTotals = {};
   let totalExpenses = 0;
+  let firstXirrPct = null;
+  let xirrPctSet = false;
+  let xirrPctConsistent = true;
   const portfolio = {
     total_value: 0,
     total_invested: 0,
     total_profit_loss: 0,
-    total_realized_gain: 0,
+    total_realized_proceeds: 0,
     day_change: 0,
     xirr_pct: null,
   };
@@ -51,9 +56,37 @@ function combineDashboardSummaries(results, selectedIds) {
     portfolio.total_value += Number(p.total_value) || 0;
     portfolio.total_invested += Number(p.total_invested) || 0;
     portfolio.total_profit_loss += Number(p.total_profit_loss) || 0;
-    portfolio.total_realized_gain += Number(p.total_realized_gain) || 0;
+    portfolio.total_realized_proceeds += Number(p.total_realized_proceeds) || 0;
     portfolio.day_change += Number(p.day_change) || 0;
     totalExpenses += Number(result?.totalExpenses) || 0;
+
+    if (p.xirr_pct != null) {
+      if (!xirrPctSet) {
+        firstXirrPct = p.xirr_pct;
+        xirrPctSet = true;
+      } else if (Math.abs(Number(firstXirrPct) - Number(p.xirr_pct)) > 1e-9) {
+        xirrPctConsistent = false;
+      }
+    } else {
+      xirrPctConsistent = false;
+    }
+
+    for (const [type, info] of Object.entries(result?.byType || {})) {
+      if (!byTypeTotals[type]) {
+        byTypeTotals[type] = {
+          totalValue: 0,
+          totalInvested: 0,
+          totalProfitLoss: 0,
+          totalRealizedGain: 0,
+          xirrPct: null,
+        };
+      }
+      byTypeTotals[type].totalValue += Number(info.totalValue) || 0;
+      byTypeTotals[type].totalInvested += Number(info.totalInvested) || 0;
+      byTypeTotals[type].totalProfitLoss += Number(info.totalProfitLoss) || 0;
+      byTypeTotals[type].totalRealizedGain += Number(info.totalRealizedGain) || 0;
+      byTypeTotals[type].xirrPct = info.xirrPct ?? byTypeTotals[type].xirrPct;
+    }
 
     for (const inv of result?.investments || []) {
       if (!mergedInvestments.has(inv.id)) {
@@ -61,31 +94,54 @@ function combineDashboardSummaries(results, selectedIds) {
           ...inv,
           current_value: 0,
           invested_amount: 0,
-          realized_gain: 0,
+          invested_amount_native: 0,
+          realized_proceeds: 0,
           profit_loss: 0,
           day_change: 0,
+          acquired_units: 0,
           total_units: 0,
+          xirr_pct: inv.xirr_pct ?? null,
+          _xirr_sources: inv.xirr_pct == null ? 0 : 1,
         });
       }
 
       const target = mergedInvestments.get(inv.id);
       target.current_value += Number(inv.current_value) || 0;
       target.invested_amount += Number(inv.invested_amount) || 0;
-      target.realized_gain += Number(inv.realized_gain) || 0;
+      target.invested_amount_native += Number(inv.invested_amount_native) || 0;
+      target.realized_proceeds += Number(inv.realized_proceeds) || 0;
       target.profit_loss += Number(inv.profit_loss) || 0;
       target.day_change += Number(inv.day_change) || 0;
+      target.acquired_units += Number(inv.acquired_units) || 0;
       target.total_units += Number(inv.total_units) || 0;
       target.price_per_unit = Number(inv.price_per_unit) || target.price_per_unit || 0;
+      if (inv.xirr_pct != null) {
+        if (target._xirr_sources === 0) {
+          target.xirr_pct = inv.xirr_pct;
+          target._xirr_sources = 1;
+        } else if (Math.abs(Number(target.xirr_pct) - Number(inv.xirr_pct)) > 1e-9) {
+          target.xirr_pct = null;
+          target._xirr_sources += 1;
+        }
+      }
     }
   }
+
+  portfolio.xirr_pct = xirrPctConsistent && xirrPctSet ? firstXirrPct : null;
 
   const investments = Array.from(mergedInvestments.values()).map((inv) => {
     const prevValue = inv.current_value - inv.day_change;
     const profitLossPct = inv.invested_amount > 0 ? (inv.profit_loss / inv.invested_amount) * 100 : 0;
     const dayChangePct = prevValue > 0 ? (inv.day_change / prevValue) * 100 : 0;
     const portfolioPct = portfolio.total_value > 0 ? (inv.current_value / portfolio.total_value) * 100 : 0;
+    const acquiredUnits = Number(inv.acquired_units) || 0;
+    const avgCostPerUnitNative = acquiredUnits > 0
+      ? (Number(inv.invested_amount_native) || 0) / acquiredUnits
+      : null;
     return {
       ...inv,
+      _xirr_sources: undefined,
+      avg_cost_per_unit_native: avgCostPerUnitNative,
       profit_loss_pct: profitLossPct,
       day_change_pct: dayChangePct,
       portfolio_pct: portfolioPct,
@@ -99,13 +155,26 @@ function combineDashboardSummaries(results, selectedIds) {
         totalValue: 0,
         totalInvested: 0,
         totalProfitLoss: 0,
+        totalRealizedGain: 0,
+        xirrPct: null,
         dayChange: 0,
       };
     }
     byType[inv.asset_type].investments.push(inv);
-    byType[inv.asset_type].totalValue += Number(inv.current_value) || 0;
-    byType[inv.asset_type].totalInvested += Number(inv.invested_amount) || 0;
-    byType[inv.asset_type].totalProfitLoss += Number(inv.profit_loss) || 0;
+
+    const totals = byTypeTotals[inv.asset_type];
+    if (totals) {
+      byType[inv.asset_type].totalValue = Number(totals.totalValue) || 0;
+      byType[inv.asset_type].totalInvested = Number(totals.totalInvested) || 0;
+      byType[inv.asset_type].totalProfitLoss = Number(totals.totalProfitLoss) || 0;
+      byType[inv.asset_type].totalRealizedGain = Number(totals.totalRealizedGain) || 0;
+      byType[inv.asset_type].xirrPct = totals.xirrPct ?? null;
+    } else {
+      byType[inv.asset_type].totalValue += Number(inv.current_value) || 0;
+      byType[inv.asset_type].totalInvested += Number(inv.invested_amount) || 0;
+      byType[inv.asset_type].totalProfitLoss += Number(inv.profit_loss) || 0;
+      byType[inv.asset_type].totalRealizedGain += Number(inv.realized_proceeds) || 0;
+    }
     byType[inv.asset_type].dayChange += Number(inv.day_change) || 0;
   }
 
@@ -218,11 +287,11 @@ function combineHealthStatuses(results) {
 
 export default function Dashboard() {
   const { selectedId, selectedIds, selectedPortfolio } = usePortfolio();
+  const { settings, loading: settingsLoading } = useAppSettings();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
-  const [hideSold, setHideSold] = useState(() => localStorage.getItem('hideSoldInvestments') !== 'false');
   const [sortConfigs, setSortConfigs] = useState({});
   const [dailyHealth, setDailyHealth] = useState(null);
   const [showHealthDetails, setShowHealthDetails] = useState(false);
@@ -246,17 +315,12 @@ export default function Dashboard() {
     }
   }, []);
 
-  const toggleHideSold = () => {
-    setHideSold(prev => {
-      const next = !prev;
-      localStorage.setItem('hideSoldInvestments', String(next));
-      return next;
-    });
-  };
+  const hideSold = settings.hideSoldInvestments;
+  const includeFullySoldInReturns = hideSold ? settings.includeFullySoldInReturns : true;
 
   useEffect(() => {
     loadData();
-  }, [selectedId, selectedIds, hideSold]);
+  }, [selectedId, selectedIds, hideSold, includeFullySoldInReturns, settingsLoading]);
 
   useEffect(() => {
     loadDailyHealth();
@@ -294,23 +358,22 @@ export default function Dashboard() {
 
   const loadData = async () => {
     const runId = ++loadRunRef.current;
+    if (settingsLoading) return;
     const showBlockingLoader = !data;
     try {
       if (showBlockingLoader) setLoading(true);
       else setRefreshing(true);
       setShowHealthDetails(false);
 
-      if (selectedIds.length > 1) {
-        const summaryResults = await Promise.all(selectedIds.map((id) => getDashboardSummary(id, { hideSold })));
-        if (runId !== loadRunRef.current) return;
-        setData(combineDashboardSummaries(summaryResults, selectedIds));
-        setError(null);
-      } else {
-        const result = await getDashboardSummary(selectedId, { hideSold });
-        if (runId !== loadRunRef.current) return;
-        setData(result);
-        setError(null);
-      }
+      // For combined view, call backend without portfolio_id so it computes combined XIRR
+      // For single portfolio, call with the portfolio_id
+      const result = await getDashboardSummary(selectedIds.length > 1 ? null : selectedId, {
+        hideSold,
+        includeFullySoldInReturns,
+      });
+      if (runId !== loadRunRef.current) return;
+      setData(result);
+      setError(null);
     } catch (e) {
       if (runId !== loadRunRef.current) return;
       setError(e.message);
@@ -346,7 +409,7 @@ export default function Dashboard() {
   const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses } = data;
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
-  const totalRealizedGain = investments.reduce((sum, inv) => sum + (Number(inv.realized_gain) || 0), 0);
+  const totalRealizedGain = Number(portfolio.total_realized_proceeds) || 0;
   const realizedGainAfterExpenses = totalRealizedGain - (totalExpenses || 0);
   const formatINRExact = (amount) => {
     if (amount == null || Number.isNaN(Number(amount))) return '₹0';
@@ -356,6 +419,22 @@ export default function Dashboard() {
       minimumFractionDigits: 0,
       maximumFractionDigits: 0,
     })}`;
+  };
+
+  const getCurrencySymbol = (currency) => {
+    const code = String(currency || 'INR').toUpperCase();
+    if (code === 'INR') return '₹';
+    if (code === 'USD') return '$';
+    if (code === 'EUR') return '€';
+    if (code === 'GBP') return '£';
+    if (code === 'JPY') return '¥';
+    return code;
+  };
+
+  const formatWithSymbol = (amount, currency, decimals = 2) => {
+    const symbol = getCurrencySymbol(currency);
+    const value = Number(amount) || 0;
+    return `${value < 0 ? '-' : ''}${symbol}${formatNumber(Math.abs(value), decimals)}`;
   };
 
   const handleSort = (type, key) => {
@@ -397,8 +476,8 @@ export default function Dashboard() {
     { key: 'dayChange', label: '1 Day Change', subLabel: '% Change', end: true },
     { key: 'totalCost', label: 'Total Cost', subLabel: 'Avg Cost / Unit', end: true },
     { key: 'currentValue', label: 'Current Value', subLabel: 'Units Held', end: true },
-    { key: 'portfolioPct', label: '% Portfolio', subLabel: 'Weight', end: true },
-    { key: 'totalReturn', label: 'Total Return', subLabel: 'Return %', end: true },
+    { key: 'portfolioPct', label: '% Portfolio', subLabel: '% within Type', end: true },
+    { key: 'totalReturn', label: 'Total P&L', subLabel: 'Absolute | XIRR P&L%', end: true },
   ];
 
   const getSortColumnsForType = (type) => {
@@ -443,16 +522,11 @@ export default function Dashboard() {
             {portfolioCount} Portfolio{portfolioCount !== 1 ? 's' : ''} Combined
           </h1>
         ) : <div />}
-        <Button
-          variant={hideSold ? 'outline-warning' : 'outline-secondary'}
-          size="sm"
-          onClick={toggleHideSold}
-          className="d-flex align-items-center gap-1"
-          title={hideSold ? 'Showing active holdings only' : 'Showing all investments'}
-        >
-          {hideSold ? <EyeOff size={16} /> : <Eye size={16} />}
-          {hideSold ? 'Sold hidden' : 'Showing all'}
-        </Button>
+        <div className="text-muted small">
+          {hideSold ? 'Sold investments hidden' : 'Showing sold investments'}
+          {' · '}
+          {includeFullySoldInReturns ? 'Returns include fully sold investments' : 'Returns exclude fully sold investments'}
+        </div>
       </div>
 
       {refreshing && (
@@ -591,13 +665,13 @@ export default function Dashboard() {
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
-                <PiggyBank size={16} /> Realized Proceeds
+                <PiggyBank size={16} /> Cash Out (Realized Proceeds)
               </div>
               <div className={`fw-bold ${profitColor(realizedGainAfterExpenses)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
                 {realizedGainAfterExpenses >= 0 ? '+' : ''}{formatINRExact(realizedGainAfterExpenses)}
               </div>
               <div className="text-muted small">
-                Net realized proceeds after expenses
+                Net cash out after expenses
               </div>
             </Card.Body>
           </Card>
@@ -636,7 +710,22 @@ export default function Dashboard() {
       </Card>
 
       {/* Investment-wise Breakdown Tables */}
-      {sortedAssetEntries.map(([type, info]) => (
+      {sortedAssetEntries.map(([type, info]) => {
+        const totalAcquiredUnits = info.investments.reduce((sum, inv) => sum + (Number(inv.acquired_units) || 0), 0);
+        const totalUnits = info.investments.reduce((sum, inv) => sum + (Number(inv.total_units) || 0), 0);
+        const latestTypeDate = info.investments.reduce((maxDate, inv) => {
+          if (!inv.date) return maxDate;
+          return !maxDate || inv.date > maxDate ? inv.date : maxDate;
+        }, null);
+        const dayChangeDenominator = Number(info.totalValue || 0) - Number(info.dayChange || 0);
+        const totalDayChangePct = dayChangeDenominator > 0
+          ? (Number(info.dayChange || 0) / dayChangeDenominator) * 100
+          : 0;
+        const totalAbsPct = Number(info.totalInvested || 0) > 0
+          ? (Number(info.totalProfitLoss || 0) / Number(info.totalInvested || 0)) * 100
+          : 0;
+
+        return (
         <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
           <Card.Header className="bg-white d-flex justify-content-between align-items-center">
             <h2 className="h6 fw-semibold mb-0" title={ASSET_TYPE_FULL_NAMES[type]}>
@@ -708,7 +797,7 @@ export default function Dashboard() {
                         </>
                       ) : (
                         <>
-                          <div className="fw-medium">{formatNumber(inv.price_per_unit, 2)}</div>
+                          <div className="fw-medium">{formatWithSymbol(inv.price_per_unit, inv.currency, 2)}</div>
                           <div className="text-muted" style={{ fontSize: '0.7rem' }}>{formatDate(inv.date)}</div>
                         </>
                       )}
@@ -720,7 +809,11 @@ export default function Dashboard() {
                     <td className="px-3 text-end">
                       <div className="fw-medium">{formatNumber(inv.invested_amount, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {inv.total_units > 0.0001 ? formatNumber(inv.invested_amount / inv.total_units, 2) : ''}
+                        {inv.acquired_units > 0.0001
+                          ? (String(inv.currency || 'INR').toUpperCase() === 'INR'
+                            ? formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)
+                            : `${inv.avg_cost_per_unit_native == null ? `${getCurrencySymbol(inv.currency)}N/A` : formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)} | ₹${formatNumber(inv.invested_amount / inv.acquired_units, 2)}`)
+                          : ''}
                       </div>
                     </td>
                     <td className="px-3 text-end">
@@ -729,34 +822,70 @@ export default function Dashboard() {
                         {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
                       </div>
                     </td>
-                    <td className="px-3 text-end">{(inv.portfolio_pct || 0).toFixed(1)}</td>
+                    <td className="px-3 text-end">
+                      <div className="fw-medium">{(inv.portfolio_pct || 0).toFixed(2)}%</div>
+                      <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                        {info.totalValue > 0 ? (((inv.current_value || 0) / info.totalValue) * 100).toFixed(2) : '0.00'}%
+                      </div>
+                    </td>
                     <td className="px-3 text-end">
                       <div className={`fw-semibold ${profitColor(inv.profit_loss)}`}>
                         {inv.profit_loss >= 0 ? '+' : ''}{formatNumber(inv.profit_loss, 0)}
                       </div>
-                      <div className={profitColor(inv.profit_loss_pct)} style={{ fontSize: '0.7rem' }}>{formatPct(inv.profit_loss_pct)}</div>
+                      <div className={profitColor(inv.profit_loss_pct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
+                        {formatPct(inv.profit_loss_pct)} | {inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}
+                      </div>
                     </td>
                   </tr>
                 ))}
                 {/* Total Row */}
                 <tr className="table-light fw-semibold">
                   <td className="px-3">Total</td>
-                  <td className="px-3"></td>
-                  <td className={`px-3 text-end ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</td>
-                  <td className="px-3 text-end">{formatNumber(info.totalInvested, 0)}</td>
-                  <td className="px-3 text-end">{formatNumber(info.totalValue, 0)}</td>
                   <td className="px-3 text-end">
-                    {portfolio.total_value > 0 ? ((info.totalValue / portfolio.total_value) * 100).toFixed(1) : '0'}
+                    <div className="fw-medium">-</div>
+                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>{latestTypeDate ? formatDate(latestTypeDate) : ''}</div>
+                  </td>
+                  <td className="px-3 text-end">
+                    <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
+                    <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>{formatPct(totalDayChangePct)}</div>
+                  </td>
+                  <td className="px-3 text-end">
+                    <div className="fw-medium">{formatNumber(info.totalInvested, 0)}</div>
+                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                      {totalAcquiredUnits > 0.0001 ? formatNumber(info.totalInvested / totalAcquiredUnits, 2) : ''}
+                    </div>
+                  </td>
+                  <td className="px-3 text-end">
+                    <div className="fw-medium">{formatNumber(info.totalValue, 0)}</div>
+                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                      {totalUnits > 0.0001 ? `${formatNumber(totalUnits, 4)} Units` : ''}
+                    </div>
+                  </td>
+                  <td className="px-3 text-end">
+                    <div className="fw-medium">
+                      {portfolio.total_value > 0 ? ((info.totalValue / portfolio.total_value) * 100).toFixed(2) : '0.00'}%
+                    </div>
+                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>100.00%</div>
                   </td>
                   <td className={`px-3 text-end ${profitColor(info.totalProfitLoss)}`}>
-                    {info.totalProfitLoss >= 0 ? '+' : ''}{formatNumber(info.totalProfitLoss, 0)}
+                    <div className="fw-semibold">
+                      {info.totalProfitLoss >= 0 ? '+' : ''}{formatNumber(info.totalProfitLoss, 0)}
+                    </div>
+                    <div className={profitColor(totalAbsPct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
+                      {formatPct(totalAbsPct)} | {info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}
+                    </div>
                   </td>
                 </tr>
               </tbody>
             </Table>
           </div>
+          <Card.Footer className="bg-white border-top-0 pt-0">
+            <div className="small text-muted text-end">
+              Cash Out (Realized Proceeds): {info.totalRealizedGain >= 0 ? '+' : ''}{formatINR(info.totalRealizedGain || 0)}
+            </div>
+          </Card.Footer>
         </Card>
-      ))}
+      );})}
 
       {/* Empty state */}
       {investments.length === 0 && (
