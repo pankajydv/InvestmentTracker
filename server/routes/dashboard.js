@@ -1,14 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const { ONE_DAY_CHANGE_POLICY, getOneDayChangePolicy } = require('../services/assetPolicy');
+const {
+  XIRR_CASH_OUTFLOW_TYPES,
+  XIRR_CASH_INFLOW_TYPES,
+  INVESTED_AMOUNT_INFLOW_TYPES_SQL,
+} = require('../constants/transactionTypes');
 
-const CASH_OUTFLOW_TYPES = new Set([
-  'BUY', 'VEST', 'ESPP_CONTRIBUTION', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC'
-]);
+const CASH_OUTFLOW_TYPES = new Set(XIRR_CASH_OUTFLOW_TYPES);
 
-const CASH_INFLOW_TYPES = new Set([
-  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'TDS'
-]);
+const CASH_INFLOW_TYPES = new Set(XIRR_CASH_INFLOW_TYPES);
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 
@@ -184,7 +185,7 @@ module.exports = function (db) {
           COALESCE(dv.current_value, 0) as current_value,
           COALESCE(dv.invested_amount,
             (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
-             WHERE investment_id = i.id AND portfolio_id = ? AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_CONTRIBUTION'))) as invested_amount,
+             WHERE investment_id = i.id AND portfolio_id = ? AND transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}))) as invested_amount,
           COALESCE(dv.realized_gain, 0) as realized_gain,
           COALESCE(dv.profit_loss, 0) as profit_loss,
           COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
@@ -233,7 +234,7 @@ module.exports = function (db) {
           COALESCE(la.current_value, 0) as current_value,
           COALESCE(la.invested_amount,
             (SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) FROM transactions
-             WHERE investment_id = i.id AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_CONTRIBUTION'))) as invested_amount,
+             WHERE investment_id = i.id AND transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}))) as invested_amount,
           COALESCE(la.realized_gain, 0) as realized_gain,
           COALESCE(la.profit_loss, 0) as profit_loss,
           CASE WHEN COALESCE(la.invested_amount, 0) > 0 THEN (COALESCE(la.profit_loss, 0) / COALESCE(la.invested_amount, 0)) * 100 ELSE 0 END as profit_loss_pct,

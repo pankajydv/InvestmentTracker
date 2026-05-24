@@ -14,6 +14,11 @@ const {
 } = require('./priceService');
 const { calculatePfInterestPreview, calculatePfValueAsOfDate, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
 const { logAppInfo, logAppError } = require('./appLogger');
+const {
+  INVESTED_AMOUNT_INFLOW_TYPES_SQL,
+  REALIZED_CASHFLOW_TYPES,
+  REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL,
+} = require('../constants/transactionTypes');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ─── Cancellation support ──────────────────────────────────────────────────
@@ -166,14 +171,14 @@ async function updateAllPrices(db, options = {}) {
 
   const getInvestedAmountPortfolio = db.prepare(`
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) as total
-    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ? AND transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION')
+    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ? AND transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL})
   `);
 
   function getRealizedCashflowPortfolio(investment, portfolioId, asOfDate) {
-    let types = ['SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST'];
+    let types = REALIZED_CASHFLOW_TYPES;
     if (investment.asset_type === 'PF' || investment.asset_type === 'PPF' || investment.asset_type === 'SSY') {
       // Provident interest/reconcile are internal accrual adjustments, not external cashflow.
-      types = ['SELL', 'WITHDRAWAL', 'DIVIDEND'];
+      types = REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL;
     }
 
     const placeholders = types.map(() => '?').join(',');

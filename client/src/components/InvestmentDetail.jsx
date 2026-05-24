@@ -509,6 +509,7 @@ export default function InvestmentDetail() {
   const xirrRate = calculateXirr(xirrCashflows);
   const xirrPct = xirrRate == null ? null : xirrRate * 100;
   const cumulativeValue = (Number(data.latestValue?.current_value) || 0) + (Number(data.saleProceeds) || 0);
+  const realizedGain = Number(data.latestValue?.realized_gain ?? data.saleProceeds ?? 0);
   const todayIso = new Date().toISOString().split('T')[0];
   const placeholderVestCount = isForeignUSD
     ? (data.transactions || []).filter((txn) => txn.transaction_type === 'VEST'
@@ -770,14 +771,21 @@ export default function InvestmentDetail() {
         <Col xs={6} md={4} lg={2}><SummaryCard label="Total Invested" value={formatINR(data.totalInvested)} /></Col>
         <Col xs={6} md={4} lg={2}><SummaryCard label="Current Value" value={formatINR(data.latestValue?.current_value)} /></Col>
         <Col xs={6} md={4} lg={2}><SummaryCard label="Cumulative Value" value={formatINR(cumulativeValue)} /></Col>
-        <Col xs={6} md={6} lg={2}>
+        <Col xs={6} md={4} lg={2}>
           <SummaryCard
-            label="Profit/Loss"
+            label="Total P&L"
             value={`${data.latestValue?.profit_loss >= 0 ? '+' : ''}${formatINR(data.latestValue?.profit_loss)}`}
             color={profitColor(data.latestValue?.profit_loss)}
           />
         </Col>
-        <Col xs={12} md={6} lg={4}>
+        <Col xs={6} md={4} lg={2}>
+          <SummaryCard
+            label="Realized Proceeds"
+            value={`${realizedGain >= 0 ? '+' : ''}${formatINR(realizedGain)}`}
+            color={profitColor(realizedGain)}
+          />
+        </Col>
+        <Col xs={12} md={8} lg={2}>
           <SummaryCard
             label="Returns"
             value={(

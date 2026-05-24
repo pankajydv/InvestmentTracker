@@ -12,6 +12,11 @@ const { updateAssetTypeDaily, updatePortfolioDaily } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
 const { toIsoDate, todayIso } = require('./dateUtils');
 const { logBackfillInfo, logBackfillError } = require('./appLogger');
+const {
+  INVESTED_AMOUNT_INFLOW_TYPES_SQL,
+  REALIZED_CASHFLOW_TYPES,
+  REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL,
+} = require('../constants/transactionTypes');
 
 function clampEndDateToToday(endDate) {
   const end = toIsoDate(endDate) || todayIso();
@@ -430,9 +435,9 @@ function computeRealizedProceeds(db, inv, date, portfolioId) {
   const portfolioFilter = portfolioId != null ? ' AND portfolio_id = ?' : '';
   const params = portfolioId != null ? [inv.id, date, portfolioId] : [inv.id, date];
 
-  let types = ['SELL', 'WITHDRAWAL', 'DIVIDEND', 'INTEREST'];
+  let types = REALIZED_CASHFLOW_TYPES;
   if (inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY') {
-    types = ['SELL', 'WITHDRAWAL', 'DIVIDEND'];
+    types = REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL;
   }
 
   const placeholders = types.map(() => '?').join(',');
@@ -525,7 +530,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) AS total
     FROM transactions
     WHERE investment_id = ?${portfolioFilter} AND transaction_date <= ?
-      AND transaction_type IN ('BUY','DEPOSIT','IPO','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','ESPP_CONTRIBUTION')
+      AND transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL})
   `);
   // Only query portfolio-scoped rows
   const getPrev = db.prepare(

@@ -2,6 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = require('../services/pfInterestCalculator');
 const { logAppInfo, logAppError } = require('../services/appLogger');
+const {
+  XIRR_CASH_OUTFLOW_TYPES,
+  XIRR_CASH_INFLOW_TYPES,
+  INVESTED_AMOUNT_INFLOW_TYPES_SQL,
+} = require('../constants/transactionTypes');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -26,13 +31,9 @@ function normalizeTransactionDate(dateInput) {
   return Number.isNaN(d.getTime()) ? null : dateStr;
 }
 
-const CASH_OUTFLOW_TYPES = new Set([
-  'BUY', 'DEPOSIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'RIGHTS', 'CHARGES', 'AMC', 'ESPP_CONTRIBUTION'
-]);
+const CASH_OUTFLOW_TYPES = new Set(XIRR_CASH_OUTFLOW_TYPES);
 
-const CASH_INFLOW_TYPES = new Set([
-  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'TDS'
-]);
+const CASH_INFLOW_TYPES = new Set(XIRR_CASH_INFLOW_TYPES);
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 
@@ -234,8 +235,8 @@ module.exports = function (db) {
     const totals = db.prepare(`
       SELECT
         COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
-        COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_CONTRIBUTION') THEN amount + COALESCE(fees, 0) ELSE 0 END), 0) as total_invested,
-        COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
+        COALESCE(SUM(CASE WHEN transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}) THEN amount + COALESCE(fees, 0) ELSE 0 END), 0) as total_invested,
+        COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
       FROM transactions WHERE investment_id = ?${portfolioFilter}
     `).get(inv.id, ...portfolioParams);
 

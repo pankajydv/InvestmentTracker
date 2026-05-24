@@ -346,8 +346,8 @@ export default function Dashboard() {
   const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses } = data;
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
-  const totalRealizedCashflows = investments.reduce((sum, inv) => sum + (Number(inv.realized_gain) || 0), 0);
-  const realizedAfterExpenses = totalRealizedCashflows - (totalExpenses || 0);
+  const totalRealizedGain = investments.reduce((sum, inv) => sum + (Number(inv.realized_gain) || 0), 0);
+  const realizedGainAfterExpenses = totalRealizedGain - (totalExpenses || 0);
   const formatINRExact = (amount) => {
     if (amount == null || Number.isNaN(Number(amount))) return '₹0';
     const value = Number(amount);
@@ -591,13 +591,13 @@ export default function Dashboard() {
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
-                <PiggyBank size={16} /> Realized Cashflows
+                <PiggyBank size={16} /> Realized Proceeds
               </div>
-              <div className={`fw-bold ${profitColor(realizedAfterExpenses)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
-                {realizedAfterExpenses >= 0 ? '+' : ''}{formatINRExact(realizedAfterExpenses)}
+              <div className={`fw-bold ${profitColor(realizedGainAfterExpenses)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
+                {realizedGainAfterExpenses >= 0 ? '+' : ''}{formatINRExact(realizedGainAfterExpenses)}
               </div>
               <div className="text-muted small">
-                Sell, withdrawal, dividend, interest (net)
+                Net realized proceeds after expenses
               </div>
             </Card.Body>
           </Card>
