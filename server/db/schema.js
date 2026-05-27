@@ -304,6 +304,14 @@ function initializeDb(db) {
 
     CREATE INDEX IF NOT EXISTS idx_portfolio_expenses_portfolio ON portfolio_expenses(portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_portfolio_expenses_date ON portfolio_expenses(expense_date);
+
+    -- Dashboard performance optimization indexes
+    CREATE INDEX IF NOT EXISTS idx_transactions_investment_portfolio ON transactions(investment_id, portfolio_id, transaction_date);
+    CREATE INDEX IF NOT EXISTS idx_transactions_price_lookup ON transactions(investment_id, price_per_unit DESC, transaction_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON daily_values(investment_id, portfolio_id, date DESC);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date DESC);
+    CREATE INDEX IF NOT EXISTS idx_portfolio_daily_latest ON portfolio_daily(portfolio_id, date DESC);
+    CREATE INDEX IF NOT EXISTS idx_market_holidays_date ON market_holidays(date);
   `);
 
   const migrationsEnabled = !isProductionMode() || process.env.ALLOW_DB_MIGRATIONS === 'true';

@@ -22,6 +22,34 @@ const ASSET_TYPE_DISPLAY_ORDER = {
 };
 
 const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+const DASHBOARD_CACHE_TTL_MS = 2 * 60 * 1000;
+const dashboardSummaryCache = new Map();
+
+function getDashboardCacheKey({ targetPortfolioId, hideSold, includeFullySoldInReturns }) {
+  return JSON.stringify({
+    targetPortfolioId: targetPortfolioId ?? null,
+    hideSold: !!hideSold,
+    includeFullySoldInReturns: !!includeFullySoldInReturns,
+  });
+}
+
+function getCachedDashboardSummary(cacheKey) {
+  const cached = dashboardSummaryCache.get(cacheKey);
+  if (!cached) return null;
+  if ((Date.now() - cached.ts) > DASHBOARD_CACHE_TTL_MS) {
+    dashboardSummaryCache.delete(cacheKey);
+    return null;
+  }
+  return cached.data;
+}
+
+function setCachedDashboardSummary(cacheKey, data) {
+  if (!data) return;
+  dashboardSummaryCache.set(cacheKey, {
+    ts: Date.now(),
+    data,
+  });
+}
 
 function sortAssetTypeEntries(byType) {
   return Object.entries(byType || {}).sort(([typeA], [typeB]) => {
@@ -285,6 +313,59 @@ function combineHealthStatuses(results) {
   return merged;
 }
 
+function mergeXirrEnrichment(baseData, enrichedData) {
+  if (!baseData) return enrichedData;
+  if (!enrichedData) return baseData;
+
+  const xirrByInvestmentId = new Map(
+    (enrichedData.investments || []).map((inv) => [Number(inv.id), inv.xirr_pct ?? null])
+  );
+
+  const mergedInvestments = (baseData.investments || []).map((inv) => {
+    const nextXirr = xirrByInvestmentId.has(Number(inv.id))
+      ? xirrByInvestmentId.get(Number(inv.id))
+      : (inv.xirr_pct ?? null);
+    if ((inv.xirr_pct ?? null) === nextXirr) return inv;
+    return {
+      ...inv,
+      xirr_pct: nextXirr,
+    };
+  });
+
+  const investmentsByType = mergedInvestments.reduce((acc, inv) => {
+    if (!acc[inv.asset_type]) acc[inv.asset_type] = [];
+    acc[inv.asset_type].push(inv);
+    return acc;
+  }, {});
+
+  const mergedByType = {};
+  for (const [type, info] of Object.entries(baseData.byType || {})) {
+    mergedByType[type] = {
+      ...info,
+      investments: investmentsByType[type] || info.investments || [],
+      xirrPct: enrichedData.byType?.[type]?.xirrPct ?? info.xirrPct ?? null,
+    };
+  }
+
+  for (const [type, info] of Object.entries(enrichedData.byType || {})) {
+    if (mergedByType[type]) continue;
+    mergedByType[type] = {
+      ...info,
+      investments: investmentsByType[type] || info.investments || [],
+    };
+  }
+
+  return {
+    ...baseData,
+    portfolio: {
+      ...(baseData.portfolio || {}),
+      xirr_pct: enrichedData.portfolio?.xirr_pct ?? baseData.portfolio?.xirr_pct ?? null,
+    },
+    investments: mergedInvestments,
+    byType: mergedByType,
+  };
+}
+
 export default function Dashboard() {
   const { selectedId, selectedIds, selectedPortfolio } = usePortfolio();
   const { settings, loading: settingsLoading } = useAppSettings();
@@ -298,7 +379,9 @@ export default function Dashboard() {
   const [complianceGaps, setComplianceGaps] = useState([]);
   const [complianceStatus, setComplianceStatus] = useState(null);
   const [complianceLoading, setComplianceLoading] = useState(false);
+  const [showDetailTables, setShowDetailTables] = useState(false);
   const loadRunRef = useRef(0);
+  const selectedIdsKey = (selectedIds || []).join(',');
 
   const scrollToSection = useCallback((sectionId, { smooth = true, updateHash = true } = {}) => {
     const el = document.getElementById(sectionId);
@@ -320,11 +403,29 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
-  }, [selectedId, selectedIds, hideSold, includeFullySoldInReturns, settingsLoading]);
+  }, [selectedId, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading]);
 
   useEffect(() => {
-    loadDailyHealth();
-  }, [selectedId, selectedIds]);
+    if (settingsLoading) return undefined;
+    const runId = loadRunRef.current;
+    const timeoutId = setTimeout(() => {
+      if (runId === loadRunRef.current) {
+        loadDailyHealth();
+      }
+    }, 100);
+    return () => clearTimeout(timeoutId);
+  }, [selectedId, selectedIdsKey, settingsLoading]);
+
+  useEffect(() => {
+    if (settingsLoading) return undefined;
+    const runId = loadRunRef.current;
+    const timeoutId = setTimeout(() => {
+      if (runId === loadRunRef.current) {
+        loadComplianceStatus();
+      }
+    }, 150);
+    return () => clearTimeout(timeoutId);
+  }, [selectedId, selectedIdsKey, settingsLoading]);
 
   useEffect(() => {
     const hash = window.location.hash;
@@ -335,10 +436,6 @@ export default function Dashboard() {
     });
     return () => window.cancelAnimationFrame(raf);
   }, [data, scrollToSection]);
-
-  useEffect(() => {
-    loadComplianceStatus();
-  }, [selectedId, selectedIds]);
 
   const loadComplianceStatus = async () => {
     try {
@@ -360,19 +457,70 @@ export default function Dashboard() {
     const runId = ++loadRunRef.current;
     if (settingsLoading) return;
     const showBlockingLoader = !data;
+    const targetPortfolioId = selectedIds.length > 1 ? null : selectedId;
+    const cacheKey = getDashboardCacheKey({
+      targetPortfolioId,
+      hideSold,
+      includeFullySoldInReturns,
+    });
+    const cachedSummary = getCachedDashboardSummary(cacheKey);
+
     try {
       if (showBlockingLoader) setLoading(true);
       else setRefreshing(true);
       setShowHealthDetails(false);
 
-      // For combined view, call backend without portfolio_id so it computes combined XIRR
-      // For single portfolio, call with the portfolio_id
-      const result = await getDashboardSummary(selectedIds.length > 1 ? null : selectedId, {
-        hideSold,
-        includeFullySoldInReturns,
-      });
-      if (runId !== loadRunRef.current) return;
-      setData(result);
+      if (showBlockingLoader && cachedSummary) {
+        setData(cachedSummary);
+        setLoading(false);
+        setShowDetailTables(true);
+      }
+
+      if (showBlockingLoader && !cachedSummary) {
+        setShowDetailTables(false);
+        const fastResult = await getDashboardSummary(targetPortfolioId, {
+          hideSold,
+          includeFullySoldInReturns,
+          xirrMode: 'portfolio_only',
+        });
+        if (runId !== loadRunRef.current) return;
+        setData(fastResult);
+        setCachedDashboardSummary(cacheKey, fastResult);
+        setLoading(false);
+
+        await new Promise((resolve) => {
+          if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+            window.requestIdleCallback(() => resolve(), { timeout: 2000 });
+          } else {
+            setTimeout(resolve, 350);
+          }
+        });
+        if (runId !== loadRunRef.current) return;
+        setShowDetailTables(true);
+
+        const fullResult = await getDashboardSummary(targetPortfolioId, {
+          hideSold,
+          includeFullySoldInReturns,
+          xirrMode: 'full',
+        });
+        if (runId !== loadRunRef.current) return;
+        setData((prev) => {
+          const merged = mergeXirrEnrichment(prev, fullResult);
+          setCachedDashboardSummary(cacheKey, merged);
+          return merged;
+        });
+      } else {
+        const result = await getDashboardSummary(targetPortfolioId, {
+          hideSold,
+          includeFullySoldInReturns,
+          xirrMode: 'full',
+        });
+        if (runId !== loadRunRef.current) return;
+        setData(result);
+        setCachedDashboardSummary(cacheKey, result);
+        setShowDetailTables(true);
+      }
+
       setError(null);
     } catch (e) {
       if (runId !== loadRunRef.current) return;
@@ -710,7 +858,15 @@ export default function Dashboard() {
       </Card>
 
       {/* Investment-wise Breakdown Tables */}
-      {sortedAssetEntries.map(([type, info]) => {
+      {!showDetailTables && investments.length > 0 && (
+        <Card className="shadow-sm mb-4">
+          <Card.Body className="d-flex align-items-center gap-2 text-muted">
+            <Spinner animation="border" size="sm" />
+            Loading holdings breakdown...
+          </Card.Body>
+        </Card>
+      )}
+      {showDetailTables && sortedAssetEntries.map(([type, info]) => {
         const totalAcquiredUnits = info.investments.reduce((sum, inv) => sum + (Number(inv.acquired_units) || 0), 0);
         const totalUnits = info.investments.reduce((sum, inv) => sum + (Number(inv.total_units) || 0), 0);
         const latestTypeDate = info.investments.reduce((maxDate, inv) => {
