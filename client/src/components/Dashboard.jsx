@@ -558,7 +558,7 @@ export default function Dashboard() {
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
   const totalRealizedGain = Number(portfolio.total_realized_proceeds) || 0;
-  const realizedGainAfterExpenses = totalRealizedGain - (totalExpenses || 0);
+  const currentInvested = (Number(portfolio.total_invested) || 0) - totalRealizedGain;
   const formatINRExact = (amount) => {
     if (amount == null || Number.isNaN(Number(amount))) return '₹0';
     const value = Number(amount);
@@ -620,9 +620,9 @@ export default function Dashboard() {
 
   const baseSortColumns = [
     { key: 'name', label: 'Name', subLabel: 'Folios / Identifier' },
-    { key: 'price', label: 'Last Price', subLabel: 'As of Date', end: true },
+    { key: 'price', label: 'Last Price', subLabel: 'Avg Cost / Unit', end: true },
     { key: 'dayChange', label: '1 Day Change', subLabel: '% Change', end: true },
-    { key: 'totalCost', label: 'Total Cost', subLabel: 'Avg Cost / Unit', end: true },
+    { key: 'totalCost', label: 'Net Invested', subLabel: 'Total Cost', end: true },
     { key: 'currentValue', label: 'Current Value', subLabel: 'Units Held', end: true },
     { key: 'portfolioPct', label: '% Portfolio', subLabel: '% within Type', end: true },
     { key: 'totalReturn', label: 'Total P&L', subLabel: 'Absolute | XIRR P&L%', end: true },
@@ -761,18 +761,19 @@ export default function Dashboard() {
 
       {/* Portfolio Summary Cards */}
       <Row className="g-3 mb-4">
-        <Col md={6} lg={3}>
+        <Col md={6} lg={4}>
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 <Wallet size={16} /> Current Value
               </div>
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINRExact(portfolio.total_value)}</div>
-              <div className="text-muted small">{formatINRExact(portfolio.total_invested)} Invested</div>
+              <div className="text-muted small">Net Invested: {formatINRExact(currentInvested)}</div>
+              <div className="text-muted small">Cash Proceeds: {formatINRExact(totalRealizedGain)}</div>
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={3}>
+        <Col md={6} lg={4}>
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
@@ -792,7 +793,7 @@ export default function Dashboard() {
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={3}>
+        <Col md={6} lg={4}>
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
@@ -805,21 +806,6 @@ export default function Dashboard() {
                 <span>Abs: {formatPct(netReturnPct)}</span>
                 <span className="mx-2 text-muted">|</span>
                 <span>XIRR: {portfolio.xirr_pct == null ? 'N/A' : formatPct(portfolio.xirr_pct)}</span>
-              </div>
-            </Card.Body>
-          </Card>
-        </Col>
-        <Col md={6} lg={3}>
-          <Card className="shadow-sm h-100">
-            <Card.Body className="py-3">
-              <div className="d-flex align-items-center gap-2 text-muted small mb-1">
-                <PiggyBank size={16} /> Cash Out (Realized Proceeds)
-              </div>
-              <div className={`fw-bold ${profitColor(realizedGainAfterExpenses)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
-                {realizedGainAfterExpenses >= 0 ? '+' : ''}{formatINRExact(realizedGainAfterExpenses)}
-              </div>
-              <div className="text-muted small">
-                Net cash out after expenses
               </div>
             </Card.Body>
           </Card>
@@ -867,8 +853,26 @@ export default function Dashboard() {
         </Card>
       )}
       {showDetailTables && sortedAssetEntries.map(([type, info]) => {
-        const totalAcquiredUnits = info.investments.reduce((sum, inv) => sum + (Number(inv.acquired_units) || 0), 0);
         const totalUnits = info.investments.reduce((sum, inv) => sum + (Number(inv.total_units) || 0), 0);
+        const activeInvestments = info.investments.filter((inv) => (Number(inv.total_units) || 0) > 0.0001);
+        const totalActiveUnits = activeInvestments.reduce((sum, inv) => sum + (Number(inv.total_units) || 0), 0);
+        const weightedLivePrice = totalActiveUnits > 0
+          ? activeInvestments.reduce((sum, inv) => sum + ((Number(inv.price_per_unit) || 0) * (Number(inv.total_units) || 0)), 0) / totalActiveUnits
+          : null;
+        const weightedAvgCostWeight = activeInvestments.reduce((sum, inv) => {
+          const avgCost = Number(inv.avg_cost_per_unit_native);
+          const units = Number(inv.total_units) || 0;
+          return Number.isFinite(avgCost) && units > 0 ? sum + units : sum;
+        }, 0);
+        const weightedAvgCostPerUnit = weightedAvgCostWeight > 0
+          ? activeInvestments.reduce((sum, inv) => {
+            const avgCost = Number(inv.avg_cost_per_unit_native);
+            const units = Number(inv.total_units) || 0;
+            if (!Number.isFinite(avgCost) || units <= 0) return sum;
+            return sum + (avgCost * units);
+          }, 0) / weightedAvgCostWeight
+          : null;
+        const weightedPriceCurrency = activeInvestments[0]?.currency || 'INR';
         const latestTypeDate = info.investments.reduce((maxDate, inv) => {
           if (!inv.date) return maxDate;
           return !maxDate || inv.date > maxDate ? inv.date : maxDate;
@@ -880,6 +884,7 @@ export default function Dashboard() {
         const totalAbsPct = Number(info.totalInvested || 0) > 0
           ? (Number(info.totalProfitLoss || 0) / Number(info.totalInvested || 0)) * 100
           : 0;
+        const totalCurrentInvested = (Number(info.totalInvested) || 0) - (Number(info.totalRealizedGain) || 0);
 
         return (
         <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
@@ -944,32 +949,35 @@ export default function Dashboard() {
                       </div>
                     </td>
                     <td className="px-3 text-end">
-                      {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type) ? (
-                        <>
-                          <div className="fw-medium">
-                            {Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-'}
-                          </div>
-                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>{formatDate(inv.date)}</div>
-                        </>
-                      ) : (
-                        <>
-                          <div className="fw-medium">{formatWithSymbol(inv.price_per_unit, inv.currency, 2)}</div>
-                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>{formatDate(inv.date)}</div>
-                        </>
-                      )}
+                      {(() => {
+                        const acquiredUnits = Number(inv.acquired_units) || 0;
+                        const avgCostText = acquiredUnits > 0.0001
+                          ? (String(inv.currency || 'INR').toUpperCase() === 'INR'
+                            ? formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)
+                            : `${inv.avg_cost_per_unit_native == null ? `${getCurrencySymbol(inv.currency)}N/A` : formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)} | ₹${formatNumber(inv.invested_amount / inv.acquired_units, 2)}`)
+                          : '';
+                        return (
+                          <>
+                            {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type) ? (
+                              <div className="fw-medium">
+                                {Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-'}
+                              </div>
+                            ) : (
+                              <div className="fw-medium">{formatWithSymbol(inv.price_per_unit, inv.currency, 2)}</div>
+                            )}
+                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>{avgCostText}</div>
+                          </>
+                        );
+                      })()}
                     </td>
                     <td className="px-3 text-end">
                       <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>
                       <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>{formatPct(inv.day_change_pct)}</div>
                     </td>
                     <td className="px-3 text-end">
-                      <div className="fw-medium">{formatNumber(inv.invested_amount, 0)}</div>
+                      <div className="fw-medium">{formatNumber((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {inv.acquired_units > 0.0001
-                          ? (String(inv.currency || 'INR').toUpperCase() === 'INR'
-                            ? formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)
-                            : `${inv.avg_cost_per_unit_native == null ? `${getCurrencySymbol(inv.currency)}N/A` : formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)} | ₹${formatNumber(inv.invested_amount / inv.acquired_units, 2)}`)
-                          : ''}
+                        {formatNumber(inv.invested_amount, 0)}
                       </div>
                     </td>
                     <td className="px-3 text-end">
@@ -998,17 +1006,34 @@ export default function Dashboard() {
                 <tr className="table-light fw-semibold">
                   <td className="px-3">Total</td>
                   <td className="px-3 text-end">
-                    <div className="fw-medium">-</div>
-                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>{latestTypeDate ? formatDate(latestTypeDate) : ''}</div>
+                    {INTEREST_RATE_ASSET_TYPES.has(type) ? (
+                      <>
+                        <div className="fw-medium">-</div>
+                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>{latestTypeDate ? formatDate(latestTypeDate) : ''}</div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="fw-medium">
+                          {weightedLivePrice == null
+                            ? '-'
+                            : formatWithSymbol(weightedLivePrice, weightedPriceCurrency, 2)}
+                        </div>
+                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                          {weightedAvgCostPerUnit == null
+                            ? ''
+                            : formatWithSymbol(weightedAvgCostPerUnit, weightedPriceCurrency, 2)}
+                        </div>
+                      </>
+                    )}
                   </td>
                   <td className="px-3 text-end">
                     <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
                     <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>{formatPct(totalDayChangePct)}</div>
                   </td>
                   <td className="px-3 text-end">
-                    <div className="fw-medium">{formatNumber(info.totalInvested, 0)}</div>
+                    <div className="fw-medium">{formatNumber(totalCurrentInvested, 0)}</div>
                     <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                      {totalAcquiredUnits > 0.0001 ? formatNumber(info.totalInvested / totalAcquiredUnits, 2) : ''}
+                      {formatNumber(info.totalInvested, 0)}
                     </div>
                   </td>
                   <td className="px-3 text-end">

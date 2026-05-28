@@ -13,7 +13,7 @@ export default function MetricsFaq() {
         <Card.Body>
           <h2 className="h6 fw-semibold mb-2">Metric Basis Used</h2>
           <ul className="small mb-0">
-            <li><strong>Top Summary Cards:</strong> Cost Basis</li>
+            <li><strong>Top Summary Cards:</strong> Current Value with Net Invested and Cash Proceeds context</li>
             <li><strong>Individual Investment Rows:</strong> Attribution Basis</li>
             <li><strong>Asset Footer Total Row:</strong> Cost Basis</li>
           </ul>
@@ -43,10 +43,18 @@ export default function MetricsFaq() {
           </Accordion.Body>
         </Accordion.Item>
         <Accordion.Item eventKey="3">
-          <Accordion.Header>Why can Cash Out (Realized Proceeds) be larger than Total P&amp;L?</Accordion.Header>
+          <Accordion.Header>Why can Cash Proceeds be larger than Total P&amp;L?</Accordion.Header>
           <Accordion.Body>
-            Cash Out (Realized Proceeds) is cash received. Total P&amp;L is net gain/loss after cost basis and current value are considered.
+            Cash Proceeds (Realized Proceeds) is cash received. Total P&amp;L is net gain/loss after cost basis and current value are considered.
             They are related but not the same metric.
+          </Accordion.Body>
+        </Accordion.Item>
+        <Accordion.Item eventKey="4">
+          <Accordion.Header>How is Net Invested calculated?</Accordion.Header>
+          <Accordion.Body>
+            Net Invested is shown in the Current Value card and is calculated as:
+            <br />
+            <strong>Net Invested</strong> = <strong>Invested</strong> - <strong>Cash Proceeds (Realized Proceeds)</strong>
           </Accordion.Body>
         </Accordion.Item>
       </Accordion>
