@@ -14,6 +14,7 @@ const {
   upsertPriceSeries,
   getSeries,
   getNearestOnOrBefore,
+  hydrateHistoricalPriceSeries,
 } = require('./marketPriceCache');
 
 function isoDate(date) {
@@ -1264,54 +1265,115 @@ async function fetchSGBPrice(symbol) {
 
 // ─── NPS NAV Fetching ─────────────────────────────────────────────────────────
 
-/**
- * Fetch latest NAV for an NPS scheme.
- * NPS Trust publishes daily NAVs but does not have a free public API.
- * This function provides a framework for fetching from configured sources:
- * 1. Direct HTTP fetch from NPS Trust if available and scheme code known
- * 2. Fallback to mock/cached data for development
- * 
- * @param {string} schemeName - Name or identifier of NPS fund (e.g., "ICICI", "HDFC", etc.)
- * @param {string} fundCode - Optional fund code for provider lookup
- * @param {number} lastPrice - Previous known price (for generating realistic variation)
- * @returns {Promise<{nav: number, date: string, change: number, changePercent: number, schemeName: string}>}
- */
-async function fetchNPSNAV(schemeName, fundCode, lastPrice) {
-  void schemeName;
-  void fundCode;
-  void lastPrice;
-  throw new Error('NPS live NAV provider is not configured');
+function parseNpsDateToIso(dateStr) {
+  const s = String(dateStr || '').trim();
+  const m = s.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (!m) return null;
+  return `${m[3]}-${m[2]}-${m[1]}`;
+}
+
+async function fetchNpsJson(pathname) {
+  const url = `https://npsnav.in${pathname}`;
+  const res = await fetch(url, {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'InvestmentTracker/1.0 (+https://localhost)',
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`NPSNAV request failed (${res.status}) for ${pathname}`);
+  }
+  return res.json();
+}
+
+function safeNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
- * Fetch historical NAV for an NPS fund
+ * Fetch latest NAV for an NPS scheme from npsnav.in.
+ * @param {string} schemeName - Name or identifier of NPS fund (e.g., "ICICI", "HDFC", etc.)
+ * @param {string} fundCode - NPS scheme code (e.g., SM008001)
+ * @param {number} lastPrice - Previous known NAV for day-change fallback
+ * @returns {Promise<{nav: number, date: string, change: number, changePercent: number, schemeName: string}>}
+ */
+async function fetchNPSNAV(schemeName, fundCode, lastPrice) {
+  const code = String(fundCode || '').trim().toUpperCase();
+  if (!code) {
+    throw new Error(`Missing nps_fund_code for ${schemeName || 'NPS investment'}`);
+  }
+
+  // Use detailed endpoint when available so we can preserve API-provided 1D change.
+  const detailed = await fetchNpsJson(`/api/detailed/${encodeURIComponent(code)}`);
+  const nav = safeNum(detailed?.NAV);
+  const oneDay = safeNum(detailed?.['1D']);
+  const updatedIso = parseNpsDateToIso(detailed?.['Last Updated']) || isoDate(new Date());
+
+  if (nav == null || nav <= 0) {
+    throw new Error(`Invalid NAV response for ${code}`);
+  }
+
+  let change = oneDay;
+  if (change == null) {
+    const prev = safeNum(lastPrice);
+    change = prev != null ? nav - prev : 0;
+  }
+  const prevBase = nav - change;
+  const changePercent = prevBase > 0 ? (change / prevBase) * 100 : 0;
+
+  return {
+    nav,
+    date: updatedIso,
+    change: Math.round(change * 10000) / 10000,
+    changePercent: Math.round(changePercent * 100) / 100,
+    schemeName: detailed?.['Scheme Name'] || schemeName || code,
+  };
+}
+
+function normalizeNpsHistoryDate(value) {
+  return String(value || '').trim().split('T')[0] || null;
+}
+
+/**
+ * Fetch historical NAV for an NPS fund from npsnav.in.
  * @param {string} npsFundCode - Unique code for the NPS fund
  * @returns {Promise<Array<{date: string, nav: number}>>}
  */
-async function fetchNPSHistory(npsFundCode) {
-  return new Promise((resolve, reject) => {
-    const url = `https://api.npsnav.in/fund/${npsFundCode}/history`; // Replace with actual API endpoint
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          if (json.data && json.data.length > 0) {
-            resolve(json.data.map(d => ({
-              date: d.date,
-              nav: parseFloat(d.nav),
-            })));
-          } else {
-            reject(new Error(`No history for NPS fund ${npsFundCode}`));
-          }
-        } catch (e) {
-          reject(new Error(`Failed to parse NPS history for ${npsFundCode}: ${e.message}`));
-        }
-      });
-      res.on('error', reject);
-    }).on('error', reject);
+async function fetchNPSHistory(npsFundCode, fromDate = null, toDate = null) {
+  const code = String(npsFundCode || '').trim().toUpperCase();
+  if (!code) throw new Error('npsFundCode is required');
+
+  const from = normalizeNpsHistoryDate(fromDate) || '1900-01-01';
+  const to = normalizeNpsHistoryDate(toDate) || isoDate(new Date());
+
+  const rows = await hydrateHistoricalPriceSeries({
+    instrumentType: 'NPS',
+    symbol: code,
+    fromDate: from,
+    toDate: to,
+    sourceLabel: 'NPSNAV',
+    fetchRange: async () => {
+      const json = await fetchNpsJson(`/api/historical/${encodeURIComponent(code)}`);
+      const data = Array.isArray(json?.data) ? json.data : [];
+      if (data.length === 0) {
+        throw new Error(`No history for NPS fund ${code}`);
+      }
+      return data;
+    },
+    mapFetchedRows: (data) => data
+      .map((r) => ({
+        date: parseNpsDateToIso(r?.date),
+        close: safeNum(r?.nav),
+        source: 'NPSNAV',
+      }))
+      .filter((r) => !!r.date && r.close != null && r.close > 0),
   });
+
+  return rows
+    .map((row) => ({ date: row.date, nav: safeNum(row.close) }))
+    .filter((row) => row.date && row.nav != null && row.nav > 0)
+    .sort((a, b) => a.date.localeCompare(b.date));
 }
 
 module.exports = {

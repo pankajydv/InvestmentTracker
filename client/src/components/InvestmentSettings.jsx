@@ -21,6 +21,7 @@ export default function InvestmentSettings() {
     ticker_symbol: '',
     isin_code: '',
     amfi_code: '',
+    nps_fund_code: '',
     is_active: true,
     exclude_from_tracking: false,
   });
@@ -37,6 +38,7 @@ export default function InvestmentSettings() {
         ticker_symbol: (result.ticker_symbol || '').replace(/\.(NS|BO)$/, ''),
         isin_code: result.isin_code || '',
         amfi_code: result.amfi_code || '',
+        nps_fund_code: result.nps_fund_code || '',
         is_active: result.is_active !== 0,
         exclude_from_tracking: result.exclude_from_tracking !== 0,
       });
@@ -61,6 +63,7 @@ export default function InvestmentSettings() {
         ticker_symbol: tickerToSave,
         isin_code: form.isin_code || null,
         amfi_code: form.amfi_code || null,
+        nps_fund_code: data.asset_type === 'NPS' ? (form.nps_fund_code || null) : undefined,
         is_active: form.is_active,
         exclude_from_tracking: form.exclude_from_tracking,
       });
@@ -77,6 +80,7 @@ export default function InvestmentSettings() {
   if (!data) return <div className="text-danger">Investment not found</div>;
 
   const isMF = data.asset_type === 'MUTUAL_FUND';
+  const isNPS = data.asset_type === 'NPS';
 
   return (
     <div>
@@ -123,8 +127,8 @@ export default function InvestmentSettings() {
                 </Form.Group>
               </Col>
 
-              {/* NSE Ticker (stocks only) */}
-              {!isMF && (
+              {/* NSE Ticker (non-MF, non-NPS) */}
+              {!isMF && !isNPS && (
               <Col md={4}>
                 <Form.Group>
                   <Form.Label className="small fw-semibold">Symbol</Form.Label>
@@ -141,7 +145,8 @@ export default function InvestmentSettings() {
               </Col>
               )}
 
-              {/* ISIN (readonly) */}
+              {/* ISIN (readonly; hidden for NPS) */}
+              {!isNPS && (
               <Col md={4}>
                 <Form.Group>
                   <Form.Label className="small fw-semibold">ISIN Code</Form.Label>
@@ -158,6 +163,25 @@ export default function InvestmentSettings() {
                   </Form.Text>
                 </Form.Group>
               </Col>
+              )}
+
+              {/* NPS Fund Code (NPS only) */}
+              {isNPS && (
+                <Col md={4}>
+                  <Form.Group>
+                    <Form.Label className="small fw-semibold">NPS Fund Code</Form.Label>
+                    <Form.Control
+                      type="text"
+                      value={form.nps_fund_code}
+                      onChange={(e) => setForm({ ...form, nps_fund_code: e.target.value })}
+                      placeholder="e.g. HDFC-XXXX"
+                    />
+                    <Form.Text className="text-muted">
+                      Used to fetch historical NAV for NPS pricing and one-day change.
+                    </Form.Text>
+                  </Form.Group>
+                </Col>
+              )}
 
               {/* AMFI Code (for mutual funds) */}
               {isMF && (

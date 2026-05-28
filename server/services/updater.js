@@ -19,6 +19,9 @@ const {
   REALIZED_CASHFLOW_TYPES,
   REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL,
 } = require('../constants/transactionTypes');
+const {
+  quantizeForStorage,
+} = require('./numberPrecision');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ─── Cancellation support ──────────────────────────────────────────────────
@@ -154,8 +157,8 @@ async function updateAllPrices(db, options = {}) {
   }
 
   const upsertDaily = db.prepare(`
-    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
       price_per_unit = excluded.price_per_unit,
       total_units = excluded.total_units,
@@ -163,10 +166,9 @@ async function updateAllPrices(db, options = {}) {
       invested_amount = excluded.invested_amount,
       realized_proceeds = excluded.realized_proceeds,
       profit_loss = excluded.profit_loss,
-      profit_loss_pct = excluded.profit_loss_pct,
       price_source = excluded.price_source,
       day_change = excluded.day_change,
-      day_change_pct = excluded.day_change_pct
+      updated_at = datetime('now')
   `);
 
   const getInvestedAmountPortfolio = db.prepare(`
@@ -409,18 +411,20 @@ async function updateAllPrices(db, options = {}) {
         const profitLoss = reinvestedType
           ? (currentValue - investedAmount)
           : (currentValue + realizedGain - investedAmount);
-        const profitLossPct = investedAmount > 0 ? (profitLoss / investedAmount) * 100 : 0;
         const prevDay = getPrevDayPortfolio.get(inv.id, pid, today);
         const prevValue = Number(prevDay?.current_value || 0);
         const netFlowToday = Number(getNetFlowTodayPortfolio.get(inv.id, pid, today)?.net_flow || 0);
         const dayChange = currentValue - prevValue - netFlowToday;
-        const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
-        const r = (v) => Math.round(v * 100) / 100;
         upsertDaily.run(
           inv.id, pid, today,
-          r(pricePerUnit), Math.round(totalUnits * 1000) / 1000,
-          r(currentValue), r(investedAmount), r(realizedGain), r(profitLoss), r(profitLossPct), priceSource,
-          r(dayChange), r(dayChangePct)
+          quantizeForStorage(pricePerUnit),
+          quantizeForStorage(totalUnits),
+          quantizeForStorage(currentValue),
+          quantizeForStorage(investedAmount),
+          quantizeForStorage(realizedGain),
+          quantizeForStorage(profitLoss),
+          priceSource,
+          quantizeForStorage(dayChange)
         );
       }
       const combinedSnapshot = db.prepare(`
@@ -608,12 +612,12 @@ function updatePortfolioDaily(db, date) {
     insertPortfolioDaily.run(
       pid,
       date,
-      Math.round(Number(totals.total_value || 0) * 100) / 100,
-      Math.round(Number(totals.total_invested || 0) * 100) / 100,
-      Math.round(Number(totals.total_profit_loss || 0) * 100) / 100,
-      Math.round(profitPct * 100) / 100,
-      Math.round(Number(totals.day_change || 0) * 100) / 100,
-      Math.round(dayChangePct * 100) / 100
+      quantizeForStorage(totals.total_value),
+      quantizeForStorage(totals.total_invested),
+      quantizeForStorage(totals.total_profit_loss),
+      quantizeForStorage(profitPct),
+      quantizeForStorage(totals.day_change),
+      quantizeForStorage(dayChangePct)
     );
   }
 }
@@ -707,14 +711,14 @@ function updateAssetTypeDaily(db, date) {
       row.portfolio_id,
       row.asset_type,
       date,
-      Math.round(totalValue * 100) / 100,
-      Math.round(totalInvested * 100) / 100,
-      Math.round(totalProfitLoss * 100) / 100,
-      Math.round(Number(row.total_realized_proceeds || 0) * 100) / 100,
-      Math.round(Number(row.total_unrealized_gain || 0) * 100) / 100,
-      Math.round(totalProfitLossPct * 100) / 100,
-      Math.round(dayChange * 100) / 100,
-      Math.round(dayChangePct * 100) / 100
+      quantizeForStorage(totalValue),
+      quantizeForStorage(totalInvested),
+      quantizeForStorage(totalProfitLoss),
+      quantizeForStorage(row.total_realized_proceeds),
+      quantizeForStorage(row.total_unrealized_gain),
+      quantizeForStorage(totalProfitLossPct),
+      quantizeForStorage(dayChange),
+      quantizeForStorage(dayChangePct)
     );
   }
 }

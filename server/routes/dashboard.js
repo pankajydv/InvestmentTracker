@@ -19,6 +19,7 @@ const CASH_INFLOW_TYPES = new Set(COST_BASIS_RECEIVED_TYPES);
 const INTERNAL_BALANCE_ASSET_TYPES_SQL = "'PF','PPF','SSY'";
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+const INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 
 function isInternalXirrCashflow(assetType, transactionType) {
   const normalizedAssetType = String(assetType || '').toUpperCase();
@@ -220,9 +221,17 @@ module.exports = function (db) {
             dv.invested_amount,
             dv.realized_proceeds,
             dv.profit_loss,
-            dv.profit_loss_pct,
+            CASE
+              WHEN COALESCE(dv.invested_amount, 0) > 0
+                THEN (COALESCE(dv.profit_loss, 0) / COALESCE(dv.invested_amount, 0)) * 100
+              ELSE 0
+            END AS profit_loss_pct,
             dv.day_change,
-            dv.day_change_pct,
+            CASE
+              WHEN (COALESCE(dv.current_value, 0) - COALESCE(dv.day_change, 0)) > 0
+                THEN (COALESCE(dv.day_change, 0) / (COALESCE(dv.current_value, 0) - COALESCE(dv.day_change, 0))) * 100
+              ELSE 0
+            END AS day_change_pct,
             dv.price_source,
             ROW_NUMBER() OVER (PARTITION BY dv.investment_id ORDER BY dv.date DESC) as row_num
           FROM daily_values dv
@@ -281,9 +290,17 @@ module.exports = function (db) {
           COALESCE(dv.invested_amount, 0) as invested_amount,
           COALESCE(dv.realized_proceeds, 0) as realized_proceeds,
           COALESCE(dv.profit_loss, 0) as profit_loss,
-          COALESCE(dv.profit_loss_pct, 0) as profit_loss_pct,
+          CASE
+            WHEN COALESCE(dv.invested_amount, 0) > 0
+              THEN (COALESCE(dv.profit_loss, 0) / COALESCE(dv.invested_amount, 0)) * 100
+            ELSE 0
+          END as profit_loss_pct,
           COALESCE(dv.day_change, 0) as day_change,
-          COALESCE(dv.day_change_pct, 0) as day_change_pct
+          CASE
+            WHEN (COALESCE(dv.current_value, 0) - COALESCE(dv.day_change, 0)) > 0
+              THEN (COALESCE(dv.day_change, 0) / (COALESCE(dv.current_value, 0) - COALESCE(dv.day_change, 0))) * 100
+            ELSE 0
+          END as day_change_pct
         FROM investments i
         LEFT JOIN daily_values dv ON i.id = dv.investment_id AND dv.portfolio_id = ? AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
         WHERE 1=1 AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)${soldFilter} AND i.exclude_from_tracking = 0
@@ -456,6 +473,8 @@ module.exports = function (db) {
           noPreviousRowCount: 0,
           marketAnchoredCount: 0,
           marketLatestFallbackCount: 0,
+          nonHeldExcludedCount: 0,
+          staleSnapshotExcludedCount: 0,
         }
       : null;
 
@@ -511,11 +530,32 @@ module.exports = function (db) {
       if (includeOneDayDebug) {
         oneDayDebugSummary.policyCounts[policy] = (oneDayDebugSummary.policyCounts[policy] || 0) + 1;
       }
+
+      // Fully sold investments should not influence current 1-day change cards,
+      // even when they are shown in tables. Keep internal balance products exempt.
+      const totalUnits = Number(inv.total_units) || 0;
+      const isInternalBalanceAsset = INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES.has(String(inv.asset_type || '').toUpperCase());
+      const isNonHeldPosition = !isInternalBalanceAsset && Math.abs(totalUnits) <= 0.001;
+      if (isNonHeldPosition) {
+        inv.day_change = 0;
+        inv.day_change_pct = 0;
+        if (includeOneDayDebug) {
+          oneDayDebugSummary.nonHeldExcludedCount += 1;
+          inv.one_day_debug = {
+            ...(inv.one_day_debug || {}),
+            policy,
+            reason: 'NON_HELD_POSITION_EXCLUDED',
+            totalUnits,
+          };
+        }
+        continue;
+      }
+
       const dvKey = `${inv.id}_${portfolio_id || 'null'}`;
       const latestRow = latestDvByInvestment.get(dvKey);
       const marketRows = dvHistoryByInvestment.get(dvKey) || [];
       const filteredMarketRows = marketRows.filter(r => 
-        !r.price_source || (r.price_source !== 'LOCF' && r.price_source !== 'NSE_BHAVCOPY_LOCF')
+        !r.price_source || r.price_source !== 'LOCF'
       );
 
       if (!latestRow) {
@@ -640,6 +680,26 @@ module.exports = function (db) {
       if (!inv.date) return maxDate;
       return !maxDate || inv.date > maxDate ? inv.date : maxDate;
     }, null);
+
+    // Prevent stale scopes (commonly fully sold investments) from polluting 1-day totals.
+    // If an investment's latest row is older than the dashboard snapshot date, its day change
+    // reflects a historical day and should not be included in today's summary cards.
+    if (latestSnapshotDate) {
+      for (const inv of investments) {
+        if (!inv.date || inv.date >= latestSnapshotDate) continue;
+        if (includeOneDayDebug) {
+          oneDayDebugSummary.staleSnapshotExcludedCount += 1;
+          inv.one_day_debug = {
+            ...(inv.one_day_debug || {}),
+            staleSnapshotExcluded: true,
+            staleSnapshotDate: inv.date,
+            summarySnapshotDate: latestSnapshotDate,
+          };
+        }
+        inv.day_change = 0;
+        inv.day_change_pct = 0;
+      }
+    }
 
     const totalsSoldFilter = hideSold && !includeSoldInReturns
       ? soldFilter
@@ -993,7 +1053,24 @@ module.exports = function (db) {
     // Per-investment performance (portfolio-scoped daily_values)
     if (portfolio_id) {
       var investmentData = db.prepare(`
-        SELECT dv.*, COALESCE(i.display_name, i.name) as name, i.asset_type
+        SELECT
+          dv.id,
+          dv.investment_id,
+          dv.portfolio_id,
+          dv.date,
+          dv.price_per_unit,
+          dv.total_units,
+          dv.current_value,
+          dv.invested_amount,
+          dv.realized_proceeds,
+          dv.profit_loss,
+          CASE WHEN COALESCE(dv.invested_amount, 0) > 0 THEN (COALESCE(dv.profit_loss, 0) / COALESCE(dv.invested_amount, 0)) * 100 ELSE 0 END as profit_loss_pct,
+          dv.price_source,
+          dv.day_change,
+          CASE WHEN (COALESCE(dv.current_value, 0) - COALESCE(dv.day_change, 0)) > 0 THEN (COALESCE(dv.day_change, 0) / (COALESCE(dv.current_value, 0) - COALESCE(dv.day_change, 0))) * 100 ELSE 0 END as day_change_pct,
+          dv.updated_at,
+          COALESCE(i.display_name, i.name) as name,
+          i.asset_type
         FROM daily_values dv
         JOIN investments i ON dv.investment_id = i.id
         WHERE dv.date BETWEEN ? AND ? AND dv.portfolio_id = ? AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)
@@ -1172,7 +1249,23 @@ module.exports = function (db) {
 
     const data = portfolio_id
       ? db.prepare(`
-          SELECT * FROM daily_values
+          SELECT
+            id,
+            investment_id,
+            portfolio_id,
+            date,
+            price_per_unit,
+            total_units,
+            current_value,
+            invested_amount,
+            realized_proceeds,
+            profit_loss,
+            CASE WHEN invested_amount > 0 THEN (profit_loss / invested_amount) * 100 ELSE 0 END as profit_loss_pct,
+            price_source,
+            day_change,
+            CASE WHEN (current_value - day_change) > 0 THEN (day_change / (current_value - day_change)) * 100 ELSE 0 END as day_change_pct,
+            updated_at
+          FROM daily_values
           WHERE investment_id = ? AND portfolio_id = ? AND date >= ?
           ORDER BY date ASC
         `).all(req.params.investmentId, portfolio_id, startDate)

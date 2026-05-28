@@ -57,13 +57,13 @@ function normalizeRow(raw = {}, index = 0, sourceLabel = '') {
   if (!(purchasePrice > 0)) throw new Error(`row ${index + 1}: purchase price must be > 0`);
 
   const usdAmount = purchaseValue != null
-    ? Number(purchaseValue.toFixed(2))
-    : Number((purchaseQty * purchasePrice).toFixed(2));
+    ? purchaseValue
+    : (purchaseQty * purchasePrice);
 
   // ESPP portal price is usually discounted purchase price; use it to infer FMV when missing.
   const fmvPurchaseDate = parsedFmvPurchaseDate != null
     ? parsedFmvPurchaseDate
-    : Number((purchasePrice / 0.9).toFixed(4));
+    : (purchasePrice / 0.9);
 
   const normalizedOffering = offeringPeriod || 'Unknown Offering';
   const compactOffering = normalizedOffering.replace(/\s+/g, '');
@@ -81,11 +81,11 @@ function normalizeRow(raw = {}, index = 0, sourceLabel = '') {
   return {
     offering_period: normalizedOffering,
     purchase_date: purchaseDate,
-    purchase_quantity: Number(purchaseQty.toFixed(3)),
-    purchase_price: Number(purchasePrice.toFixed(4)),
+    purchase_quantity: purchaseQty,
+    purchase_price: purchasePrice,
     purchase_value: usdAmount,
-    fmv_purchase_date: fmvPurchaseDate != null ? Number(fmvPurchaseDate.toFixed(4)) : null,
-    fmv_offering_start_date: fmvOfferingStart != null ? Number(fmvOfferingStart.toFixed(4)) : null,
+    fmv_purchase_date: fmvPurchaseDate,
+    fmv_offering_start_date: fmvOfferingStart,
     import_key: key,
     notes: noteParts.join(' | '),
   };

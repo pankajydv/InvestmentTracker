@@ -320,8 +320,8 @@ describe('Investments — Balance Account XIRR', () => {
       VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)
     `);
     const dailyInsert = db.prepare(`
-      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
-      VALUES (?, ?, ?, 0, 1, ?, ?, 0, ?, ?, 'COMPUTED', 0, 0)
+      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+      VALUES (?, ?, ?, 0, 1, ?, ?, 0, ?, 'COMPUTED', 0)
     `);
 
     for (const investmentId of [pf.body.id, ppf.body.id]) {
@@ -329,7 +329,7 @@ describe('Investments — Balance Account XIRR', () => {
       txInsert.run(investmentId, 1, 'INTEREST', '2025-03-31', 120, 'Internal annual interest');
       txInsert.run(investmentId, 1, 'TDS', '2025-04-01', -20, 'Internal tax adjustment');
       txInsert.run(investmentId, 1, 'RECONCILE', '2025-04-01', 30, 'Passbook reconcile / checkpoint');
-      dailyInsert.run(investmentId, 1, '2099-01-01', 1100, 1000, 100, 10);
+      dailyInsert.run(investmentId, 1, '2099-01-01', 1100, 1000, 100);
     }
 
     const latestByPortfolio = db.prepare(

@@ -10,6 +10,7 @@ const { parseOpenLots, parseClosedLots, reconcileVestTransactions } = require('.
 const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisitionImportService');
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 const { logAppInfo, logAppError } = require('../services/appLogger');
+const { quantizeForStorage, quantizeNullableForStorage } = require('../services/numberPrecision');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -198,7 +199,7 @@ function parseEsppContributionRowsFromPayslipText(pageText, sourceFileName, page
     import_key: `ESPP_CONTRIB|${monthKey}`,
     month_key: monthKey,
     contribution_date: contributionDate,
-    amount: Number(monthlyContribution.toFixed(2)),
+    amount: monthlyContribution,
     source_file: sourceFileName,
     source_page: pageNo,
     raw_line: esppLine,
@@ -1012,7 +1013,7 @@ module.exports = function (db) {
             investmentId,
             portfolioId,
             contributionDate,
-            Number(amount.toFixed(2)),
+            amount,
             noteParts.join(' | '),
           );
           created += 1;
@@ -1444,9 +1445,9 @@ module.exports = function (db) {
           }
 
           const pricing = pricingByDate.get(row.vest_date) || { price_per_unit: null, exchange_rate_used: null };
-          const usdAmount = pricing.price_per_unit != null ? Number((row.units * pricing.price_per_unit).toFixed(4)) : null;
+          const usdAmount = pricing.price_per_unit != null ? (row.units * pricing.price_per_unit) : null;
           const amount = pricing.price_per_unit != null && pricing.exchange_rate_used != null
-            ? Number((usdAmount * pricing.exchange_rate_used).toFixed(2))
+            ? (usdAmount * pricing.exchange_rate_used)
             : 0;
 
           insertTxn.run(
@@ -1611,8 +1612,8 @@ module.exports = function (db) {
           const fx = fxByDate.get(effectiveDate) != null
             ? Number(fxByDate.get(effectiveDate))
             : (row.exchange_rate_used != null ? Number(row.exchange_rate_used) : null);
-          const usdAmount = price != null ? Number((u.gross_units * price).toFixed(4)) : null;
-          const amount = usdAmount != null && fx != null ? Number((usdAmount * fx).toFixed(2)) : 0;
+          const usdAmount = price != null ? (u.gross_units * price) : null;
+          const amount = usdAmount != null && fx != null ? (usdAmount * fx) : 0;
 
           updateTxn.run(
             effectiveDate,
@@ -1925,11 +1926,16 @@ module.exports = function (db) {
           const isCleanSplit = split.denominator === 1 && split.numerator >= 2 && Number.isInteger(ratio);
           const txnType = isCleanSplit ? 'SPLIT' : 'BONUS';
           const rawNewUnits = holdingUnits * (ratio - 1);
-          const newUnits = txnType === 'BONUS' ? Math.floor(rawNewUnits) : Math.round(rawNewUnits * 1000) / 1000;
+          const isIndianStock = inv.asset_type === 'INDIAN_STOCK';
+          const newUnits = isIndianStock
+            ? Math.max(0, Math.floor(rawNewUnits + 0.000000001))
+            : (txnType === 'BONUS' ? Math.floor(rawNewUnits) : Math.round(rawNewUnits * 1000) / 1000);
           if (newUnits <= 0) continue;
 
-          // Fractional bonus entitlement → cash payout (using previous day's LOW price)
-          const fractional = txnType === 'BONUS' ? Math.round((rawNewUnits - newUnits) * 1e6) / 1e6 : 0;
+          // For Indian stocks, bonus/split grants are whole shares and residue is cash payout.
+          const fractional = isIndianStock
+            ? Math.round(Math.max(0, rawNewUnits - newUnits) * 1e6) / 1e6
+            : (txnType === 'BONUS' ? Math.round((rawNewUnits - newUnits) * 1e6) / 1e6 : 0);
           let fractionalAmount = 0;
           if (fractional > 0.0001) {
             // Use previous day's LOW price for fractional payout calculation
@@ -2095,8 +2101,15 @@ module.exports = function (db) {
 
             insert.run(
               txn.investment_id, txn.transaction_type, txn.transaction_date,
-              txn.units || null, txn.price_per_unit || null, txn.amount, txn.fees || 0, txn.notes || null,
-              txn.broker || null, portfolioId, txn.exchange_rate_used || null, txn.usd_amount || null
+              quantizeNullableForStorage(txn.units),
+              quantizeNullableForStorage(txn.price_per_unit),
+              quantizeForStorage(txn.amount),
+              quantizeForStorage(txn.fees || 0),
+              txn.notes || null,
+              txn.broker || null,
+              portfolioId,
+              quantizeNullableForStorage(txn.exchange_rate_used),
+              quantizeNullableForStorage(txn.usd_amount)
             );
             dirtyCandidates.push({
               investment_id: txn.investment_id,
@@ -2118,14 +2131,14 @@ module.exports = function (db) {
             }
             update.run(
               c.transaction_date,
-              c.expected_units,
-              c.expected_price_per_unit,
-              c.expected_amount,
+              quantizeNullableForStorage(c.expected_units),
+              quantizeNullableForStorage(c.expected_price_per_unit),
+              quantizeForStorage(c.expected_amount),
               c.notes,
               c.broker || null,
               portfolioId,
-              c.expected_exchange_rate_used || null,
-              c.expected_usd_amount || null,
+              quantizeNullableForStorage(c.expected_exchange_rate_used),
+              quantizeNullableForStorage(c.expected_usd_amount),
               c.id
             );
             dirtyCandidates.push({

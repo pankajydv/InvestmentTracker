@@ -20,7 +20,7 @@ const UNIT_INFLOW_TYPES = new Set([
 const UNIT_OUTFLOW_TYPES = new Set([
   'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC',
 ]);
-const LOCF_SOURCES = new Set(['LOCF', 'NSE_BHAVCOPY_LOCF']);
+const LOCF_SOURCES = new Set(['LOCF']);
 
 const complianceJobStore = new Map();
 let complianceJobSeq = 0;

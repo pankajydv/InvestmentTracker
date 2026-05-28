@@ -8,7 +8,7 @@
 
 const https = require('https');
 const AdmZip = require('adm-zip');
-const { getSeries, upsertPricePoint } = require('./marketPriceCache');
+const { hydrateHistoricalPriceSeries } = require('./marketPriceCache');
 
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
@@ -105,15 +105,8 @@ function parseBhavcopyCSV(csv, symbol, format) {
 // Rate-limit: small delay between requests
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-async function getSGBHistoricalPrices(symbol, fromDate, toDate) {
-  const out = new Map();
-
-  const cached = getSeries('SGB', symbol, fromDate, toDate);
-  for (const row of cached) {
-    if (row.close != null) {
-      out.set(row.date, Number(row.close));
-    }
-  }
+async function fetchSGBHistoricalRaw(symbol, fromDate, toDate) {
+  const out = [];
 
   let d = new Date(`${fromDate}T00:00:00.000Z`);
   const end = new Date(`${toDate}T00:00:00.000Z`);
@@ -127,24 +120,13 @@ async function getSGBHistoricalPrices(symbol, fromDate, toDate) {
       const m = pad(d.getUTCMonth() + 1);
       const day = pad(d.getUTCDate());
       const dateStr = `${y}-${m}-${day}`;
-      if (out.has(dateStr)) {
-        d.setUTCDate(d.getUTCDate() + 1);
-        continue;
-      }
       try {
         const { url, format } = getBhavcopyUrlInfo(dateStr);
         const zipBuf = await fetchBuffer(url);
         const csv = extractCSVFromZip(zipBuf);
         const price = parseBhavcopyCSV(csv, symbol, format);
         if (price != null) {
-          out.set(dateStr, price);
-          upsertPricePoint({
-            instrumentType: 'SGB',
-            symbol,
-            date: dateStr,
-            close: price,
-            source: 'NSE_BHAVCOPY',
-          });
+          out.push({ date: dateStr, close: Number(price), source: 'NSE_BHAVCOPY' });
           consecutiveErrors = 0;
         }
         await delay(150);
@@ -159,8 +141,27 @@ async function getSGBHistoricalPrices(symbol, fromDate, toDate) {
     }
     d.setUTCDate(d.getUTCDate() + 1);
   }
+
   return out;
 }
 
-module.exports = { getSGBHistoricalPrices, parseBhavcopyCSV, extractCSVFromZip };
+async function getSGBHistoricalPrices(symbol, fromDate, toDate) {
+  const rows = await hydrateHistoricalPriceSeries({
+    instrumentType: 'SGB',
+    symbol,
+    fromDate,
+    toDate,
+    sourceLabel: 'NSE_BHAVCOPY',
+    fetchRange: async (missingFrom, missingTo) => fetchSGBHistoricalRaw(symbol, missingFrom, missingTo),
+    mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),
+  });
+
+  const out = new Map();
+  for (const row of rows) {
+    if (row?.date && row.close != null) out.set(row.date, Number(row.close));
+  }
+  return out;
+}
+
+module.exports = { getSGBHistoricalPrices, fetchSGBHistoricalRaw, parseBhavcopyCSV, extractCSVFromZip };
 

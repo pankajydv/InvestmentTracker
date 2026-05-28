@@ -151,11 +151,9 @@ function initializeDb(db) {
       invested_amount REAL NOT NULL, -- Total amount invested till date
       realized_proceeds REAL DEFAULT 0, -- Cumulative cash out (realized proceeds)
       profit_loss REAL NOT NULL,   -- current_value - invested_amount
-      profit_loss_pct REAL,        -- Percentage gain/loss
       price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED')),
       day_change REAL DEFAULT 0,   -- Change from previous day
-      day_change_pct REAL DEFAULT 0,
-      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
       UNIQUE(investment_id, portfolio_id, date)
     );
@@ -1844,6 +1842,143 @@ function initializeDb(db) {
     }
   } else if (!hasMigrationRecord(db, dailyValuesEnhancementId) && dvColsNow.has('price_source') && dvColsNow.has('realized_proceeds')) {
     recordMigration(db, dailyValuesEnhancementId, 'skipped', 'already present');
+  }
+
+  // ── Migration: rationalize daily_values columns (drop derived columns, add updated_at) ──
+  const dvColsRationalize = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
+  const dailyValuesRationalizationId = '20260528-daily-values-column-rationalization';
+  const dailyValuesNeedsRationalization =
+    dvColsRationalize.has('profit_loss_pct')
+    || dvColsRationalize.has('day_change_pct')
+    || dvColsRationalize.has('created_at')
+    || !dvColsRationalize.has('updated_at');
+
+  if (requireMigrationsEnabled(
+    dailyValuesRationalizationId,
+    dailyValuesNeedsRationalization,
+    'daily_values has legacy derived/timestamp columns'
+  )) {
+    const beforeDailyCount = getTableCount(db, 'daily_values');
+    const updatedAtExpr = dvColsRationalize.has('updated_at')
+      ? (dvColsRationalize.has('created_at')
+        ? 'COALESCE(updated_at, created_at, datetime(\'now\'))'
+        : 'COALESCE(updated_at, datetime(\'now\'))')
+      : (dvColsRationalize.has('created_at') ? 'COALESCE(created_at, datetime(\'now\'))' : 'datetime(\'now\')');
+    const realizedProceedsExpr = dvColsRationalize.has('realized_proceeds') ? 'COALESCE(realized_proceeds, 0)' : '0';
+    const priceSourceExpr = dvColsRationalize.has('price_source') ? "COALESCE(price_source, 'LIVE')" : "'LIVE'";
+    const dayChangeExpr = dvColsRationalize.has('day_change') ? 'COALESCE(day_change, 0)' : '0';
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE daily_values_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          portfolio_id INTEGER,
+          date TEXT NOT NULL,
+          price_per_unit REAL,
+          total_units REAL,
+          current_value REAL NOT NULL,
+          invested_amount REAL NOT NULL,
+          realized_proceeds REAL DEFAULT 0,
+          profit_loss REAL NOT NULL,
+          price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED')),
+          day_change REAL DEFAULT 0,
+          updated_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
+          UNIQUE(investment_id, portfolio_id, date)
+        )
+      `);
+
+      db.exec(`
+        INSERT INTO daily_values_new (
+          id,
+          investment_id,
+          portfolio_id,
+          date,
+          price_per_unit,
+          total_units,
+          current_value,
+          invested_amount,
+          realized_proceeds,
+          profit_loss,
+          price_source,
+          day_change,
+          updated_at
+        )
+        SELECT
+          id,
+          investment_id,
+          portfolio_id,
+          date,
+          price_per_unit,
+          total_units,
+          current_value,
+          invested_amount,
+          ${realizedProceedsExpr},
+          profit_loss,
+          ${priceSourceExpr},
+          ${dayChangeExpr},
+          ${updatedAtExpr}
+        FROM daily_values
+      `);
+
+      db.exec('DROP TABLE daily_values');
+      db.exec('ALTER TABLE daily_values_new RENAME TO daily_values');
+
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON daily_values(portfolio_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON daily_values(investment_id, portfolio_id, date DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date DESC)');
+
+      // Recreate NOT NULL enforcement triggers dropped during table rebuild.
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_insert
+        BEFORE INSERT ON daily_values
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_update
+        BEFORE UPDATE OF portfolio_id ON daily_values
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec('COMMIT');
+      db.exec('PRAGMA foreign_keys = ON');
+
+      const afterDailyCount = getTableCount(db, 'daily_values');
+      ensureRowCountPreserved({
+        before: beforeDailyCount,
+        after: afterDailyCount,
+        table: 'daily_values',
+        migrationName: dailyValuesRationalizationId,
+      });
+
+      assertDbIntegrity(db, dailyValuesRationalizationId);
+      recordMigration(
+        db,
+        dailyValuesRationalizationId,
+        'applied',
+        `rows before=${beforeDailyCount}, after=${afterDailyCount}; dropped profit_loss_pct/day_change_pct/created_at, added updated_at`
+      );
+    } catch (e) {
+      db.exec('ROLLBACK');
+      db.exec('PRAGMA foreign_keys = ON');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, dailyValuesRationalizationId) && !dailyValuesNeedsRationalization) {
+    recordMigration(db, dailyValuesRationalizationId, 'skipped', 'already rationalized');
   }
 
   // ── Migration: add investments.last_active_date ───────────────────────────

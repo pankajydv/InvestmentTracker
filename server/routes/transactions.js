@@ -27,6 +27,29 @@ function normalizeTransactionDate(dateInput) {
   return Number.isNaN(d.getTime()) ? null : dateStr;
 }
 
+function normalizeIndianCorporateUnits(assetType, transactionType, unitsInput) {
+  if (assetType !== 'INDIAN_STOCK') return { ok: true, value: unitsInput };
+  if (transactionType !== 'SPLIT' && transactionType !== 'BONUS') return { ok: true, value: unitsInput };
+
+  const units = Number(unitsInput);
+  if (!Number.isFinite(units) || units <= 0) {
+    return {
+      ok: false,
+      error: 'For Indian stocks, SPLIT/BONUS units must be a positive whole number',
+    };
+  }
+
+  const wholeUnits = Math.round(units);
+  if (Math.abs(units - wholeUnits) > 0.000001) {
+    return {
+      ok: false,
+      error: 'For Indian stocks, SPLIT/BONUS units must be a positive whole number',
+    };
+  }
+
+  return { ok: true, value: wholeUnits };
+}
+
 // PF transaction types that get merged into a single contribution row per date
 const PF_GROUPABLE_TYPES = new Set(['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'EPS_CONTRIBUTION']);
 
@@ -147,11 +170,17 @@ module.exports = function (db) {
         }
       }
 
+      const normalizedUnitsCheck = normalizeIndianCorporateUnits(inv.asset_type, transaction_type, units);
+      if (!normalizedUnitsCheck.ok) {
+        return res.status(400).json({ error: normalizedUnitsCheck.error });
+      }
+      const normalizedUnits = normalizedUnitsCheck.value;
+
       const result = db.prepare(`
         INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(investment_id, portfolio_id, transaction_type, normalizedTransactionDate,
-        units || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null,
+        normalizedUnits || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null,
         resolvedRate, usd_amount || null, fmv_per_unit || null, gross_units || null, tax_withheld_units || null);
 
       const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
@@ -307,12 +336,21 @@ module.exports = function (db) {
     try {
       const existing = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
       if (!existing) return res.status(404).json({ error: 'Transaction not found' });
+      const inv = db.prepare('SELECT asset_type FROM investments WHERE id = ?').get(existing.investment_id);
 
       const {
         transaction_date, units, price_per_unit, amount, fees, notes, broker,
         folio_number, exchange_rate_used, usd_amount, fmv_per_unit,
         gross_units, tax_withheld_units,
       } = req.body;
+
+      const nextUnits = units ?? existing.units;
+      const normalizedUnitsCheck = normalizeIndianCorporateUnits(inv?.asset_type, existing.transaction_type, nextUnits);
+      if (!normalizedUnitsCheck.ok) {
+        return res.status(400).json({ error: normalizedUnitsCheck.error });
+      }
+      const normalizedUnits = normalizedUnitsCheck.value;
+
       const nextDate = normalizeTransactionDate(transaction_date || existing.transaction_date) || existing.transaction_date;
       db.prepare(`
         UPDATE transactions
@@ -321,7 +359,7 @@ module.exports = function (db) {
         WHERE id = ?
       `).run(
         nextDate,
-        units ?? existing.units,
+        normalizedUnits,
         price_per_unit ?? existing.price_per_unit,
         amount ?? existing.amount,
         fees ?? existing.fees,

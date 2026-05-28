@@ -7,7 +7,7 @@ const {
   calculateSmallSavingsInterestPreview,
   calculateSmallSavingsValueAsOfDate,
 } = require('./pfInterestCalculator');
-const { getSeries, upsertPriceSeries } = require('./marketPriceCache');
+const { getSeries, upsertPriceSeries, hydrateHistoricalPriceSeries } = require('./marketPriceCache');
 const { updateAssetTypeDaily, updatePortfolioDaily } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
 const { toIsoDate, todayIso } = require('./dateUtils');
@@ -17,6 +17,10 @@ const {
   REALIZED_CASHFLOW_TYPES,
   REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL,
 } = require('../constants/transactionTypes');
+const {
+  quantizeForStorage,
+  quantizeNullableForStorage,
+} = require('./numberPrecision');
 
 function clampEndDateToToday(endDate) {
   const end = toIsoDate(endDate) || todayIso();
@@ -223,13 +227,39 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     if (!cache.sgb) cache.sgb = new Map();
     if (!cache.sgb.has(symbol)) {
       try {
-        const { getSGBHistoricalPrices } = require('./sgbBhavcopy');
+        const { fetchSGBHistoricalRaw } = require('./sgbBhavcopy');
         const from = cache.sgbRangeBySymbol?.get(symbol) || cache.rangeStart || date;
         const to = cache.rangeEnd || date;
-        logBackfillInfo(`[SGB][Bhavcopy] Fetching ${symbol} from ${from} to ${to} (this may take several minutes)`);
-        const hist = await getSGBHistoricalPrices(symbol, from, to);
-        logBackfillInfo(`[SGB][Bhavcopy] Fetched ${hist.size} price points for ${symbol}`);
-        cache.sgb.set(symbol, hist);
+
+        // Check if DB cache is already fresh enough (bhavcopy is T-1; tolerate 1-day gap)
+        // This mirrors fetchStockSeries recency check to avoid re-downloading every run.
+        const recentRows = getSeries('SGB', symbol, addDays(to, -5), to).filter((r) => r.close != null);
+        const latestCachedDate = recentRows.map((r) => r.date).sort().pop();
+        if (latestCachedDate && latestCachedDate >= addDays(to, -1)) {
+          // Cache is fresh — load full range from DB, skip HTTP fetch
+          const allRows = getSeries('SGB', symbol, from, to).filter((r) => r.close != null);
+          const hist = new Map();
+          for (const row of allRows) hist.set(row.date, Number(row.close));
+          logBackfillInfo(`[SGB][Bhavcopy] Loaded ${hist.size} price points for ${symbol} from cache (latest: ${latestCachedDate})`);
+          cache.sgb.set(symbol, hist);
+        } else {
+          logBackfillInfo(`[SGB][Bhavcopy] Cache stale or missing for ${symbol} (latest: ${latestCachedDate || 'none'}), fetching up to ${to} from source`);
+          const rows = await hydrateHistoricalPriceSeries({
+            instrumentType: 'SGB',
+            symbol,
+            fromDate: from,
+            toDate: to,
+            sourceLabel: 'NSE_BHAVCOPY',
+            fetchRange: async (missingFrom, missingTo) => fetchSGBHistoricalRaw(symbol, missingFrom, missingTo),
+            mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),
+          });
+          const hist = new Map();
+          for (const row of rows) {
+            if (row?.date && row.close != null) hist.set(row.date, Number(row.close));
+          }
+          logBackfillInfo(`[SGB][Bhavcopy] Fetched ${hist.size} price points for ${symbol}`);
+          cache.sgb.set(symbol, hist);
+        }
       } catch (e) {
         logBackfillError(`[SGB][Bhavcopy] Failed to fetch prices for ${symbol}: ${e.message}`);
         cache.sgb.set(symbol, new Map());
@@ -237,21 +267,21 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     }
     const hist = cache.sgb.get(symbol);
     if (hist && hist.has(date)) {
-      return { price: Number(hist.get(date)), source: 'NSE_BHAVCOPY' };
+      return { price: Number(hist.get(date)), source: 'LIVE' };
     }
     // fallback: try latest NSE quote for today
     if (date === todayIso()) {
       try {
         const { fetchSGBPrice } = require('./priceService');
         const live = await fetchSGBPrice(symbol);
-        if (live && live.price > 0) return { price: Number(live.price), source: 'NSE_QUOTE' };
+        if (live && live.price > 0) return { price: Number(live.price), source: 'LIVE' };
       } catch (e) {}
     }
     // fallback: LOCF from hist
     if (hist && hist.size > 0) {
       // find nearest on or before
       const keys = Array.from(hist.keys()).filter(k => k <= date).sort();
-      if (keys.length > 0) return { price: Number(hist.get(keys[keys.length-1])), source: 'NSE_BHAVCOPY_LOCF' };
+      if (keys.length > 0) return { price: Number(hist.get(keys[keys.length-1])), source: 'LOCF' };
     }
     // fallback: stored
     const stored = getStoredPriceOnOrBefore(db, inv.id, portfolioId, date);
@@ -291,7 +321,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
   if (inv.asset_type === 'NPS') {
     if (inv.nps_fund_code) {
       if (!cache.nps.has(inv.nps_fund_code)) {
-        const history = await fetchNPSHistory(inv.nps_fund_code).catch(() => []);
+        const history = await fetchNPSHistory(inv.nps_fund_code, cache.rangeStart || date, cache.rangeEnd || date).catch(() => []);
         const map = new Map();
         for (const row of history) {
           const d = normalizeMfDate(row.date);
@@ -394,9 +424,20 @@ function upsertDailyRow(db, row, statements = null) {
   // Only write portfolio-scoped rows (portfolio_id NOT NULL)
   if (row.portfolio_id == null) return;
 
+  const normalizedRow = {
+    ...row,
+    price_per_unit: quantizeForStorage(row.price_per_unit),
+    total_units: quantizeForStorage(row.total_units),
+    current_value: quantizeForStorage(row.current_value),
+    invested_amount: quantizeForStorage(row.invested_amount),
+    realized_proceeds: quantizeForStorage(row.realized_proceeds),
+    profit_loss: quantizeForStorage(row.profit_loss),
+    day_change: quantizeForStorage(row.day_change),
+  };
+
   const upsertScoped = statements?.upsertScoped || db.prepare(`
-    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
       price_per_unit = excluded.price_per_unit,
       total_units = excluded.total_units,
@@ -404,26 +445,23 @@ function upsertDailyRow(db, row, statements = null) {
       invested_amount = excluded.invested_amount,
       realized_proceeds = excluded.realized_proceeds,
       profit_loss = excluded.profit_loss,
-      profit_loss_pct = excluded.profit_loss_pct,
       price_source = excluded.price_source,
       day_change = excluded.day_change,
-      day_change_pct = excluded.day_change_pct
+      updated_at = datetime('now')
   `);
 
   upsertScoped.run(
-    row.investment_id,
-    row.portfolio_id,
-    row.date,
-    row.price_per_unit,
-    row.total_units,
-    row.current_value,
-    row.invested_amount,
-    row.realized_proceeds,
-    row.profit_loss,
-    row.profit_loss_pct,
-    row.price_source,
-    row.day_change,
-    row.day_change_pct
+    normalizedRow.investment_id,
+    normalizedRow.portfolio_id,
+    normalizedRow.date,
+    normalizedRow.price_per_unit,
+    normalizedRow.total_units,
+    normalizedRow.current_value,
+    normalizedRow.invested_amount,
+    normalizedRow.realized_proceeds,
+    normalizedRow.profit_loss,
+    normalizedRow.price_source,
+    normalizedRow.day_change
   );
 }
 
@@ -484,8 +522,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
 
     const dailyStatements = {
       upsertScoped: db.prepare(`
-        INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, profit_loss_pct, price_source, day_change, day_change_pct)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
           price_per_unit = excluded.price_per_unit,
           total_units = excluded.total_units,
@@ -493,10 +531,9 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
           invested_amount = excluded.invested_amount,
           realized_proceeds = excluded.realized_proceeds,
           profit_loss = excluded.profit_loss,
-          profit_loss_pct = excluded.profit_loss_pct,
           price_source = excluded.price_source,
           day_change = excluded.day_change,
-          day_change_pct = excluded.day_change_pct
+          updated_at = datetime('now')
       `),
     };
 
@@ -567,9 +604,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     const units = Number(unitsRow?.total || 0);
     const invested = Number(getInvested.get(...baseParams, date)?.total || 0);
 
-    // Stop writing trailing zero-unit rows after exit for unit-based assets.
-    // NPS must continue through runDate so full dirty windows are rebuilt.
-    if (latestTxnDate && date > latestTxnDate && units <= 0 && inv.asset_type !== 'NPS' && !isProvidentAsset) {
+    // Stop writing trailing zero-unit rows after exit for all unit-based assets.
+    if (latestTxnDate && date > latestTxnDate && units <= 0 && !isProvidentAsset) {
       break;
     }
 
@@ -631,18 +667,16 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       investment_id: inv.id,
       portfolio_id: portfolioId,
       date,
-      price_per_unit: round2(price),
+      price_per_unit: price,
       total_units: isProvidentAsset
         ? 1
-        : Math.round(units * 1000) / 1000,
-      current_value: round2(currentValue),
-      invested_amount: round2(invested),
-      realized_proceeds: round2(realizedGain),
-      profit_loss: round2(profitLoss),
-      profit_loss_pct: round2(profitLossPct),
+        : units,
+      current_value: currentValue,
+      invested_amount: invested,
+      realized_proceeds: realizedGain,
+      profit_loss: profitLoss,
       price_source: priceSource,
-      day_change: round2(dayChange),
-      day_change_pct: round2(dayChangePct),
+      day_change: dayChange,
     }, dailyStatements);
     written += 1;
 
@@ -699,6 +733,19 @@ function holdingUnitsAtDate(db, investmentId, portfolioId, date, excludeSameDayT
     }
   }
   return Math.round(units * 1000) / 1000;
+}
+
+function toRecordSnapshot(row) {
+  if (!row) return null;
+  return {
+    units: Number(row.units == null ? 0 : row.units),
+    pricePerUnit: Number(row.price_per_unit == null ? 0 : row.price_per_unit),
+    amount: Number(row.amount == null ? 0 : row.amount),
+    notes: row.notes || null,
+    broker: row.broker || null,
+    fxRate: row.exchange_rate_used == null ? null : Number(row.exchange_rate_used),
+    usdAmount: row.usd_amount == null ? null : Number(row.usd_amount),
+  };
 }
 
 async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDate, cache) {
@@ -760,74 +807,123 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
   };
 
   function upsertCorporateActionTxn(desired) {
+    const normalizedDesired = {
+      ...desired,
+      units: quantizeForStorage(desired.units),
+      pricePerUnit: quantizeForStorage(desired.pricePerUnit),
+      amount: quantizeForStorage(desired.amount),
+      fxRate: quantizeNullableForStorage(desired.fxRate),
+      usdAmount: quantizeNullableForStorage(desired.usdAmount),
+    };
+
     const rows = selectByKey.all(
-      desired.investmentId,
-      desired.portfolioId,
-      desired.date,
-      desired.transactionType
+      normalizedDesired.investmentId,
+      normalizedDesired.portfolioId,
+      normalizedDesired.date,
+      normalizedDesired.transactionType
     );
 
     if (!rows.length) {
-      insertTxn.run(
-        desired.investmentId,
-        desired.portfolioId,
-        desired.transactionType,
-        desired.date,
-        desired.units,
-        desired.pricePerUnit,
-        desired.amount,
-        desired.notes,
-        desired.broker,
-        desired.fxRate,
-        desired.usdAmount
+      const insertRes = insertTxn.run(
+        normalizedDesired.investmentId,
+        normalizedDesired.portfolioId,
+        normalizedDesired.transactionType,
+        normalizedDesired.date,
+        normalizedDesired.units,
+        normalizedDesired.pricePerUnit,
+        normalizedDesired.amount,
+        normalizedDesired.notes,
+        normalizedDesired.broker,
+        normalizedDesired.fxRate,
+        normalizedDesired.usdAmount
       );
-      return 'inserted';
+      return {
+        changeType: 'inserted',
+        recordId: Number(insertRes.lastInsertRowid),
+        previous: null,
+        next: {
+          units: Number(normalizedDesired.units == null ? 0 : normalizedDesired.units),
+          pricePerUnit: Number(normalizedDesired.pricePerUnit == null ? 0 : normalizedDesired.pricePerUnit),
+          amount: Number(normalizedDesired.amount == null ? 0 : normalizedDesired.amount),
+          notes: normalizedDesired.notes || null,
+          broker: normalizedDesired.broker || null,
+          fxRate: normalizedDesired.fxRate == null ? null : Number(normalizedDesired.fxRate),
+          usdAmount: normalizedDesired.usdAmount == null ? null : Number(normalizedDesired.usdAmount),
+        },
+        deletedDuplicateIds: [],
+        locked: false,
+      };
     }
 
     const lockedRow = rows.find((r) => Number(r.locked || 0) === 1);
     const canonical = lockedRow || rows[0];
     let changed = false;
+    const deletedDuplicateIds = [];
 
     for (const r of rows) {
       if (r.id === canonical.id) continue;
       if (Number(r.locked || 0) === 1) continue;
       deleteById.run(r.id);
+      deletedDuplicateIds.push(r.id);
       changed = true;
     }
 
     if (Number(canonical.locked || 0) === 1) {
-      return changed ? 'updated' : 'unchanged';
+      return {
+        changeType: changed ? 'updated' : 'unchanged',
+        recordId: canonical.id,
+        previous: toRecordSnapshot(canonical),
+        next: toRecordSnapshot(canonical),
+        deletedDuplicateIds,
+        locked: true,
+      };
     }
 
     const needsUpdate =
-      !nearlyEqual(canonical.units, desired.units) ||
-      !nearlyEqual(canonical.price_per_unit, desired.pricePerUnit) ||
-      !nearlyEqual(canonical.amount, desired.amount) ||
-      String(canonical.notes || '') !== String(desired.notes || '') ||
-      String(canonical.broker || '') !== String(desired.broker || '') ||
-      !nearlyEqual(canonical.exchange_rate_used, desired.fxRate) ||
-      !nearlyEqual(canonical.usd_amount, desired.usdAmount);
+      !nearlyEqual(canonical.units, normalizedDesired.units) ||
+      !nearlyEqual(canonical.price_per_unit, normalizedDesired.pricePerUnit) ||
+      !nearlyEqual(canonical.amount, normalizedDesired.amount) ||
+      String(canonical.notes || '') !== String(normalizedDesired.notes || '') ||
+      String(canonical.broker || '') !== String(normalizedDesired.broker || '') ||
+      !nearlyEqual(canonical.exchange_rate_used, normalizedDesired.fxRate) ||
+      !nearlyEqual(canonical.usd_amount, normalizedDesired.usdAmount);
 
     if (needsUpdate) {
       updateById.run(
-        desired.units,
-        desired.pricePerUnit,
-        desired.amount,
-        desired.notes,
-        desired.broker,
-        desired.fxRate,
-        desired.usdAmount,
+        normalizedDesired.units,
+        normalizedDesired.pricePerUnit,
+        normalizedDesired.amount,
+        normalizedDesired.notes,
+        normalizedDesired.broker,
+        normalizedDesired.fxRate,
+        normalizedDesired.usdAmount,
         canonical.id
       );
       changed = true;
     }
 
-    return changed ? 'updated' : 'unchanged';
+    return {
+      changeType: changed ? 'updated' : 'unchanged',
+      recordId: canonical.id,
+      previous: toRecordSnapshot(canonical),
+      next: {
+        units: Number(normalizedDesired.units == null ? 0 : normalizedDesired.units),
+        pricePerUnit: Number(normalizedDesired.pricePerUnit == null ? 0 : normalizedDesired.pricePerUnit),
+        amount: Number(normalizedDesired.amount == null ? 0 : normalizedDesired.amount),
+        notes: normalizedDesired.notes || null,
+        broker: normalizedDesired.broker || null,
+        fxRate: normalizedDesired.fxRate == null ? null : Number(normalizedDesired.fxRate),
+        usdAmount: normalizedDesired.usdAmount == null ? null : Number(normalizedDesired.usdAmount),
+      },
+      deletedDuplicateIds,
+      locked: false,
+    };
   }
 
   let inserted = 0;
   let updated = 0;
   let earliestChangedDate = null;
+  const caChanges = [];
 
   const markChangedDate = (date) => {
     if (!date) return;
@@ -867,7 +963,7 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       let usdAmount = null;
       let amount = units * perShare;
       if (inv.asset_type === 'FOREIGN_STOCK') {
-        usdAmount = Math.round(amount * 100) / 100;
+        usdAmount = amount;
         fxRate = cache.fx.get(eventDate);
         if (fxRate == null) {
           fxRate = await fetchHistoricalUSDToINR(eventDate).catch(() => 0);
@@ -878,23 +974,37 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       }
 
       const notes = `AutoBackfill CA Dividend ${perShare} x ${units}`;
-      const changeType = upsertCorporateActionTxn({
+      const change = upsertCorporateActionTxn({
         investmentId: inv.id,
         portfolioId,
         transactionType: 'DIVIDEND',
         date: eventDate,
         units,
         pricePerUnit: perShare,
-        amount: round2(amount),
+        amount,
         notes,
         broker: null,
         fxRate: fxRate ? Number(fxRate) : null,
         usdAmount,
       });
+      const changeType = change?.changeType || 'unchanged';
       if (changeType !== 'unchanged') {
         if (changeType === 'inserted') inserted += 1;
         else updated += 1;
         markChangedDate(eventDate);
+        caChanges.push({
+          action: changeType,
+          recordId: change.recordId,
+          investmentId: inv.id,
+          investmentName: inv.name,
+          portfolioId,
+          transactionType: 'DIVIDEND',
+          transactionDate: eventDate,
+          previous: change.previous,
+          next: change.next,
+          deletedDuplicateIds: change.deletedDuplicateIds || [],
+          locked: !!change.locked,
+        });
       }
     }
 
@@ -915,13 +1025,16 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       const cleanSplit = Number(split.denominator) === 1 && Number(split.numerator) >= 2 && Number.isInteger(ratio);
       const txnType = cleanSplit ? 'SPLIT' : 'BONUS';
       const addedUnitsRaw = held * (ratio - 1);
-      const addedUnits = txnType === 'BONUS'
-        ? Math.floor(addedUnitsRaw)
-        : Math.round(addedUnitsRaw * 1000) / 1000;
+      const isIndianStock = inv.asset_type === 'INDIAN_STOCK';
+      const addedUnits = isIndianStock
+        ? Math.max(0, Math.floor(addedUnitsRaw + 0.000000001))
+        : addedUnitsRaw;
       if (addedUnits <= 0) continue;
 
-      // Fractional bonus entitlement → cash payout (using previous day's LOW price)
-      const fractional = txnType === 'BONUS' ? Math.round((addedUnitsRaw - addedUnits) * 1e6) / 1e6 : 0;
+      // For Indian stocks, bonus/split grants are whole shares and residue is cash payout.
+      const fractional = isIndianStock
+        ? Math.max(0, addedUnitsRaw - addedUnits)
+        : (txnType === 'BONUS' ? Math.max(0, addedUnitsRaw - addedUnits) : 0);
       let fractionalAmount = 0;
       if (fractional > 0.0001) {
         // Use previous day's LOW price for fractional payout calculation
@@ -930,13 +1043,13 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
         const prevDayStr = prevDay.toISOString().split('T')[0];
         const ohlc = await fetchHistoricalOHLC(ticker, prevDayStr).catch(() => null);
         const lowPrice = ohlc?.low || 0;
-        fractionalAmount = lowPrice > 0 ? Math.round(fractional * lowPrice * 100) / 100 : 0;
+        fractionalAmount = lowPrice > 0 ? (fractional * lowPrice) : 0;
       }
 
       const notes = fractional > 0.0001
         ? `AutoBackfill CA ${txnType} ${split.numerator}:${split.denominator} + \u20B9${fractionalAmount} fractional payout`
         : `AutoBackfill CA ${txnType} ${split.numerator}:${split.denominator}`;
-      const changeType = upsertCorporateActionTxn({
+      const change = upsertCorporateActionTxn({
         investmentId: inv.id,
         portfolioId,
         transactionType: txnType,
@@ -949,10 +1062,24 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
         fxRate: null,
         usdAmount: null,
       });
+      const changeType = change?.changeType || 'unchanged';
       if (changeType !== 'unchanged') {
         if (changeType === 'inserted') inserted += 1;
         else updated += 1;
         markChangedDate(eventDate);
+        caChanges.push({
+          action: changeType,
+          recordId: change.recordId,
+          investmentId: inv.id,
+          investmentName: inv.name,
+          portfolioId,
+          transactionType: txnType,
+          transactionDate: eventDate,
+          previous: change.previous,
+          next: change.next,
+          deletedDuplicateIds: change.deletedDuplicateIds || [],
+          locked: !!change.locked,
+        });
       }
     }
   }
@@ -962,6 +1089,7 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
     updated,
     modified: inserted + updated,
     earliestChangedDate,
+    caChanges,
   };
 }
 
@@ -1197,6 +1325,7 @@ async function processAutoBackfillCAEntries(db, options = {}) {
   let inserted = 0;
   let updated = 0;
   let earliestChangedDate = null;
+  const allCaChanges = [];
 
   const invIds = Array.from(new Set(scopeList.map((s) => s.investment_id).filter((id) => id != null)));
   const corporateActionSyncPairs = new Map();
@@ -1244,6 +1373,9 @@ async function processAutoBackfillCAEntries(db, options = {}) {
       const result = await syncCorporateActionsForScope(db, inv, pair.portfolioId, pair.fromDate, runDate, cache);
       inserted += Number(result?.inserted || 0);
       updated += Number(result?.updated || 0);
+      if (Array.isArray(result?.caChanges) && result.caChanges.length) {
+        allCaChanges.push(...result.caChanges);
+      }
       const changedDate = result?.earliestChangedDate || null;
       if (changedDate && (!earliestChangedDate || changedDate < earliestChangedDate)) {
         earliestChangedDate = changedDate;
@@ -1263,12 +1395,18 @@ async function processAutoBackfillCAEntries(db, options = {}) {
   }
 
   logBackfillInfo(`[Backfill][Step-1] Completed AutoBackfill CA. inserted=${inserted}, updated=${updated}, modified=${inserted + updated}`);
+  if (allCaChanges.length) {
+    for (const change of allCaChanges) {
+      logBackfillInfo('[Backfill][Step-1][CA-Change] ' + JSON.stringify(change));
+    }
+  }
 
   return {
     inserted,
     updated,
     modified: inserted + updated,
     earliestChangedDate,
+    caChanges: allCaChanges,
   };
 }
 
@@ -1587,7 +1725,7 @@ async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
     }
 
     // Fetch historical NAV data
-    const history = await fetchNPSHistory(inv.nps_fund_code);
+    const history = await fetchNPSHistory(inv.nps_fund_code, startDate, endDate);
     if (!history || history.length === 0) {
       logBackfillInfo(`[NPS Backfill] No historical data found for investment ${investmentId}`);
       return;
@@ -1638,15 +1776,15 @@ async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
         invested_amount,
         realized_proceeds,
         profit_loss,
-        profit_loss_pct,
         price_source,
         day_change,
-        day_change_pct
+        updated_at
       )
-      VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, 0, 0)
+      VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, ?, 0, datetime('now'))
       ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
         price_per_unit = excluded.price_per_unit,
-        price_source = excluded.price_source
+        price_source = excluded.price_source,
+        updated_at = datetime('now')
     `);
 
     db.transaction(() => {

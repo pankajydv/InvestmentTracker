@@ -198,10 +198,13 @@ module.exports = function (db) {
       }
 
       const xirrRate = calculateXirr(xirrCashflows);
+      const absoluteReturnPct = latestValue && Number(latestValue.invested_amount || 0) > 0
+        ? (Number(latestValue.profit_loss || 0) / Number(latestValue.invested_amount || 0)) * 100
+        : null;
 
       return {
         ...inv,
-        absolute_return_pct: latestValue?.profit_loss_pct ?? null,
+        absolute_return_pct: absoluteReturnPct,
         xirr_pct: xirrRate == null ? null : xirrRate * 100,
       };
     });
@@ -337,7 +340,7 @@ module.exports = function (db) {
         name, ticker_symbol, amfi_code,
         account_number, currency, notes, portfolio_id,
         face_value, coupon_frequency, maturity_date,
-        display_name, isin_code,
+        display_name, isin_code, nps_fund_code,
       } = req.body;
 
       const existing = db.prepare('SELECT * FROM investments WHERE id = ?').get(req.params.id);
@@ -359,6 +362,7 @@ module.exports = function (db) {
       // New fields: only update if explicitly present in body
       if (display_name !== undefined) { sets.push('display_name = ?'); params.push(display_name || null); }
       if (isin_code !== undefined) { sets.push('isin_code = ?'); params.push(isin_code || null); }
+      if (nps_fund_code !== undefined) { sets.push('nps_fund_code = ?'); params.push(nps_fund_code || null); }
       if (req.body.is_active !== undefined) { sets.push('is_active = ?'); params.push(req.body.is_active ? 1 : 0); }
       if (req.body.exclude_from_tracking !== undefined) { sets.push('exclude_from_tracking = ?'); params.push(req.body.exclude_from_tracking ? 1 : 0); }
 
