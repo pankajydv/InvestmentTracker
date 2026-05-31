@@ -91,6 +91,8 @@ function writeLog(_prefix, level, message, meta = null) {
       const text = line.trimEnd();
       if (level === 'ERROR') {
         console.error(text);
+      } else if (level === 'WARN') {
+        console.warn(text);
       } else {
         console.log(text);
       }
@@ -106,12 +108,20 @@ function logAppInfo(message, meta = null) {
   writeLog('app', 'INFO', message, meta);
 }
 
+function logAppWarn(message, meta = null) {
+  writeLog('app', 'WARN', message, meta);
+}
+
 function logAppError(message, meta = null) {
   writeLog('app', 'ERROR', message, meta);
 }
 
 function logBackfillInfo(message, meta = null) {
   writeLog('backfill', 'INFO', message, meta);
+}
+
+function logBackfillWarn(message, meta = null) {
+  writeLog('backfill', 'WARN', message, meta);
 }
 
 function logBackfillError(message, meta = null) {
@@ -136,8 +146,10 @@ function getLogDir() {
 
 module.exports = {
   logAppInfo,
+  logAppWarn,
   logAppError,
   logBackfillInfo,
+  logBackfillWarn,
   logBackfillError,
   getUnifiedLogPathForDate,
   getAppLogPathForDate,

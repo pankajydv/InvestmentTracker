@@ -12,12 +12,12 @@ const { updateAllPrices } = require('./updater');
 const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate } = require('./dirtyBackfillService');
 const {
   fetchMutualFundHistory,
-  fetchHistoricalOHLC,
   fetchHistoricalUSDToINR,
 } = require('./priceService');
 const { getSGBHistoricalPrices } = require('./sgbBhavcopy');
+const { hydrateStockSeriesForPhase2 } = require('./marketPriceCache');
 const { todayIso } = require('./dateUtils');
-const { logAppInfo, logAppError } = require('./appLogger');
+const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
 const { scanAndRepairComplianceGaps } = require('./compliance/complianceScanService');
 const { auditHistoricalPriceCoverage } = require('./historicalPriceAuditService');
 const { runHistoricalPriceRepairWorker } = require('./historicalPriceRepairWorkerService');
@@ -48,7 +48,7 @@ const ENABLE_STARTUP_COMPLIANCE = String(process.env.ENABLE_STARTUP_COMPLIANCE |
 const ENABLE_STARTUP_PREFLIGHT = String(process.env.ENABLE_STARTUP_PREFLIGHT || 'false').toLowerCase() === 'true';
 const NIGHTLY_MARKET_CACHE_WARM_DAYS = parseNonNegativeIntEnv('NIGHTLY_MARKET_CACHE_WARM_DAYS', 5);
 const ENABLE_HISTORICAL_PRICE_AUDIT = parseBooleanEnv('ENABLE_HISTORICAL_PRICE_AUDIT', true);
-const HISTORICAL_PRICE_AUDIT_DRY_RUN = parseBooleanEnv('HISTORICAL_PRICE_AUDIT_DRY_RUN', true);
+const HISTORICAL_PRICE_AUDIT_DRY_RUN = false;
 const HISTORICAL_PRICE_AUDIT_WINDOW_DAYS = parsePositiveIntEnv('HISTORICAL_PRICE_AUDIT_WINDOW_DAYS', 5);
 const ENABLE_HISTORICAL_PRICE_REPAIR_WORKER = parseBooleanEnv('ENABLE_HISTORICAL_PRICE_REPAIR_WORKER', true);
 const HISTORICAL_PRICE_REPAIR_BATCH_SIZE = parsePositiveIntEnv('HISTORICAL_PRICE_REPAIR_BATCH_SIZE', 10);
@@ -77,6 +77,52 @@ function eachDate(fromDate, toDate) {
     d.setUTCDate(d.getUTCDate() + 1);
   }
   return out;
+}
+
+function inferStockInstrumentType(symbol) {
+  return /\.(NS|BO)$/i.test(String(symbol || '')) ? 'INDIAN_STOCK' : 'FOREIGN_STOCK';
+}
+
+function fetchStockSeriesFromSource(symbol, startDate, endDate) {
+  const from = new Date(`${startDate}T00:00:00.000Z`);
+  from.setUTCDate(from.getUTCDate() - 7);
+  const to = new Date(`${endDate}T00:00:00.000Z`);
+  to.setUTCDate(to.getUTCDate() + 1);
+
+  const p1 = Math.floor(from.getTime() / 1000);
+  const p2 = Math.floor(to.getTime() / 1000);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${p1}&period2=${p2}&interval=1d`;
+
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const result = json.chart?.result?.[0];
+          if (!result) {
+            resolve([]);
+            return;
+          }
+          const timestamps = result.timestamp || [];
+          const closes = result.indicators?.quote?.[0]?.close || [];
+          const rows = [];
+          for (let i = 0; i < timestamps.length; i += 1) {
+            const close = closes[i];
+            if (close == null) continue;
+            const d = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            rows.push({ date: d, close: Number(close), source: 'YAHOO' });
+          }
+          resolve(rows);
+        } catch (e) {
+          reject(new Error(`Failed to parse stock series for ${symbol}: ${e.message}`));
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
 }
 
 async function warmRecentMarketCache(db, runDate, refreshDays, label) {
@@ -145,14 +191,22 @@ async function warmRecentMarketCache(db, runDate, refreshDays, label) {
   let errors = 0;
 
   for (const symbol of stockSymbols) {
-    for (const d of dateRange) {
-      try {
-        await fetchHistoricalOHLC(symbol, d);
-      } catch (_e) {
-        errors += 1;
-      }
-      stockCalls += 1;
+    try {
+      await hydrateStockSeriesForPhase2({
+        instrumentType: inferStockInstrumentType(symbol),
+        symbol,
+        fromDate,
+        toDate: runDate,
+        sourceLabel: 'YAHOO',
+        fetchRange: async (missingFrom, missingTo) => fetchStockSeriesFromSource(symbol, missingFrom, missingTo),
+        mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),
+        onWarn: (message, meta) => logAppWarn(message, meta),
+        onInfo: (message, meta) => logAppInfo(message, meta),
+      });
+    } catch (_e) {
+      errors += 1;
     }
+    stockCalls += 1;
   }
 
   for (const symbol of sgbSymbols) {

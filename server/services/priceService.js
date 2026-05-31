@@ -288,8 +288,18 @@ async function fetchHistoricalStockPrice(symbol, date) {
   if (!symbol || !date) throw new Error('symbol and date are required');
 
   const instrumentType = inferStockInstrumentType(symbol);
+  const resolveCachedPrice = (row) => {
+    if (!row) return null;
+    if (instrumentType === 'INDIAN_STOCK') {
+      const adjusted = row.adj_close ?? row.adjClose;
+      if (adjusted != null) return Number(adjusted);
+    }
+    if (row.close != null) return Number(row.close);
+    return null;
+  };
   const cached = getNearestOnOrBefore(instrumentType, symbol, date);
-  if (cached && cached.close != null) return Number(cached.close);
+  const cachedPrice = resolveCachedPrice(cached);
+  if (cachedPrice != null) return cachedPrice;
 
   const target = new Date(date);
   const from = new Date(target);
@@ -336,7 +346,10 @@ async function fetchHistoricalStockPrice(symbol, date) {
             upsertPriceSeries(instrumentType, symbol, parsedRows, 'YAHOO');
           }
 
-          if (bestPrice != null) resolve(bestPrice);
+          const refreshed = getNearestOnOrBefore(instrumentType, symbol, date);
+          const refreshedPrice = resolveCachedPrice(refreshed);
+          if (refreshedPrice != null) resolve(refreshedPrice);
+          else if (bestPrice != null) resolve(bestPrice);
           else reject(new Error(`No historical close found for ${symbol} on or before ${date}`));
         } catch (e) {
           reject(new Error(`Failed to parse historical chart for ${symbol}: ${e.message}`));

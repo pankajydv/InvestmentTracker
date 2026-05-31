@@ -73,6 +73,12 @@ export const updateInvestment = (id, data) =>
   fetchJSON(`/investments/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteInvestment = (id) =>
   fetchJSON(`/investments/${id}`, { method: 'DELETE' });
+export const getInvestmentSymbolHistory = (id) =>
+  fetchJSON(`/investments/${id}/symbol-history`);
+export const createInvestmentSymbolHistory = (id, data) =>
+  fetchJSON(`/investments/${id}/symbol-history`, { method: 'POST', body: JSON.stringify(data) });
+export const updateInvestmentSymbolHistory = (id, historyId, data) =>
+  fetchJSON(`/investments/${id}/symbol-history/${historyId}`, { method: 'PUT', body: JSON.stringify(data) });
 
 // Transactions
 export const getTransactions = (params = {}) => {

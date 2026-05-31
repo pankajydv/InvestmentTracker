@@ -1,7 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, Link, useLocation } from 'react-router-dom';
-import { Card, Form, Button, Row, Col, Spinner, Alert } from 'react-bootstrap';
-import { getInvestment, updateInvestment } from '../services/api';
+import { Card, Form, Button, Row, Col, Spinner, Alert, Table } from 'react-bootstrap';
+import {
+  getInvestment,
+  updateInvestment,
+  getInvestmentSymbolHistory,
+  createInvestmentSymbolHistory,
+} from '../services/api';
 import { ArrowLeft, Save } from 'lucide-react';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 
@@ -16,6 +21,18 @@ export default function InvestmentSettings() {
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState(null);
+  const [historyRows, setHistoryRows] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historySaving, setHistorySaving] = useState(false);
+  const [historyError, setHistoryError] = useState(null);
+  const [historySuccess, setHistorySuccess] = useState('');
+  const [isAddingHistory, setIsAddingHistory] = useState(false);
+  const [historyForm, setHistoryForm] = useState({
+    symbol: '',
+    valid_from: '',
+    valid_to: '',
+    notes: '',
+  });
   const [form, setForm] = useState({
     display_name: '',
     ticker_symbol: '',
@@ -28,10 +45,37 @@ export default function InvestmentSettings() {
 
   useEffect(() => { loadData(); }, [id]);
 
+  const resetHistoryForm = () => {
+    setIsAddingHistory(false);
+    setHistoryForm({
+      symbol: '',
+      valid_from: '',
+      valid_to: '',
+      notes: '',
+    });
+  };
+
+  const loadSymbolHistory = async (investmentId) => {
+    try {
+      setHistoryLoading(true);
+      setHistoryError(null);
+      const response = await getInvestmentSymbolHistory(investmentId);
+      setHistoryRows(Array.isArray(response.history) ? response.history : []);
+    } catch (e) {
+      setHistoryError(e.message || 'Failed to load symbol history');
+      setHistoryRows([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
   const loadData = async () => {
     try {
       setLoading(true);
-      const result = await getInvestment(id);
+      const [result, symbolHistory] = await Promise.all([
+        getInvestment(id),
+        getInvestmentSymbolHistory(id).catch(() => ({ history: [] })),
+      ]);
       setData(result);
       setForm({
         display_name: result.display_name || '',
@@ -42,11 +86,27 @@ export default function InvestmentSettings() {
         is_active: result.is_active !== 0,
         exclude_from_tracking: result.exclude_from_tracking !== 0,
       });
+      setHistoryRows(Array.isArray(symbolHistory.history) ? symbolHistory.history : []);
+      resetHistoryForm();
+      setHistoryError(null);
+      setHistorySuccess('');
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleStartAddHistory = () => {
+    setHistoryError(null);
+    setHistorySuccess('');
+    setIsAddingHistory(true);
+    setHistoryForm({
+      symbol: '',
+      valid_from: '',
+      valid_to: '',
+      notes: '',
+    });
   };
 
   const handleSave = async (e) => {
@@ -76,11 +136,39 @@ export default function InvestmentSettings() {
     }
   };
 
+  const handleSaveHistory = async (e) => {
+    e.preventDefault();
+    if (!isAddingHistory) return;
+    try {
+      setHistorySaving(true);
+      setHistoryError(null);
+      setHistorySuccess('');
+      const payload = {
+        symbol: historyForm.symbol,
+        valid_from: historyForm.valid_from,
+        valid_to: historyForm.valid_to || null,
+        notes: historyForm.notes || null,
+      };
+
+      await createInvestmentSymbolHistory(id, payload);
+      setHistorySuccess('Symbol history added successfully.');
+
+      await loadSymbolHistory(id);
+      resetHistoryForm();
+      setTimeout(() => setHistorySuccess(''), 3000);
+    } catch (e) {
+      setHistoryError(e.message || 'Failed to save symbol history');
+    } finally {
+      setHistorySaving(false);
+    }
+  };
+
   if (loading) return <div className="d-flex justify-content-center py-5"><Spinner animation="border" variant="primary" /></div>;
   if (!data) return <div className="text-danger">Investment not found</div>;
 
   const isMF = data.asset_type === 'MUTUAL_FUND';
   const isNPS = data.asset_type === 'NPS';
+  const showSymbolHistory = data.asset_type === 'INDIAN_STOCK';
 
   return (
     <div>
@@ -241,6 +329,119 @@ export default function InvestmentSettings() {
           </Form>
         </Card.Body>
       </Card>
+
+      {showSymbolHistory && (
+        <Card className="shadow-sm mt-4">
+          <Card.Body>
+            <div className="d-flex align-items-center justify-content-between mb-2">
+              <h2 className="h6 fw-bold mb-0">Symbol History</h2>
+              <Button variant="outline-primary" size="sm" onClick={handleStartAddHistory} disabled={historySaving || isAddingHistory}>
+                Add
+              </Button>
+            </div>
+            <p className="text-muted small mb-3">
+              Track ticker changes over time for correct historical price fetch and compliance checks.
+            </p>
+
+            {historyError && (
+              <Alert variant="danger" dismissible onClose={() => setHistoryError(null)}>
+                {historyError}
+              </Alert>
+            )}
+            {historySuccess && <Alert variant="success">{historySuccess}</Alert>}
+
+            {historyLoading ? (
+              <div className="text-muted small">Loading symbol history...</div>
+            ) : historyRows.length > 0 ? (
+              <Table size="sm" bordered responsive className="mb-3">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Valid From</th>
+                    <th>Valid To</th>
+                    <th>Notes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {historyRows.map((row) => (
+                    <tr key={row.id}>
+                      <td>{row.symbol}</td>
+                      <td>{row.valid_from}</td>
+                      <td>{row.valid_to || 'Open'}</td>
+                      <td className="small text-muted">{row.notes || '-'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            ) : (
+              <div className="text-muted small mb-3">None</div>
+            )}
+
+            {isAddingHistory && (
+              <Form onSubmit={handleSaveHistory}>
+                <Row className="g-3">
+                  <Col md={3}>
+                    <Form.Group>
+                      <Form.Label className="small fw-semibold">Symbol</Form.Label>
+                      <Form.Control
+                        type="text"
+                        value={historyForm.symbol}
+                        onChange={(e) => setHistoryForm((prev) => ({ ...prev, symbol: e.target.value }))}
+                        placeholder="e.g. ITIETF"
+                        required
+                        disabled={historySaving}
+                      />
+                    </Form.Group>
+                  </Col>
+                  <Col md={3}>
+                    <Form.Group>
+                      <Form.Label className="small fw-semibold">Valid From</Form.Label>
+                      <Form.Control
+                        type="date"
+                        value={historyForm.valid_from}
+                        onChange={(e) => setHistoryForm((prev) => ({ ...prev, valid_from: e.target.value }))}
+                        required
+                        disabled={historySaving}
+                      />
+                    </Form.Group>
+                  </Col>
+                  <Col md={3}>
+                    <Form.Group>
+                      <Form.Label className="small fw-semibold">Valid To</Form.Label>
+                      <Form.Control
+                        type="date"
+                        value={historyForm.valid_to}
+                        onChange={(e) => setHistoryForm((prev) => ({ ...prev, valid_to: e.target.value }))}
+                        disabled={historySaving}
+                      />
+                    </Form.Group>
+                  </Col>
+                  <Col md={3}>
+                    <Form.Group>
+                      <Form.Label className="small fw-semibold">Notes</Form.Label>
+                      <Form.Control
+                        type="text"
+                        value={historyForm.notes}
+                        onChange={(e) => setHistoryForm((prev) => ({ ...prev, notes: e.target.value }))}
+                        placeholder="Optional"
+                        disabled={historySaving}
+                      />
+                    </Form.Group>
+                  </Col>
+                  <Col xs={12} className="d-flex align-items-center gap-2">
+                    <Button type="submit" variant="primary" disabled={historySaving}>
+                      {historySaving ? 'Saving...' : 'Add History Row'}
+                    </Button>
+                    <Button type="button" variant="outline-secondary" onClick={resetHistoryForm} disabled={historySaving}>
+                      Cancel
+                    </Button>
+                  </Col>
+                </Row>
+              </Form>
+            )}
+          </Card.Body>
+        </Card>
+      )}
     </div>
   );
 }

@@ -122,6 +122,19 @@ function initializeDb(db) {
       updated_at TEXT DEFAULT (datetime('now'))
     );
 
+    -- Ticker history for investments where symbols changed over time.
+    CREATE TABLE IF NOT EXISTS investment_symbol_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      investment_id INTEGER NOT NULL,
+      symbol TEXT NOT NULL,
+      valid_from TEXT NOT NULL,
+      valid_to TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
+    );
+
     -- Individual buy/sell transactions
     CREATE TABLE IF NOT EXISTS transactions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -282,6 +295,8 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_status_date ON dirty_backfill_scope(status, dirty_from_date);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_investment_portfolio ON dirty_backfill_scope(investment_id, portfolio_id, status);
+    CREATE INDEX IF NOT EXISTS idx_symbol_history_investment_dates ON investment_symbol_history(investment_id, valid_from, valid_to);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_symbol_history_unique_window ON investment_symbol_history(investment_id, symbol, valid_from);
     CREATE INDEX IF NOT EXISTS idx_hist_price_repair_status_priority ON historical_price_repair_scope(status, priority, created_at);
     CREATE INDEX IF NOT EXISTS idx_hist_price_repair_lookup ON historical_price_repair_scope(instrument_type, symbol, from_date, to_date, status);
     CREATE INDEX IF NOT EXISTS idx_market_holidays_year ON market_holidays(year);
@@ -1981,6 +1996,143 @@ function initializeDb(db) {
     recordMigration(db, dailyValuesRationalizationId, 'skipped', 'already rationalized');
   }
 
+  // ── Migration: remove ILLIQUID_CARRY from daily_values.price_source CHECK constraint ──
+  const dailyValuesConstraintMigrationId = '20260531-daily-values-price-source-remove-illiquid-carry';
+  const dailyValuesTableSql = String(
+    db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_values'").get()?.sql || ''
+  ).toUpperCase();
+  const hasIlliquidCarryInConstraint = dailyValuesTableSql.includes("'ILLIQUID_CARRY'");
+
+  if (requireMigrationsEnabled(
+    dailyValuesConstraintMigrationId,
+    hasIlliquidCarryInConstraint,
+    'daily_values.price_source CHECK still includes ILLIQUID_CARRY'
+  )) {
+    const dvColsConstraint = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
+    const beforeDailyCount = getTableCount(db, 'daily_values');
+    const updatedAtExpr = dvColsConstraint.has('updated_at')
+      ? (dvColsConstraint.has('created_at')
+        ? 'COALESCE(updated_at, created_at, datetime(\'now\'))'
+        : 'COALESCE(updated_at, datetime(\'now\'))')
+      : (dvColsConstraint.has('created_at') ? 'COALESCE(created_at, datetime(\'now\'))' : 'datetime(\'now\')');
+    const realizedProceedsExpr = dvColsConstraint.has('realized_proceeds') ? 'COALESCE(realized_proceeds, 0)' : '0';
+    const dayChangeExpr = dvColsConstraint.has('day_change') ? 'COALESCE(day_change, 0)' : '0';
+    const priceSourceExpr = dvColsConstraint.has('price_source')
+      ? "CASE WHEN price_source IN ('LIVE', 'LOCF', 'COMPUTED') THEN price_source ELSE 'LIVE' END"
+      : "'LIVE'";
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE daily_values_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          portfolio_id INTEGER,
+          date TEXT NOT NULL,
+          price_per_unit REAL,
+          total_units REAL,
+          current_value REAL NOT NULL,
+          invested_amount REAL NOT NULL,
+          realized_proceeds REAL DEFAULT 0,
+          profit_loss REAL NOT NULL,
+          price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED')),
+          day_change REAL DEFAULT 0,
+          updated_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
+          UNIQUE(investment_id, portfolio_id, date)
+        )
+      `);
+
+      db.exec(`
+        INSERT INTO daily_values_new (
+          id,
+          investment_id,
+          portfolio_id,
+          date,
+          price_per_unit,
+          total_units,
+          current_value,
+          invested_amount,
+          realized_proceeds,
+          profit_loss,
+          price_source,
+          day_change,
+          updated_at
+        )
+        SELECT
+          id,
+          investment_id,
+          portfolio_id,
+          date,
+          price_per_unit,
+          total_units,
+          current_value,
+          invested_amount,
+          ${realizedProceedsExpr},
+          profit_loss,
+          ${priceSourceExpr},
+          ${dayChangeExpr},
+          ${updatedAtExpr}
+        FROM daily_values
+      `);
+
+      db.exec('DROP TABLE daily_values');
+      db.exec('ALTER TABLE daily_values_new RENAME TO daily_values');
+
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON daily_values(portfolio_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON daily_values(investment_id, portfolio_id, date DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date DESC)');
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_insert
+        BEFORE INSERT ON daily_values
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_update
+        BEFORE UPDATE OF portfolio_id ON daily_values
+        WHEN NEW.portfolio_id IS NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+        END;
+      `);
+
+      db.exec('COMMIT');
+      db.exec('PRAGMA foreign_keys = ON');
+
+      const afterDailyCount = getTableCount(db, 'daily_values');
+      ensureRowCountPreserved({
+        before: beforeDailyCount,
+        after: afterDailyCount,
+        table: 'daily_values',
+        migrationName: dailyValuesConstraintMigrationId,
+      });
+
+      assertDbIntegrity(db, dailyValuesConstraintMigrationId);
+      recordMigration(
+        db,
+        dailyValuesConstraintMigrationId,
+        'applied',
+        `rows before=${beforeDailyCount}, after=${afterDailyCount}; removed ILLIQUID_CARRY from price_source CHECK`
+      );
+    } catch (e) {
+      db.exec('ROLLBACK');
+      db.exec('PRAGMA foreign_keys = ON');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, dailyValuesConstraintMigrationId) && !hasIlliquidCarryInConstraint) {
+    recordMigration(db, dailyValuesConstraintMigrationId, 'skipped', 'constraint already excludes ILLIQUID_CARRY');
+  }
+
   // ── Migration: add investments.last_active_date ───────────────────────────
   const invColsLatest = new Set(db.prepare('PRAGMA table_info(investments)').all().map((c) => c.name));
   const lastActiveMigrationId = '20260510-add-investments-last-active-date';
@@ -2083,6 +2235,134 @@ function initializeDb(db) {
     }
   } else if (!hasMigrationRecord(db, historicalPriceRepairScopeMigrationId) && hasHistoricalPriceRepairScope) {
     recordMigration(db, historicalPriceRepairScopeMigrationId, 'skipped', 'already present');
+  }
+
+  // ── Migration: add investment_split_events table (investment-level split metadata) ──
+  const hasInvestmentSplitEvents = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='investment_split_events'").get();
+  const hasMarketPriceCacheTable = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_price_cache'").get();
+  const investmentSplitEventsMigrationId = '20260601-add-investment-split-events-table';
+  if (requireMigrationsEnabled(
+    investmentSplitEventsMigrationId,
+    !hasInvestmentSplitEvents,
+    'investment_split_events missing'
+  )) {
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS investment_split_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          event_date TEXT NOT NULL,
+          ratio REAL NOT NULL CHECK(ratio > 1),
+          locked INTEGER NOT NULL DEFAULT 0 CHECK(locked IN (0, 1)),
+          source TEXT,
+          created_at TEXT DEFAULT (datetime('now')),
+          updated_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
+          UNIQUE(investment_id, event_date)
+        )
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_investment_split_events_lookup ON investment_split_events(investment_id, event_date)');
+
+      const splitRows = hasMarketPriceCacheTable
+        ? db.prepare(`
+          SELECT m.investment_id, m.split_history_json
+          FROM market_price_cache m
+          JOIN investments i ON i.id = m.investment_id
+          WHERE m.investment_id IS NOT NULL
+            AND i.asset_type IN ('INDIAN_STOCK', 'FOREIGN_STOCK')
+            AND m.split_history_json IS NOT NULL
+            AND m.split_history_json <> ''
+        `).all()
+        : [];
+
+      const normalizeIsoDate = (value) => {
+        const raw = String(value || '').trim();
+        if (!raw) return null;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+        const d = new Date(raw);
+        if (Number.isNaN(d.getTime())) return null;
+        return d.toISOString().split('T')[0];
+      };
+
+      const byInvestment = new Map();
+      for (const row of splitRows) {
+        const invId = Number(row.investment_id || 0);
+        if (!(invId > 0)) continue;
+        let parsed = [];
+        try {
+          const raw = JSON.parse(String(row.split_history_json || '[]'));
+          parsed = Array.isArray(raw) ? raw : [];
+        } catch (_e) {
+          parsed = [];
+        }
+
+        let perInvestment = byInvestment.get(invId);
+        if (!perInvestment) {
+          perInvestment = new Map();
+          byInvestment.set(invId, perInvestment);
+        }
+
+        for (const event of parsed) {
+          const eventDate = normalizeIsoDate(event?.date);
+          const ratio = Number(event?.ratio);
+          if (!eventDate || !Number.isFinite(ratio) || ratio <= 1) continue;
+          const locked = !!event?.locked;
+          const source = String(event?.source || 'migration_cache_row');
+
+          const prev = perInvestment.get(eventDate);
+          if (!prev) {
+            perInvestment.set(eventDate, { ratio, locked, source });
+            continue;
+          }
+
+          perInvestment.set(eventDate, {
+            ratio: Math.max(Number(prev.ratio || 0), ratio),
+            locked: !!prev.locked || locked,
+            source: (locked || prev.locked) ? (locked ? source : prev.source) : source,
+          });
+        }
+      }
+
+      const upsertSplitEvent = db.prepare(`
+        INSERT INTO investment_split_events (investment_id, event_date, ratio, locked, source, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(investment_id, event_date) DO UPDATE SET
+          ratio = excluded.ratio,
+          locked = excluded.locked,
+          source = excluded.source,
+          updated_at = datetime('now')
+      `);
+
+      for (const [invId, eventMap] of byInvestment.entries()) {
+        const events = Array.from(eventMap.entries())
+          .map(([eventDate, payload]) => ({ eventDate, ...payload }))
+          .sort((a, b) => String(a.eventDate).localeCompare(String(b.eventDate)));
+        for (const event of events) {
+          upsertSplitEvent.run(invId, event.eventDate, Number(event.ratio), event.locked ? 1 : 0, String(event.source || 'migration_cache_row'));
+        }
+      }
+
+      if (hasMarketPriceCacheTable) {
+        db.prepare(`
+          UPDATE market_price_cache
+          SET split_history_json = NULL,
+              updated_at = datetime('now')
+          WHERE instrument_type IN ('INDIAN_STOCK', 'FOREIGN_STOCK')
+            AND split_history_json IS NOT NULL
+            AND split_history_json <> ''
+        `).run();
+      }
+
+      db.exec('COMMIT');
+      assertDbIntegrity(db, investmentSplitEventsMigrationId);
+      recordMigration(db, investmentSplitEventsMigrationId, 'applied');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, investmentSplitEventsMigrationId) && hasInvestmentSplitEvents) {
+    recordMigration(db, investmentSplitEventsMigrationId, 'skipped', 'already present');
   }
 
   // Ensure backfill watermark key exists even on upgraded DBs.

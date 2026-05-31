@@ -6,13 +6,13 @@ const ONE_DAY_CHANGE_POLICY = Object.freeze({
 });
 
 const UNEXPECTED_LOCF_POLICY = Object.freeze({
-  STRICT: { thresholdSessions: 0, recentWindowDays: 180 },
-  INDIAN_STOCK: { thresholdSessions: 1, recentWindowDays: 180 },
-  FOREIGN_STOCK: { thresholdSessions: 2, recentWindowDays: 180 },
+  STRICT: { thresholdSessions: 5, recentWindowDays: 180 },
+  INDIAN_STOCK: { thresholdSessions: 5, recentWindowDays: 180 },
+  FOREIGN_STOCK: { thresholdSessions: 5, recentWindowDays: 180 },
   SGB: { thresholdSessions: 5, recentWindowDays: 365 },
-  MUTUAL_FUND: { thresholdSessions: 2, recentWindowDays: 180 },
-  NPS: { thresholdSessions: 1, recentWindowDays: 180 },
-  SNAPSHOT: { thresholdSessions: 0, recentWindowDays: 180 },
+  MUTUAL_FUND: { thresholdSessions: 5, recentWindowDays: 180 },
+  NPS: { thresholdSessions: 5, recentWindowDays: 180 },
+  SNAPSHOT: { thresholdSessions: 5, recentWindowDays: 180 },
 });
 
 function getOneDayChangePolicy(assetType) {

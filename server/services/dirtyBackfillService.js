@@ -19,6 +19,28 @@ function normalizeDirtyDate(inputDate) {
   return parsed;
 }
 
+function mergeDelimitedValues(existingValue, nextValue, delimiter = ' | ') {
+  const parts = [];
+  const seen = new Set();
+
+  const add = (value) => {
+    if (!value) return;
+    const tokens = String(value)
+      .split(delimiter)
+      .map((token) => token.trim())
+      .filter(Boolean);
+    for (const token of tokens) {
+      if (seen.has(token)) continue;
+      seen.add(token);
+      parts.push(token);
+    }
+  };
+
+  add(existingValue);
+  add(nextValue);
+  return parts.length ? parts.join(delimiter) : null;
+}
+
 function upsertConfig(db, key, value) {
   db.prepare(`
     INSERT INTO config (key, value, updated_at)
@@ -53,27 +75,50 @@ function markScopeDirty(db, { investmentId = null, portfolioId = null, dirtyFrom
   const dirtyDate = normalizeDirtyDate(dirtyFromDate);
   if (!dirtyDate) return null;
 
-  const existing = db.prepare(`
-    SELECT id, dirty_from_date
+  const existingRows = db.prepare(`
+    SELECT id, dirty_from_date, dirty_reason, source_event_id, status
     FROM dirty_backfill_scope
     WHERE COALESCE(investment_id, 0) = COALESCE(?, 0)
       AND COALESCE(portfolio_id, 0) = COALESCE(?, 0)
       AND status IN ('pending', 'running', 'failed')
-    ORDER BY id DESC
-    LIMIT 1
+    ORDER BY CASE WHEN status IN ('pending', 'running') THEN 0 ELSE 1 END ASC, id DESC
   `).get(investmentId, portfolioId);
 
-  if (existing) {
-    const nextDirtyFromDate = minDate(existing.dirty_from_date, dirtyDate);
+  if (existingRows) {
+    const rows = db.prepare(`
+      SELECT id, dirty_from_date, dirty_reason, source_event_id, status
+      FROM dirty_backfill_scope
+      WHERE COALESCE(investment_id, 0) = COALESCE(?, 0)
+        AND COALESCE(portfolio_id, 0) = COALESCE(?, 0)
+        AND status IN ('pending', 'running', 'failed')
+      ORDER BY CASE WHEN status IN ('pending', 'running') THEN 0 ELSE 1 END ASC, id DESC
+    `).all(investmentId, portfolioId);
+
+    const primary = rows[0];
+    let nextDirtyFromDate = dirtyDate;
+    let mergedReason = reason || null;
+    let mergedSourceEventId = sourceEventId || null;
+    for (const row of rows) {
+      nextDirtyFromDate = minDate(nextDirtyFromDate, row.dirty_from_date);
+      mergedReason = mergeDelimitedValues(mergedReason, row.dirty_reason);
+      mergedSourceEventId = mergeDelimitedValues(mergedSourceEventId, row.source_event_id);
+    }
+
     db.prepare(`
       UPDATE dirty_backfill_scope
       SET dirty_from_date = ?,
-          dirty_reason = COALESCE(?, dirty_reason),
-          source_event_id = COALESCE(?, source_event_id),
+          dirty_reason = ?,
+          source_event_id = ?,
           status = 'pending',
           updated_at = datetime('now')
       WHERE id = ?
-    `).run(nextDirtyFromDate, reason, sourceEventId, existing.id);
+    `).run(nextDirtyFromDate, mergedReason, mergedSourceEventId, primary.id);
+
+    if (rows.length > 1) {
+      const duplicateIds = rows.slice(1).map((row) => row.id);
+      const placeholders = duplicateIds.map(() => '?').join(',');
+      db.prepare(`DELETE FROM dirty_backfill_scope WHERE id IN (${placeholders})`).run(...duplicateIds);
+    }
   } else {
     db.prepare(`
       INSERT INTO dirty_backfill_scope (investment_id, portfolio_id, dirty_from_date, dirty_reason, source_event_id, status)

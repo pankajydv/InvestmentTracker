@@ -7,6 +7,7 @@ const {
   XIRR_CASH_INFLOW_TYPES,
   INVESTED_AMOUNT_INFLOW_TYPES_SQL,
 } = require('../constants/transactionTypes');
+const { markScopeDirty } = require('../services/dirtyBackfillService');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -428,6 +429,38 @@ module.exports = function (db) {
     return m[1];
   }
 
+  function normalizeSymbolInput(input) {
+    if (input == null) return null;
+    const raw = String(input).trim().toUpperCase();
+    if (!raw) return null;
+    if (raw.includes('.')) return raw;
+    return `${raw}.NS`;
+  }
+
+  function assertValidDateRangeOrThrow(validFrom, validTo) {
+    if (!validFrom) {
+      throw new Error('valid_from is required and must be YYYY-MM-DD');
+    }
+    if (validTo && validTo < validFrom) {
+      throw new Error('valid_to cannot be before valid_from');
+    }
+  }
+
+  function ensureNoSymbolWindowOverlap(db, { investmentId, validFrom, validTo, excludeId = null }) {
+    const overlap = db.prepare(`
+      SELECT id, symbol, valid_from, valid_to
+      FROM investment_symbol_history
+      WHERE investment_id = ?
+        AND (? IS NULL OR id != ?)
+        AND date(valid_from) <= date(COALESCE(?, '9999-12-31'))
+        AND date(COALESCE(valid_to, '9999-12-31')) >= date(?)
+      LIMIT 1
+    `).get(investmentId, excludeId, excludeId, validTo, validFrom);
+
+    if (overlap) {
+      throw new Error(`Symbol history overlaps existing row #${overlap.id} (${overlap.symbol}: ${overlap.valid_from} to ${overlap.valid_to || 'open'})`);
+    }
+  }
   function getRateRowsForType(assetType) {
     const dbRates = db.prepare(
       'SELECT rate, effective_from, effective_to FROM interest_rates WHERE rate_type = ? ORDER BY effective_from ASC'
@@ -437,6 +470,150 @@ module.exports = function (db) {
     }
     return dbRates;
   }
+    router.get('/:id/symbol-history', (req, res) => {
+      try {
+        const investment = db.prepare('SELECT id, name, asset_type, ticker_symbol FROM investments WHERE id = ?').get(req.params.id);
+        if (!investment) {
+          return res.status(404).json({ error: 'Investment not found' });
+        }
+
+        const rows = db.prepare(`
+          SELECT id, investment_id, symbol, valid_from, valid_to, notes, created_at, updated_at
+          FROM investment_symbol_history
+          WHERE investment_id = ?
+          ORDER BY valid_from ASC, id ASC
+        `).all(req.params.id);
+
+        res.json({
+          investment: {
+            id: investment.id,
+            name: investment.name,
+            asset_type: investment.asset_type,
+            ticker_symbol: investment.ticker_symbol,
+          },
+          history: rows,
+        });
+      } catch (e) {
+        res.status(500).json({ error: e.message || 'Failed to fetch symbol history' });
+      }
+    });
+
+    // ─── Create symbol history row ─────────────────────────────────────────
+    router.post('/:id/symbol-history', (req, res) => {
+      try {
+        const investmentId = Number(req.params.id);
+        const investment = db.prepare('SELECT id, name FROM investments WHERE id = ?').get(investmentId);
+        if (!investment) {
+          return res.status(404).json({ error: 'Investment not found' });
+        }
+
+        const symbol = normalizeSymbolInput(req.body.symbol);
+        const validFrom = normalizeDateOnly(req.body.valid_from);
+        const validTo = normalizeDateOnly(req.body.valid_to);
+        const notes = req.body.notes ? String(req.body.notes).trim() : null;
+
+        if (!symbol) {
+          return res.status(400).json({ error: 'symbol is required' });
+        }
+
+        assertValidDateRangeOrThrow(validFrom, validTo);
+        ensureNoSymbolWindowOverlap(db, { investmentId, validFrom, validTo });
+
+        const result = db.prepare(`
+          INSERT INTO investment_symbol_history (investment_id, symbol, valid_from, valid_to, notes)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(investmentId, symbol, validFrom, validTo || null, notes);
+
+        markScopeDirty(db, {
+          investmentId,
+          portfolioId: null,
+          dirtyFromDate: validFrom,
+          reason: 'symbol_history_create',
+        });
+
+        const row = db.prepare('SELECT * FROM investment_symbol_history WHERE id = ?').get(result.lastInsertRowid);
+        res.status(201).json(row);
+      } catch (e) {
+        const message = e.message || 'Failed to create symbol history';
+        if (message.includes('overlaps') || message.includes('valid_')) {
+          return res.status(400).json({ error: message });
+        }
+        return res.status(500).json({ error: message });
+      }
+    });
+
+    // ─── Update symbol history row ─────────────────────────────────────────
+    router.put('/:id/symbol-history/:historyId', (req, res) => {
+      try {
+        const investmentId = Number(req.params.id);
+        const historyId = Number(req.params.historyId);
+
+        const investment = db.prepare('SELECT id FROM investments WHERE id = ?').get(investmentId);
+        if (!investment) {
+          return res.status(404).json({ error: 'Investment not found' });
+        }
+
+        const existing = db.prepare(`
+          SELECT * FROM investment_symbol_history
+          WHERE id = ? AND investment_id = ?
+        `).get(historyId, investmentId);
+        if (!existing) {
+          return res.status(404).json({ error: 'Symbol history row not found' });
+        }
+
+        const symbol = req.body.symbol !== undefined
+          ? normalizeSymbolInput(req.body.symbol)
+          : existing.symbol;
+        const validFrom = req.body.valid_from !== undefined
+          ? normalizeDateOnly(req.body.valid_from)
+          : existing.valid_from;
+        const validTo = req.body.valid_to !== undefined
+          ? normalizeDateOnly(req.body.valid_to)
+          : existing.valid_to;
+        const notes = req.body.notes !== undefined
+          ? (req.body.notes ? String(req.body.notes).trim() : null)
+          : existing.notes;
+
+        if (!symbol) {
+          return res.status(400).json({ error: 'symbol is required' });
+        }
+
+        assertValidDateRangeOrThrow(validFrom, validTo);
+        ensureNoSymbolWindowOverlap(db, {
+          investmentId,
+          validFrom,
+          validTo,
+          excludeId: historyId,
+        });
+
+        db.prepare(`
+          UPDATE investment_symbol_history
+          SET symbol = ?,
+              valid_from = ?,
+              valid_to = ?,
+              notes = ?,
+              updated_at = datetime('now')
+          WHERE id = ? AND investment_id = ?
+        `).run(symbol, validFrom, validTo || null, notes, historyId, investmentId);
+
+        const dirtyFromDate = [existing.valid_from, validFrom].filter(Boolean).sort()[0];
+        markScopeDirty(db, {
+          investmentId,
+          portfolioId: null,
+          dirtyFromDate,
+          reason: 'symbol_history_update',
+        });
+
+        const row = db.prepare('SELECT * FROM investment_symbol_history WHERE id = ?').get(historyId);
+        res.json(row);
+      } catch (e) {
+        const message = e.message || 'Failed to update symbol history';
+        if (message.includes('overlaps') || message.includes('valid_')) {
+          return res.status(400).json({ error: message });
+        }
+        return res.status(500).json({ error: message });
+      }
+    });
 
   function getInterestInvestment(invId) {
     const invCols = new Set(db.prepare("PRAGMA table_info(investments)").all().map(c => c.name));

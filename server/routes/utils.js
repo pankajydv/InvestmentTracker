@@ -21,6 +21,7 @@ const UNIT_OUTFLOW_TYPES = new Set([
   'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC',
 ]);
 const LOCF_SOURCES = new Set(['LOCF']);
+const IPO_PRELISTING_CARRY_MAX_DAYS = 12;
 
 const complianceJobStore = new Map();
 let complianceJobSeq = 0;
@@ -238,7 +239,100 @@ function addDaysIso(isoDate, days) {
   return d.toISOString().split('T')[0];
 }
 
-function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
+function normalizeIndianStockSymbol(symbol) {
+  const raw = String(symbol || '').trim();
+  if (!raw) return null;
+  if (raw.includes('.')) return raw;
+  return `${raw}.NS`;
+}
+
+function loadSymbolHistoryByInvestment(db, investmentIds = []) {
+  const ids = Array.from(new Set((investmentIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)));
+  const map = new Map();
+  if (!ids.length) return map;
+
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT investment_id, symbol, date(valid_from) AS valid_from, date(valid_to) AS valid_to
+    FROM investment_symbol_history
+    WHERE investment_id IN (${placeholders})
+    ORDER BY investment_id ASC, valid_from ASC, id ASC
+  `).all(...ids);
+
+  for (const row of rows) {
+    const investmentId = Number(row.investment_id);
+    const list = map.get(investmentId) || [];
+    list.push({
+      symbol: String(row.symbol || '').trim(),
+      validFrom: String(row.valid_from || ''),
+      validTo: row.valid_to ? String(row.valid_to) : null,
+    });
+    map.set(investmentId, list);
+  }
+
+  return map;
+}
+
+function resolveIndianSymbolForDate(scope, date, symbolHistoryByInvestment = null) {
+  const rows = symbolHistoryByInvestment?.get(Number(scope.investment_id)) || [];
+  for (const row of rows) {
+    if (!row?.symbol || !row?.validFrom) continue;
+    if (date < row.validFrom) continue;
+    if (row.validTo && date > row.validTo) continue;
+    return normalizeIndianStockSymbol(row.symbol);
+  }
+  return normalizeIndianStockSymbol(scope.ticker_symbol);
+}
+
+function getFirstTradableDateByInvestment(db, scopes, symbolHistoryByInvestment, runDate) {
+  const map = new Map();
+  const byInvestment = new Map();
+
+  for (const scope of scopes || []) {
+    if (scope.asset_type !== 'INDIAN_STOCK') continue;
+    if (!byInvestment.has(scope.investment_id)) {
+      byInvestment.set(scope.investment_id, scope);
+    }
+  }
+
+  for (const scope of byInvestment.values()) {
+    const symbols = new Set();
+    const current = normalizeIndianStockSymbol(scope.ticker_symbol);
+    if (current) symbols.add(current);
+
+    const historyRows = symbolHistoryByInvestment?.get(Number(scope.investment_id)) || [];
+    for (const row of historyRows) {
+      const normalized = normalizeIndianStockSymbol(row?.symbol);
+      if (normalized) symbols.add(normalized);
+    }
+
+    const symbolList = Array.from(symbols);
+    if (!symbolList.length) continue;
+
+    const placeholders = symbolList.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT symbol, date
+      FROM market_price_cache
+      WHERE instrument_type = 'INDIAN_STOCK'
+        AND symbol IN (${placeholders})
+        AND date <= ?
+        AND close IS NOT NULL
+      ORDER BY date ASC
+    `).all(...symbolList, runDate);
+
+    for (const row of rows) {
+      const effective = resolveIndianSymbolForDate(scope, row.date, symbolHistoryByInvestment);
+      if (effective && effective === String(row.symbol)) {
+        map.set(Number(scope.investment_id), String(row.date));
+        break;
+      }
+    }
+  }
+
+  return map;
+}
+
+function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByInvestment = null) {
   const txns = db.prepare(`
     SELECT
       date(transaction_date) AS date,
@@ -261,6 +355,7 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
       first_missing_date: null,
       missing_count: 0,
       unexpected_locf_count: 0,
+      compliance_error_count: 0,
       stale: false,
     };
   }
@@ -274,11 +369,18 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
   const isBalanceBased = scope.asset_type === 'PF' || scope.asset_type === 'PPF' || scope.asset_type === 'SSY';
   const dateDeltas = new Map();
   const txnDateSet = new Set();
+  let firstUnitInflowTxn = null;
 
   for (const txn of txns) {
     txnDateSet.add(txn.date);
     if (!isBalanceBased) {
       const t = String(txn.transaction_type || '').toUpperCase();
+      if (!firstUnitInflowTxn && UNIT_INFLOW_TYPES.has(t) && Number(txn.units || 0) > 0) {
+        firstUnitInflowTxn = {
+          date: txn.date,
+          transaction_type: t,
+        };
+      }
       let delta = 0;
       if (UNIT_INFLOW_TYPES.has(t)) delta = Number(txn.units || 0);
       else if (UNIT_OUTFLOW_TYPES.has(t)) delta = -Number(txn.units || 0);
@@ -288,9 +390,49 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
     }
   }
 
+  let expectedStartDate = firstTxnDate;
+  const tickerSymbol = String(scope.ticker_symbol || '').trim();
+  const isIpoFirstIndianStock = scope.asset_type === 'INDIAN_STOCK'
+    && firstUnitInflowTxn?.transaction_type === 'IPO';
+  let ipoCarryComplianceErrorCount = 0;
+  let ipoCarryComplianceErrorReason = null;
+  if (isIpoFirstIndianStock && tickerSymbol) {
+    const firstTradableDate = firstTradableByInvestment?.get(Number(scope.investment_id)) || null;
+    const carryEndDate = addDaysIso(firstUnitInflowTxn.date, IPO_PRELISTING_CARRY_MAX_DAYS - 1);
+    if (runDate > carryEndDate && (!firstTradableDate || firstTradableDate > carryEndDate)) {
+      ipoCarryComplianceErrorCount = 1;
+      ipoCarryComplianceErrorReason = 'IPO_CARRY_WINDOW_EXCEEDED';
+    }
+    if (firstTradableDate && firstTradableDate > expectedStartDate) {
+      expectedStartDate = firstTradableDate;
+    } else if (!firstTradableDate) {
+      expectedStartDate = null;
+    }
+  }
+
+  if (!expectedStartDate || expectedStartDate > runDate) {
+    return {
+      ...scope,
+      first_txn_date: firstTxnDate,
+      latest_expected_date: null,
+      last_row_date: null,
+      first_missing_date: null,
+      missing_count: 0,
+      unexpected_locf_count: 0,
+      compliance_error_count: ipoCarryComplianceErrorCount,
+      compliance_error_reason: ipoCarryComplianceErrorReason,
+      stale: false,
+    };
+  }
+
   const expectedDates = [];
   let runningUnits = 0;
-  for (const date of eachDate(firstTxnDate, runDate)) {
+  if (!isBalanceBased && expectedStartDate > firstTxnDate) {
+    for (const [date, delta] of dateDeltas.entries()) {
+      if (date < expectedStartDate) runningUnits += Number(delta || 0);
+    }
+  }
+  for (const date of eachDate(expectedStartDate, runDate)) {
     const delta = Number(dateDeltas.get(date) || 0);
     const hasTxn = txnDateSet.has(date);
     const unitsAfter = runningUnits + delta;
@@ -324,6 +466,8 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
       first_missing_date: null,
       missing_count: 0,
       unexpected_locf_count: 0,
+      compliance_error_count: ipoCarryComplianceErrorCount,
+      compliance_error_reason: ipoCarryComplianceErrorReason,
       stale: false,
     };
   }
@@ -335,7 +479,7 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
       AND portfolio_id = ?
       AND date >= ?
       AND date <= ?
-  `).all(scope.investment_id, scope.portfolio_id, firstTxnDate, runDate);
+  `).all(scope.investment_id, scope.portfolio_id, expectedStartDate, runDate);
 
   const rowByDate = new Map();
   let lastRowDate = null;
@@ -385,6 +529,8 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet) {
     first_missing_date: firstMissingDate,
     missing_count: missingCount,
     unexpected_locf_count: unexpectedLocfCount,
+    compliance_error_count: ipoCarryComplianceErrorCount,
+    compliance_error_reason: ipoCarryComplianceErrorReason,
     stale: !!latestExpectedDate && (!lastRowDate || lastRowDate < latestExpectedDate),
   };
 }
@@ -407,6 +553,7 @@ module.exports = function (db) {
           i.id AS investment_id,
           i.name AS investment_name,
           i.asset_type,
+          i.ticker_symbol,
           t.portfolio_id,
           p.name AS portfolio_name
         FROM investments i
@@ -420,11 +567,19 @@ module.exports = function (db) {
         ORDER BY i.id ASC, t.portfolio_id ASC
       `).all(...(portfolioId != null ? [portfolioId] : []));
 
-      const details = scopes.map((scope) => buildScopeHealth(db, scope, runDate, marketHolidaySet));
+      const symbolHistoryByInvestment = loadSymbolHistoryByInvestment(
+        db,
+        scopes.map((scope) => Number(scope.investment_id))
+      );
+
+      const firstTradableByInvestment = getFirstTradableDateByInvestment(db, scopes, symbolHistoryByInvestment, runDate);
+
+      const details = scopes.map((scope) => buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByInvestment));
 
       const issues = details
-        .filter((row) => row.missing_count > 0 || row.unexpected_locf_count > 0 || row.stale)
+        .filter((row) => row.missing_count > 0 || row.unexpected_locf_count > 0 || row.compliance_error_count > 0 || row.stale)
         .sort((a, b) => {
+          if (b.compliance_error_count !== a.compliance_error_count) return b.compliance_error_count - a.compliance_error_count;
           if (b.missing_count !== a.missing_count) return b.missing_count - a.missing_count;
           if (b.unexpected_locf_count !== a.unexpected_locf_count) return b.unexpected_locf_count - a.unexpected_locf_count;
           return String(a.first_missing_date || '').localeCompare(String(b.first_missing_date || ''));
@@ -433,12 +588,13 @@ module.exports = function (db) {
       const counts = {
         scopes_checked: details.length,
         issue_scopes: issues.length,
+        compliance_errors: details.reduce((sum, row) => sum + Number(row.compliance_error_count || 0), 0),
         missing_rows: details.reduce((sum, row) => sum + Number(row.missing_count || 0), 0),
         unexpected_locf: details.reduce((sum, row) => sum + Number(row.unexpected_locf_count || 0), 0),
         stale_scopes: details.filter((row) => row.stale).length,
       };
 
-      const status = counts.missing_rows > 0
+      const status = counts.missing_rows > 0 || counts.compliance_errors > 0
         ? 'error'
         : (counts.unexpected_locf > 0 || counts.stale_scopes > 0 ? 'warning' : 'ok');
 

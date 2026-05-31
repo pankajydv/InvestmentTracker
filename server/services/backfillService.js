@@ -1,5 +1,5 @@
 const https = require('https');
-const { fetchCorporateActions, fetchHistoricalStockPrice, fetchHistoricalOHLC, fetchHistoricalUSDToINR, fetchMutualFundHistory } = require('./priceService');
+const { fetchCorporateActions, fetchHistoricalOHLC, fetchHistoricalUSDToINR, fetchMutualFundHistory } = require('./priceService');
 const { fetchNPSHistory } = require('./priceService');
 const {
   calculatePfInterestPreview,
@@ -7,13 +7,24 @@ const {
   calculateSmallSavingsInterestPreview,
   calculateSmallSavingsValueAsOfDate,
 } = require('./pfInterestCalculator');
-const { getSeries, upsertPriceSeries, hydrateHistoricalPriceSeries } = require('./marketPriceCache');
-const { updateAssetTypeDaily, updatePortfolioDaily } = require('./updater');
+const {
+  getSeries,
+  upsertPriceSeries,
+  upsertInvestmentPriceSeries,
+  getInvestmentSeries,
+  getInvestmentNearestOnOrBefore,
+  hydrateHistoricalPriceSeries,
+  hydrateStockSeriesForPhase2,
+  getMarketSessionDates,
+  getNearestOnOrBefore,
+} = require('./marketPriceCache');
+const { updateAggregateDailyRange } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
 const { toIsoDate, todayIso } = require('./dateUtils');
-const { logBackfillInfo, logBackfillError } = require('./appLogger');
+const { logBackfillInfo, logBackfillWarn, logBackfillError } = require('./appLogger');
+const { getMarketHolidays, getWeekends } = require('./holidays/marketHolidayService');
 const {
-  INVESTED_AMOUNT_INFLOW_TYPES_SQL,
+  INVESTED_AMOUNT_INFLOW_TYPES,
   REALIZED_CASHFLOW_TYPES,
   REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL,
 } = require('../constants/transactionTypes');
@@ -45,8 +56,137 @@ function addDays(dateIso, days) {
   return d.toISOString().split('T')[0];
 }
 
+function getMarketClosedSetForYear(year, db, cache) {
+  if (!cache.closedMarketDaysByYear) cache.closedMarketDaysByYear = new Map();
+  if (cache.closedMarketDaysByYear.has(year)) return cache.closedMarketDaysByYear.get(year);
+  const holidays = getMarketHolidays(year, db).map((h) => h.date);
+  const weekends = getWeekends(year).map((w) => w.date);
+  const set = new Set([...holidays, ...weekends]);
+  cache.closedMarketDaysByYear.set(year, set);
+  return set;
+}
+
+function isMarketSessionDate(dateIso, db, cache) {
+  if (!dateIso) return false;
+  const d = new Date(`${dateIso}T00:00:00.000Z`);
+  const day = d.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const year = d.getUTCFullYear();
+  const closed = getMarketClosedSetForYear(year, db, cache);
+  return !closed.has(dateIso);
+}
+
 function inferStockInstrumentType(symbol) {
   return /\.(NS|BO)$/i.test(String(symbol || '')) ? 'INDIAN_STOCK' : 'FOREIGN_STOCK';
+}
+
+function normalizeStockSymbol(symbol, assetType) {
+  const raw = String(symbol || '').trim();
+  if (!raw) return null;
+  if (String(assetType || '') === 'INDIAN_STOCK' && !raw.includes('.')) {
+    return `${raw}.NS`;
+  }
+  return raw;
+}
+
+function loadSymbolHistoryByInvestment(db, investmentIds = []) {
+  const ids = Array.from(new Set((investmentIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)));
+  const map = new Map();
+  if (!ids.length) return map;
+
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT investment_id, symbol, date(valid_from) AS valid_from, date(valid_to) AS valid_to
+    FROM investment_symbol_history
+    WHERE investment_id IN (${placeholders})
+    ORDER BY investment_id ASC, valid_from ASC, id ASC
+  `).all(...ids);
+
+  for (const row of rows) {
+    const investmentId = Number(row.investment_id);
+    const list = map.get(investmentId) || [];
+    list.push({
+      symbol: String(row.symbol || '').trim(),
+      validFrom: String(row.valid_from || ''),
+      validTo: row.valid_to ? String(row.valid_to) : null,
+    });
+    map.set(investmentId, list);
+  }
+
+  return map;
+}
+
+function resolveStockSymbolForDate(inv, date, cache) {
+  const currentTicker = normalizeStockSymbol(inv?.ticker_symbol, inv?.asset_type);
+  const historyRows = cache?.symbolHistoryByInvestment?.get(inv?.id) || [];
+  for (const row of historyRows) {
+    if (!row?.symbol || !row?.validFrom) continue;
+    if (date < row.validFrom) continue;
+    if (row.validTo && date > row.validTo) continue;
+    return normalizeStockSymbol(row.symbol, inv?.asset_type) || currentTicker;
+  }
+  return currentTicker;
+}
+
+function getInvestmentStockSymbols(inv, cache) {
+  const symbols = new Set();
+  const currentTicker = normalizeStockSymbol(inv?.ticker_symbol, inv?.asset_type);
+  if (currentTicker) symbols.add(currentTicker);
+
+  const historyRows = cache?.symbolHistoryByInvestment?.get(inv?.id) || [];
+  for (const row of historyRows) {
+    const normalized = normalizeStockSymbol(row?.symbol, inv?.asset_type);
+    if (normalized) symbols.add(normalized);
+  }
+
+  return Array.from(symbols);
+}
+
+function getSymbolHistoryRows(inv, cache) {
+  return cache?.symbolHistoryByInvestment?.get(inv?.id) || [];
+}
+
+function getSymbolEffectiveStartDate(inv, symbol, baseStartDate, cache, runDate) {
+  const normalizedSymbol = normalizeStockSymbol(symbol, inv?.asset_type);
+  if (!normalizedSymbol) return baseStartDate;
+
+  const rows = getSymbolHistoryRows(inv, cache)
+    .map((r) => ({
+      symbol: normalizeStockSymbol(r?.symbol, inv?.asset_type),
+      validFrom: r?.validFrom || null,
+      validTo: r?.validTo || null,
+    }))
+    .filter((r) => !!r.symbol && !!r.validFrom)
+    .sort((a, b) => String(a.validFrom).localeCompare(String(b.validFrom)));
+
+  // Historical rows explicitly declaring this symbol.
+  const matching = rows.filter((r) => r.symbol === normalizedSymbol);
+  if (matching.length) {
+    // For backfill coverage checks, evaluate from the holding window start.
+    // This keeps sparse-coverage warnings aligned to transaction scope even when
+    // symbol-history metadata starts later than the first transaction date.
+    return baseStartDate;
+  }
+
+  // If this is the current ticker and history exists, assume it starts after the latest closed window.
+  const currentTicker = normalizeStockSymbol(inv?.ticker_symbol, inv?.asset_type);
+  if (rows.length && currentTicker === normalizedSymbol) {
+    const closedRows = rows.filter((r) => !!r.validTo);
+    if (closedRows.length) {
+      const latestClosed = closedRows
+        .map((r) => r.validTo)
+        .sort()
+        .pop();
+      if (latestClosed) {
+        const inferredStart = addDays(latestClosed, 1);
+        if (inferredStart <= runDate && inferredStart > baseStartDate) {
+          return inferredStart;
+        }
+      }
+    }
+  }
+
+  return baseStartDate;
 }
 
 const AGGREGATE_RESUME_KEY = 'backfill_aggregate_resume_v1';
@@ -124,22 +264,80 @@ function nearestOnOrBefore(seriesMap, date) {
   return bestValue;
 }
 
-function fetchStockSeries(symbol, startDate, endDate) {
-  const instrumentType = inferStockInstrumentType(symbol);
-  const cacheStart = addDays(startDate, -7);
-  const cacheRows = getSeries(instrumentType, symbol, cacheStart, endDate);
-  const cached = new Map();
-  for (const row of cacheRows) {
-    if (row.close != null) cached.set(row.date, Number(row.close));
+function warnBackfillOnce(cache, key, message, meta = null) {
+  if (!cache || !cache.warnedFallbacks) {
+    logBackfillWarn(message, meta);
+    return;
   }
+  if (cache.warnedFallbacks.has(key)) return;
+  cache.warnedFallbacks.add(key);
+  logBackfillWarn(message, meta);
+}
 
-  if (cached.size > 0) {
-    const latestCached = Array.from(cached.keys()).sort().pop();
-    if (latestCached && latestCached >= addDays(endDate, -1)) {
-      return Promise.resolve(cached);
-    }
+function isPhase3LocalOnly(cache) {
+  return cache?.phase === 'phase3_local_only';
+}
+
+function warnPhase3ProviderViolation(cache, key, message, meta = null) {
+  warnBackfillOnce(cache, `phase3-provider:${key}`, message, {
+    ...(meta || {}),
+    phase: cache?.phase || null,
+  });
+}
+
+function loadSeriesMapFromLocalCache(instrumentType, symbol, fromDate, toDate, valuePicker = (row) => row.close) {
+  const rows = getSeries(instrumentType, symbol, fromDate, toDate).filter((row) => row?.date);
+  const map = new Map();
+  for (const row of rows) {
+    const value = valuePicker(row);
+    if (value == null) continue;
+    map.set(row.date, Number(value));
   }
+  return map;
+}
 
+function loadInvestmentSeriesMapFromLocalCache(investmentId, fromDate, toDate, valuePicker = (row) => row.close) {
+  const rows = getInvestmentSeries(investmentId, fromDate, toDate).filter((row) => row?.date);
+  const map = new Map();
+  for (const row of rows) {
+    const value = valuePicker(row);
+    if (value == null) continue;
+    map.set(row.date, Number(value));
+  }
+  return map;
+}
+
+function getLocalFxRateOnOrBefore(date) {
+  const row = getNearestOnOrBefore('FX', 'USDINR', date);
+  if (row?.close == null) return null;
+  return Number(row.close);
+}
+
+// Must remain within daily_values.price_source CHECK constraint.
+const IPO_CACHE_FILL_MAX_SESSIONS = 20;
+const IPO_CACHE_FILL_SOURCE = 'IPO';
+const STOCK_PROVIDER_PUBLISH_CUTOFF_MINUTES = 9 * 60 + 30;
+
+function getProviderReadyEndDate(runDate, db) {
+  const normalizedRunDate = toIsoDate(runDate) || todayIso();
+  const today = todayIso();
+  let readyEndDate = normalizedRunDate > today ? today : normalizedRunDate;
+
+  if (readyEndDate !== today) return readyEndDate;
+
+  const now = new Date();
+  const minutesNow = now.getHours() * 60 + now.getMinutes();
+  if (minutesNow >= STOCK_PROVIDER_PUBLISH_CUTOFF_MINUTES) return readyEndDate;
+
+  const localCache = { closedMarketDaysByYear: new Map() };
+  let cursor = addDays(readyEndDate, -1);
+  while (cursor && !isMarketSessionDate(cursor, db, localCache)) {
+    cursor = addDays(cursor, -1);
+  }
+  return cursor || readyEndDate;
+}
+
+function fetchStockSeriesFromSource(symbol, startDate, endDate) {
   const from = new Date(`${startDate}T00:00:00.000Z`);
   from.setUTCDate(from.getUTCDate() - 7);
   const to = new Date(`${endDate}T00:00:00.000Z`);
@@ -158,24 +356,19 @@ function fetchStockSeries(symbol, startDate, endDate) {
           const json = JSON.parse(data);
           const result = json.chart?.result?.[0];
           if (!result) {
-            resolve(new Map());
+            resolve([]);
             return;
           }
           const timestamps = result.timestamp || [];
           const closes = result.indicators?.quote?.[0]?.close || [];
-          const series = new Map();
-          const rowsForCache = [];
+          const rows = [];
           for (let i = 0; i < timestamps.length; i += 1) {
             const close = closes[i];
             if (close == null) continue;
             const d = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
-            series.set(d, Number(close));
-            rowsForCache.push({ date: d, close: Number(close), source: 'YAHOO' });
+            rows.push({ date: d, close: Number(close), source: 'YAHOO' });
           }
-          if (rowsForCache.length > 0) {
-            upsertPriceSeries(instrumentType, symbol, rowsForCache, 'YAHOO');
-          }
-          resolve(series);
+          resolve(rows);
         } catch (e) {
           reject(new Error(`Failed to parse stock series for ${symbol}: ${e.message}`));
         }
@@ -183,6 +376,51 @@ function fetchStockSeries(symbol, startDate, endDate) {
       res.on('error', reject);
     }).on('error', reject);
   });
+}
+
+async function fetchStockSeries(symbol, startDate, endDate, options = {}) {
+  if (!startDate || !endDate || startDate > endDate) {
+    return new Map();
+  }
+
+  const instrumentType = inferStockInstrumentType(symbol);
+  const rows = await hydrateStockSeriesForPhase2({
+    investmentId: options.investmentId || null,
+    instrumentType,
+    symbol,
+    fromDate: startDate,
+    toDate: endDate,
+    sourceLabel: 'YAHOO',
+    fetchRange: async (missingFrom, missingTo) => fetchStockSeriesFromSource(symbol, missingFrom, missingTo),
+    mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),
+    onWarn: (message, meta) => logBackfillWarn(message, meta),
+    onInfo: (message, meta) => logBackfillInfo(message, meta),
+  }).catch(() => []);
+
+  const series = new Map();
+  for (const row of rows) {
+    if (!row?.date) continue;
+    const effectiveClose = row.adj_close ?? row.adjClose ?? row.close;
+    if (effectiveClose != null) series.set(row.date, Number(effectiveClose));
+  }
+
+  const marketSessionDates = getMarketSessionDates(startDate, endDate);
+  const firstCachedSessionDate = marketSessionDates.find((d) => series.has(d));
+  const firstMissingDate = marketSessionDates.find((d) => !series.has(d));
+
+  if (firstMissingDate && options?.suppressSparseWarning !== true) {
+    logBackfillWarn(`[Backfill][StockCache] Coverage still sparse after hydration for ${symbol}`, {
+      symbol,
+      startDate,
+      endDate,
+      cachedPoints: series.size,
+      expectedSessions: marketSessionDates.length,
+      firstCachedSessionDate: firstCachedSessionDate || null,
+      firstMissingDate,
+    });
+  }
+
+  return series;
 }
 
 function getStoredPriceOnOrBefore(db, investmentId, portfolioId, date) {
@@ -201,12 +439,23 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
   if (inv.asset_type === 'MUTUAL_FUND') {
     if (!inv.amfi_code) return { price: 0, source: 'COMPUTED' };
     if (!cache.mf.has(inv.amfi_code)) {
-      const history = await fetchMutualFundHistory(inv.amfi_code).catch(() => []);
       const map = new Map();
-      for (const row of history) {
-        const d = normalizeMfDate(row.date);
-        if (!d) continue;
-        map.set(d, Number(row.nav));
+      if (isPhase3LocalOnly(cache)) {
+        const localMap = loadSeriesMapFromLocalCache('MUTUAL_FUND', inv.amfi_code, cache.rangeStart || '1900-01-01', cache.rangeEnd || date);
+        for (const [d, v] of localMap.entries()) map.set(d, v);
+        warnPhase3ProviderViolation(
+          cache,
+          `mf-history:${inv.amfi_code}`,
+          `[Backfill][Phase-3] Provider fetch blocked for MUTUAL_FUND ${inv.amfi_code}; using local cache only`,
+          { investmentId: inv.id, portfolioId, date }
+        );
+      } else {
+        const history = await fetchMutualFundHistory(inv.amfi_code).catch(() => []);
+        for (const row of history) {
+          const d = normalizeMfDate(row.date);
+          if (!d) continue;
+          map.set(d, Number(row.nav));
+        }
       }
       cache.mf.set(inv.amfi_code, map);
     }
@@ -227,38 +476,50 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     if (!cache.sgb) cache.sgb = new Map();
     if (!cache.sgb.has(symbol)) {
       try {
-        const { fetchSGBHistoricalRaw } = require('./sgbBhavcopy');
         const from = cache.sgbRangeBySymbol?.get(symbol) || cache.rangeStart || date;
         const to = cache.rangeEnd || date;
 
-        // Check if DB cache is already fresh enough (bhavcopy is T-1; tolerate 1-day gap)
-        // This mirrors fetchStockSeries recency check to avoid re-downloading every run.
-        const recentRows = getSeries('SGB', symbol, addDays(to, -5), to).filter((r) => r.close != null);
-        const latestCachedDate = recentRows.map((r) => r.date).sort().pop();
-        if (latestCachedDate && latestCachedDate >= addDays(to, -1)) {
-          // Cache is fresh — load full range from DB, skip HTTP fetch
-          const allRows = getSeries('SGB', symbol, from, to).filter((r) => r.close != null);
-          const hist = new Map();
-          for (const row of allRows) hist.set(row.date, Number(row.close));
-          logBackfillInfo(`[SGB][Bhavcopy] Loaded ${hist.size} price points for ${symbol} from cache (latest: ${latestCachedDate})`);
+        if (isPhase3LocalOnly(cache)) {
+          const hist = loadSeriesMapFromLocalCache('SGB', symbol, from, to, (row) => row.close);
           cache.sgb.set(symbol, hist);
+          warnPhase3ProviderViolation(
+            cache,
+            `sgb-history:${symbol}`,
+            `[Backfill][Phase-3] Provider fetch blocked for SGB ${symbol}; using local cache only`,
+            { investmentId: inv.id, portfolioId, date }
+          );
         } else {
-          logBackfillInfo(`[SGB][Bhavcopy] Cache stale or missing for ${symbol} (latest: ${latestCachedDate || 'none'}), fetching up to ${to} from source`);
-          const rows = await hydrateHistoricalPriceSeries({
-            instrumentType: 'SGB',
-            symbol,
-            fromDate: from,
-            toDate: to,
-            sourceLabel: 'NSE_BHAVCOPY',
-            fetchRange: async (missingFrom, missingTo) => fetchSGBHistoricalRaw(symbol, missingFrom, missingTo),
-            mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),
-          });
-          const hist = new Map();
-          for (const row of rows) {
-            if (row?.date && row.close != null) hist.set(row.date, Number(row.close));
+          const { fetchSGBHistoricalRaw } = require('./sgbBhavcopy');
+
+          // Check if DB cache is already fresh enough (bhavcopy is T-1; tolerate 1-day gap)
+          // This mirrors fetchStockSeries recency check to avoid re-downloading every run.
+          const recentRows = getSeries('SGB', symbol, addDays(to, -5), to).filter((r) => r.close != null);
+          const latestCachedDate = recentRows.map((r) => r.date).sort().pop();
+          if (latestCachedDate && latestCachedDate >= addDays(to, -1)) {
+            // Cache is fresh — load full range from DB, skip HTTP fetch
+            const allRows = getSeries('SGB', symbol, from, to).filter((r) => r.close != null);
+            const hist = new Map();
+            for (const row of allRows) hist.set(row.date, Number(row.close));
+            logBackfillInfo(`[SGB][Bhavcopy] Loaded ${hist.size} price points for ${symbol} from cache (latest: ${latestCachedDate})`);
+            cache.sgb.set(symbol, hist);
+          } else {
+            logBackfillInfo(`[SGB][Bhavcopy] Cache stale or missing for ${symbol} (latest: ${latestCachedDate || 'none'}), fetching up to ${to} from source`);
+            const rows = await hydrateHistoricalPriceSeries({
+              instrumentType: 'SGB',
+              symbol,
+              fromDate: from,
+              toDate: to,
+              sourceLabel: 'NSE_BHAVCOPY',
+              fetchRange: async (missingFrom, missingTo) => fetchSGBHistoricalRaw(symbol, missingFrom, missingTo),
+              mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),
+            });
+            const hist = new Map();
+            for (const row of rows) {
+              if (row?.date && row.close != null) hist.set(row.date, Number(row.close));
+            }
+            logBackfillInfo(`[SGB][Bhavcopy] Fetched ${hist.size} price points for ${symbol}`);
+            cache.sgb.set(symbol, hist);
           }
-          logBackfillInfo(`[SGB][Bhavcopy] Fetched ${hist.size} price points for ${symbol}`);
-          cache.sgb.set(symbol, hist);
         }
       } catch (e) {
         logBackfillError(`[SGB][Bhavcopy] Failed to fetch prices for ${symbol}: ${e.message}`);
@@ -271,11 +532,20 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     }
     // fallback: try latest NSE quote for today
     if (date === todayIso()) {
-      try {
-        const { fetchSGBPrice } = require('./priceService');
-        const live = await fetchSGBPrice(symbol);
-        if (live && live.price > 0) return { price: Number(live.price), source: 'LIVE' };
-      } catch (e) {}
+      if (isPhase3LocalOnly(cache)) {
+        warnPhase3ProviderViolation(
+          cache,
+          `sgb-live:${symbol}`,
+          `[Backfill][Phase-3] Provider quote blocked for SGB ${symbol}; using local fallback`,
+          { investmentId: inv.id, portfolioId, date }
+        );
+      } else {
+        try {
+          const { fetchSGBPrice } = require('./priceService');
+          const live = await fetchSGBPrice(symbol);
+          if (live && live.price > 0) return { price: Number(live.price), source: 'LIVE' };
+        } catch (e) {}
+      }
     }
     // fallback: LOCF from hist
     if (hist && hist.size > 0) {
@@ -289,45 +559,58 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     return { price: 0, source: 'COMPUTED' };
   }
   if (inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'FOREIGN_STOCK') {
-    const symbol = inv.ticker_symbol;
-    if (!symbol) return { price: 0, source: 'COMPUTED' };
-    if (!cache.stock.has(symbol)) {
-      const symbolStart = cache.stockRangeBySymbol?.get(symbol) || cache.rangeStart;
-      const series = await fetchStockSeries(symbol, symbolStart, cache.rangeEnd).catch(() => new Map());
-      cache.stock.set(symbol, series);
+    if (!cache.stockByInvestment) cache.stockByInvestment = new Map();
+    if (!cache.stockByInvestment.has(inv.id)) {
+      const localMap = loadInvestmentSeriesMapFromLocalCache(
+        inv.id,
+        cache.rangeStart || '1900-01-01',
+        cache.rangeEnd || date,
+        (row) => row.adj_close ?? row.close
+      );
+      cache.stockByInvestment.set(inv.id, localMap);
     }
-    const series = cache.stock.get(symbol);
+    const series = cache.stockByInvestment.get(inv.id) || new Map();
     const exact = series.get(date);
     if (exact != null) {
       return { price: Number(exact), source: 'LIVE' };
     }
-    const nearest = nearestOnOrBefore(series, date);
-    if (nearest != null) {
-      return { price: Number(nearest), source: 'LOCF' };
-    }
-
-    if (cache.allowNetworkFallback === true) {
-      const historical = await fetchHistoricalStockPrice(symbol, date).catch(() => null);
-      if (historical != null) {
-        return { price: Number(historical), source: 'LOCF' };
+    warnBackfillOnce(
+      cache,
+      `stock-missing-cache:inv-${inv.id}:${portfolioId || 'na'}`,
+      `[Backfill][StockPrice] Missing market cache price for investment ${inv.id}`,
+      {
+        investmentId: inv.id,
+        portfolioId,
+        date,
+        reason: 'missing-market-cache-entry',
       }
-    }
-
-    const stored = getStoredPriceOnOrBefore(db, inv.id, portfolioId, date);
-    if (stored && stored.price > 0) return stored;
+    );
     return { price: 0, source: 'COMPUTED' };
   }
 
   if (inv.asset_type === 'NPS') {
     if (inv.nps_fund_code) {
       if (!cache.nps.has(inv.nps_fund_code)) {
-        const history = await fetchNPSHistory(inv.nps_fund_code, cache.rangeStart || date, cache.rangeEnd || date).catch(() => []);
         const map = new Map();
-        for (const row of history) {
-          const d = normalizeMfDate(row.date);
-          if (!d) continue;
-          if (!isValidNpsNav(row.nav)) continue;
-          map.set(d, Number(row.nav));
+        if (isPhase3LocalOnly(cache)) {
+          const localMap = loadSeriesMapFromLocalCache('NPS', inv.nps_fund_code, cache.rangeStart || '1900-01-01', cache.rangeEnd || date, (row) => row.close);
+          for (const [d, v] of localMap.entries()) {
+            if (isValidNpsNav(v)) map.set(d, Number(v));
+          }
+          warnPhase3ProviderViolation(
+            cache,
+            `nps-history:${inv.nps_fund_code}`,
+            `[Backfill][Phase-3] Provider fetch blocked for NPS ${inv.nps_fund_code}; using local cache only`,
+            { investmentId: inv.id, portfolioId, date }
+          );
+        } else {
+          const history = await fetchNPSHistory(inv.nps_fund_code, cache.rangeStart || date, cache.rangeEnd || date).catch(() => []);
+          for (const row of history) {
+            const d = normalizeMfDate(row.date);
+            if (!d) continue;
+            if (!isValidNpsNav(row.nav)) continue;
+            map.set(d, Number(row.nav));
+          }
         }
         cache.nps.set(inv.nps_fund_code, map);
       }
@@ -469,53 +752,6 @@ function round2(n) {
   return Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 }
 
-function computeRealizedProceeds(db, inv, date, portfolioId) {
-  const portfolioFilter = portfolioId != null ? ' AND portfolio_id = ?' : '';
-  const params = portfolioId != null ? [inv.id, date, portfolioId] : [inv.id, date];
-
-  let types = REALIZED_CASHFLOW_TYPES;
-  if (inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY') {
-    types = REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL;
-  }
-
-  const placeholders = types.map(() => '?').join(',');
-  const row = db.prepare(`
-    SELECT COALESCE(SUM(amount - COALESCE(fees, 0)), 0) AS total
-    FROM transactions
-    WHERE investment_id = ? AND transaction_date <= ?${portfolioFilter}
-      AND transaction_type IN (${placeholders})
-  `).get(...params, ...types);
-  return Number(row?.total || 0);
-}
-
-function computeNetFlowForDate(db, inv, date, portfolioId, statements = null) {
-  const getNetFlow = statements?.getNetFlow || db.prepare(`
-    SELECT COALESCE(SUM(CASE
-      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
-      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
-      ELSE 0
-    END), 0) AS net_flow
-    FROM transactions
-    WHERE investment_id = ? AND date(transaction_date) = ?
-  `);
-  const getNetFlowPortfolio = statements?.getNetFlowPortfolio || db.prepare(`
-    SELECT COALESCE(SUM(CASE
-      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
-      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
-      ELSE 0
-    END), 0) AS net_flow
-    FROM transactions
-    WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
-  `);
-
-  const row = portfolioId != null
-    ? getNetFlowPortfolio.get(inv.id, portfolioId, date)
-    : getNetFlow.get(inv.id, date);
-  return Number(row?.net_flow || 0);
-}
-
 async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache, onProgress = null) {
     // Only handle portfolio-scoped rows (portfolio_id NOT NULL)
     if (portfolioId == null) return 0;
@@ -538,82 +774,153 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     };
 
   const dates = eachDate(fromDate, toDate);
-  const portfolioFilter = portfolioId != null ? ' AND portfolio_id = ?' : '';
-  const baseParams = portfolioId != null ? [inv.id, portfolioId] : [inv.id];
-
-  const latestTxnDateRow = db.prepare(`
-    SELECT MAX(date(transaction_date)) AS latest_date
+  const txRows = db.prepare(`
+    SELECT
+      date(transaction_date) AS tx_date,
+      UPPER(transaction_type) AS transaction_type,
+      COALESCE(units, 0) AS units,
+      COALESCE(amount, 0) AS amount,
+      COALESCE(fees, 0) AS fees,
+      id
     FROM transactions
-    WHERE investment_id = ?${portfolioFilter}
+    WHERE investment_id = ?
+      AND portfolio_id = ?
       AND date(transaction_date) <= ?
-  `).get(...baseParams, toDate);
-  const latestTxnDate = latestTxnDateRow?.latest_date || null;
+    ORDER BY date(transaction_date) ASC, id ASC
+  `).all(inv.id, portfolioId, toDate);
+
+  const latestTxnDate = txRows.length ? txRows[txRows.length - 1].tx_date : null;
 
   // Only delete portfolio-scoped rows
   const deleteSql = 'DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date >= ? AND date <= ?';
   const deleteParams = [inv.id, portfolioId, fromDate, toDate];
-  db.prepare(deleteSql).run(...deleteParams);
+  const deleteResult = db.prepare(deleteSql).run(...deleteParams);
+  const deletedRows = Number(deleteResult?.changes || 0);
 
-  const getUnits = db.prepare(`
-    SELECT COALESCE(SUM(CASE
-      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
-      ELSE 0
-    END), 0) AS total
-    FROM transactions
-    WHERE investment_id = ?${portfolioFilter} AND transaction_date <= ?
-  `);
-  const getInvested = db.prepare(`
-    SELECT COALESCE(SUM(amount + COALESCE(fees, 0)), 0) AS total
-    FROM transactions
-    WHERE investment_id = ?${portfolioFilter} AND transaction_date <= ?
-      AND transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL})
-  `);
-  // Only query portfolio-scoped rows
-  const getPrev = db.prepare(
-    'SELECT current_value FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
+  const unitInflowTypes = new Set([
+    'BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN',
+    'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE',
+  ]);
+  const unitOutflowTypes = new Set([
+    'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC',
+  ]);
+  const investedInflowTypes = new Set(INVESTED_AMOUNT_INFLOW_TYPES);
+  const realizedCashflowTypes = new Set(
+    (inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY')
+      ? REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL
+      : REALIZED_CASHFLOW_TYPES
   );
-  const getNetFlow = db.prepare(`
-    SELECT COALESCE(SUM(CASE
-      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
-      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
-      ELSE 0
-    END), 0) AS net_flow
-    FROM transactions
-    WHERE investment_id = ? AND date(transaction_date) = ?
-  `);
-  const getNetFlowPortfolio = db.prepare(`
-    SELECT COALESCE(SUM(CASE
-      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
-      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
-      ELSE 0
-    END), 0) AS net_flow
-    FROM transactions
-    WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
-  `);
+  const netFlowPositiveTypes = new Set([
+    'BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN',
+    'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION',
+  ]);
+  const netFlowNegativeTypes = new Set([
+    'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC',
+  ]);
+
+  const byDate = new Map();
+  let cumulativeUnits = 0;
+  let cumulativeInvested = 0;
+  let cumulativeRealized = 0;
+  let firstUnitInflow = null;
+
+  const applyTxToCumulative = (tx) => {
+    const type = String(tx.transaction_type || '').toUpperCase();
+    const units = Number(tx.units || 0);
+    const amount = Number(tx.amount || 0);
+    const fees = Number(tx.fees || 0);
+
+    let unitsDelta = 0;
+    if (unitInflowTypes.has(type)) unitsDelta += units;
+    else if (unitOutflowTypes.has(type)) unitsDelta -= units;
+
+    const investedDelta = investedInflowTypes.has(type) ? (amount + fees) : 0;
+    const realizedDelta = realizedCashflowTypes.has(type) ? (amount - fees) : 0;
+
+    let netFlowDelta = 0;
+    if (netFlowPositiveTypes.has(type)) netFlowDelta = amount;
+    else if (netFlowNegativeTypes.has(type)) netFlowDelta = -amount;
+    else if (type === 'TDS') netFlowDelta = -Math.abs(amount);
+
+    cumulativeUnits += unitsDelta;
+    cumulativeInvested += investedDelta;
+    cumulativeRealized += realizedDelta;
+
+    return { unitsDelta, investedDelta, realizedDelta, netFlowDelta };
+  };
+
+  for (const tx of txRows) {
+    if (!firstUnitInflow && Number(tx.units || 0) > 0) {
+      firstUnitInflow = {
+        date: tx.tx_date,
+        transaction_type: String(tx.transaction_type || '').toUpperCase(),
+      };
+    }
+
+    const delta = applyTxToCumulative(tx);
+    if (tx.tx_date >= fromDate) {
+      const day = byDate.get(tx.tx_date) || { unitsDelta: 0, investedDelta: 0, realizedDelta: 0, netFlowDelta: 0 };
+      day.unitsDelta += delta.unitsDelta;
+      day.investedDelta += delta.investedDelta;
+      day.realizedDelta += delta.realizedDelta;
+      day.netFlowDelta += delta.netFlowDelta;
+      byDate.set(tx.tx_date, day);
+    }
+  }
+
+  // Convert to baseline state as of day before fromDate.
+  cumulativeUnits = 0;
+  cumulativeInvested = 0;
+  cumulativeRealized = 0;
+  for (const tx of txRows) {
+    if (tx.tx_date >= fromDate) break;
+    const type = String(tx.transaction_type || '').toUpperCase();
+    const units = Number(tx.units || 0);
+    const amount = Number(tx.amount || 0);
+    const fees = Number(tx.fees || 0);
+
+    if (unitInflowTypes.has(type)) cumulativeUnits += units;
+    else if (unitOutflowTypes.has(type)) cumulativeUnits -= units;
+
+    if (investedInflowTypes.has(type)) cumulativeInvested += (amount + fees);
+    if (realizedCashflowTypes.has(type)) cumulativeRealized += (amount - fees);
+  }
+
+  const prevBeforeRange = db.prepare(
+    'SELECT current_value FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
+  ).get(inv.id, portfolioId, fromDate);
+  let prevValue = Number(prevBeforeRange?.current_value || 0);
 
   let written = 0;
   let lastNonZeroDate = null;
   let exitDate = null;
+  let locfMarketStreak = 0;
+  let locfStreakStartDate = null;
   const dayStride = progressLogStride(dates.length, 20);
   const isProvidentAsset = inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY';
+  const trackLocfStreak = ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(inv.asset_type || ''));
   for (const date of dates) {
-    const unitsRow = getUnits.get(...baseParams, date);
-    const units = Number(unitsRow?.total || 0);
-    const invested = Number(getInvested.get(...baseParams, date)?.total || 0);
+    const dayDelta = byDate.get(date) || { unitsDelta: 0, investedDelta: 0, realizedDelta: 0, netFlowDelta: 0 };
+    cumulativeUnits += Number(dayDelta.unitsDelta || 0);
+    cumulativeInvested += Number(dayDelta.investedDelta || 0);
+    cumulativeRealized += Number(dayDelta.realizedDelta || 0);
+
+    const units = Number(cumulativeUnits || 0);
+    const invested = Number(cumulativeInvested || 0);
+    const realized = Number(cumulativeRealized || 0);
 
     // Stop writing trailing zero-unit rows after exit for all unit-based assets.
     if (latestTxnDate && date > latestTxnDate && units <= 0 && !isProvidentAsset) {
       break;
     }
 
-    const priced = await getPriceForDate(db, inv, date, cache, portfolioId);
-    let price = Number(priced.price || 0);
-    let priceSource = priced.source || 'COMPUTED';
+    let price = 0;
+    let priceSource = 'COMPUTED';
     let currentValue = 0;
     let totalUnits = units;
+    const priced = await getPriceForDate(db, inv, date, cache, portfolioId);
+    price = Number(priced.price || 0);
+    priceSource = priced.source || 'COMPUTED';
 
     if (isProvidentAsset) {
       currentValue = getProvidentValue(db, inv, date, portfolioId);
@@ -629,7 +936,17 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       const fxKey = date;
       let fxRate = cache.fx.get(fxKey);
       if (fxRate == null) {
-        fxRate = await fetchHistoricalUSDToINR(date).catch(() => 0);
+        if (isPhase3LocalOnly(cache)) {
+          warnPhase3ProviderViolation(
+            cache,
+            `fx-history:${date}`,
+            `[Backfill][Phase-3] Provider fetch blocked for USDINR ${date}; using local cache only`,
+            { investmentId: inv.id, portfolioId, date }
+          );
+          fxRate = getLocalFxRateOnOrBefore(date) || 0;
+        } else {
+          fxRate = await fetchHistoricalUSDToINR(date).catch(() => 0);
+        }
         cache.fx.set(fxKey, Number(fxRate || 0));
       }
       currentValue = units * price * Number(fxRate || 0);
@@ -637,11 +954,11 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       currentValue = units * price;
     }
 
-    const realized = computeRealizedProceeds(db, inv, date, portfolioId);
     const reinvestType = inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY';
     const realizedGain = inv.asset_type === 'PF'
       ? realized
       : (reinvestType ? 0 : realized);
+
     const profitLoss = reinvestType
       ? currentValue - invested
       : currentValue + realized - invested;
@@ -653,13 +970,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       exitDate = date;
     }
 
-    // Query portfolio-scoped rows
-    const prev = getPrev.get(inv.id, portfolioId, date);
-    const prevValue = Number(prev?.current_value || 0);
-    const netFlow = computeNetFlowForDate(db, inv, date, portfolioId, {
-      getNetFlow,
-      getNetFlowPortfolio,
-    });
+    const netFlow = Number(dayDelta.netFlowDelta || 0);
     const dayChange = currentValue - prevValue - netFlow;
     const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
 
@@ -678,6 +989,30 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       price_source: priceSource,
       day_change: dayChange,
     }, dailyStatements);
+
+    prevValue = currentValue;
+
+    if (trackLocfStreak && isMarketSessionDate(date, db, cache)) {
+      if (priceSource === 'LOCF') {
+        if (locfMarketStreak === 0) locfStreakStartDate = date;
+        locfMarketStreak += 1;
+        if (locfMarketStreak === 3) {
+          logBackfillWarn('[Backfill][LOCF] Unexpected LOCF streak reached threshold', {
+            investmentId: inv.id,
+            investmentName: inv.name,
+            portfolioId,
+            assetType: inv.asset_type,
+            streak: locfMarketStreak,
+            streakStartDate: locfStreakStartDate,
+            streakEndDate: date,
+          });
+        }
+      } else {
+        locfMarketStreak = 0;
+        locfStreakStartDate = null;
+      }
+    }
+
     written += 1;
 
     if (typeof onProgress === 'function' && (written === dates.length || written % dayStride === 0)) {
@@ -704,7 +1039,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     ).run(inv.id);
   }
 
-  return written;
+  return written + deletedRows;
 }
 
 function holdingUnitsAtDate(db, investmentId, portfolioId, date, excludeSameDayTrading = false, excludeSameDayCorporateUnitAdds = false) {
@@ -1203,16 +1538,16 @@ function getImpactedInvestmentStartDates(db, scopeList, runDate) {
     const minTxnDate = row?.min_txn_date || null;
     const minDirtyDate = minScopeDateByInvestment.get(invId) || null;
 
-    const txnStart = minTxnDate ? addDays(minTxnDate, -1) : null;
-    const dirtyStart = minDirtyDate ? addDays(minDirtyDate, -1) : null;
+    const txnStart = minTxnDate || null;
+    const dirtyStart = minDirtyDate || null;
 
     // Reuse prior backfill windows by preferring the later start date.
-    // start = max((earliest_txn - 1d), (least_dirty - 1d)) with safe fallbacks.
+    // start = max(earliest_txn_date, least_dirty_date) with safe fallbacks.
     let startDate = null;
     if (txnStart && dirtyStart) {
       startDate = txnStart >= dirtyStart ? txnStart : dirtyStart;
     } else {
-      startDate = txnStart || dirtyStart || addDays(runDate, -1);
+      startDate = txnStart || dirtyStart || runDate;
     }
 
     startByInvestment.set(invId, startDate);
@@ -1257,8 +1592,8 @@ function getMarketHistoryFetchStartDates(db, scopeList, invMap, runDate) {
     const minTxnDate = row?.min_txn_date || null;
     const minDirtyDate = minScopeDateByInvestment.get(invId) || null;
 
-    const txnStart = minTxnDate ? addDays(minTxnDate, -1) : null;
-    const dirtyStart = minDirtyDate ? addDays(minDirtyDate, -1) : null;
+    const txnStart = minTxnDate || null;
+    const dirtyStart = minDirtyDate || null;
 
     let startDate = null;
     if (txnStart && dirtyStart) {
@@ -1273,23 +1608,109 @@ function getMarketHistoryFetchStartDates(db, scopeList, invMap, runDate) {
   return startByInvestment;
 }
 
-async function preloadStockHistoryForRun(invMap, scopeList, runDate, fetchStartByInvestment, cache) {
+function getMarketHistoryFetchEndDates(db, scopeList, invMap, runDate) {
+  const stockInvIds = Array.from(new Set(
+    scopeList
+      .map((s) => s.investment_id)
+      .filter((id) => {
+        const inv = invMap.get(id);
+        return inv && ['INDIAN_STOCK', 'FOREIGN_STOCK'].includes(inv.asset_type);
+      })
+  ));
+
+  const endByInvestment = new Map();
+  if (!stockInvIds.length) return endByInvestment;
+  const providerReadyEndDate = getProviderReadyEndDate(runDate, db);
+
+  const placeholders = stockInvIds.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT
+      investment_id,
+      MAX(date(transaction_date)) AS max_txn_date,
+      COALESCE(SUM(
+        CASE
+          WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0)
+          WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+          ELSE 0
+        END
+      ), 0) AS net_units
+    FROM transactions
+    WHERE investment_id IN (${placeholders})
+      AND date(transaction_date) <= ?
+    GROUP BY investment_id
+  `).all(...stockInvIds, runDate);
+
+  for (const invId of stockInvIds) {
+    const row = rows.find((r) => r.investment_id === invId);
+    const maxTxnDate = toIsoDate(row?.max_txn_date) || null;
+    const netUnits = Number(row?.net_units || 0);
+    const cappedEnd = (netUnits <= 0 && maxTxnDate)
+      ? (maxTxnDate < providerReadyEndDate ? maxTxnDate : providerReadyEndDate)
+      : providerReadyEndDate;
+    endByInvestment.set(invId, cappedEnd);
+  }
+
+  return endByInvestment;
+}
+
+async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, fetchStartByInvestment, fetchEndByInvestment, cache) {
   const symbolStart = new Map();
+  const symbolEnd = new Map();
+  const investmentSymbolWindows = new Map();
   const sgbSymbolStart = new Map();
   for (const s of scopeList) {
     const inv = invMap.get(s.investment_id);
     if (!inv) continue;
     if (!['INDIAN_STOCK', 'FOREIGN_STOCK', 'SGB'].includes(inv.asset_type)) continue;
-    if (!inv.ticker_symbol) continue;
     const startDate = fetchStartByInvestment.get(inv.id) || s.dirty_from_date;
+    const endDate = fetchEndByInvestment.get(inv.id) || runDate;
     const targetMap = inv.asset_type === 'SGB' ? sgbSymbolStart : symbolStart;
-    const existing = targetMap.get(inv.ticker_symbol);
-    if (!existing || startDate < existing) {
-      targetMap.set(inv.ticker_symbol, startDate);
+
+    const symbols = inv.asset_type === 'SGB'
+      ? [normalizeStockSymbol(inv.ticker_symbol, inv.asset_type)].filter(Boolean)
+      : getInvestmentStockSymbols(inv, cache);
+
+    for (const symbol of symbols) {
+      const symbolStartDate = inv.asset_type === 'SGB'
+        ? startDate
+        : getSymbolEffectiveStartDate(inv, symbol, startDate, cache, runDate);
+
+      // Symbol history can produce post-transition tickers with no overlap in the
+      // requested holding window (for example, current symbol starts after exit date).
+      if (inv.asset_type !== 'SGB' && symbolStartDate && endDate && symbolStartDate > endDate) {
+        continue;
+      }
+
+      const existing = targetMap.get(symbol);
+      if (!existing || symbolStartDate < existing) {
+        targetMap.set(symbol, symbolStartDate);
+      }
+      if (inv.asset_type !== 'SGB') {
+        const existingEnd = symbolEnd.get(symbol);
+        if (!existingEnd || endDate > existingEnd) {
+          symbolEnd.set(symbol, endDate);
+        }
+
+        const windowKey = `${inv.id}|${symbol}`;
+        const existingWindow = investmentSymbolWindows.get(windowKey);
+        if (!existingWindow) {
+          investmentSymbolWindows.set(windowKey, {
+            investmentId: inv.id,
+            instrumentType: inferStockInstrumentType(symbol),
+            symbol,
+            startDate: symbolStartDate,
+            endDate,
+          });
+        } else {
+          if (symbolStartDate < existingWindow.startDate) existingWindow.startDate = symbolStartDate;
+          if (endDate > existingWindow.endDate) existingWindow.endDate = endDate;
+        }
+      }
     }
   }
 
   cache.stockRangeBySymbol = symbolStart;
+  cache.stockRangeEndBySymbol = symbolEnd;
   cache.sgbRangeBySymbol = sgbSymbolStart;
   const totalSymbols = symbolStart.size;
   if (totalSymbols > 0) {
@@ -1300,7 +1721,8 @@ async function preloadStockHistoryForRun(invMap, scopeList, runDate, fetchStartB
   const stride = progressLogStride(totalSymbols, 8);
   for (const [symbol, startDate] of symbolStart.entries()) {
     if (cache.stock.has(symbol)) continue;
-    const series = await fetchStockSeries(symbol, startDate, runDate).catch(() => new Map());
+    const endDate = symbolEnd.get(symbol) || runDate;
+    const series = await fetchStockSeries(symbol, startDate, endDate, { suppressSparseWarning: true }).catch(() => new Map());
     cache.stock.set(symbol, series);
     fetched += 1;
     if (fetched === totalSymbols || fetched % stride === 0) {
@@ -1310,6 +1732,154 @@ async function preloadStockHistoryForRun(invMap, scopeList, runDate, fetchStartB
 
   if (totalSymbols > 0) {
     logBackfillInfo('[Backfill][Step-1] Historical price prefetch completed.');
+  }
+
+  for (const window of investmentSymbolWindows.values()) {
+    const rows = await hydrateStockSeriesForPhase2({
+      investmentId: window.investmentId,
+      instrumentType: window.instrumentType,
+      symbol: window.symbol,
+      fromDate: window.startDate,
+      toDate: window.endDate,
+      sourceLabel: 'YAHOO',
+      fetchRange: async (missingFrom, missingTo) => fetchStockSeriesFromSource(window.symbol, missingFrom, missingTo),
+      mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),
+      onWarn: (message, meta) => logBackfillWarn(message, meta),
+      onInfo: (message, meta) => logBackfillInfo(message, meta),
+    }).catch(() => []);
+    if (!rows.length) continue;
+    const points = rows.map((row) => ({
+      date: row.date,
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+      adjClose: row.adj_close,
+      volume: row.volume,
+      source: row.source,
+    }));
+    upsertInvestmentPriceSeries(window.investmentId, window.instrumentType, window.symbol, points, null);
+  }
+
+  const stockInvIds = Array.from(new Set(
+    scopeList
+      .map((s) => s.investment_id)
+      .filter((id) => {
+        const inv = invMap.get(id);
+        return inv && ['INDIAN_STOCK', 'FOREIGN_STOCK'].includes(inv.asset_type);
+      })
+  ));
+
+  cache.stockByInvestment = cache.stockByInvestment || new Map();
+  for (const invId of stockInvIds) {
+    const startDate = fetchStartByInvestment.get(invId);
+    const endDate = fetchEndByInvestment.get(invId) || runDate;
+    if (!startDate || !endDate || startDate > endDate) continue;
+
+    const seriesRows = getInvestmentSeries(invId, startDate, endDate).filter((row) => row?.close != null);
+    const seriesMap = new Map(seriesRows.map((row) => [row.date, Number(row.adj_close ?? row.close)]));
+    cache.stockByInvestment.set(invId, seriesMap);
+  }
+
+  const firstUnitInflowByInvestment = new Map();
+  if (stockInvIds.length) {
+    const txStmt = db.prepare(`
+      SELECT date(transaction_date) AS tx_date, UPPER(transaction_type) AS tx_type, COALESCE(units, 0) AS units
+      FROM transactions
+      WHERE investment_id = ?
+        AND date(transaction_date) <= ?
+      ORDER BY date(transaction_date) ASC, id ASC
+    `);
+
+    for (const invId of stockInvIds) {
+      const txRows = txStmt.all(invId, runDate);
+      const firstUnitInflow = txRows.find((tx) => Number(tx.units || 0) > 0);
+      if (!firstUnitInflow) continue;
+      firstUnitInflowByInvestment.set(invId, {
+        date: String(firstUnitInflow.tx_date || ''),
+        transactionType: String(firstUnitInflow.tx_type || ''),
+      });
+    }
+  }
+
+  for (const invId of stockInvIds) {
+    const inv = invMap.get(invId);
+    if (!inv || inv.asset_type !== 'INDIAN_STOCK') continue;
+
+    const firstUnitInflow = firstUnitInflowByInvestment.get(invId);
+    if (!firstUnitInflow || firstUnitInflow.transactionType !== 'IPO' || !firstUnitInflow.date) continue;
+
+    const invEndDate = fetchEndByInvestment.get(invId) || runDate;
+    if (!invEndDate || firstUnitInflow.date > invEndDate) continue;
+
+    const sessions = getMarketSessionDates(firstUnitInflow.date, invEndDate);
+    if (!sessions.length) continue;
+
+    const series = cache.stockByInvestment.get(invId) || new Map();
+    const firstProviderDate = sessions.find((d) => series.has(d));
+    if (!firstProviderDate || firstProviderDate <= firstUnitInflow.date) continue;
+
+    const preProviderSessionDates = sessions.filter((d) => d < firstProviderDate);
+    if (!preProviderSessionDates.length || preProviderSessionDates.length > IPO_CACHE_FILL_MAX_SESSIONS) continue;
+
+    const providerClose = Number(series.get(firstProviderDate));
+    if (!Number.isFinite(providerClose) || providerClose <= 0) continue;
+
+    const missingDates = preProviderSessionDates.filter((d) => !series.has(d));
+    if (!missingDates.length) continue;
+
+    const ipoPoints = missingDates.map((d) => ({
+      date: d,
+      open: providerClose,
+      high: providerClose,
+      low: providerClose,
+      close: providerClose,
+      adjClose: providerClose,
+      volume: null,
+      source: IPO_CACHE_FILL_SOURCE,
+    }));
+
+    upsertInvestmentPriceSeries(invId, 'INDIAN_STOCK', inv.ticker_symbol || null, ipoPoints, IPO_CACHE_FILL_SOURCE);
+    for (const d of missingDates) series.set(d, providerClose);
+    cache.stockByInvestment.set(invId, series);
+
+    logBackfillInfo('[Backfill][Step-1][IPO] Backfilled pre-provider IPO sessions in investment market cache', {
+      investmentId: invId,
+      investmentName: inv.name,
+      tickerSymbol: inv.ticker_symbol || null,
+      ipoDate: firstUnitInflow.date,
+      firstProviderDate,
+      ipoFilledSessions: missingDates.length,
+      maxAllowedSessions: IPO_CACHE_FILL_MAX_SESSIONS,
+    });
+  }
+
+  // Emit sparse coverage warnings only after IPO pre-provider backfill has run,
+  // so warnings reflect true unresolved gaps.
+  for (const invId of stockInvIds) {
+    const startDate = fetchStartByInvestment.get(invId);
+    const endDate = fetchEndByInvestment.get(invId) || runDate;
+    if (!startDate || !endDate || startDate > endDate) continue;
+
+    const seriesRows = getInvestmentSeries(invId, startDate, endDate).filter((row) => row?.close != null);
+    const seriesMap = new Map(seriesRows.map((row) => [row.date, Number(row.adj_close ?? row.close)]));
+    cache.stockByInvestment.set(invId, seriesMap);
+
+    const sessions = getMarketSessionDates(startDate, endDate);
+    const firstMissingDate = sessions.find((d) => !seriesMap.has(d));
+    if (!firstMissingDate) continue;
+
+    const inv = invMap.get(invId);
+    logBackfillWarn('[Backfill][StockCache] Coverage still sparse after hydration for investment', {
+      investmentId: invId,
+      investmentName: inv?.name || null,
+      tickerSymbol: inv?.ticker_symbol || null,
+      startDate,
+      endDate,
+      cachedPoints: seriesMap.size,
+      expectedSessions: sessions.length,
+      firstMissingDate,
+    });
   }
 }
 
@@ -1422,11 +1992,24 @@ async function updateDailyValues(db, options = {}) {
   let totalRows = 0;
   let completedScopes = 0;
   let earliestTouchedDate = runDate;
+  let earliestAggregateDate = null;
+  const forwardReplaySummary = {
+    historicalScopeCount: 0,
+    maxReplayDays: 0,
+    reasons: new Map(),
+  };
   const totalScopes = scopeList.length;
   const stride = progressLogStride(totalScopes, 10);
   let lastScopeHeartbeatAt = Date.now();
 
   logBackfillInfo(`[Backfill][Step-2] Recomputing daily values for ${totalScopes} scope(s)...`);
+
+  const daysBetweenIso = (startIso, endIso) => {
+    const start = Date.parse(`${startIso}T00:00:00.000Z`);
+    const end = Date.parse(`${endIso}T00:00:00.000Z`);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return 0;
+    return Math.floor((end - start) / 86400000);
+  };
 
   for (const scope of scopeList) {
     const inv = invMap.get(scope.investment_id);
@@ -1434,6 +2017,31 @@ async function updateDailyValues(db, options = {}) {
 
     const fromDate = scope.dirty_from_date;
     if (fromDate < earliestTouchedDate) earliestTouchedDate = fromDate;
+
+    const replayDays = daysBetweenIso(fromDate, runDate);
+    if (replayDays > 1) {
+      forwardReplaySummary.historicalScopeCount += 1;
+      if (replayDays > forwardReplaySummary.maxReplayDays) {
+        forwardReplaySummary.maxReplayDays = replayDays;
+      }
+      const reasonTokens = String(scope.dirty_reason || 'unspecified')
+        .split('|')
+        .map((token) => token.trim())
+        .filter(Boolean);
+      for (const token of reasonTokens) {
+        const existingCount = forwardReplaySummary.reasons.get(token) || 0;
+        forwardReplaySummary.reasons.set(token, existingCount + 1);
+      }
+
+      logBackfillWarn('[Backfill][Step-2][ForwardOnly] Recomputing from historical dirty date (forward-only replay).', {
+        investmentId: scope.investment_id,
+        portfolioId: scope.portfolio_id,
+        dirtyFromDate: fromDate,
+        runDate,
+        replayDays,
+        dirtyReason: scope.dirty_reason || null,
+      });
+    }
 
     setBackfillProgress(db, {
       phase: 'running',
@@ -1482,6 +2090,9 @@ async function updateDailyValues(db, options = {}) {
     );
     totalRows += rows;
     completedScopes += 1;
+    if (rows > 0 && (earliestAggregateDate == null || fromDate < earliestAggregateDate)) {
+      earliestAggregateDate = fromDate;
+    }
     details.push({
       investment_id: scope.investment_id,
       portfolio_id: scope.portfolio_id,
@@ -1505,16 +2116,50 @@ async function updateDailyValues(db, options = {}) {
     }
   }
 
+  if (forwardReplaySummary.historicalScopeCount > 0) {
+    const topReasons = Array.from(forwardReplaySummary.reasons.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([reason, count]) => ({ reason, count }));
+
+    logBackfillWarn('[Backfill][Step-2][ForwardOnly] Historical replay summary.', {
+      scopeCount: totalScopes,
+      historicalScopeCount: forwardReplaySummary.historicalScopeCount,
+      maxReplayDays: forwardReplaySummary.maxReplayDays,
+      topReasons,
+    });
+  }
+
+  if (!earliestAggregateDate) {
+    clearAggregateResumeState(db);
+    setBackfillProgress(db, {
+      phase: 'finalizing',
+      total: scopeList.length,
+      completed: scopeList.length,
+      current: null,
+      message: 'No daily-value changes detected; skipped aggregate refresh.',
+      runDate,
+      startedAt: new Date().toISOString(),
+    });
+    logBackfillInfo('[Backfill][Step-2] Skipping aggregate refresh because no daily-value rows changed.');
+    logBackfillInfo(`[Backfill][Step-2] Completed daily recompute. scopes=${totalScopes}, rowsWritten=${totalRows}`);
+    return {
+      rowsWritten: totalRows,
+      details,
+      earliestTouchedDate,
+    };
+  }
+
   const previousResume = readAggregateResumeState(db);
   const canResume = previousResume
     && previousResume.runDate === runDate
-    && previousResume.rangeStart === earliestTouchedDate
+    && previousResume.rangeStart === earliestAggregateDate
     && previousResume.rangeEnd === runDate
     && previousResume.nextDate
-    && previousResume.nextDate >= earliestTouchedDate
+    && previousResume.nextDate >= earliestAggregateDate
     && previousResume.nextDate <= runDate;
 
-  const aggregateStartDate = canResume ? previousResume.nextDate : earliestTouchedDate;
+  const aggregateStartDate = canResume ? previousResume.nextDate : earliestAggregateDate;
   const aggregateDates = eachDate(aggregateStartDate, runDate);
   const aggregateTotal = aggregateDates.length;
   const aggregateStride = progressLogStride(aggregateTotal, 20);
@@ -1522,14 +2167,31 @@ async function updateDailyValues(db, options = {}) {
   const aggregateStartedAtMs = Date.now();
 
   if (canResume) {
-    logBackfillInfo(`[Backfill][Step-2] Resuming aggregate refresh from ${aggregateStartDate} (range ${earliestTouchedDate} to ${runDate})...`);
+    logBackfillInfo(`[Backfill][Step-2] Resuming aggregate refresh from ${aggregateStartDate} (range ${earliestAggregateDate} to ${runDate})...`);
   } else {
-    logBackfillInfo(`[Backfill][Step-2] Refreshing aggregate tables from ${earliestTouchedDate} to ${runDate}...`);
+    logBackfillInfo(`[Backfill][Step-2] Refreshing aggregate tables from ${earliestAggregateDate} to ${runDate}...`);
+  }
+
+  const aggregateReplayDays = daysBetweenIso(earliestAggregateDate, runDate);
+  if (aggregateReplayDays > 1) {
+    const topReasons = Array.from(forwardReplaySummary.reasons.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([reason, count]) => ({ reason, count }));
+
+    logBackfillWarn('[Backfill][Step-2][ForwardOnly] Aggregate refresh spans historical window due to earliest dirty scope date.', {
+      aggregateFromDate: earliestAggregateDate,
+      aggregateEffectiveFromDate: earliestAggregateDate,
+      aggregateToDate: runDate,
+      aggregateReplayDays,
+      scopeCount: totalScopes,
+      topReasons,
+    });
   }
 
   writeAggregateResumeState(db, {
     runDate,
-    rangeStart: earliestTouchedDate,
+    rangeStart: earliestAggregateDate,
     rangeEnd: runDate,
     nextDate: aggregateStartDate,
   });
@@ -1544,59 +2206,41 @@ async function updateDailyValues(db, options = {}) {
     startedAt: new Date().toISOString(),
   });
 
-  for (let i = 0; i < aggregateDates.length; i += 1) {
-    const d = aggregateDates[i];
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      updatePortfolioDaily(db, d);
-      updateAssetTypeDaily(db, d);
-      db.exec('COMMIT');
-    } catch (e) {
-      try {
-        db.exec('ROLLBACK');
-      } catch (_) {
-        // best-effort rollback
+  updateAggregateDailyRange(db, aggregateStartDate, runDate, {
+    onProgress: (done, total, d) => {
+      const nextDate = done < total ? addDays(d, 1) : null;
+      if (nextDate) {
+        writeAggregateResumeState(db, {
+          runDate,
+          rangeStart: earliestAggregateDate,
+          rangeEnd: runDate,
+          nextDate,
+        });
       }
-      throw e;
-    }
 
-    const done = i + 1;
-    const nextDate = done < aggregateTotal ? addDays(d, 1) : null;
-    if (nextDate) {
-      writeAggregateResumeState(db, {
-        runDate,
-        rangeStart: earliestTouchedDate,
-        rangeEnd: runDate,
-        nextDate,
-      });
-    }
-
-    const shouldLog = done === aggregateTotal || (done % aggregateStride === 0) || shouldHeartbeat(lastAggregateHeartbeatAt, 60_000);
-    if (shouldLog) {
-      lastAggregateHeartbeatAt = Date.now();
-      const remaining = Math.max(aggregateTotal - done, 0);
-      const pct = aggregateTotal > 0 ? (done / aggregateTotal) * 100 : 100;
-      const elapsedMs = Math.max(Date.now() - aggregateStartedAtMs, 1);
-      const perDayMs = done > 0 ? elapsedMs / done : 0;
-      const etaMs = Math.max(Math.round(perDayMs * remaining), 0);
-      const etaSeconds = Math.ceil(etaMs / 1000);
-      const message = `Refreshing daily aggregates: completed=${done}/${aggregateTotal}, remaining=${remaining}, progress=${pct.toFixed(2)}%, current_date=${d}, eta_seconds=${etaSeconds}`;
-      setBackfillProgress(db, {
-        phase: 'finalizing',
-        total: scopeList.length,
-        completed: scopeList.length,
-        current: null,
-        message,
-        runDate,
-        startedAt: new Date().toISOString(),
-      });
-      logBackfillInfo(`[Backfill][Step-2][Heartbeat] ${message}`);
-    }
-
-    if (done % 60 === 0) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-  }
+      const shouldLog = done === total || (done % aggregateStride === 0) || shouldHeartbeat(lastAggregateHeartbeatAt, 60_000);
+      if (shouldLog) {
+        lastAggregateHeartbeatAt = Date.now();
+        const remaining = Math.max(total - done, 0);
+        const pct = total > 0 ? (done / total) * 100 : 100;
+        const elapsedMs = Math.max(Date.now() - aggregateStartedAtMs, 1);
+        const perDayMs = done > 0 ? elapsedMs / done : 0;
+        const etaMs = Math.max(Math.round(perDayMs * remaining), 0);
+        const etaSeconds = Math.ceil(etaMs / 1000);
+        const message = `Refreshing daily aggregates: completed=${done}/${total}, remaining=${remaining}, progress=${pct.toFixed(2)}%, current_date=${d}, eta_seconds=${etaSeconds}`;
+        setBackfillProgress(db, {
+          phase: 'finalizing',
+          total: scopeList.length,
+          completed: scopeList.length,
+          current: null,
+          message,
+          runDate,
+          startedAt: new Date().toISOString(),
+        });
+        logBackfillInfo(`[Backfill][Step-2][Heartbeat] ${message}`);
+      }
+    },
+  });
 
   clearAggregateResumeState(db);
 
@@ -1646,23 +2290,30 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
     for (const row of rows) invMap.set(row.id, row);
   }
 
+  const symbolHistoryByInvestment = loadSymbolHistoryByInvestment(db, invIds);
+
   const startByInvestment = getImpactedInvestmentStartDates(db, scopeList, runDate);
   const fetchStartByInvestment = getMarketHistoryFetchStartDates(db, scopeList, invMap, runDate);
+  const fetchEndByInvestment = getMarketHistoryFetchEndDates(db, scopeList, invMap, runDate);
   const cache = {
     mf: new Map(),
     nps: new Map(),
     stock: new Map(),
     fx: new Map(),
     actions: new Map(),
+    symbolHistoryByInvestment,
     stockRangeBySymbol: new Map(),
+    stockRangeEndBySymbol: new Map(),
+    warnedFallbacks: new Set(),
     allowNetworkFallback: false,
+    phase: 'phase2_cache_build',
     rangeStart: Array.from(fetchStartByInvestment.values()).reduce((m, s) => (m == null || s < m ? s : m), null)
       || scopeList.reduce((m, s) => (m == null || s.dirty_from_date < m ? s.dirty_from_date : m), null)
       || runDate,
     rangeEnd: runDate,
   };
 
-  await preloadStockHistoryForRun(invMap, scopeList, runDate, fetchStartByInvestment, cache);
+  await preloadStockHistoryForRun(db, invMap, scopeList, runDate, fetchStartByInvestment, fetchEndByInvestment, cache);
 
   const step1Result = await processAutoBackfillCAEntries(db, {
     scopeList,
@@ -1683,6 +2334,8 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
       step1: step1Result,
     };
   }
+
+  cache.phase = 'phase3_local_only';
 
   const step2Result = await updateDailyValues(db, {
     scopeList,
@@ -1790,7 +2443,7 @@ async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
     db.transaction(() => {
       for (const { date, nav } of filtered) {
         for (const pid of portfolioIds) {
-          upsertStmt.run(investmentId, pid, date, nav, 'BACKFILL');
+          upsertStmt.run(investmentId, pid, date, nav, 'COMPUTED');
         }
       }
     })();

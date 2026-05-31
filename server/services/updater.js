@@ -13,7 +13,8 @@ const {
   fetchNPSNAV,
 } = require('./priceService');
 const { calculatePfInterestPreview, calculatePfValueAsOfDate, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
-const { logAppInfo, logAppError } = require('./appLogger');
+const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
+const { getMarketHolidays, getWeekends } = require('./holidays/marketHolidayService');
 const {
   INVESTED_AMOUNT_INFLOW_TYPES_SQL,
   REALIZED_CASHFLOW_TYPES,
@@ -23,6 +24,58 @@ const {
   quantizeForStorage,
 } = require('./numberPrecision');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function addDaysIso(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+
+function getMarketClosedSetForYear(year, db, cache) {
+  if (!cache.has(year)) {
+    const holidays = getMarketHolidays(year, db).map((h) => h.date);
+    const weekends = getWeekends(year).map((w) => w.date);
+    cache.set(year, new Set([...holidays, ...weekends]));
+  }
+  return cache.get(year);
+}
+
+function isMarketSessionDate(dateIso, db, cache) {
+  const d = new Date(`${dateIso}T00:00:00.000Z`);
+  const day = d.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const closed = getMarketClosedSetForYear(d.getUTCFullYear(), db, cache);
+  return !closed.has(dateIso);
+}
+
+function getPriorMarketSessionLocfStreak(db, investmentId, portfolioId, asOfDate, holidayCache) {
+  const fromDate = addDaysIso(asOfDate, -90);
+  const rows = db.prepare(`
+    SELECT date, price_source
+    FROM daily_values
+    WHERE investment_id = ?
+      AND portfolio_id = ?
+      AND date >= ?
+      AND date < ?
+    ORDER BY date ASC
+  `).all(investmentId, portfolioId, fromDate, asOfDate);
+
+  const byDate = new Map(rows.map((r) => [r.date, String(r.price_source || '')]));
+  let cursor = addDaysIso(asOfDate, -1);
+  let streak = 0;
+  while (cursor >= fromDate) {
+    if (isMarketSessionDate(cursor, db, holidayCache)) {
+      const source = byDate.get(cursor);
+      if (source === 'LOCF') {
+        streak += 1;
+      } else {
+        break;
+      }
+    }
+    cursor = addDaysIso(cursor, -1);
+  }
+  return streak;
+}
 
 // ─── Cancellation support ──────────────────────────────────────────────────
 let _cancelled = false;
@@ -95,9 +148,9 @@ async function updateAllPrices(db, options = {}) {
   // Skip investments excluded from tracking (derived/synthetic)
   investments = investments.filter(i => i.exclude_from_tracking !== 1);
 
-  // Skip fully-sold investments (net units ≤ 0). Balance-based types (PPF/SSY/PF/NPS)
-  // don't use units, so they are always included.
-  const BALANCE_BASED_TYPES = new Set(['PPF', 'SSY', 'PF', 'NPS']);
+  // Skip fully-sold investments (net units <= 0). Only provident/small-savings
+  // products are balance-based and should always be included.
+  const BALANCE_BASED_TYPES = new Set(['PPF', 'SSY', 'PF']);
   const openInvestmentIds = new Set(
     db.prepare(`
       SELECT investment_id FROM transactions
@@ -110,7 +163,27 @@ async function updateAllPrices(db, options = {}) {
       END) > 0.0001
     `).all(today).map(r => r.investment_id)
   );
+
+  const exitedUnitBasedIds = investments
+    .filter(i => !BALANCE_BASED_TYPES.has(i.asset_type) && !openInvestmentIds.has(i.id))
+    .map(i => i.id);
+
   investments = investments.filter(i => BALANCE_BASED_TYPES.has(i.asset_type) || openInvestmentIds.has(i.id));
+
+  // Remove same-day rows previously written for fully exited unit-based holdings.
+  // This keeps latest valuation anchored to the true exit date (no trailing zero-unit snapshots).
+  if (exitedUnitBasedIds.length > 0) {
+    const CHUNK = 400;
+    for (let i = 0; i < exitedUnitBasedIds.length; i += CHUNK) {
+      const chunk = exitedUnitBasedIds.slice(i, i + CHUNK);
+      const placeholders = chunk.map(() => '?').join(',');
+      db.prepare(`
+        DELETE FROM daily_values
+        WHERE date = ?
+          AND investment_id IN (${placeholders})
+      `).run(today, ...chunk);
+    }
+  }
 
   logAppInfo('[UpdatePrices] Step 1/3 prepared investment universe', {
     date: today,
@@ -225,11 +298,29 @@ async function updateAllPrices(db, options = {}) {
     SELECT DISTINCT portfolio_id FROM transactions WHERE investment_id = ? AND portfolio_id IS NOT NULL AND transaction_date <= ?
   `);
 
+  const getOpenUnitsPortfolio = db.prepare(`
+    SELECT COALESCE(
+      SUM(CASE
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+        ELSE 0
+      END), 0
+    ) as total
+    FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ?
+  `);
+
+  const deleteTodaySnapshotForScope = db.prepare(`
+    DELETE FROM daily_values
+    WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+  `);
+
   let successCount = 0;
   let errorCount = 0;
   let skippedCount = 0;
   const totalCount = investments.length;
   let heartbeatAt = Date.now();
+  const marketHolidayCache = new Map();
+  const warnedUnexpectedLocf = new Set();
 
 
   for (const inv of investments) {
@@ -395,6 +486,12 @@ async function updateAllPrices(db, options = {}) {
           investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
           realizedCashflow = getRealizedCashflowPortfolio(inv, pid, today);
         } else {
+          const scopeOpenUnits = Number(getOpenUnitsPortfolio.get(inv.id, pid, today)?.total || 0);
+          if (scopeOpenUnits <= 0.0001) {
+            deleteTodaySnapshotForScope.run(inv.id, pid, today);
+            continue;
+          }
+
           totalUnits = getTotalUnitsPortfolio.get(inv.id, pid, today).total;
           investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
           realizedCashflow = getRealizedCashflowPortfolio(inv, pid, today);
@@ -426,6 +523,27 @@ async function updateAllPrices(db, options = {}) {
           priceSource,
           quantizeForStorage(dayChange)
         );
+
+        if (
+          priceSource === 'LOCF'
+          && ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(inv.asset_type || ''))
+          && isMarketSessionDate(today, db, marketHolidayCache)
+        ) {
+          const priorStreak = getPriorMarketSessionLocfStreak(db, inv.id, pid, today, marketHolidayCache);
+          const currentStreak = priorStreak + 1;
+          const warnKey = `${inv.id}:${pid}:${today}`;
+          if (currentStreak >= 3 && !warnedUnexpectedLocf.has(warnKey)) {
+            warnedUnexpectedLocf.add(warnKey);
+            logAppWarn('[UpdatePrices][LOCF] Unexpected LOCF streak reached threshold', {
+              investmentId: inv.id,
+              investmentName: inv.name,
+              portfolioId: pid,
+              assetType: inv.asset_type,
+              date: today,
+              streak: currentStreak,
+            });
+          }
+        }
       }
       const combinedSnapshot = db.prepare(`
         SELECT
@@ -723,4 +841,256 @@ function updateAssetTypeDaily(db, date) {
   }
 }
 
-module.exports = { updateAllPrices, updatePortfolioDaily, updateAssetTypeDaily, cancelUpdate };
+function buildDateRange(fromDate, toDate) {
+  const out = [];
+  let d = fromDate;
+  while (d <= toDate) {
+    out.push(d);
+    d = addDaysIso(d, 1);
+  }
+  return out;
+}
+
+function portfolioKey(portfolioId) {
+  return String(portfolioId);
+}
+
+function assetKey(portfolioId, assetType) {
+  return `${String(portfolioId)}::${assetType}`;
+}
+
+function ensurePortfolioTotals(map, portfolioId) {
+  const key = portfolioKey(portfolioId);
+  if (!map.has(key)) {
+    map.set(key, {
+      total_value: 0,
+      total_invested: 0,
+      total_profit_loss: 0,
+      day_change: 0,
+    });
+  }
+  return map.get(key);
+}
+
+function ensureAssetTotals(map, portfolioId, assetType) {
+  const key = assetKey(portfolioId, assetType);
+  if (!map.has(key)) {
+    map.set(key, {
+      portfolio_id: portfolioId,
+      asset_type: assetType,
+      total_value: 0,
+      total_invested: 0,
+      total_profit_loss: 0,
+      total_realized_proceeds: 0,
+      total_unrealized_gain: 0,
+      day_change: 0,
+    });
+  }
+  return map.get(key);
+}
+
+function applySnapshotDelta(portfolioTotals, assetTotals, snapshot, sign) {
+  const factor = sign >= 0 ? 1 : -1;
+  const value = Number(snapshot.current_value || 0);
+  const invested = Number(snapshot.invested_amount || 0);
+  const profit = Number(snapshot.profit_loss || 0);
+  const realized = Number(snapshot.realized_proceeds || 0);
+  const dayChange = Number(snapshot.day_change || 0);
+  const unrealized = value - (invested - realized);
+
+  const p = ensurePortfolioTotals(portfolioTotals, snapshot.portfolio_id);
+  p.total_value += factor * value;
+  p.total_invested += factor * invested;
+  p.total_profit_loss += factor * profit;
+  p.day_change += factor * dayChange;
+
+  const a = ensureAssetTotals(assetTotals, snapshot.portfolio_id, snapshot.asset_type);
+  a.total_value += factor * value;
+  a.total_invested += factor * invested;
+  a.total_profit_loss += factor * profit;
+  a.total_realized_proceeds += factor * realized;
+  a.total_unrealized_gain += factor * unrealized;
+  a.day_change += factor * dayChange;
+}
+
+function updateAggregateDailyRange(db, fromDate, toDate, options = {}) {
+  if (!fromDate || !toDate || fromDate > toDate) return;
+
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const dates = buildDateRange(fromDate, toDate);
+
+  const rangeSnapshots = db.prepare(`
+    SELECT
+      dv.date,
+      dv.investment_id,
+      dv.portfolio_id,
+      i.asset_type,
+      COALESCE(dv.current_value, 0) AS current_value,
+      COALESCE(dv.invested_amount, 0) AS invested_amount,
+      COALESCE(dv.profit_loss, 0) AS profit_loss,
+      COALESCE(dv.realized_proceeds, 0) AS realized_proceeds,
+      COALESCE(dv.day_change, 0) AS day_change
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE dv.date >= ?
+      AND dv.date <= ?
+      AND dv.portfolio_id IS NOT NULL
+      AND i.exclude_from_tracking != 1
+    ORDER BY dv.date ASC, dv.investment_id ASC, dv.portfolio_id ASC
+  `).all(fromDate, toDate);
+
+  const snapshotsByDate = new Map();
+  for (const row of rangeSnapshots) {
+    const list = snapshotsByDate.get(row.date) || [];
+    list.push(row);
+    snapshotsByDate.set(row.date, list);
+  }
+
+  const prevPortfolioRows = db.prepare(`
+    SELECT pd.portfolio_id, pd.total_value
+    FROM portfolio_daily pd
+    INNER JOIN (
+      SELECT portfolio_id, MAX(date) as max_date
+      FROM portfolio_daily
+      WHERE date < ?
+      GROUP BY portfolio_id
+    ) prev ON pd.portfolio_id = prev.portfolio_id
+      AND pd.date = prev.max_date
+  `).all(fromDate);
+
+  const prevAssetRows = db.prepare(`
+    SELECT atd.portfolio_id, atd.asset_type, atd.total_value
+    FROM asset_type_daily atd
+    INNER JOIN (
+      SELECT portfolio_id, asset_type, MAX(date) AS max_date
+      FROM asset_type_daily
+      WHERE date < ?
+      GROUP BY portfolio_id, asset_type
+    ) prev ON atd.portfolio_id = prev.portfolio_id
+      AND atd.asset_type = prev.asset_type
+      AND atd.date = prev.max_date
+  `).all(fromDate);
+
+  const prevPortfolioValue = new Map();
+  for (const row of prevPortfolioRows) {
+    prevPortfolioValue.set(portfolioKey(row.portfolio_id), Number(row.total_value || 0));
+  }
+  const prevAssetValue = new Map();
+  for (const row of prevAssetRows) {
+    prevAssetValue.set(assetKey(row.portfolio_id, row.asset_type), Number(row.total_value || 0));
+  }
+
+  db.prepare('DELETE FROM portfolio_daily WHERE date >= ? AND date <= ?').run(fromDate, toDate);
+  db.prepare('DELETE FROM asset_type_daily WHERE date >= ? AND date <= ?').run(fromDate, toDate);
+
+  const insertPortfolioDaily = db.prepare(`
+    INSERT INTO portfolio_daily (portfolio_id, date, total_value, total_invested, total_profit_loss, total_profit_loss_pct, day_change, day_change_pct)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const insertAssetDaily = db.prepare(`
+    INSERT INTO asset_type_daily (
+      portfolio_id,
+      asset_type,
+      date,
+      total_value,
+      total_invested,
+      total_profit_loss,
+      total_realized_proceeds,
+      total_unrealized_gain,
+      total_profit_loss_pct,
+      day_change,
+      day_change_pct
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const tx = db.transaction(() => {
+    for (let i = 0; i < dates.length; i += 1) {
+      const date = dates[i];
+      const changed = snapshotsByDate.get(date) || [];
+      const portfolioTotalsForDate = new Map();
+      const assetTotalsForDate = new Map();
+
+      for (const row of changed) {
+        const p = ensurePortfolioTotals(portfolioTotalsForDate, row.portfolio_id);
+        p.total_value += Number(row.current_value || 0);
+        p.total_invested += Number(row.invested_amount || 0);
+        p.total_profit_loss += Number(row.profit_loss || 0);
+        p.day_change += Number(row.day_change || 0);
+
+        const a = ensureAssetTotals(assetTotalsForDate, row.portfolio_id, row.asset_type);
+        const currentValue = Number(row.current_value || 0);
+        const investedAmount = Number(row.invested_amount || 0);
+        const profitLoss = Number(row.profit_loss || 0);
+        const realizedProceeds = Number(row.realized_proceeds || 0);
+        const dayChange = Number(row.day_change || 0);
+        const unrealizedGain = currentValue - (investedAmount - realizedProceeds);
+
+        a.total_value += currentValue;
+        a.total_invested += investedAmount;
+        a.total_profit_loss += profitLoss;
+        a.total_realized_proceeds += realizedProceeds;
+        a.total_unrealized_gain += unrealizedGain;
+        a.day_change += dayChange;
+      }
+
+      for (const [pidKey, totals] of portfolioTotalsForDate.entries()) {
+        const pid = Number(pidKey);
+        const prev = prevPortfolioValue.has(portfolioKey(pid))
+          ? prevPortfolioValue.get(portfolioKey(pid))
+          : Number(totals.total_value || 0);
+        const dayChangePct = prev > 0 ? (Number(totals.day_change || 0) / prev) * 100 : 0;
+        const profitPct = Number(totals.total_invested || 0) > 0
+          ? (Number(totals.total_profit_loss || 0) / Number(totals.total_invested || 0)) * 100
+          : 0;
+
+        insertPortfolioDaily.run(
+          pid,
+          date,
+          quantizeForStorage(totals.total_value),
+          quantizeForStorage(totals.total_invested),
+          quantizeForStorage(totals.total_profit_loss),
+          quantizeForStorage(profitPct),
+          quantizeForStorage(totals.day_change),
+          quantizeForStorage(dayChangePct)
+        );
+        prevPortfolioValue.set(portfolioKey(pid), Number(totals.total_value || 0));
+      }
+
+      for (const [k, totals] of assetTotalsForDate.entries()) {
+        const prev = prevAssetValue.get(k) || 0;
+        const dayChangePct = prev > 0 ? (Number(totals.day_change || 0) / prev) * 100 : 0;
+        const totalInvested = Number(totals.total_invested || 0);
+        const totalProfitLoss = Number(totals.total_profit_loss || 0);
+        const totalProfitLossPct = totalInvested > 0 ? (totalProfitLoss / totalInvested) * 100 : 0;
+
+        insertAssetDaily.run(
+          totals.portfolio_id,
+          totals.asset_type,
+          date,
+          quantizeForStorage(totals.total_value),
+          quantizeForStorage(totals.total_invested),
+          quantizeForStorage(totals.total_profit_loss),
+          quantizeForStorage(totals.total_realized_proceeds),
+          quantizeForStorage(totals.total_unrealized_gain),
+          quantizeForStorage(totalProfitLossPct),
+          quantizeForStorage(totals.day_change),
+          quantizeForStorage(dayChangePct)
+        );
+        prevAssetValue.set(k, Number(totals.total_value || 0));
+      }
+
+      if (onProgress) onProgress(i + 1, dates.length, date);
+    }
+  });
+
+  tx();
+}
+
+module.exports = {
+  updateAllPrices,
+  updatePortfolioDaily,
+  updateAssetTypeDaily,
+  updateAggregateDailyRange,
+  cancelUpdate,
+};
