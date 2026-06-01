@@ -32,6 +32,53 @@ function inferStockInstrumentType(symbol) {
   return 'FOREIGN_STOCK';
 }
 
+// ─── Market Hours & Staleness Helpers ─────────────────────────────────────────
+
+/**
+ * Check if a date (YYYY-MM-DD) is a weekday (Mon-Fri), used for NSE trading day.
+ * @param {string} dateIso - ISO date string (YYYY-MM-DD)
+ * @returns {boolean}
+ */
+function isWeekday(dateIso) {
+  const d = new Date(`${dateIso}T00:00:00.000Z`);
+  const dayOfWeek = d.getUTCDay();
+  return dayOfWeek >= 1 && dayOfWeek <= 5; // 0=Sun, 1=Mon, ..., 6=Sat
+}
+
+/**
+ * Check if data for a given date should be marked LIVE or LOCF based on asset type.
+ * NSE trades 9:15 AM - 3:30 PM IST (weekdays only).
+ * - If NOT a weekday: definitely LOCF (market closed)
+ * - If weekday but before 9:15 AM or after 3:30 PM IST: likely LOCF (market hours haven't started or have ended)
+ * - If weekday and within 9:15 AM - 3:30 PM IST: could be LIVE
+ * 
+ * For asset types where API returns date info (e.g. MF), prefer explicit date check over this.
+ * 
+ * @param {string} dateIso - ISO date string (YYYY-MM-DD)
+ * @param {Date} [now] - Current time (defaults to now)
+ * @returns {string} - 'LIVE' if likely market is/was open, 'LOCF' if likely market was closed
+ */
+function getMarketDataSourceForNSE(dateIso, now = new Date()) {
+  if (!isWeekday(dateIso)) {
+    return 'LOCF'; // Weekend, definitely closed
+  }
+  
+  // Convert now to IST (UTC+5:30)
+  const istNow = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
+  const hours = istNow.getUTCHours();
+  const minutes = istNow.getUTCMinutes();
+  const timeInMinutes = hours * 60 + minutes;
+  
+  const nseOpenIST = 9 * 60 + 15; // 9:15 AM
+  const nseCloseIST = 15 * 60 + 30; // 3:30 PM
+  
+  if (timeInMinutes >= nseOpenIST && timeInMinutes <= nseCloseIST) {
+    return 'LIVE';
+  } else {
+    return 'LOCF';
+  }
+}
+
 // ─── Mutual Fund NAV from AMFI ────────────────────────────────────────────────
 
 /**
@@ -446,6 +493,111 @@ async function fetchHistoricalOHLC(symbol, date) {
 }
 
 /**
+ * Fetch historical OHLC rows for an inclusive date range in a single provider call.
+ * @param {string} symbol - Stock ticker
+ * @param {string} fromDate - Start date as YYYY-MM-DD
+ * @param {string} toDate - End date as YYYY-MM-DD
+ * @returns {Promise<Array<{date: string, open: number, high: number, low: number, close: number}>>}
+ */
+async function fetchHistoricalOHLCRange(symbol, fromDate, toDate) {
+  if (!symbol || !fromDate || !toDate) {
+    throw new Error('symbol, fromDate, and toDate are required');
+  }
+
+  const start = String(fromDate).split('T')[0];
+  const end = String(toDate).split('T')[0];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    throw new Error(`Invalid stock date range ${fromDate}..${toDate}`);
+  }
+  if (start > end) {
+    throw new Error(`Invalid stock date range ordering ${start}..${end}`);
+  }
+
+  const instrumentType = inferStockInstrumentType(symbol);
+  const cachedBefore = getSeries(instrumentType, symbol, start, end)
+    .filter((row) => row.open != null && row.high != null && row.low != null && row.close != null)
+    .map((row) => ({
+      date: row.date,
+      open: Number(row.open),
+      high: Number(row.high),
+      low: Number(row.low),
+      close: Number(row.close),
+    }));
+
+  const from = new Date(`${start}T00:00:00.000Z`);
+  from.setUTCDate(from.getUTCDate() - 7);
+  const to = new Date(`${end}T00:00:00.000Z`);
+  to.setUTCDate(to.getUTCDate() + 1);
+
+  const p1 = Math.floor(from.getTime() / 1000);
+  const p2 = Math.floor(to.getTime() / 1000);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${p1}&period2=${p2}&interval=1d`;
+
+  try {
+    await new Promise((resolve, reject) => {
+      https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            const result = json.chart?.result?.[0];
+            if (!result) {
+              reject(new Error(`No Yahoo data for ${symbol}`));
+              return;
+            }
+
+            const timestamps = result.timestamp || [];
+            const quote = result.indicators?.quote?.[0] || {};
+            const opens = quote.open || [];
+            const highs = quote.high || [];
+            const lows = quote.low || [];
+            const closes = quote.close || [];
+
+            const parsedRows = [];
+            for (let i = 0; i < timestamps.length; i += 1) {
+              const o = opens[i];
+              const h = highs[i];
+              const l = lows[i];
+              const c = closes[i];
+              if (o == null || h == null || l == null || c == null) continue;
+
+              const pointDate = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+              if (pointDate < start || pointDate > end) continue;
+              parsedRows.push({ date: pointDate, open: o, high: h, low: l, close: c, source: 'YAHOO' });
+            }
+
+            if (parsedRows.length > 0) {
+              upsertPriceSeries(instrumentType, symbol, parsedRows, 'YAHOO');
+            }
+
+            resolve();
+          } catch (e) {
+            reject(new Error(`Failed to parse historical OHLC range for ${symbol}: ${e.message}`));
+          }
+        });
+        res.on('error', reject);
+      }).on('error', reject);
+    });
+  } catch (error) {
+    if (cachedBefore.length > 0) return cachedBefore;
+    throw error;
+  }
+
+  const refreshed = getSeries(instrumentType, symbol, start, end)
+    .filter((row) => row.open != null && row.high != null && row.low != null && row.close != null)
+    .map((row) => ({
+      date: row.date,
+      open: Number(row.open),
+      high: Number(row.high),
+      low: Number(row.low),
+      close: Number(row.close),
+    }));
+
+  return refreshed;
+}
+
+/**
  * Fetch USD to INR exchange rate (current)
  */
 async function fetchUSDToINR() {
@@ -480,8 +632,11 @@ async function fetchUSDToINR() {
 async function fetchHistoricalUSDToINR(date) {
   if (!date) return fetchUSDToINR();
 
-  const cached = getNearestOnOrBefore('FX', 'USDINR=X', date);
-  if (cached && cached.close != null) return Number(cached.close);
+  const exact = getSeries('FX', 'USDINR=X', date, date)
+    .find((row) => row?.date === date && row?.close != null);
+  if (exact && exact.close != null) return Number(exact.close);
+
+  const nearestCached = getNearestOnOrBefore('FX', 'USDINR=X', date);
 
   // ── 1. FBIL reference rate ────────────────────────────────────────────────
   try {
@@ -502,8 +657,22 @@ async function fetchHistoricalUSDToINR(date) {
   } catch (_) { /* fall through */ }
 
   // ── 3. Current rate as fallback ───────────────────────────────────────────
+  if (nearestCached && nearestCached.close != null) {
+    const locfRate = Number(nearestCached.close);
+    if (Number.isFinite(locfRate) && locfRate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: locfRate, source: 'LOCF' });
+      return locfRate;
+    }
+  }
+
   console.warn(`fetchHistoricalUSDToINR: could not get rate for ${date}, using current rate`);
-  return fetchUSDToINR();
+  const currentRate = await fetchUSDToINR();
+  if (Number.isFinite(Number(currentRate)) && Number(currentRate) > 0) {
+    upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: Number(currentRate), source: 'YAHOO' });
+    return Number(currentRate);
+  }
+
+  return currentRate;
 }
 
 const fbilMonthlyCache = new Map();
@@ -610,8 +779,9 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
   let fallbackDays = 0;
 
   for (const day of dates) {
-    const cached = getNearestOnOrBefore('FX', 'USDINR=X', day);
-    if (cached && cached.close != null) {
+    const exact = getSeries('FX', 'USDINR=X', day, day)
+      .find((row) => row?.date === day && row?.close != null);
+    if (exact && exact.close != null) {
       successfulDays += 1;
       continue;
     }
@@ -1492,6 +1662,7 @@ module.exports = {
   fetchStockHistory,
   fetchHistoricalStockPrice,
   fetchHistoricalOHLC,
+  fetchHistoricalOHLCRange,
   fetchCorporateActions,
   fetchDividendEventsForRange,
   fetchUSDToINR,
@@ -1505,4 +1676,5 @@ module.exports = {
   fetchSGBPrice,
   fetchNPSNAV,
   fetchNPSHistory,
+  getMarketDataSourceForNSE,
 };

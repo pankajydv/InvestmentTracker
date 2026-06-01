@@ -19,7 +19,10 @@ function toEnvString(value) {
 function resolveConfigPath() {
   const rootDir = path.join(__dirname, '..', '..');
   const explicit = process.env.INVESTTRACK_CONFIG;
-  const mode = normalizeAppMode(process.env.APP_MODE);
+  const hasExplicitAppMode = process.env.APP_MODE != null && String(process.env.APP_MODE).trim() !== '';
+  const mode = hasExplicitAppMode
+    ? normalizeAppMode(process.env.APP_MODE)
+    : (String(process.env.NODE_ENV || '').toLowerCase() === 'production' ? 'production' : 'dev');
 
   const modeFileName = mode === 'dev' ? 'investtrack-dev.json' : 'investtrack-prod.json';
 

@@ -13,6 +13,10 @@ const COMPLIANCE_LAST_RUN_DATE_KEY = 'compliance_last_run_date';
 const COMPLIANCE_LAST_GAPS_KEY = 'compliance_last_gaps_detected';
 const COMPLIANCE_LAST_REPAIRS_KEY = 'compliance_last_repairs_enqueued';
 const INCREMENTAL_LOOKBACK_DAYS = Math.max(1, Number(process.env.INCREMENTAL_COMPLIANCE_LOOKBACK_DAYS || 14));
+const MARKET_DATA_CUTOFF_MINUTES_IST = Object.freeze({
+  // US equities settle after midnight IST; avoid same-day compliance gaps until end of IST day.
+  FOREIGN_STOCK: 23 * 60 + 59,
+});
 
 function todayIso() {
   return new Date().toISOString().slice(0, 10);
@@ -32,6 +36,46 @@ function minIsoDate(a, b) {
   if (!a) return b || null;
   if (!b) return a || null;
   return a < b ? a : b;
+}
+
+function getIstClock(now = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(now);
+  const values = {};
+  for (const part of parts) {
+    if (!part?.type || part.type === 'literal') continue;
+    values[part.type] = part.value;
+  }
+
+  const date = `${values.year}-${values.month}-${values.day}`;
+  const hour = Number(values.hour || 0);
+  const minute = Number(values.minute || 0);
+  return {
+    date,
+    minutes: (hour * 60) + minute,
+  };
+}
+
+function shouldDeferSameDayMarketLinkedGap(assetType, runDate) {
+  const normalized = String(assetType || '').toUpperCase();
+  if (normalized !== 'FOREIGN_STOCK') return false;
+  if (!runDate) return false;
+
+  const istNow = getIstClock();
+  if (runDate !== istNow.date) return false;
+
+  const cutoffMinutes = MARKET_DATA_CUTOFF_MINUTES_IST[normalized];
+  if (!Number.isFinite(cutoffMinutes)) return false;
+  return istNow.minutes < cutoffMinutes;
 }
 
 function getConfigValue(db, key) {
@@ -193,10 +237,10 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
     // For daily_values: get investments and check their date ranges
     const investments = db.prepare(`
       SELECT DISTINCT i.id, i.asset_type, 
-             MIN(t.date) as start_date, MAX(t.date) as end_date
+             MIN(date(t.transaction_date)) as start_date, MAX(date(t.transaction_date)) as end_date
       FROM investments i
       LEFT JOIN transactions t ON i.id = t.investment_id
-      WHERE t.date IS NOT NULL
+      WHERE t.transaction_date IS NOT NULL
       GROUP BY i.id
     `).all();
 
@@ -205,7 +249,10 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
       if (!start_date || !end_date) continue;
 
       const effectiveStartDate = startBoundary && startBoundary > start_date ? startBoundary : start_date;
-      const effectiveEndDate = endBoundary && endBoundary < end_date ? endBoundary : end_date;
+      let effectiveEndDate = endBoundary && endBoundary < end_date ? endBoundary : end_date;
+      if (shouldDeferSameDayMarketLinkedGap(asset_type, endBoundary) && effectiveEndDate === endBoundary) {
+        effectiveEndDate = addDaysIso(effectiveEndDate, -1);
+      }
       if (!effectiveStartDate || !effectiveEndDate || effectiveStartDate > effectiveEndDate) continue;
 
       const isMarketLinked = isMarketLinkedAsset(asset_type);

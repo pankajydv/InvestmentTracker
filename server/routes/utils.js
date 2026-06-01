@@ -25,12 +25,15 @@ const IPO_PRELISTING_CARRY_MAX_DAYS = 12;
 const MARKET_LINKED_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
 const MARKET_DATA_CUTOFF_MINUTES_IST = Object.freeze({
   INDIAN_STOCK: 17 * 60 + 45,
-  FOREIGN_STOCK: 18 * 60 + 30,
+  // US equities settle after midnight IST; keep same-day LOCF as pending through IST day.
+  FOREIGN_STOCK: 23 * 60 + 59,
   SGB: 19 * 60,
   MUTUAL_FUND: 23 * 60,
   NPS: 23 * 60,
   DEFAULT: 23 * 60,
 });
+const FOREIGN_UNEXPECTED_LOCF_RECENT_DAYS = 4;
+const FOREIGN_UNEXPECTED_LOCF_THRESHOLD_SESSIONS = 1;
 
 const complianceJobStore = new Map();
 let complianceJobSeq = 0;
@@ -224,9 +227,13 @@ function isWeekendIso(isoDate) {
   return day === 0 || day === 6;
 }
 
-function isMarketSessionDate(isoDate, marketHolidaySet) {
+function isMarketSessionDate(isoDate, marketHolidaySet, assetType = null) {
   if (!isoDate) return false;
   if (isWeekendIso(isoDate)) return false;
+  if (String(assetType || '').toUpperCase() === 'FOREIGN_STOCK') {
+    // We don't maintain a US holiday calendar; for foreign stocks use weekday-only sessions.
+    return true;
+  }
   if (marketHolidaySet?.has(isoDate)) return false;
   return true;
 }
@@ -520,7 +527,7 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       expected = false;
     }
 
-    if (expected && (!needsMarketSessions || isMarketSessionDate(date, marketHolidaySet))) {
+    if (expected && (!needsMarketSessions || isMarketSessionDate(date, marketHolidaySet, scope.asset_type))) {
       expectedDates.push(date);
     }
 
@@ -568,8 +575,20 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
   let locfStreak = 0;
   let complianceErrorReason = ipoCarryComplianceErrorReason;
   const latestExpectedDate = expectedDates[expectedDates.length - 1] || null;
+  const effectiveRecentWindowDays = String(scope.asset_type || '').toUpperCase() === 'FOREIGN_STOCK'
+    ? Math.min(
+      Math.max(1, Number(unexpectedLocfPolicy.recentWindowDays) || 180),
+      FOREIGN_UNEXPECTED_LOCF_RECENT_DAYS
+    )
+    : Math.max(1, Number(unexpectedLocfPolicy.recentWindowDays) || 180);
+  const effectiveThresholdSessions = String(scope.asset_type || '').toUpperCase() === 'FOREIGN_STOCK'
+    ? Math.min(
+      Math.max(1, Number(unexpectedLocfPolicy.thresholdSessions) || 5),
+      FOREIGN_UNEXPECTED_LOCF_THRESHOLD_SESSIONS
+    )
+    : Math.max(1, Number(unexpectedLocfPolicy.thresholdSessions) || 5);
   const unexpectedLocfStartDate = latestExpectedDate
-    ? addDaysIso(latestExpectedDate, -(Math.max(1, Number(unexpectedLocfPolicy.recentWindowDays) || 180) - 1))
+    ? addDaysIso(latestExpectedDate, -(effectiveRecentWindowDays - 1))
     : null;
 
   for (const date of expectedDates) {
@@ -597,11 +616,11 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
     const isUnexpectedWindowDate = !unexpectedLocfStartDate || date >= unexpectedLocfStartDate;
     const isUnexpectedLocfCandidate = isUnexpectedWindowDate
       && LOCF_SOURCES.has(String(row.price_source || ''))
-      && isMarketSessionDate(date, marketHolidaySet);
+      && isMarketSessionDate(date, marketHolidaySet, scope.asset_type);
 
     if (isUnexpectedLocfCandidate) {
       locfStreak += 1;
-      if (locfStreak > Math.max(0, Number(unexpectedLocfPolicy.thresholdSessions) || 0)) {
+      if (locfStreak > Math.max(0, effectiveThresholdSessions)) {
         unexpectedLocfCount += 1;
       }
     } else {

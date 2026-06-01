@@ -1,6 +1,7 @@
 const { toIsoDate, todayIso } = require('./dateUtils');
 
 const PROVIDENT_TYPES = new Set(['PPF', 'SSY', 'PF']);
+const EXITED_UNITS_EPSILON = 1e-6;
 
 function startOfMonth(isoDate) {
   const d = toIsoDate(isoDate);
@@ -193,13 +194,94 @@ function markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourc
   if (!normalized) return 0;
 
   const rows = db.prepare(`
-    SELECT DISTINCT i.id AS investment_id, t.portfolio_id
+    SELECT
+      i.id AS investment_id,
+      t.portfolio_id,
+      MAX(date(t.transaction_date)) AS max_txn_date,
+      COALESCE(SUM(
+        CASE
+          WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(t.units, 0)
+          WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(t.units, 0)
+          ELSE 0
+        END
+      ), 0) AS net_units
     FROM investments i
-    LEFT JOIN transactions t ON t.investment_id = i.id
+    JOIN transactions t ON t.investment_id = i.id
     WHERE i.is_active != 0
       AND COALESCE(i.exclude_from_tracking, 0) != 1
       AND t.portfolio_id IS NOT NULL
+    GROUP BY i.id, t.portfolio_id
   `).all();
+
+  let count = 0;
+  for (const row of rows) {
+    const maxTxnDate = toIsoDate(row.max_txn_date);
+    const netUnits = Number(row.net_units || 0);
+    const isExited = Math.abs(netUnits) <= EXITED_UNITS_EPSILON;
+
+    // Source-side guard: don't enqueue scopes for exited holdings when dirty date is after exit.
+    if (isExited && maxTxnDate && normalized > maxTxnDate) {
+      continue;
+    }
+
+    const dirtyDate = markScopeDirty(db, {
+      investmentId: row.investment_id,
+      portfolioId: row.portfolio_id,
+      dirtyFromDate: normalized,
+      reason,
+      sourceEventId,
+    });
+    if (dirtyDate) count += 1;
+  }
+
+  return count;
+}
+
+function getEarliestPendingDirtyDateForAssetType(db, assetType, runDate = todayIso()) {
+  const normalizedRunDate = normalizeDirtyDate(runDate) || todayIso();
+  const normalizedAssetType = String(assetType || '').trim().toUpperCase();
+  if (!normalizedAssetType) return null;
+
+  const row = db.prepare(`
+    SELECT MIN(s.dirty_from_date) AS min_dirty_from
+    FROM dirty_backfill_scope s
+    JOIN investments i ON i.id = s.investment_id
+    WHERE s.status IN ('pending', 'running', 'failed')
+      AND s.dirty_from_date <= ?
+      AND i.asset_type = ?
+      AND i.is_active != 0
+      AND COALESCE(i.exclude_from_tracking, 0) != 1
+  `).get(normalizedRunDate, normalizedAssetType);
+
+  return normalizeDirtyDate(row?.min_dirty_from);
+}
+
+function markActiveTrackedForeignScopesDirtyFromDate(db, dirtyFromDate, reason, sourceEventId = null) {
+  const normalized = normalizeDirtyDate(dirtyFromDate);
+  if (!normalized) return 0;
+
+  const rows = db.prepare(`
+    SELECT
+      i.id AS investment_id,
+      t.portfolio_id,
+      COALESCE(SUM(
+        CASE
+          WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(t.units, 0)
+          WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(t.units, 0)
+          ELSE 0
+        END
+      ), 0) AS net_units
+    FROM investments i
+    JOIN transactions t ON t.investment_id = i.id
+    WHERE i.asset_type = 'FOREIGN_STOCK'
+      AND i.is_active != 0
+      AND COALESCE(i.exclude_from_tracking, 0) != 1
+      AND t.portfolio_id IS NOT NULL
+      AND date(t.transaction_date) <= ?
+    GROUP BY i.id, t.portfolio_id
+    HAVING net_units > ?
+    ORDER BY i.id ASC, t.portfolio_id ASC
+  `).all(todayIso(), EXITED_UNITS_EPSILON);
 
   let count = 0;
   for (const row of rows) {
@@ -218,9 +300,6 @@ function markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourc
 
 function getPendingDirtyScopes(db, runDate = todayIso(), options = {}) {
   const effectiveRunDate = normalizeDirtyDate(runDate) || todayIso();
-  const maxScopes = Number.isFinite(Number(options.maxScopes))
-    ? Math.max(0, Math.floor(Number(options.maxScopes)))
-    : 0;
 
   const query = `
     SELECT id, investment_id, portfolio_id, dirty_from_date, dirty_reason, source_event_id, status, created_at, updated_at
@@ -228,7 +307,6 @@ function getPendingDirtyScopes(db, runDate = todayIso(), options = {}) {
     WHERE status IN ('pending', 'running', 'failed')
       AND dirty_from_date <= ?
     ORDER BY dirty_from_date ASC, id ASC
-    ${maxScopes > 0 ? `LIMIT ${maxScopes}` : ''}
   `;
 
   return db.prepare(query).all(effectiveRunDate);
@@ -237,10 +315,7 @@ function getPendingDirtyScopes(db, runDate = todayIso(), options = {}) {
 async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {}) {
   const { runBackfillInTwoSteps } = require('./backfillService');
   const effectiveRunDate = normalizeDirtyDate(runDate) || todayIso();
-  const maxScopes = Number.isFinite(Number(options.maxScopes))
-    ? Math.max(0, Math.floor(Number(options.maxScopes)))
-    : 0;
-  const scopes = getPendingDirtyScopes(db, effectiveRunDate, { maxScopes });
+  const scopes = getPendingDirtyScopes(db, effectiveRunDate, options);
   if (!scopes.length) {
     clearBackfillProgress(db);
     return {
@@ -248,7 +323,7 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {})
       pending: 0,
       processed: 0,
       skippedFuture: 0,
-      scopeLimitApplied: maxScopes > 0 ? maxScopes : null,
+      scopeLimitApplied: null,
     };
   }
 
@@ -337,7 +412,7 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {})
       pending: scopes.length,
       processed: result.processed || 0,
       skippedFuture: result.skippedFuture || 0,
-      scopeLimitApplied: maxScopes > 0 ? maxScopes : null,
+      scopeLimitApplied: null,
     };
   } catch (e) {
     setBackfillProgress(db, {
@@ -428,7 +503,9 @@ function markNPSInvestmentsDirtyFromTransactions(db) {
 module.exports = {
   clearBackfillProgress,
   getPendingDirtyScopes,
+  getEarliestPendingDirtyDateForAssetType,
   markAllTrackedInvestmentsDirtyFromDate,
+  markActiveTrackedForeignScopesDirtyFromDate,
   markDirtyForAssetTypeFromDate,
   markDirtyFromTransactions,
   markScopeDirty,

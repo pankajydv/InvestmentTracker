@@ -20,6 +20,9 @@ const INTERNAL_BALANCE_ASSET_TYPES_SQL = "'PF','PPF','SSY'";
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+const ONE_DAY_IGNORE_INDIAN_HOLIDAYS_ASSET_TYPES = new Set(['FOREIGN_STOCK']);
+const ONE_DAY_MAX_PREVIOUS_SESSIONS = 3;
+const ONE_DAY_EPSILON_UNITS = 0.001;
 
 function isInternalXirrCashflow(assetType, transactionType) {
   const normalizedAssetType = String(assetType || '').toUpperCase();
@@ -34,6 +37,13 @@ function isInternalXirrCashflow(assetType, transactionType) {
   }
 
   return normalizedType === 'RECONCILE';
+}
+
+function isAccrualOnlyXirrCashflow(transactionType, notes) {
+  const normalizedType = String(transactionType || '').toUpperCase();
+  if (normalizedType !== 'INTEREST') return false;
+  const noteText = String(notes || '').toUpperCase();
+  return noteText.includes('AUTO_ACCRUAL_INTERNAL') || noteText.includes('ACCRUAL_ONLY_INTERNAL');
 }
 
 function xnpv(rate, flows, baseDate) {
@@ -97,6 +107,12 @@ function diffIsoDays(startIso, endIso) {
   return Math.max(Math.floor((endMs - startMs) / 86400000), 1);
 }
 
+function addDaysIso(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+
 function loadMarketHolidaySet(db, runDate) {
   try {
     const hasTable = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_holidays'").get();
@@ -126,6 +142,25 @@ function isMarketSessionDate(isoDate, marketHolidaySet) {
   if (isWeekendIso(isoDate)) return false;
   if (marketHolidaySet?.has(isoDate)) return false;
   return true;
+}
+
+function isWithinPreviousMarketSessions(candidateIso, anchorIso, marketHolidaySet, maxSessions = ONE_DAY_MAX_PREVIOUS_SESSIONS) {
+  if (!candidateIso || !anchorIso || candidateIso >= anchorIso) return false;
+  if (!isMarketSessionDate(candidateIso, marketHolidaySet)) return false;
+
+  let cursor = addDaysIso(anchorIso, -1);
+  let seenSessions = 0;
+  while (cursor >= candidateIso) {
+    if (isMarketSessionDate(cursor, marketHolidaySet)) {
+      seenSessions += 1;
+      if (seenSessions > maxSessions) return false;
+    }
+    if (cursor === candidateIso) {
+      return seenSessions <= maxSessions;
+    }
+    cursor = addDaysIso(cursor, -1);
+  }
+  return false;
 }
 
 module.exports = function (db) {
@@ -217,6 +252,7 @@ module.exports = function (db) {
             dv.investment_id,
             dv.date,
             dv.price_per_unit,
+            dv.total_units,
             dv.current_value,
             dv.invested_amount,
             dv.realized_proceeds,
@@ -243,6 +279,7 @@ module.exports = function (db) {
             dv.investment_id,
             dv.date,
             MAX(dv.price_per_unit) AS price_per_unit,
+            SUM(COALESCE(dv.total_units, 0)) AS total_units,
             SUM(COALESCE(dv.current_value, 0)) AS current_value,
             SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
             SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
@@ -573,12 +610,16 @@ module.exports = function (db) {
 
       const useSessionAnchoring = policy === ONE_DAY_CHANGE_POLICY.MARKET_SESSION
         || policy === ONE_DAY_CHANGE_POLICY.NAV_SNAPSHOT;
+      const normalizedAssetType = String(inv.asset_type || '').toUpperCase();
+      const effectiveMarketHolidaySet = ONE_DAY_IGNORE_INDIAN_HOLIDAYS_ASSET_TYPES.has(normalizedAssetType)
+        ? null
+        : marketHolidaySet;
       let anchorRow = latestRow;
       let anchoredToMarketSession = false;
       let marketSessionRows = null;
       if (useSessionAnchoring) {
         marketSessionRows = filteredMarketRows.filter((row) =>
-          isMarketSessionDate(row.date, marketHolidaySet)
+          isMarketSessionDate(row.date, effectiveMarketHolidaySet)
         );
 
         if (marketSessionRows.length > 0) {
@@ -594,9 +635,20 @@ module.exports = function (db) {
         }
       }
 
-      const previousRow = useSessionAnchoring
-        ? (marketSessionRows || []).find((row) => row.date < anchorRow.date)
-        : marketRows.find((row) => row.date < anchorRow.date);
+      const previousCandidates = useSessionAnchoring
+        ? (marketSessionRows || []).filter((row) => row.date < anchorRow.date)
+        : marketRows.filter((row) => row.date < anchorRow.date);
+
+      const previousRow = previousCandidates.find((row) => {
+        const rowUnits = Number(row?.total_units || 0);
+        if (!isInternalBalanceAsset && Math.abs(rowUnits) <= ONE_DAY_EPSILON_UNITS) {
+          return false;
+        }
+        if (!useSessionAnchoring) {
+          return true;
+        }
+        return isWithinPreviousMarketSessions(row.date, anchorRow.date, effectiveMarketHolidaySet);
+      });
 
       if (!previousRow) {
         inv.day_change = 0;
@@ -609,8 +661,8 @@ module.exports = function (db) {
             anchorDate: anchorRow.date,
             anchorPriceSource: anchorRow.price_source || null,
             anchoredToMarketSession,
-            marketHolidayCount: marketHolidaySet.size,
-            reason: 'NO_PREVIOUS_ROW',
+            marketHolidayCount: effectiveMarketHolidaySet?.size || 0,
+            reason: 'NO_VALID_PREVIOUS_ROW_WITHIN_3_SESSIONS_OR_REENTRY',
           };
         }
         continue;
@@ -644,7 +696,7 @@ module.exports = function (db) {
           previousDate: previousRow.date,
           anchorPriceSource: anchorRow.price_source || null,
           anchoredToMarketSession,
-          marketHolidayCount: marketHolidaySet.size,
+          marketHolidayCount: effectiveMarketHolidaySet?.size || 0,
           daySpan,
           netFlow,
           netFlowRange,
@@ -869,7 +921,7 @@ module.exports = function (db) {
     const txnFilter = portfolio_id ? 'WHERE portfolio_id = ?' : '';
     const txnParams = portfolio_id ? [portfolio_id] : [];
     const transactionRows = db.prepare(`
-      SELECT t.investment_id, t.transaction_type, t.transaction_date, COALESCE(t.amount, 0) as amount, COALESCE(t.fees, 0) as fees, i.asset_type
+      SELECT t.investment_id, t.transaction_type, t.transaction_date, COALESCE(t.amount, 0) as amount, COALESCE(t.fees, 0) as fees, t.notes, i.asset_type
       FROM transactions t
       JOIN investments i ON i.id = t.investment_id
       ${portfolio_id ? 'WHERE t.portfolio_id = ?' : ''}
@@ -886,6 +938,7 @@ module.exports = function (db) {
       const fees = Number(txn.fees) || 0;
       let cashflow = 0;
       const treatAsInternal = isInternalXirrCashflow(txn.asset_type, txn.transaction_type);
+      const treatAsAccrualOnly = isAccrualOnlyXirrCashflow(txn.transaction_type, txn.notes);
       const assetTypeKey = String(txn.asset_type || '').toUpperCase();
       const investmentId = Number(txn.investment_id);
 
@@ -896,7 +949,9 @@ module.exports = function (db) {
         xirrCashflowsByInvestmentId.set(investmentId, []);
       }
 
-      if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+      if (treatAsAccrualOnly) {
+        cashflow = 0;
+      } else if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
         cashflow = -(amount + fees);
       } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
         cashflow = amount - fees;

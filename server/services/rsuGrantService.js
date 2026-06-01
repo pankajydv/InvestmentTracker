@@ -8,6 +8,20 @@ function addMonths(isoDate, months) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+function shiftToNextWeekday(isoDate) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) return isoDate;
+
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) {
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 function buildAnnualPlan() {
   const plan = [];
   for (let months = 3; months <= 60; months += 3) {
@@ -129,7 +143,7 @@ function generateGrantRows(grant) {
 
     allocatedUnits += units;
 
-    const vestDate = addMonths(grant.awardDate, tranche.months);
+    const vestDate = shiftToNextWeekday(addMonths(grant.awardDate, tranche.months));
     const seq = String(trancheIndex).padStart(2, '0');
 
     rows.push({

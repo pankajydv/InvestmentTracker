@@ -7,12 +7,15 @@ const {
   fetchMutualFundNAV,
   fetchStockPrice,
   fetchUSDToINR,
+  fetchHistoricalUSDToINR,
   toNSETicker,
   resolveAmfiCodeByISIN,
   fetchSGBPrice,
   fetchNPSNAV,
+  getMarketDataSourceForNSE,
 } = require('./priceService');
 const { calculatePfInterestPreview, calculatePfValueAsOfDate, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
+const { computeBondAccruedCoupon } = require('./bondAccrualService');
 const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
 const { getMarketHolidays, getWeekends } = require('./holidays/marketHolidayService');
 const {
@@ -24,6 +27,9 @@ const {
   quantizeForStorage,
 } = require('./numberPrecision');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+const DAY_CHANGE_MAX_PREVIOUS_SESSIONS = 3;
+const DAY_CHANGE_EPSILON_UNITS = 0.0001;
 
 function addDaysIso(isoDate, days) {
   const d = new Date(`${isoDate}T00:00:00.000Z`);
@@ -50,6 +56,25 @@ function isMarketSessionDate(dateIso, db, cache) {
 
 function isMarketLinkedAssetType(assetType) {
   return ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(assetType || ''));
+}
+
+function isWithinPreviousMarketSessions(candidateIso, anchorIso, db, holidayCache, maxSessions = DAY_CHANGE_MAX_PREVIOUS_SESSIONS) {
+  if (!candidateIso || !anchorIso || candidateIso >= anchorIso) return false;
+  if (!isMarketSessionDate(candidateIso, db, holidayCache)) return false;
+
+  let cursor = addDaysIso(anchorIso, -1);
+  let seenSessions = 0;
+  while (cursor >= candidateIso) {
+    if (isMarketSessionDate(cursor, db, holidayCache)) {
+      seenSessions += 1;
+      if (seenSessions > maxSessions) return false;
+    }
+    if (cursor === candidateIso) {
+      return seenSessions <= maxSessions;
+    }
+    cursor = addDaysIso(cursor, -1);
+  }
+  return false;
 }
 
 function getPriorMarketSessionLocfStreak(db, investmentId, portfolioId, asOfDate, holidayCache) {
@@ -165,8 +190,8 @@ async function updateAllPrices(db, options = {}) {
       WHERE transaction_date <= ?
       GROUP BY investment_id
       HAVING SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
-        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
         ELSE 0
       END) > 0.0001
     `).all(today).map(r => r.investment_id)
@@ -226,15 +251,28 @@ async function updateAllPrices(db, options = {}) {
     }
   }
 
-  // Fetch USD/INR rate for foreign stocks
+  const hasForeignInScope = investments.some((inv) => inv.asset_type === 'FOREIGN_STOCK');
+
+  // Fetch USD/INR rate for foreign stocks and persist per-day FX cache when needed.
   let usdToInr = parseFloat(db.prepare("SELECT value FROM config WHERE key = 'usd_to_inr'").get()?.value || '83.5');
-  try {
-    usdToInr = await fetchUSDToINR();
-    db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'usd_to_inr'").run(String(usdToInr));
-    logAppInfo('[UpdatePrices] USD/INR rate refreshed', { usdToInr });
-  } catch (e) {
-    console.warn('Could not update USD/INR rate, using cached value:', usdToInr);
-    logAppError('[UpdatePrices] USD/INR refresh failed, using cached value', { error: e.message, usdToInr });
+  if (hasForeignInScope) {
+    try {
+      usdToInr = await fetchHistoricalUSDToINR(today);
+      db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'usd_to_inr'").run(String(usdToInr));
+      logAppInfo('[UpdatePrices] USD/INR rate refreshed', { usdToInr, source: 'historical_fx_cache' });
+    } catch (e) {
+      console.warn('Could not update USD/INR historical rate, trying live rate. Using cached value if needed:', usdToInr);
+      logAppError('[UpdatePrices] USD/INR historical refresh failed', { error: e.message, usdToInr });
+      try {
+        usdToInr = await fetchUSDToINR();
+        db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'usd_to_inr'").run(String(usdToInr));
+      } catch (e2) {
+        logAppError('[UpdatePrices] USD/INR live refresh failed, using cached value', {
+          error: e2.message,
+          usdToInr,
+        });
+      }
+    }
   }
 
   const upsertDaily = db.prepare(`
@@ -277,18 +315,20 @@ async function updateAllPrices(db, options = {}) {
   const getTotalUnitsPortfolio = db.prepare(`
     SELECT COALESCE(
       SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
-        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
         ELSE 0
       END), 0
     ) as total
     FROM transactions WHERE investment_id = ? AND portfolio_id = ? AND transaction_date <= ?
   `);
 
-  const getPrevDayPortfolio = db.prepare(`
-    SELECT price_per_unit, current_value FROM daily_values
+  const getPrevRowsPortfolio = db.prepare(`
+    SELECT date, price_per_unit, current_value, total_units, price_source
+    FROM daily_values
     WHERE investment_id = ? AND portfolio_id = ? AND date < ?
-    ORDER BY date DESC LIMIT 1
+    ORDER BY date DESC
+    LIMIT 120
   `);
 
   const getNetFlowTodayPortfolio = db.prepare(`
@@ -306,11 +346,24 @@ async function updateAllPrices(db, options = {}) {
     SELECT DISTINCT portfolio_id FROM transactions WHERE investment_id = ? AND portfolio_id IS NOT NULL AND transaction_date <= ?
   `);
 
+  const getBondTransactionsPortfolio = db.prepare(`
+    SELECT
+      date(transaction_date) AS tx_date,
+      UPPER(transaction_type) AS transaction_type,
+      COALESCE(units, 0) AS units,
+      COALESCE(amount, 0) AS amount
+    FROM transactions
+    WHERE investment_id = ?
+      AND portfolio_id = ?
+      AND date(transaction_date) <= ?
+    ORDER BY date(transaction_date) ASC, id ASC
+  `);
+
   const getOpenUnitsPortfolio = db.prepare(`
     SELECT COALESCE(
       SUM(CASE
-        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION') THEN COALESCE(units, 0)
-        WHEN transaction_type IN ('SELL', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
         ELSE 0
       END), 0
     ) as total
@@ -374,10 +427,13 @@ async function updateAllPrices(db, options = {}) {
         case 'MUTUAL_FUND': {
           if (inv.amfi_code) {
             const navData = await fetchMutualFundNAV(inv.amfi_code);
+            // Check if NAV date is today; if not, mark as LOCF (stale)
+            const mfNavIsStale = navData.date && navData.date !== today;
+            console.log(`  ${inv.name} (id=${inv.id}): MF NAV fetch returned nav=${navData.nav}, navDate=${navData.date}, stale=${mfNavIsStale}`);
             pricePerUnit = navData.nav;
             apiChange = navData.change;
             apiChangePct = navData.changePercent;
-            priceSource = 'LIVE';
+            priceSource = mfNavIsStale ? 'LOCF' : 'LIVE';
           } else {
             console.warn(`  ${inv.name}: No AMFI code, computing from transactions only`);
           }
@@ -394,7 +450,9 @@ async function updateAllPrices(db, options = {}) {
           pricePerUnit = stockData.price;
           apiChange = stockData.change;
           apiChangePct = stockData.changePercent;
-          priceSource = 'LIVE';
+          // NSE-traded stock; check if market was open today
+          priceSource = getMarketDataSourceForNSE(today);
+          console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, priceSource=${priceSource}`);
           break;
         }
         case 'FOREIGN_STOCK': {
@@ -407,7 +465,10 @@ async function updateAllPrices(db, options = {}) {
           pricePerUnit = foreignData.price;
           apiChange = foreignData.change;
           apiChangePct = foreignData.changePercent;
-          priceSource = 'LIVE';
+          // Foreign stocks on various exchanges; use conservative NSE-hours check
+          // (doesn't account for exchange-specific times, but better than always LIVE)
+          priceSource = getMarketDataSourceForNSE(today);
+          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK price fetch returned price=${foreignData.price}, priceSource=${priceSource}`);
           break;
         }
         case 'BOND': {
@@ -421,7 +482,9 @@ async function updateAllPrices(db, options = {}) {
               pricePerUnit = sgbData.price;
               apiChange = sgbData.change;
               apiChangePct = sgbData.changePercent;
-              priceSource = 'LIVE';
+              // NSE-traded security; check if market was open today
+              priceSource = getMarketDataSourceForNSE(today);
+              console.log(`  ${inv.name} (id=${inv.id}): SGB price fetch returned price=${sgbData.price}, priceSource=${priceSource}`);
             } catch (e) {
               console.warn(`  ${inv.name}: NSE price fetch failed (${e.message}), falling back to last known price`);
             }
@@ -460,11 +523,15 @@ async function updateAllPrices(db, options = {}) {
             
             await delay(300); // Rate limiting for API calls
             const npsData = await fetchNPSNAV(inv.name, inv.nps_fund_code, lastKnownPrice);
-            console.log(`  ${inv.name} (id=${inv.id}): NPS NAV fetch returned nav=${npsData.nav}, previousPrice=${lastKnownPrice}, change=${npsData.change}`);
+            // NPS NAVs are published after market close and may lag by 1–2 days.
+            // If the API's Last Updated date is not today, treat it as LOCF (carry-forward)
+            // so we don't falsely label stale data as LIVE.
+            const navIsStale = npsData.date && npsData.date !== today;
+            console.log(`  ${inv.name} (id=${inv.id}): NPS NAV fetch returned nav=${npsData.nav}, navDate=${npsData.date}, previousPrice=${lastKnownPrice}, change=${npsData.change}, stale=${navIsStale}`);
             pricePerUnit = npsData.nav;
             apiChange = npsData.change;
             apiChangePct = npsData.changePercent;
-            priceSource = 'LIVE';
+            priceSource = navIsStale ? 'LOCF' : 'LIVE';
           } catch (e) {
             console.warn(`  ${inv.name}: NPS NAV fetch failed (${e.message}), falling back to last known price`);
             // Fallback 1: use last valid stored daily value (exclude placeholder 99.99)
@@ -526,6 +593,28 @@ async function updateAllPrices(db, options = {}) {
           realizedCashflow = getRealizedCashflowPortfolio(inv, pid, today);
           if (inv.asset_type === 'FOREIGN_STOCK') {
             currentValue = totalUnits * pricePerUnit * usdToInr;
+          } else if (inv.asset_type === 'BOND') {
+            const bondTransactions = getBondTransactionsPortfolio.all(inv.id, pid, today);
+            const accrual = computeBondAccruedCoupon({
+              investment: inv,
+              transactions: bondTransactions,
+              asOfDate: today,
+              dayCount: 365,
+            });
+
+            currentValue = totalUnits * pricePerUnit + Number(accrual?.accruedCoupon || 0);
+
+            if (accrual?.meta?.missingExpectedCouponPayment) {
+              logAppWarn('[UpdatePrices][BondAccrual] Expected coupon transaction missing on scheduled date', {
+                investmentId: inv.id,
+                investmentName: inv.name,
+                portfolioId: pid,
+                date: today,
+                couponFrequency: accrual?.meta?.couponFrequency || null,
+                expectedCouponDate: accrual?.meta?.expectedCouponDate || null,
+                lastCouponDate: accrual?.meta?.lastCouponDate || null,
+              });
+            }
           } else {
             currentValue = totalUnits * pricePerUnit;
           }
@@ -537,10 +626,24 @@ async function updateAllPrices(db, options = {}) {
         const profitLoss = reinvestedType
           ? (currentValue - investedAmount)
           : (currentValue + realizedGain - investedAmount);
-        const prevDay = getPrevDayPortfolio.get(inv.id, pid, today);
-        const prevValue = Number(prevDay?.current_value || 0);
+        const prevRows = getPrevRowsPortfolio.all(inv.id, pid, today);
+        const previousRow = prevRows.find((row) => {
+          const rowUnits = Number(row?.total_units || 0);
+          if (Math.abs(rowUnits) <= DAY_CHANGE_EPSILON_UNITS) return false;
+
+          if (!isMarketLinkedAssetType(inv.asset_type)) {
+            return true;
+          }
+
+          if (String(row?.price_source || '') === 'LOCF') return false;
+          return isWithinPreviousMarketSessions(row.date, today, db, marketHolidayCache);
+        });
+
+        const prevValue = Number(previousRow?.current_value || 0);
         const netFlowToday = Number(getNetFlowTodayPortfolio.get(inv.id, pid, today)?.net_flow || 0);
-        const dayChange = currentValue - prevValue - netFlowToday;
+        const dayChange = previousRow
+          ? (currentValue - prevValue - netFlowToday)
+          : 0;
         upsertDaily.run(
           inv.id, pid, today,
           quantizeForStorage(pricePerUnit),

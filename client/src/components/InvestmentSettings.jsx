@@ -6,6 +6,8 @@ import {
   updateInvestment,
   getInvestmentSymbolHistory,
   createInvestmentSymbolHistory,
+  updateInvestmentSymbolHistory,
+  deleteInvestmentSymbolHistory,
 } from '../services/api';
 import { ArrowLeft, Save } from 'lucide-react';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
@@ -27,8 +29,11 @@ export default function InvestmentSettings() {
   const [historyError, setHistoryError] = useState(null);
   const [historySuccess, setHistorySuccess] = useState('');
   const [isAddingHistory, setIsAddingHistory] = useState(false);
+  const [editingHistoryId, setEditingHistoryId] = useState(null);
   const [historyForm, setHistoryForm] = useState({
     symbol: '',
+    isin_code: '',
+    security_name: '',
     valid_from: '',
     valid_to: '',
     notes: '',
@@ -47,8 +52,11 @@ export default function InvestmentSettings() {
 
   const resetHistoryForm = () => {
     setIsAddingHistory(false);
+    setEditingHistoryId(null);
     setHistoryForm({
       symbol: '',
+      isin_code: '',
+      security_name: '',
       valid_from: '',
       valid_to: '',
       notes: '',
@@ -101,12 +109,49 @@ export default function InvestmentSettings() {
     setHistoryError(null);
     setHistorySuccess('');
     setIsAddingHistory(true);
+    setEditingHistoryId(null);
     setHistoryForm({
       symbol: '',
+      isin_code: '',
+      security_name: '',
       valid_from: '',
       valid_to: '',
       notes: '',
     });
+  };
+
+  const handleStartEditHistory = (row) => {
+    setHistoryError(null);
+    setHistorySuccess('');
+    setIsAddingHistory(true);
+    setEditingHistoryId(row.id);
+    setHistoryForm({
+      symbol: row.symbol || '',
+      isin_code: row.isin_code || '',
+      security_name: row.security_name || '',
+      valid_from: row.valid_from || '',
+      valid_to: row.valid_to || '',
+      notes: row.notes || '',
+    });
+  };
+
+  const handleDeleteHistory = async (row) => {
+    const confirmed = window.confirm('Delete this history row? This will mark daily values dirty for recomputation.');
+    if (!confirmed) return;
+    try {
+      setHistorySaving(true);
+      setHistoryError(null);
+      setHistorySuccess('');
+      await deleteInvestmentSymbolHistory(id, row.id);
+      setHistorySuccess('History row deleted successfully.');
+      await loadSymbolHistory(id);
+      resetHistoryForm();
+      setTimeout(() => setHistorySuccess(''), 3000);
+    } catch (e) {
+      setHistoryError(e.message || 'Failed to delete history row');
+    } finally {
+      setHistorySaving(false);
+    }
   };
 
   const handleSave = async (e) => {
@@ -148,13 +193,20 @@ export default function InvestmentSettings() {
       setHistorySuccess('');
       const payload = {
         symbol: historyForm.symbol,
+        isin_code: isMF ? (historyForm.isin_code || null) : null,
+        security_name: isMF ? (historyForm.security_name || null) : null,
         valid_from: historyForm.valid_from,
         valid_to: historyForm.valid_to || null,
         notes: historyForm.notes || null,
       };
 
-      await createInvestmentSymbolHistory(id, payload);
-      setHistorySuccess('Symbol history added successfully.');
+      if (editingHistoryId) {
+        await updateInvestmentSymbolHistory(id, editingHistoryId, payload);
+        setHistorySuccess('History row updated successfully.');
+      } else {
+        await createInvestmentSymbolHistory(id, payload);
+        setHistorySuccess('History row added successfully.');
+      }
 
       await loadSymbolHistory(id);
       resetHistoryForm();
@@ -171,7 +223,7 @@ export default function InvestmentSettings() {
 
   const isMF = data.asset_type === 'MUTUAL_FUND';
   const isNPS = data.asset_type === 'NPS';
-  const showSymbolHistory = data.asset_type === 'INDIAN_STOCK';
+  const showSymbolHistory = data.asset_type === 'INDIAN_STOCK' || data.asset_type === 'MUTUAL_FUND';
 
   return (
     <div>
@@ -335,13 +387,15 @@ export default function InvestmentSettings() {
         <Card className="shadow-sm mt-4">
           <Card.Body>
             <div className="d-flex align-items-center justify-content-between mb-2">
-              <h2 className="h6 fw-bold mb-0">Symbol History</h2>
+              <h2 className="h6 fw-bold mb-0">{isMF ? 'AMFI History' : 'Symbol History'}</h2>
               <Button variant="outline-primary" size="sm" onClick={handleStartAddHistory} disabled={historySaving || isAddingHistory}>
                 Add
               </Button>
             </div>
             <p className="text-muted small mb-3">
-              Track ticker changes over time for correct historical price fetch and compliance checks.
+              {isMF
+                ? 'Track AMFI code changes over time so missing cache windows are fetched using the correct historical identifier.'
+                : 'Track ticker changes over time for correct historical price fetch and compliance checks.'}
             </p>
 
             {historyError && (
@@ -357,19 +411,32 @@ export default function InvestmentSettings() {
               <Table size="sm" bordered responsive className="mb-3">
                 <thead>
                   <tr>
-                    <th>Symbol</th>
+                    <th>{isMF ? 'AMFI' : 'Symbol'}</th>
+                    {isMF && <th>ISIN</th>}
+                    {isMF && <th>Name</th>}
                     <th>Valid From</th>
                     <th>Valid To</th>
                     <th>Notes</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {historyRows.map((row) => (
                     <tr key={row.id}>
                       <td>{row.symbol}</td>
+                      {isMF && <td>{row.isin_code || '-'}</td>}
+                      {isMF && <td>{row.security_name || '-'}</td>}
                       <td>{row.valid_from}</td>
                       <td>{row.valid_to || 'Open'}</td>
                       <td className="small text-muted">{row.notes || '-'}</td>
+                      <td className="text-nowrap">
+                        <Button size="sm" variant="outline-secondary" className="me-2" onClick={() => handleStartEditHistory(row)} disabled={historySaving}>
+                          Edit
+                        </Button>
+                        <Button size="sm" variant="outline-danger" onClick={() => handleDeleteHistory(row)} disabled={historySaving}>
+                          Delete
+                        </Button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -381,19 +448,47 @@ export default function InvestmentSettings() {
             {isAddingHistory && (
               <Form onSubmit={handleSaveHistory}>
                 <Row className="g-3">
-                  <Col md={3}>
+                  <Col md={isMF ? 2 : 3}>
                     <Form.Group>
-                      <Form.Label className="small fw-semibold">Symbol</Form.Label>
+                      <Form.Label className="small fw-semibold">{isMF ? 'AMFI' : 'Symbol'}</Form.Label>
                       <Form.Control
                         type="text"
                         value={historyForm.symbol}
                         onChange={(e) => setHistoryForm((prev) => ({ ...prev, symbol: e.target.value }))}
-                        placeholder="e.g. ITIETF"
+                        placeholder={isMF ? 'e.g. 112496' : 'e.g. ITIETF'}
                         required
                         disabled={historySaving}
                       />
                     </Form.Group>
                   </Col>
+                  {isMF && (
+                    <Col md={2}>
+                      <Form.Group>
+                        <Form.Label className="small fw-semibold">ISIN</Form.Label>
+                        <Form.Control
+                          type="text"
+                          value={historyForm.isin_code}
+                          onChange={(e) => setHistoryForm((prev) => ({ ...prev, isin_code: e.target.value }))}
+                          placeholder="e.g. INF917K01254"
+                          disabled={historySaving}
+                        />
+                      </Form.Group>
+                    </Col>
+                  )}
+                  {isMF && (
+                    <Col md={2}>
+                      <Form.Group>
+                        <Form.Label className="small fw-semibold">Name</Form.Label>
+                        <Form.Control
+                          type="text"
+                          value={historyForm.security_name}
+                          onChange={(e) => setHistoryForm((prev) => ({ ...prev, security_name: e.target.value }))}
+                          placeholder="Scheme name"
+                          disabled={historySaving}
+                        />
+                      </Form.Group>
+                    </Col>
+                  )}
                   <Col md={3}>
                     <Form.Group>
                       <Form.Label className="small fw-semibold">Valid From</Form.Label>
@@ -431,7 +526,7 @@ export default function InvestmentSettings() {
                   </Col>
                   <Col xs={12} className="d-flex align-items-center gap-2">
                     <Button type="submit" variant="primary" disabled={historySaving}>
-                      {historySaving ? 'Saving...' : 'Add History Row'}
+                      {historySaving ? 'Saving...' : (editingHistoryId ? 'Update History Row' : 'Add History Row')}
                     </Button>
                     <Button type="button" variant="outline-secondary" onClick={resetHistoryForm} disabled={historySaving}>
                       Cancel

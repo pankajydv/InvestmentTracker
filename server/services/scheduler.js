@@ -10,7 +10,7 @@ applyEnvDefaults();
 
 const cron = require('node-cron');
 const { updateAllPrices } = require('./updater');
-const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate } = require('./dirtyBackfillService');
+const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate, markScopeDirty } = require('./dirtyBackfillService');
 const {
   fetchMutualFundHistory,
   fetchHistoricalUSDToINR,
@@ -43,7 +43,6 @@ function parseBooleanEnv(name, fallback = false) {
   return String(raw).toLowerCase() === 'true';
 }
 
-const INTRADAY_BACKFILL_MAX_SCOPES = parsePositiveIntEnv('INTRADAY_BACKFILL_MAX_SCOPES', 25);
 const ENABLE_INTRADAY_COMPLIANCE = String(process.env.ENABLE_INTRADAY_COMPLIANCE || 'false').toLowerCase() === 'true';
 const ENABLE_STARTUP_COMPLIANCE = String(process.env.ENABLE_STARTUP_COMPLIANCE || 'false').toLowerCase() === 'true';
 const ENABLE_STARTUP_PREFLIGHT = String(process.env.ENABLE_STARTUP_PREFLIGHT || 'false').toLowerCase() === 'true';
@@ -54,8 +53,13 @@ const HISTORICAL_PRICE_AUDIT_WINDOW_DAYS = parsePositiveIntEnv('HISTORICAL_PRICE
 const ENABLE_HISTORICAL_PRICE_REPAIR_WORKER = parseBooleanEnv('ENABLE_HISTORICAL_PRICE_REPAIR_WORKER', true);
 const HISTORICAL_PRICE_REPAIR_BATCH_SIZE = parsePositiveIntEnv('HISTORICAL_PRICE_REPAIR_BATCH_SIZE', 10);
 const HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS = parsePositiveIntEnv('HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS', 3);
+const ENABLE_FOREIGN_RECONCILE = parseBooleanEnv('ENABLE_FOREIGN_RECONCILE', true);
+const FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS = parsePositiveIntEnv('FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS', 10);
+const FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST = parseNonNegativeIntEnv('FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST', (4 * 60) + 25);
+const EXITED_UNITS_EPSILON = 1e-6;
 
 let isHistoricalPriceRepairWorkerRunning = false;
+let isSchedulerCycleRunning = false;
 
 function addDays(isoDate, days) {
   const d = new Date(`${isoDate}T00:00:00.000Z`);
@@ -84,6 +88,302 @@ function inferStockInstrumentType(symbol) {
   return /\.(NS|BO)$/i.test(String(symbol || '')) ? 'INDIAN_STOCK' : 'FOREIGN_STOCK';
 }
 
+function normalizeMutualFundCode(code) {
+  const raw = String(code || '').trim();
+  return raw || null;
+}
+
+function loadSymbolHistoryByInvestment(db, investmentIds = []) {
+  const ids = Array.from(new Set((investmentIds || []).map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)));
+  const map = new Map();
+  if (!ids.length) return map;
+
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT investment_id, symbol, date(valid_from) AS valid_from, date(valid_to) AS valid_to
+    FROM investment_symbol_history
+    WHERE investment_id IN (${placeholders})
+    ORDER BY investment_id ASC, valid_from ASC, id ASC
+  `).all(...ids);
+
+  for (const row of rows) {
+    const investmentId = Number(row.investment_id);
+    const list = map.get(investmentId) || [];
+    list.push({
+      symbol: String(row.symbol || '').trim(),
+      validFrom: String(row.valid_from || ''),
+      validTo: row.valid_to ? String(row.valid_to) : null,
+    });
+    map.set(investmentId, list);
+  }
+
+  return map;
+}
+
+function resolveMutualFundCodeForDate(investmentId, currentCode, date, historyByInvestment) {
+  const normalizedCurrent = normalizeMutualFundCode(currentCode);
+  const rows = historyByInvestment?.get(Number(investmentId)) || [];
+  for (const row of rows) {
+    if (!row?.symbol || !row?.validFrom) continue;
+    if (date < row.validFrom) continue;
+    if (row.validTo && date > row.validTo) continue;
+    return normalizeMutualFundCode(row.symbol) || normalizedCurrent;
+  }
+  return normalizedCurrent;
+}
+
+function buildMutualFundCodeWindows(investmentId, currentCode, fromDate, toDate, historyByInvestment) {
+  const windows = [];
+  let active = null;
+  const dates = eachDate(fromDate, toDate);
+  for (const date of dates) {
+    const code = resolveMutualFundCodeForDate(investmentId, currentCode, date, historyByInvestment);
+    if (!code) {
+      active = null;
+      continue;
+    }
+
+    if (!active || active.code !== code) {
+      active = { investmentId: Number(investmentId), code, fromDate: date, toDate: date };
+      windows.push(active);
+      continue;
+    }
+
+    active.toDate = date;
+  }
+  return windows;
+}
+
+function getIstClock(now = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(now);
+  const values = {};
+  for (const part of parts) {
+    if (!part?.type || part.type === 'literal') continue;
+    values[part.type] = part.value;
+  }
+
+  const date = `${values.year}-${values.month}-${values.day}`;
+  const hour = Number(values.hour || 0);
+  const minute = Number(values.minute || 0);
+  return {
+    date,
+    minutes: (hour * 60) + minute,
+  };
+}
+
+function getPreviousUsSessionDate(anchorDate) {
+  let cursor = anchorDate;
+  while (cursor) {
+    const day = new Date(`${cursor}T00:00:00.000Z`).getUTCDay();
+    if (day !== 0 && day !== 6) return cursor;
+    cursor = addDays(cursor, -1);
+  }
+  return anchorDate;
+}
+
+function resolveForeignSettlementDate(now = new Date()) {
+  const ist = getIstClock(now);
+  const anchor = ist.minutes < FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST
+    ? addDays(ist.date, -1)
+    : ist.date;
+  return getPreviousUsSessionDate(anchor);
+}
+
+function isIsoWeekday(dateIso) {
+  if (!dateIso) return false;
+  const day = new Date(`${dateIso}T00:00:00.000Z`).getUTCDay();
+  return day !== 0 && day !== 6;
+}
+
+function minIsoDate(...dates) {
+  const valid = dates.filter((d) => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d));
+  if (!valid.length) return null;
+  return valid.reduce((min, cur) => (cur < min ? cur : min), valid[0]);
+}
+
+function maxIsoDate(a, b) {
+  if (!a) return b || null;
+  if (!b) return a || null;
+  return a > b ? a : b;
+}
+
+function resolvePendingForeignDirtyStartByScope(db, runDate) {
+  const rows = db.prepare(`
+    SELECT s.investment_id, s.portfolio_id, MIN(date(s.dirty_from_date)) AS dirty_from_date
+    FROM dirty_backfill_scope s
+    JOIN investments i ON i.id = s.investment_id
+    WHERE i.asset_type = 'FOREIGN_STOCK'
+      AND s.status IN ('pending', 'running', 'failed')
+      AND date(s.dirty_from_date) <= ?
+      AND s.investment_id IS NOT NULL
+      AND s.portfolio_id IS NOT NULL
+    GROUP BY s.investment_id, s.portfolio_id
+  `).all(runDate);
+
+  const map = new Map();
+  for (const row of rows) {
+    const key = `${row.investment_id}:${row.portfolio_id}`;
+    map.set(key, String(row.dirty_from_date));
+  }
+  return map;
+}
+
+function resolveLocfSignalStartByScope(db, startDate, endDate) {
+  if (!startDate || !endDate || startDate > endDate) return new Map();
+
+  const rows = db.prepare(`
+    SELECT dv.investment_id, dv.portfolio_id, MIN(dv.date) AS locf_start
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE i.asset_type = 'FOREIGN_STOCK'
+      AND dv.portfolio_id IS NOT NULL
+      AND dv.price_source = 'LOCF'
+      AND date(dv.date) >= ?
+      AND date(dv.date) <= ?
+    GROUP BY dv.investment_id, dv.portfolio_id
+  `).all(startDate, endDate);
+
+  const map = new Map();
+  for (const row of rows) {
+    const locfDate = String(row.locf_start || '');
+    if (!isIsoWeekday(locfDate)) continue;
+    const key = `${row.investment_id}:${row.portfolio_id}`;
+    map.set(key, locfDate);
+  }
+  return map;
+}
+
+function resolveActiveForeignScopes(db, runDate) {
+  return db.prepare(`
+    SELECT
+      i.id AS investment_id,
+      t.portfolio_id,
+      MIN(date(t.transaction_date)) AS min_txn_date,
+      MAX(date(t.transaction_date)) AS max_txn_date,
+      COALESCE(SUM(
+        CASE
+          WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(t.units, 0)
+          WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(t.units, 0)
+          ELSE 0
+        END
+      ), 0) AS net_units
+    FROM investments i
+    JOIN transactions t ON t.investment_id = i.id
+    WHERE i.asset_type = 'FOREIGN_STOCK'
+      AND i.is_active != 0
+      AND COALESCE(i.exclude_from_tracking, 0) != 1
+      AND t.portfolio_id IS NOT NULL
+      AND date(t.transaction_date) <= ?
+    GROUP BY i.id, t.portfolio_id
+    ORDER BY i.id ASC, t.portfolio_id ASC
+  `).all(runDate);
+}
+
+function ensureForeignReconcileScopes(db, runDate, label, catchUp = null) {
+  if (!ENABLE_FOREIGN_RECONCILE) {
+    return {
+      enabled: false,
+      settlementDate: null,
+      lookbackStart: null,
+      enqueued: 0,
+      activeScopes: 0,
+    };
+  }
+
+  const settlementDate = resolveForeignSettlementDate();
+  if (!settlementDate || settlementDate > runDate) {
+    return {
+      enabled: true,
+      settlementDate,
+      lookbackStart: null,
+      enqueued: 0,
+      activeScopes: 0,
+      skipped: 'settlement-date-outside-run-window',
+    };
+  }
+
+  const lookbackStart = addDays(settlementDate, -(Math.max(1, Number(FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS || 10)) - 1));
+  const pendingDirtyByScope = resolvePendingForeignDirtyStartByScope(db, runDate);
+  const locfStartByScope = resolveLocfSignalStartByScope(db, lookbackStart, settlementDate);
+  const complianceInvalidFrom = (() => {
+    const row = db.prepare("SELECT value FROM config WHERE key = 'compliance_invalid_from' LIMIT 1").get();
+    const value = String(row?.value || '');
+    return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
+  })();
+
+  const watermarkCatchUpFrom = catchUp?.catchUpFrom && /^\d{4}-\d{2}-\d{2}$/.test(String(catchUp.catchUpFrom))
+    ? String(catchUp.catchUpFrom)
+    : null;
+
+  const activeScopes = resolveActiveForeignScopes(db, runDate)
+    .filter((row) => Number(row.net_units || 0) > EXITED_UNITS_EPSILON);
+
+  let enqueued = 0;
+  for (const scope of activeScopes) {
+    const key = `${scope.investment_id}:${scope.portfolio_id}`;
+    const fallbackStart = settlementDate;
+    const mergedStart = minIsoDate(
+      fallbackStart,
+      pendingDirtyByScope.get(key),
+      locfStartByScope.get(key),
+      watermarkCatchUpFrom,
+      complianceInvalidFrom
+    );
+    const boundedStart = maxIsoDate(mergedStart, lookbackStart);
+    const finalStart = maxIsoDate(boundedStart, String(scope.min_txn_date || boundedStart));
+    if (!finalStart || finalStart > settlementDate) continue;
+
+    const reasonParts = ['foreign-reconcile'];
+    if (pendingDirtyByScope.has(key)) reasonParts.push('pending-dirty');
+    if (locfStartByScope.has(key)) reasonParts.push('locf-signal');
+    if (watermarkCatchUpFrom) reasonParts.push('watermark-catchup');
+    if (complianceInvalidFrom) reasonParts.push('compliance-invalid-from');
+
+    const dirtyDate = markScopeDirty(db, {
+      investmentId: scope.investment_id,
+      portfolioId: scope.portfolio_id,
+      dirtyFromDate: finalStart,
+      reason: reasonParts.join('|'),
+      sourceEventId: `foreign-reconcile:${runDate}:${settlementDate}`,
+    });
+    if (dirtyDate) enqueued += 1;
+  }
+
+  logAppInfo(`[Scheduler] ${label}: Foreign reconcile scopes prepared`, {
+    runDate,
+    settlementDate,
+    lookbackStart,
+    watermarkCatchUpFrom,
+    complianceInvalidFrom,
+    activeScopes: activeScopes.length,
+    pendingDirtySignals: pendingDirtyByScope.size,
+    locfSignals: locfStartByScope.size,
+    enqueued,
+  });
+
+  return {
+    enabled: true,
+    settlementDate,
+    lookbackStart,
+    watermarkCatchUpFrom,
+    complianceInvalidFrom,
+    activeScopes: activeScopes.length,
+    pendingDirtySignals: pendingDirtyByScope.size,
+    locfSignals: locfStartByScope.size,
+    enqueued,
+  };
+}
+
 function fetchStockSeriesFromSource(symbol, startDate, endDate) {
   const from = new Date(`${startDate}T00:00:00.000Z`);
   from.setUTCDate(from.getUTCDate() - 7);
@@ -108,13 +408,39 @@ function fetchStockSeriesFromSource(symbol, startDate, endDate) {
             return;
           }
           const timestamps = result.timestamp || [];
-          const closes = result.indicators?.quote?.[0]?.close || [];
+          const quote = result.indicators?.quote?.[0] || {};
+          const opens = quote.open || [];
+          const highs = quote.high || [];
+          const lows = quote.low || [];
+          const closes = quote.close || [];
+          const volumes = quote.volume || [];
           const rows = [];
           for (let i = 0; i < timestamps.length; i += 1) {
             const close = closes[i];
             if (close == null) continue;
             const d = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
-            rows.push({ date: d, close: Number(close), source: 'YAHOO' });
+            const closeNum = Number(close);
+            if (!Number.isFinite(closeNum) || closeNum <= 0) continue;
+
+            const openNumRaw = Number(opens[i]);
+            const highNumRaw = Number(highs[i]);
+            const lowNumRaw = Number(lows[i]);
+            const volumeRaw = Number(volumes[i]);
+
+            const openNum = Number.isFinite(openNumRaw) && openNumRaw > 0 ? openNumRaw : closeNum;
+            const highNum = Number.isFinite(highNumRaw) && highNumRaw > 0 ? highNumRaw : Math.max(openNum, closeNum);
+            const lowNum = Number.isFinite(lowNumRaw) && lowNumRaw > 0 ? lowNumRaw : Math.min(openNum, closeNum);
+            const volumeNum = Number.isFinite(volumeRaw) && volumeRaw >= 0 ? Math.round(volumeRaw) : 0;
+
+            rows.push({
+              date: d,
+              open: openNum,
+              high: highNum,
+              low: lowNum,
+              close: closeNum,
+              volume: volumeNum,
+              source: 'YAHOO',
+            });
           }
           resolve(rows);
         } catch (e) {
@@ -167,12 +493,14 @@ async function warmRecentMarketCache(db, runDate, refreshDays, label) {
       .map((r) => String(r.symbol).trim())
       .filter(Boolean)
   )];
-  const amfiCodes = [...new Set(
-    activeRows
-      .filter((r) => r.asset_type === 'MUTUAL_FUND' && r.amfi_code)
-      .map((r) => String(r.amfi_code).trim())
-      .filter(Boolean)
-  )];
+  const mfActiveRows = activeRows.filter((r) => r.asset_type === 'MUTUAL_FUND');
+  const mfHistoryByInvestment = loadSymbolHistoryByInvestment(db, mfActiveRows.map((r) => r.id));
+  const mutualFundWindows = [];
+  for (const row of mfActiveRows) {
+    const windows = buildMutualFundCodeWindows(row.id, row.amfi_code, fromDate, runDate, mfHistoryByInvestment);
+    for (const window of windows) mutualFundWindows.push(window);
+  }
+  const amfiCodes = [...new Set(mutualFundWindows.map((w) => w.code).filter(Boolean))];
   const hasForeign = activeRows.some((r) => r.asset_type === 'FOREIGN_STOCK');
 
   logAppInfo(`[Scheduler] ${label}: Nightly cache warm started`, {
@@ -182,6 +510,7 @@ async function warmRecentMarketCache(db, runDate, refreshDays, label) {
     stockSymbols: stockSymbols.length,
     sgbSymbols: sgbSymbols.length,
     mutualFunds: amfiCodes.length,
+    mutualFundWindows: mutualFundWindows.length,
     foreignHoldings: hasForeign,
   });
 
@@ -247,6 +576,7 @@ async function warmRecentMarketCache(db, runDate, refreshDays, label) {
     stockSymbols: stockSymbols.length,
     sgbSymbols: sgbSymbols.length,
     mutualFunds: amfiCodes.length,
+    mutualFundWindows: mutualFundWindows.length,
     stockCalls,
     sgbCalls,
     mfCalls,
@@ -318,6 +648,15 @@ function ensureSchedulerCatchUpScopes(db, runDate, label) {
  * @param {string[]} [options.assetTypes]     - restrict price update to these asset types
  */
 async function runSchedulerCycle(db, label, options = {}) {
+  if (isSchedulerCycleRunning) {
+    logAppWarn(`[Scheduler] ${label}: Skipping cycle because another scheduler cycle is already running`, {
+      requestedLabel: label,
+    });
+    return { skipped: true, reason: 'scheduler-cycle-already-running' };
+  }
+
+  isSchedulerCycleRunning = true;
+  try {
   const runDate = todayIso();
   logAppInfo(`[Scheduler] ${label}: Step 1/4 scheduler cycle started`, {
     runDate,
@@ -361,11 +700,11 @@ async function runSchedulerCycle(db, label, options = {}) {
     preflightRunDate,
   });
   const catchUp = ensureSchedulerCatchUpScopes(db, preflightRunDate, label);
-  const preflight = await runDirtyBackfillPreflight(db, preflightRunDate, {
-    maxScopes: options.backfillMaxScopes,
-  });
+  const foreignReconcile = ensureForeignReconcileScopes(db, preflightRunDate, label, catchUp);
+  const preflight = await runDirtyBackfillPreflight(db, preflightRunDate);
   logAppInfo(`[Scheduler] ${label}: Step 3/4 completed`, {
     catchUp,
+    foreignReconcile,
     preflight,
   });
 
@@ -374,9 +713,10 @@ async function runSchedulerCycle(db, label, options = {}) {
       runDate,
       preflightRunDate,
       catchUp,
+      foreignReconcile,
       preflight,
     });
-    return { preflightOnly: true, catchUp, preflight };
+    return { preflightOnly: true, catchUp, foreignReconcile, preflight };
   }
 
   const warmRecentCacheDays = Number(options.warmRecentCacheDays || 0);
@@ -442,6 +782,7 @@ async function runSchedulerCycle(db, label, options = {}) {
     runDate,
     preflightRunDate,
     catchUp,
+    foreignReconcile,
     preflight,
     historicalPriceAudit,
     historicalPriceRepair,
@@ -450,7 +791,10 @@ async function runSchedulerCycle(db, label, options = {}) {
     errors: result?.errors || 0,
     watermarkUpdated: !!result?.watermarkUpdated,
   });
-  return { catchUp, preflight, historicalPriceAudit, historicalPriceRepair, result };
+  return { catchUp, foreignReconcile, preflight, historicalPriceAudit, historicalPriceRepair, result };
+  } finally {
+    isSchedulerCycleRunning = false;
+  }
 }
 
 async function runComplianceScan(db, label, options = {}) {
@@ -516,7 +860,6 @@ function startScheduler(db) {
       try {
         await runSchedulerCycle(db, `Intraday run ${hour}:25`, {
           assetTypes: ['INDIAN_STOCK', 'FOREIGN_STOCK'],
-          backfillMaxScopes: INTRADAY_BACKFILL_MAX_SCOPES,
         });
         if (ENABLE_INTRADAY_COMPLIANCE) {
           await runComplianceScan(db, `Intraday run ${hour}:25`, { mode: 'incremental' });
@@ -572,7 +915,6 @@ function startScheduler(db) {
     earlyMorningAccrualRun: '04:25',
     intradayRuns: 8,
     nightlyRun: '22:25',
-    intradayBackfillMaxScopes: INTRADAY_BACKFILL_MAX_SCOPES,
     nightlyMarketCacheWarmDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
     historicalPriceAuditEnabled: ENABLE_HISTORICAL_PRICE_AUDIT,
     historicalPriceAuditWindowDays: HISTORICAL_PRICE_AUDIT_WINDOW_DAYS,
@@ -580,6 +922,9 @@ function startScheduler(db) {
     historicalPriceRepairWorkerEnabled: ENABLE_HISTORICAL_PRICE_REPAIR_WORKER,
     historicalPriceRepairBatchSize: HISTORICAL_PRICE_REPAIR_BATCH_SIZE,
     historicalPriceRepairMaxAttempts: HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS,
+    foreignReconcileEnabled: ENABLE_FOREIGN_RECONCILE,
+    foreignReconcileMaxLookbackDays: FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS,
+    foreignReconcileSettlementCutoffMinutesIst: FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST,
     intradayComplianceEnabled: ENABLE_INTRADAY_COMPLIANCE,
     startupPreflightEnabled: ENABLE_STARTUP_PREFLIGHT,
     startupComplianceEnabled: ENABLE_STARTUP_COMPLIANCE,

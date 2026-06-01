@@ -54,6 +54,13 @@ function isInternalXirrCashflow(assetType, transactionType) {
   return normalizedType === 'RECONCILE';
 }
 
+function isAccrualOnlyXirrCashflow(transactionType, notes) {
+  const normalizedType = String(transactionType || '').toUpperCase();
+  if (normalizedType !== 'INTEREST') return false;
+  const noteText = String(notes || '').toUpperCase();
+  return noteText.includes('AUTO_ACCRUAL_INTERNAL') || noteText.includes('ACCRUAL_ONLY_INTERNAL');
+}
+
 function xnpv(rate, flows, baseDate) {
   const msPerDay = 24 * 60 * 60 * 1000;
   return flows.reduce((sum, flow) => {
@@ -151,7 +158,7 @@ module.exports = function (db) {
     const portfolioIdNum = portfolio_id ? parseInt(portfolio_id, 10) : null;
 
     const latestValueByPortfolioStmt = db.prepare('SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1');
-    const txnsByPortfolioStmt = db.prepare('SELECT transaction_type, transaction_date, amount, fees FROM transactions WHERE investment_id = ? AND portfolio_id = ?');
+    const txnsByPortfolioStmt = db.prepare('SELECT transaction_type, transaction_date, amount, fees, notes FROM transactions WHERE investment_id = ? AND portfolio_id = ?');
 
     const enriched = investments.map((inv) => {
       // For portfolio-scoped queries or combined: aggregate from all portfolio-scoped rows
@@ -167,7 +174,7 @@ module.exports = function (db) {
 
       const txns = portfolioIdNum
         ? txnsByPortfolioStmt.all(inv.id, portfolioIdNum)
-        : db.prepare('SELECT transaction_type, transaction_date, amount, fees FROM transactions WHERE investment_id = ?').all(inv.id);
+        : db.prepare('SELECT transaction_type, transaction_date, amount, fees, notes FROM transactions WHERE investment_id = ?').all(inv.id);
       const xirrCashflows = [];
 
       for (const txn of txns) {
@@ -178,8 +185,11 @@ module.exports = function (db) {
         const fees = Number(txn.fees) || 0;
         let cashflow = 0;
         const treatAsInternal = isInternalXirrCashflow(inv.asset_type, txn.transaction_type);
+        const treatAsAccrualOnly = isAccrualOnlyXirrCashflow(txn.transaction_type, txn.notes);
 
-        if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+        if (treatAsAccrualOnly) {
+          cashflow = 0;
+        } else if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
           cashflow = -(amount + fees);
         } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
           cashflow = amount - fees;
@@ -429,10 +439,11 @@ module.exports = function (db) {
     return m[1];
   }
 
-  function normalizeSymbolInput(input) {
+  function normalizeSymbolInput(input, assetType = null) {
     if (input == null) return null;
     const raw = String(input).trim().toUpperCase();
     if (!raw) return null;
+    if (String(assetType || '').toUpperCase() === 'MUTUAL_FUND') return raw;
     if (raw.includes('.')) return raw;
     return `${raw}.NS`;
   }
@@ -472,13 +483,13 @@ module.exports = function (db) {
   }
     router.get('/:id/symbol-history', (req, res) => {
       try {
-        const investment = db.prepare('SELECT id, name, asset_type, ticker_symbol FROM investments WHERE id = ?').get(req.params.id);
+        const investment = db.prepare('SELECT id, name, asset_type, ticker_symbol, amfi_code, isin_code FROM investments WHERE id = ?').get(req.params.id);
         if (!investment) {
           return res.status(404).json({ error: 'Investment not found' });
         }
 
         const rows = db.prepare(`
-          SELECT id, investment_id, symbol, valid_from, valid_to, notes, created_at, updated_at
+          SELECT id, investment_id, symbol, isin_code, security_name, valid_from, valid_to, notes, created_at, updated_at
           FROM investment_symbol_history
           WHERE investment_id = ?
           ORDER BY valid_from ASC, id ASC
@@ -490,6 +501,8 @@ module.exports = function (db) {
             name: investment.name,
             asset_type: investment.asset_type,
             ticker_symbol: investment.ticker_symbol,
+            amfi_code: investment.amfi_code,
+            isin_code: investment.isin_code,
           },
           history: rows,
         });
@@ -502,27 +515,29 @@ module.exports = function (db) {
     router.post('/:id/symbol-history', (req, res) => {
       try {
         const investmentId = Number(req.params.id);
-        const investment = db.prepare('SELECT id, name FROM investments WHERE id = ?').get(investmentId);
+        const investment = db.prepare('SELECT id, name, asset_type FROM investments WHERE id = ?').get(investmentId);
         if (!investment) {
           return res.status(404).json({ error: 'Investment not found' });
         }
 
-        const symbol = normalizeSymbolInput(req.body.symbol);
+        const symbol = normalizeSymbolInput(req.body.symbol, investment.asset_type);
         const validFrom = normalizeDateOnly(req.body.valid_from);
         const validTo = normalizeDateOnly(req.body.valid_to);
+        const isinCode = req.body.isin_code ? String(req.body.isin_code).trim().toUpperCase() : null;
+        const securityName = req.body.security_name ? String(req.body.security_name).trim() : null;
         const notes = req.body.notes ? String(req.body.notes).trim() : null;
 
         if (!symbol) {
-          return res.status(400).json({ error: 'symbol is required' });
+          return res.status(400).json({ error: investment.asset_type === 'MUTUAL_FUND' ? 'amfi code is required' : 'symbol is required' });
         }
 
         assertValidDateRangeOrThrow(validFrom, validTo);
         ensureNoSymbolWindowOverlap(db, { investmentId, validFrom, validTo });
 
         const result = db.prepare(`
-          INSERT INTO investment_symbol_history (investment_id, symbol, valid_from, valid_to, notes)
-          VALUES (?, ?, ?, ?, ?)
-        `).run(investmentId, symbol, validFrom, validTo || null, notes);
+          INSERT INTO investment_symbol_history (investment_id, symbol, isin_code, security_name, valid_from, valid_to, notes)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(investmentId, symbol, isinCode, securityName, validFrom, validTo || null, notes);
 
         markScopeDirty(db, {
           investmentId,
@@ -562,8 +577,14 @@ module.exports = function (db) {
         }
 
         const symbol = req.body.symbol !== undefined
-          ? normalizeSymbolInput(req.body.symbol)
+          ? normalizeSymbolInput(req.body.symbol, investment.asset_type)
           : existing.symbol;
+        const isinCode = req.body.isin_code !== undefined
+          ? (req.body.isin_code ? String(req.body.isin_code).trim().toUpperCase() : null)
+          : existing.isin_code;
+        const securityName = req.body.security_name !== undefined
+          ? (req.body.security_name ? String(req.body.security_name).trim() : null)
+          : existing.security_name;
         const validFrom = req.body.valid_from !== undefined
           ? normalizeDateOnly(req.body.valid_from)
           : existing.valid_from;
@@ -575,7 +596,7 @@ module.exports = function (db) {
           : existing.notes;
 
         if (!symbol) {
-          return res.status(400).json({ error: 'symbol is required' });
+          return res.status(400).json({ error: investment.asset_type === 'MUTUAL_FUND' ? 'amfi code is required' : 'symbol is required' });
         }
 
         assertValidDateRangeOrThrow(validFrom, validTo);
@@ -589,12 +610,14 @@ module.exports = function (db) {
         db.prepare(`
           UPDATE investment_symbol_history
           SET symbol = ?,
+              isin_code = ?,
+              security_name = ?,
               valid_from = ?,
               valid_to = ?,
               notes = ?,
               updated_at = datetime('now')
           WHERE id = ? AND investment_id = ?
-        `).run(symbol, validFrom, validTo || null, notes, historyId, investmentId);
+        `).run(symbol, isinCode, securityName, validFrom, validTo || null, notes, historyId, investmentId);
 
         const dirtyFromDate = [existing.valid_from, validFrom].filter(Boolean).sort()[0];
         markScopeDirty(db, {
@@ -612,6 +635,40 @@ module.exports = function (db) {
           return res.status(400).json({ error: message });
         }
         return res.status(500).json({ error: message });
+      }
+    });
+
+    // ─── Delete symbol history row ─────────────────────────────────────────
+    router.delete('/:id/symbol-history/:historyId', (req, res) => {
+      try {
+        const investmentId = Number(req.params.id);
+        const historyId = Number(req.params.historyId);
+
+        const investment = db.prepare('SELECT id FROM investments WHERE id = ?').get(investmentId);
+        if (!investment) {
+          return res.status(404).json({ error: 'Investment not found' });
+        }
+
+        const existing = db.prepare(`
+          SELECT * FROM investment_symbol_history
+          WHERE id = ? AND investment_id = ?
+        `).get(historyId, investmentId);
+        if (!existing) {
+          return res.status(404).json({ error: 'Symbol history row not found' });
+        }
+
+        db.prepare('DELETE FROM investment_symbol_history WHERE id = ? AND investment_id = ?').run(historyId, investmentId);
+
+        markScopeDirty(db, {
+          investmentId,
+          portfolioId: null,
+          dirtyFromDate: existing.valid_from,
+          reason: 'symbol_history_delete',
+        });
+
+        res.json({ success: true });
+      } catch (e) {
+        return res.status(500).json({ error: e.message || 'Failed to delete symbol history' });
       }
     });
 

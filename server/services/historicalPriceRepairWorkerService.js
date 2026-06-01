@@ -1,4 +1,4 @@
-const { fetchMutualFundHistory, fetchHistoricalOHLC, fetchHistoricalUSDToINRRange } = require('./priceService');
+const { fetchMutualFundHistory, fetchHistoricalOHLCRange, fetchHistoricalUSDToINRRange } = require('./priceService');
 const { getSGBHistoricalPrices } = require('./sgbBhavcopy');
 const {
   claimPendingBatch,
@@ -28,18 +28,13 @@ function eachDate(fromDate, toDate) {
 
 async function processStockScope(symbol, fromDate, toDate) {
   const dates = eachDate(fromDate, toDate);
-  let ok = 0;
-  for (const d of dates) {
-    try {
-      await fetchHistoricalOHLC(symbol, d);
-      ok += 1;
-    } catch (_) {
-      // Best effort. We validate aggregate success after loop.
-    }
-  }
-  if (ok === 0) {
+  const rows = await fetchHistoricalOHLCRange(symbol, fromDate, toDate);
+  const ok = Array.isArray(rows) ? rows.length : 0;
+
+  if (ok <= 0) {
     throw new Error(`No stock prices fetched for ${symbol} in range ${fromDate}..${toDate}`);
   }
+
   return { attemptedDays: dates.length, successfulDays: ok };
 }
 

@@ -53,23 +53,37 @@ function mergeGaps(gaps) {
 
   const merged = [];
   for (const [key, rows] of grouped.entries()) {
-    rows.sort((a, b) => a.fromDate.localeCompare(b.fromDate));
-    let current = null;
+    let minFrom = null;
+    let maxTo = null;
+    let minPriority = null;
+    let sourceEventId = null;
+    const reasons = new Set();
+
     for (const row of rows) {
-      if (!current) {
-        current = { ...row };
-        continue;
+      if (!minFrom || row.fromDate < minFrom) minFrom = row.fromDate;
+      if (!maxTo || row.toDate > maxTo) maxTo = row.toDate;
+
+      const p = Number(row.priority);
+      if (Number.isFinite(p)) {
+        if (minPriority == null || p < minPriority) minPriority = p;
       }
 
-      if (row.fromDate <= addDays(current.toDate, 1)) {
-        if (row.toDate > current.toDate) current.toDate = row.toDate;
-        current.reason = `${current.reason};${row.reason}`;
-      } else {
-        merged.push(current);
-        current = { ...row };
-      }
+      if (!sourceEventId && row.sourceEventId) sourceEventId = row.sourceEventId;
+      if (row.reason) reasons.add(String(row.reason));
     }
-    if (current) merged.push(current);
+
+    if (minFrom && maxTo) {
+      const first = rows[0] || {};
+      merged.push({
+        ...first,
+        fromDate: minFrom,
+        toDate: maxTo,
+        reason: Array.from(reasons).join(';'),
+        priority: minPriority ?? first.priority,
+        sourceEventId: sourceEventId ?? first.sourceEventId,
+      });
+    }
+
     void key;
   }
 
@@ -307,6 +321,8 @@ async function auditHistoricalPriceCoverage(db, options = {}) {
     activeInstrumentRows: activeRows.length,
     dirtyScopeInstrumentRows: dirtyRows.length,
     candidateGapCount: candidates.length,
+    groupedInstrumentCount: new Set(candidates.map((g) => `${g.instrumentType}::${g.symbol}`)).size,
+    envelopeGapCount: mergedGaps.length,
     mergedGapCount: mergedGaps.length,
     sampleGaps: mergedGaps.slice(0, 10),
     enqueueSummary,

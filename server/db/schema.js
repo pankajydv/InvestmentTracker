@@ -106,7 +106,7 @@ function initializeDb(db) {
       account_number TEXT,         -- For PPF/SSY/PF accounts
       currency TEXT DEFAULT 'INR', -- INR or USD
       face_value REAL,              -- Face/par value per unit (for bonds)
-      coupon_rate REAL,             -- Annual coupon rate in percent (for bonds)
+      coupon_rate REAL,             -- Annual coupon rate percentage (for bonds)
       coupon_frequency TEXT,        -- MONTHLY, QUARTERLY, SEMI_ANNUAL, ANNUAL (for bonds)
       maturity_date TEXT,           -- Maturity date (for bonds)
       notes TEXT,
@@ -274,25 +274,6 @@ function initializeDb(db) {
       completed_at TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS corporate_action_suggestions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      source TEXT NOT NULL DEFAULT 'auto_backfill',
-      action TEXT NOT NULL CHECK(action IN ('inserted', 'updated', 'deleted')),
-      investment_id INTEGER NOT NULL,
-      portfolio_id INTEGER,
-      transaction_type TEXT NOT NULL,
-      transaction_date TEXT NOT NULL,
-      fingerprint TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      notes TEXT,
-      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected', 'applied')),
-      created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now')),
-      resolved_at TEXT,
-      FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
-      FOREIGN KEY (portfolio_id) REFERENCES portfolios(id) ON DELETE SET NULL
-    );
-
     -- Applied schema migrations (audit + idempotency)
     CREATE TABLE IF NOT EXISTS schema_migrations (
       id TEXT PRIMARY KEY,
@@ -319,9 +300,6 @@ function initializeDb(db) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_symbol_history_unique_window ON investment_symbol_history(investment_id, symbol, valid_from);
     CREATE INDEX IF NOT EXISTS idx_hist_price_repair_status_priority ON historical_price_repair_scope(status, priority, created_at);
     CREATE INDEX IF NOT EXISTS idx_hist_price_repair_lookup ON historical_price_repair_scope(instrument_type, symbol, from_date, to_date, status);
-    CREATE INDEX IF NOT EXISTS idx_ca_suggestions_status_created ON corporate_action_suggestions(status, created_at);
-    CREATE INDEX IF NOT EXISTS idx_ca_suggestions_fingerprint ON corporate_action_suggestions(fingerprint);
-    CREATE INDEX IF NOT EXISTS idx_ca_suggestions_investment_date ON corporate_action_suggestions(investment_id, transaction_date);
     CREATE INDEX IF NOT EXISTS idx_market_holidays_year ON market_holidays(year);
     CREATE INDEX IF NOT EXISTS idx_daily_data_gaps_entity ON daily_data_gaps(table_name, entity_id);
 
@@ -405,7 +383,6 @@ function initializeDb(db) {
           account_number TEXT,
           currency TEXT DEFAULT 'INR',
           face_value REAL,
-          coupon_rate REAL,
           coupon_frequency TEXT,
           maturity_date TEXT,
           notes TEXT,
@@ -426,7 +403,7 @@ function initializeDb(db) {
       db.exec(`
         INSERT INTO investments (
           id, name, asset_type, ticker_symbol, amfi_code, account_number,
-          currency, face_value, coupon_rate, coupon_frequency, maturity_date, notes,
+          currency, face_value, coupon_frequency, maturity_date, notes,
           display_name, isin_code, previous_isin_codes, opening_balance,
           is_active, created_at, updated_at, category
         )
@@ -439,7 +416,6 @@ function initializeDb(db) {
           ${selectOr('account_number', 'NULL')},
           ${selectOr('currency', "'INR'")},
           ${selectOr('face_value', 'NULL')},
-          ${selectOr('coupon_rate', 'NULL')},
           ${selectOr('coupon_frequency', 'NULL')},
           ${selectOr('maturity_date', 'NULL')},
           ${selectOr('notes', 'NULL')},
@@ -577,79 +553,6 @@ function initializeDb(db) {
 
   // Add previous_isin_codes column if missing
   const invCols = db.prepare("PRAGMA table_info(investments)").all().map(c => c.name);
-
-  // Add coupon_rate for bonds and backfill from name/notes/interest transactions.
-  const bondCouponRateMigrationId = '20260601-add-and-backfill-bond-coupon-rate';
-  if (!hasMigrationRecord(db, bondCouponRateMigrationId)) {
-    if (!migrationsEnabled) {
-      throw new Error(`Pending migration ${bondCouponRateMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
-    }
-
-    db.exec('BEGIN');
-    try {
-      const invColsNow = db.prepare("PRAGMA table_info(investments)").all().map(c => c.name);
-      if (!invColsNow.includes('coupon_rate')) {
-        db.exec("ALTER TABLE investments ADD COLUMN coupon_rate REAL");
-      }
-
-      const bonds = db.prepare(`
-        SELECT id, name, notes, face_value, coupon_frequency
-        FROM investments
-        WHERE asset_type = 'BOND'
-      `).all();
-      const txRowsStmt = db.prepare(`
-        SELECT amount, units
-        FROM transactions
-        WHERE investment_id = ?
-          AND transaction_type = 'INTEREST'
-          AND COALESCE(amount, 0) > 0
-          AND COALESCE(units, 0) > 0
-        ORDER BY date(transaction_date) DESC, id DESC
-        LIMIT 20
-      `);
-      const updateCouponRate = db.prepare('UPDATE investments SET coupon_rate = ? WHERE id = ?');
-
-      let updatedCount = 0;
-      for (const bond of bonds) {
-        let rate = parseCouponRateFromText(bond.name);
-        if (!(rate > 0)) rate = parseCouponRateFromText(bond.notes);
-
-        if (!(rate > 0)) {
-          const frequencyFactor = getCouponFrequencyFactor(bond.coupon_frequency);
-          const faceValue = Number(bond.face_value || 0);
-          if (frequencyFactor > 0 && faceValue > 0) {
-            const inferredRates = txRowsStmt
-              .all(bond.id)
-              .map((r) => {
-                const amount = Number(r.amount || 0);
-                const units = Number(r.units || 0);
-                if (!(amount > 0) || !(units > 0)) return null;
-                return (amount * frequencyFactor * 100) / (units * faceValue);
-              })
-              .filter((v) => Number.isFinite(v) && v > 0 && v < 100);
-
-            if (inferredRates.length > 0) {
-              const avg = inferredRates.reduce((sum, v) => sum + v, 0) / inferredRates.length;
-              rate = Math.round(avg * 10000) / 10000;
-            }
-          }
-        }
-
-        if (rate > 0) {
-          updateCouponRate.run(rate, bond.id);
-          updatedCount += 1;
-        }
-      }
-
-      db.exec('COMMIT');
-      assertDbIntegrity(db, bondCouponRateMigrationId);
-      recordMigration(db, bondCouponRateMigrationId, 'applied', `coupon_rate populated for ${updatedCount} bond(s)`);
-    } catch (e) {
-      db.exec('ROLLBACK');
-      throw e;
-    }
-  }
-
   if (requireMigrationsEnabled('20260412-add-investments-previous-isin-codes', !invCols.includes('previous_isin_codes'), 'investments.previous_isin_codes missing')) {
     db.exec("ALTER TABLE investments ADD COLUMN previous_isin_codes TEXT");
     assertDbIntegrity(db, '20260412-add-investments-previous-isin-codes');
@@ -1290,6 +1193,10 @@ function initializeDb(db) {
   if (!invColsNow.has('exclude_from_tracking')) {
     db.exec("ALTER TABLE investments ADD COLUMN exclude_from_tracking INTEGER DEFAULT 0");
     addedInvestmentCols.push('exclude_from_tracking');
+  }
+  if (!invColsNow.has('coupon_rate')) {
+    db.exec("ALTER TABLE investments ADD COLUMN coupon_rate REAL");
+    addedInvestmentCols.push('coupon_rate');
   }
 
   if (addedInvestmentCols.length > 0) {
@@ -2465,42 +2372,11 @@ function initializeDb(db) {
 
   // Ensure backfill watermark key exists even on upgraded DBs.
   db.prepare("INSERT OR IGNORE INTO config (key, value, updated_at) VALUES ('backfill_watermark', '', datetime('now'))").run();
-
-  ensureNumericPrecisionGuardrailsMigration(db);
 }
 
 /**
  * Infer mutual fund category from scheme name
  */
-function parseCouponRateFromText(value) {
-  const text = String(value || '');
-  if (!text) return null;
-  const match = text.match(/(\d+(?:\.\d+)?)\s*%/);
-  if (!match) return null;
-
-  const rate = Number(match[1]);
-  if (!Number.isFinite(rate) || rate <= 0 || rate >= 100) return null;
-  return rate;
-}
-
-function getCouponFrequencyFactor(frequency) {
-  const normalized = String(frequency || '').trim().toUpperCase();
-  switch (normalized) {
-    case 'MONTHLY':
-      return 12;
-    case 'QUARTERLY':
-      return 4;
-    case 'SEMI_ANNUAL':
-    case 'SEMIANNUAL':
-    case 'HALF_YEARLY':
-      return 2;
-    case 'ANNUAL':
-      return 1;
-    default:
-      return 0;
-  }
-}
-
 function inferMFCategory(name) {
   const n = name.toLowerCase();
   if (n.includes('elss') || n.includes('tax saver') || n.includes('tax saving')) return 'ELSS';
@@ -2628,179 +2504,6 @@ function ensureRemoveCombinedAggregatesMigration(db) {
       db.exec('ROLLBACK');
       throw e;
     }
-  }
-}
-
-function ensureNumericPrecisionGuardrailsMigration(db) {
-  const migrationId = '20260531-enforce-six-decimal-units-and-prices';
-  const hasMigration = db.prepare('SELECT id FROM schema_migrations WHERE id = ?').get(migrationId);
-  const hasMarketPriceCacheTable = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_price_cache'").get();
-
-  if (hasMigration) return;
-
-  db.exec('BEGIN');
-  try {
-    // One-time normalization for existing rows.
-    db.exec(`
-      UPDATE transactions
-      SET
-        units = CASE WHEN units IS NULL THEN NULL ELSE ROUND(units, 6) END,
-        price_per_unit = CASE WHEN price_per_unit IS NULL THEN NULL ELSE ROUND(price_per_unit, 6) END,
-        exchange_rate_used = CASE WHEN exchange_rate_used IS NULL THEN NULL ELSE ROUND(exchange_rate_used, 6) END,
-        fmv_per_unit = CASE WHEN fmv_per_unit IS NULL THEN NULL ELSE ROUND(fmv_per_unit, 6) END,
-        gross_units = CASE WHEN gross_units IS NULL THEN NULL ELSE ROUND(gross_units, 6) END,
-        tax_withheld_units = CASE WHEN tax_withheld_units IS NULL THEN NULL ELSE ROUND(tax_withheld_units, 6) END;
-
-      UPDATE daily_values
-      SET
-        price_per_unit = CASE WHEN price_per_unit IS NULL THEN NULL ELSE ROUND(price_per_unit, 6) END,
-        total_units = CASE WHEN total_units IS NULL THEN NULL ELSE ROUND(total_units, 6) END;
-    `);
-
-    if (hasMarketPriceCacheTable) {
-      db.exec(`
-        UPDATE market_price_cache
-        SET
-          open = CASE WHEN open IS NULL THEN NULL ELSE ROUND(open, 6) END,
-          high = CASE WHEN high IS NULL THEN NULL ELSE ROUND(high, 6) END,
-          low = CASE WHEN low IS NULL THEN NULL ELSE ROUND(low, 6) END,
-          close = CASE WHEN close IS NULL THEN NULL ELSE ROUND(close, 6) END,
-          adj_close = CASE WHEN adj_close IS NULL THEN NULL ELSE ROUND(adj_close, 6) END,
-          reverse_factor = CASE WHEN reverse_factor IS NULL THEN NULL ELSE ROUND(reverse_factor, 6) END;
-      `);
-    }
-
-    // Write-time precision guardrails for all code paths.
-    db.exec(`
-      CREATE TRIGGER IF NOT EXISTS trg_transactions_precision_insert
-      AFTER INSERT ON transactions
-      WHEN
-        (NEW.units IS NOT NULL AND ABS(NEW.units - ROUND(NEW.units, 6)) > 0.0000005)
-        OR (NEW.price_per_unit IS NOT NULL AND ABS(NEW.price_per_unit - ROUND(NEW.price_per_unit, 6)) > 0.0000005)
-        OR (NEW.exchange_rate_used IS NOT NULL AND ABS(NEW.exchange_rate_used - ROUND(NEW.exchange_rate_used, 6)) > 0.0000005)
-        OR (NEW.fmv_per_unit IS NOT NULL AND ABS(NEW.fmv_per_unit - ROUND(NEW.fmv_per_unit, 6)) > 0.0000005)
-        OR (NEW.gross_units IS NOT NULL AND ABS(NEW.gross_units - ROUND(NEW.gross_units, 6)) > 0.0000005)
-        OR (NEW.tax_withheld_units IS NOT NULL AND ABS(NEW.tax_withheld_units - ROUND(NEW.tax_withheld_units, 6)) > 0.0000005)
-      BEGIN
-        UPDATE transactions
-        SET
-          units = CASE WHEN NEW.units IS NULL THEN NULL ELSE ROUND(NEW.units, 6) END,
-          price_per_unit = CASE WHEN NEW.price_per_unit IS NULL THEN NULL ELSE ROUND(NEW.price_per_unit, 6) END,
-          exchange_rate_used = CASE WHEN NEW.exchange_rate_used IS NULL THEN NULL ELSE ROUND(NEW.exchange_rate_used, 6) END,
-          fmv_per_unit = CASE WHEN NEW.fmv_per_unit IS NULL THEN NULL ELSE ROUND(NEW.fmv_per_unit, 6) END,
-          gross_units = CASE WHEN NEW.gross_units IS NULL THEN NULL ELSE ROUND(NEW.gross_units, 6) END,
-          tax_withheld_units = CASE WHEN NEW.tax_withheld_units IS NULL THEN NULL ELSE ROUND(NEW.tax_withheld_units, 6) END
-        WHERE id = NEW.id;
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS trg_transactions_precision_update
-      AFTER UPDATE OF units, price_per_unit, exchange_rate_used, fmv_per_unit, gross_units, tax_withheld_units ON transactions
-      WHEN
-        (NEW.units IS NOT NULL AND ABS(NEW.units - ROUND(NEW.units, 6)) > 0.0000005)
-        OR (NEW.price_per_unit IS NOT NULL AND ABS(NEW.price_per_unit - ROUND(NEW.price_per_unit, 6)) > 0.0000005)
-        OR (NEW.exchange_rate_used IS NOT NULL AND ABS(NEW.exchange_rate_used - ROUND(NEW.exchange_rate_used, 6)) > 0.0000005)
-        OR (NEW.fmv_per_unit IS NOT NULL AND ABS(NEW.fmv_per_unit - ROUND(NEW.fmv_per_unit, 6)) > 0.0000005)
-        OR (NEW.gross_units IS NOT NULL AND ABS(NEW.gross_units - ROUND(NEW.gross_units, 6)) > 0.0000005)
-        OR (NEW.tax_withheld_units IS NOT NULL AND ABS(NEW.tax_withheld_units - ROUND(NEW.tax_withheld_units, 6)) > 0.0000005)
-      BEGIN
-        UPDATE transactions
-        SET
-          units = CASE WHEN NEW.units IS NULL THEN NULL ELSE ROUND(NEW.units, 6) END,
-          price_per_unit = CASE WHEN NEW.price_per_unit IS NULL THEN NULL ELSE ROUND(NEW.price_per_unit, 6) END,
-          exchange_rate_used = CASE WHEN NEW.exchange_rate_used IS NULL THEN NULL ELSE ROUND(NEW.exchange_rate_used, 6) END,
-          fmv_per_unit = CASE WHEN NEW.fmv_per_unit IS NULL THEN NULL ELSE ROUND(NEW.fmv_per_unit, 6) END,
-          gross_units = CASE WHEN NEW.gross_units IS NULL THEN NULL ELSE ROUND(NEW.gross_units, 6) END,
-          tax_withheld_units = CASE WHEN NEW.tax_withheld_units IS NULL THEN NULL ELSE ROUND(NEW.tax_withheld_units, 6) END
-        WHERE id = NEW.id;
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS trg_daily_values_precision_insert
-      AFTER INSERT ON daily_values
-      WHEN
-        (NEW.price_per_unit IS NOT NULL AND ABS(NEW.price_per_unit - ROUND(NEW.price_per_unit, 6)) > 0.0000005)
-        OR (NEW.total_units IS NOT NULL AND ABS(NEW.total_units - ROUND(NEW.total_units, 6)) > 0.0000005)
-      BEGIN
-        UPDATE daily_values
-        SET
-          price_per_unit = CASE WHEN NEW.price_per_unit IS NULL THEN NULL ELSE ROUND(NEW.price_per_unit, 6) END,
-          total_units = CASE WHEN NEW.total_units IS NULL THEN NULL ELSE ROUND(NEW.total_units, 6) END
-        WHERE id = NEW.id;
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS trg_daily_values_precision_update
-      AFTER UPDATE OF price_per_unit, total_units ON daily_values
-      WHEN
-        (NEW.price_per_unit IS NOT NULL AND ABS(NEW.price_per_unit - ROUND(NEW.price_per_unit, 6)) > 0.0000005)
-        OR (NEW.total_units IS NOT NULL AND ABS(NEW.total_units - ROUND(NEW.total_units, 6)) > 0.0000005)
-      BEGIN
-        UPDATE daily_values
-        SET
-          price_per_unit = CASE WHEN NEW.price_per_unit IS NULL THEN NULL ELSE ROUND(NEW.price_per_unit, 6) END,
-          total_units = CASE WHEN NEW.total_units IS NULL THEN NULL ELSE ROUND(NEW.total_units, 6) END
-        WHERE id = NEW.id;
-      END;
-
-    `);
-
-    if (hasMarketPriceCacheTable) {
-      db.exec(`
-        CREATE TRIGGER IF NOT EXISTS trg_market_price_cache_precision_insert
-        AFTER INSERT ON market_price_cache
-        WHEN
-          (NEW.open IS NOT NULL AND ABS(NEW.open - ROUND(NEW.open, 6)) > 0.0000005)
-          OR (NEW.high IS NOT NULL AND ABS(NEW.high - ROUND(NEW.high, 6)) > 0.0000005)
-          OR (NEW.low IS NOT NULL AND ABS(NEW.low - ROUND(NEW.low, 6)) > 0.0000005)
-          OR (NEW.close IS NOT NULL AND ABS(NEW.close - ROUND(NEW.close, 6)) > 0.0000005)
-          OR (NEW.adj_close IS NOT NULL AND ABS(NEW.adj_close - ROUND(NEW.adj_close, 6)) > 0.0000005)
-          OR (NEW.reverse_factor IS NOT NULL AND ABS(NEW.reverse_factor - ROUND(NEW.reverse_factor, 6)) > 0.0000005)
-        BEGIN
-          UPDATE market_price_cache
-          SET
-            open = CASE WHEN NEW.open IS NULL THEN NULL ELSE ROUND(NEW.open, 6) END,
-            high = CASE WHEN NEW.high IS NULL THEN NULL ELSE ROUND(NEW.high, 6) END,
-            low = CASE WHEN NEW.low IS NULL THEN NULL ELSE ROUND(NEW.low, 6) END,
-            close = CASE WHEN NEW.close IS NULL THEN NULL ELSE ROUND(NEW.close, 6) END,
-            adj_close = CASE WHEN NEW.adj_close IS NULL THEN NULL ELSE ROUND(NEW.adj_close, 6) END,
-            reverse_factor = CASE WHEN NEW.reverse_factor IS NULL THEN NULL ELSE ROUND(NEW.reverse_factor, 6) END
-          WHERE id = NEW.id;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS trg_market_price_cache_precision_update
-        AFTER UPDATE OF open, high, low, close, adj_close, reverse_factor ON market_price_cache
-        WHEN
-          (NEW.open IS NOT NULL AND ABS(NEW.open - ROUND(NEW.open, 6)) > 0.0000005)
-          OR (NEW.high IS NOT NULL AND ABS(NEW.high - ROUND(NEW.high, 6)) > 0.0000005)
-          OR (NEW.low IS NOT NULL AND ABS(NEW.low - ROUND(NEW.low, 6)) > 0.0000005)
-          OR (NEW.close IS NOT NULL AND ABS(NEW.close - ROUND(NEW.close, 6)) > 0.0000005)
-          OR (NEW.adj_close IS NOT NULL AND ABS(NEW.adj_close - ROUND(NEW.adj_close, 6)) > 0.0000005)
-          OR (NEW.reverse_factor IS NOT NULL AND ABS(NEW.reverse_factor - ROUND(NEW.reverse_factor, 6)) > 0.0000005)
-        BEGIN
-          UPDATE market_price_cache
-          SET
-            open = CASE WHEN NEW.open IS NULL THEN NULL ELSE ROUND(NEW.open, 6) END,
-            high = CASE WHEN NEW.high IS NULL THEN NULL ELSE ROUND(NEW.high, 6) END,
-            low = CASE WHEN NEW.low IS NULL THEN NULL ELSE ROUND(NEW.low, 6) END,
-            close = CASE WHEN NEW.close IS NULL THEN NULL ELSE ROUND(NEW.close, 6) END,
-            adj_close = CASE WHEN NEW.adj_close IS NULL THEN NULL ELSE ROUND(NEW.adj_close, 6) END,
-            reverse_factor = CASE WHEN NEW.reverse_factor IS NULL THEN NULL ELSE ROUND(NEW.reverse_factor, 6) END
-          WHERE id = NEW.id;
-        END;
-      `);
-    }
-
-    db.exec('COMMIT');
-    assertDbIntegrity(db, migrationId);
-    recordMigration(
-      db,
-      migrationId,
-      'applied',
-      hasMarketPriceCacheTable
-        ? 'normalized existing rows and added precision guard triggers for transactions/daily_values/market_price_cache'
-        : 'normalized existing rows and added precision guard triggers for transactions/daily_values (market_price_cache not present yet)'
-    );
-  } catch (e) {
-    db.exec('ROLLBACK');
-    throw e;
   }
 }
 

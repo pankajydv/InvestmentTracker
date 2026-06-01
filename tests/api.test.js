@@ -15,6 +15,9 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { computeBondAccruedCoupon } = require('../server/services/bondAccrualService');
+const { markAllTrackedInvestmentsDirtyFromDate } = require('../server/services/dirtyBackfillService');
+const { updateAllPrices } = require('../server/services/updater');
 
 // ──────────────────────────────────────────────────────────────────────
 // Helpers
@@ -73,6 +76,12 @@ function calculateXirrForTest(flows) {
   }
 
   return (low + high) / 2;
+}
+
+function addDaysIso(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
 }
 
 /** POST/PUT/DELETE helper with JSON body */
@@ -423,6 +432,110 @@ describe('Investments — Bonds', () => {
   });
 });
 
+describe('Bonds — Accrual Engine', () => {
+  it('computes annual coupon accrual and resets on coupon payout date (Model A)', () => {
+    const investment = {
+      id: 9991,
+      asset_type: 'BOND',
+      face_value: 1000,
+      coupon_rate: 12,
+      coupon_frequency: 'ANNUAL',
+      name: 'Test Annual Bond',
+    };
+
+    const transactions = [
+      { tx_date: '2025-01-01', transaction_type: 'BUY', units: 10, amount: 10000 },
+      { tx_date: '2025-01-01', transaction_type: 'INTEREST', units: 10, amount: 1200 },
+      { tx_date: '2026-01-01', transaction_type: 'INTEREST', units: 10, amount: 1200 },
+    ];
+
+    const midResult = computeBondAccruedCoupon({
+      investment,
+      transactions,
+      asOfDate: '2025-07-01',
+      dayCount: 365,
+    });
+
+    assert.ok(Number(midResult.accruedCoupon) > 500, `Expected annual accrual carry, got ${midResult.accruedCoupon}`);
+    assert.equal(midResult.meta?.hasCouponPaymentOnAsOf, false);
+
+    const payoutDay = computeBondAccruedCoupon({
+      investment,
+      transactions,
+      asOfDate: '2026-01-01',
+      dayCount: 365,
+    });
+
+    assert.equal(Number(payoutDay.accruedCoupon), 0);
+    assert.equal(payoutDay.meta?.hasCouponPaymentOnAsOf, true);
+  });
+
+  it('computes monthly coupon accrual and flags missing expected coupon transaction', () => {
+    const investment = {
+      id: 9992,
+      asset_type: 'BOND',
+      face_value: 1000,
+      coupon_rate: 12,
+      coupon_frequency: 'MONTHLY',
+      name: 'Test Monthly Bond',
+    };
+
+    const transactions = [
+      { tx_date: '2025-01-01', transaction_type: 'BUY', units: 10, amount: 10000 },
+      { tx_date: '2025-01-01', transaction_type: 'INTEREST', units: 10, amount: 100 },
+    ];
+
+    const regularAccrual = computeBondAccruedCoupon({
+      investment,
+      transactions,
+      asOfDate: '2025-01-16',
+      dayCount: 365,
+    });
+    assert.ok(Number(regularAccrual.accruedCoupon) > 40, `Expected monthly accrual carry, got ${regularAccrual.accruedCoupon}`);
+    assert.equal(regularAccrual.meta?.missingExpectedCouponPayment, false);
+
+    const expectedButMissing = computeBondAccruedCoupon({
+      investment,
+      transactions,
+      asOfDate: '2025-02-01',
+      dayCount: 365,
+    });
+
+    assert.equal(expectedButMissing.meta?.missingExpectedCouponPayment, true);
+    assert.ok(Number(expectedButMissing.accruedCoupon) > 90, 'Accrual should continue when expected coupon transaction is missing');
+  });
+
+  it('suppresses missing-coupon warning when payment is within ±2 days tolerance', () => {
+    const investment = {
+      id: 9993,
+      asset_type: 'BOND',
+      face_value: 1000,
+      coupon_rate: 12,
+      coupon_frequency: 'MONTHLY',
+      name: 'Tolerance Monthly Bond',
+    };
+
+    const transactions = [
+      { tx_date: '2025-01-01', transaction_type: 'BUY', units: 10, amount: 10000 },
+      { tx_date: '2025-01-01', transaction_type: 'INTEREST', units: 10, amount: 100 },
+      // Next coupon paid one day late (holiday/weekend scenario)
+      { tx_date: '2025-02-02', transaction_type: 'INTEREST', units: 10, amount: 100 },
+    ];
+
+    const result = computeBondAccruedCoupon({
+      investment,
+      transactions,
+      asOfDate: '2025-02-01',
+      dayCount: 365,
+    });
+
+    assert.equal(result.meta?.expectedCouponDate, '2025-02-01');
+    assert.equal(result.meta?.hasCouponWithinExpectedTolerance, true);
+    assert.equal(result.meta?.nearbyCouponDate, '2025-02-02');
+    assert.equal(result.meta?.missingExpectedCouponPayment, false);
+  });
+});
+
 // ======================================================================
 // 5.  INVESTMENTS — PPF
 // ======================================================================
@@ -743,6 +856,109 @@ describe('Transactions — Bond Interest', () => {
     });
     assert.equal(status, 201);
     assert.equal(body.transaction_type, 'INTEREST');
+  });
+});
+
+describe('Bonds — XIRR and Day Change', () => {
+  it('includes real bond INTEREST cashflows in XIRR and ignores accrual-only marker rows', async () => {
+    const created = await api('POST', '/investments', {
+      name: 'Bond XIRR Guard',
+      asset_type: 'BOND',
+      face_value: 1000,
+      coupon_rate: 12,
+      coupon_frequency: 'ANNUAL',
+    });
+    assert.equal(created.status, 201);
+    const bondId = created.body.id;
+
+    const txInsert = db.prepare(`
+      INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, amount, fees, units, price_per_unit, notes)
+      VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)
+    `);
+
+    txInsert.run(bondId, 1, 'BUY', '2025-01-01', 10000, 10, 'Initial buy');
+    txInsert.run(bondId, 1, 'INTEREST', '2025-06-30', 120, 10, 'Coupon payout');
+    txInsert.run(bondId, 1, 'INTEREST', '2025-07-15', 80, 10, 'AUTO_ACCRUAL_INTERNAL generated');
+
+    db.prepare(`
+      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPUTED', 0)
+    `).run(bondId, 1, '2025-12-31', 1000, 10, 10200, 10000, 120, 320);
+
+    const expectedRate = calculateXirrForTest([
+      { amount: -10000, date: new Date('2025-01-01T00:00:00.000Z') },
+      { amount: 120, date: new Date('2025-06-30T00:00:00.000Z') },
+      { amount: 10200, date: new Date('2025-12-31T00:00:00.000Z') },
+    ]);
+
+    const { status, body } = await api('GET', '/investments?portfolio_id=1');
+    assert.equal(status, 200);
+    const row = body.find((r) => r.id === bondId);
+    assert.ok(row, 'Expected bond row in /investments response');
+    assert.ok(row.xirr_pct != null, 'Expected non-null XIRR for bond with buy/coupon/terminal value');
+
+    const actualRate = Number(row.xirr_pct) / 100;
+    assert.ok(Number.isFinite(actualRate));
+    assert.ok(Math.abs(actualRate - expectedRate) < 1e-4, `Bond XIRR mismatch: expected=${expectedRate}, actual=${actualRate}`);
+  });
+
+  it('updater includes accrued coupon in current_value and one-day change', async () => {
+    const created = await api('POST', '/investments', {
+      name: 'Bond Day Change Accrual',
+      asset_type: 'BOND',
+      face_value: 1000,
+      coupon_rate: 12,
+      coupon_frequency: 'MONTHLY',
+    });
+    assert.equal(created.status, 201);
+    const bondId = created.body.id;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const prevDate = addDaysIso(today, -1);
+    const lastCouponDate = addDaysIso(today, -5);
+
+    const txInsert = db.prepare(`
+      INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, amount, fees, units, price_per_unit, notes)
+      VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+    `);
+
+    txInsert.run(bondId, 1, 'BUY', addDaysIso(lastCouponDate, -20), 10000, 10, 1000, 'Initial buy');
+    txInsert.run(bondId, 1, 'INTEREST', lastCouponDate, 100, 10, 10, 'Monthly coupon payout');
+
+    const txRows = db.prepare(`
+      SELECT date(transaction_date) AS tx_date, UPPER(transaction_type) AS transaction_type, COALESCE(units, 0) AS units, COALESCE(amount, 0) AS amount
+      FROM transactions
+      WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) <= ?
+      ORDER BY date(transaction_date) ASC, id ASC
+    `).all(bondId, 1, today);
+
+    const prevAccrual = computeBondAccruedCoupon({
+      investment: { ...created.body, asset_type: 'BOND' },
+      transactions: txRows,
+      asOfDate: prevDate,
+      dayCount: 365,
+    });
+
+    const prevCurrentValue = 10000 + Number(prevAccrual.accruedCoupon || 0);
+    db.prepare(`
+      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPUTED', 0)
+    `).run(bondId, 1, prevDate, 1000, 10, prevCurrentValue, 10000, 100, prevCurrentValue - 10000 + 100);
+
+    const result = await updateAllPrices(db, { assetTypes: ['BOND'] });
+    assert.equal(Number(result.errorCount || 0), 0);
+
+    const todayRow = db.prepare(`
+      SELECT current_value, day_change
+      FROM daily_values
+      WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(bondId, 1, today);
+
+    assert.ok(todayRow, 'Expected updater to write today daily_values row for bond');
+    assert.ok(Number(todayRow.current_value) > 10000, 'Current value should include accrued coupon above principal');
+    assert.ok(Number(todayRow.day_change) > 0, 'One-day change should reflect accrued coupon drift');
   });
 });
 
@@ -1212,4 +1428,80 @@ describe('Route existence — all endpoints respond (not 404)', () => {
       assert.notEqual(status, 404, `POST ${route} returned 404 — route missing!`);
     });
   }
+});
+
+// ======================================================================
+// 28.  DIRTY SCOPE SOURCE GUARDS
+// ======================================================================
+
+describe('Dirty scope source guard for exited holdings', () => {
+  it('drops catch-up enqueue after exit date but allows historical dirty date before exit', () => {
+    const Database = require('better-sqlite3');
+    const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-dirtyscope-test-'));
+    const localDbPath = path.join(localDataDir, 'investments.db');
+    const localDb = new Database(localDbPath);
+
+    try {
+      localDb.pragma('journal_mode = WAL');
+      localDb.pragma('foreign_keys = ON');
+
+      const { initializeDb } = require('../server/db/schema');
+      initializeDb(localDb);
+
+      const portfolio = localDb.prepare(`
+        INSERT INTO portfolios (name) VALUES (?)
+      `).run('Dirty Scope Test Portfolio');
+
+      const investment = localDb.prepare(`
+        INSERT INTO investments (name, asset_type, is_active, exclude_from_tracking)
+        VALUES (?, 'INDIAN_STOCK', 1, 0)
+      `).run('Exited Window Guard Test');
+
+      localDb.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees
+        ) VALUES (?, ?, 'BUY', ?, ?, ?, ?, ?)
+      `).run(investment.lastInsertRowid, portfolio.lastInsertRowid, '2012-12-14', 10, 100, 1000, 0);
+
+      localDb.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees
+        ) VALUES (?, ?, 'SELL', ?, ?, ?, ?, ?)
+      `).run(investment.lastInsertRowid, portfolio.lastInsertRowid, '2014-05-02', 10, 110, 1100, 0);
+
+      const dropped = markAllTrackedInvestmentsDirtyFromDate(
+        localDb,
+        '2026-06-01',
+        'scheduler-downtime-catchup',
+        'test-catchup-after-exit'
+      );
+
+      assert.equal(dropped, 0);
+      const afterInvalid = localDb.prepare('SELECT COUNT(*) AS c FROM dirty_backfill_scope').get();
+      assert.equal(afterInvalid.c, 0);
+
+      const enqueued = markAllTrackedInvestmentsDirtyFromDate(
+        localDb,
+        '2014-05-01',
+        'manual-historical-fix',
+        'test-historical-before-exit'
+      );
+
+      assert.equal(enqueued, 1);
+      const scope = localDb.prepare(`
+        SELECT investment_id, portfolio_id, dirty_from_date, status
+        FROM dirty_backfill_scope
+      `).get();
+
+      assert.equal(scope.investment_id, investment.lastInsertRowid);
+      assert.equal(scope.portfolio_id, portfolio.lastInsertRowid);
+      assert.equal(scope.dirty_from_date, '2014-05-01');
+      assert.equal(scope.status, 'pending');
+    } finally {
+      localDb.close();
+      fs.rmSync(localDataDir, { recursive: true, force: true });
+    }
+  });
 });
