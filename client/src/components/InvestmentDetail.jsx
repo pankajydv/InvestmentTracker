@@ -9,7 +9,7 @@ import { usePortfolio } from '../context/PortfolioContext';
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
 const UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
-const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE', 'ESPP_CONTRIBUTION', 'DIVIDEND'];
+const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE', 'ESPP_CONTRIBUTION', 'DIVIDEND', 'BONUS', 'SPLIT', 'RIGHTS'];
 const TYPE_LABELS = {
   DEPOSIT: 'Deposit',
   EMPLOYER_CONTRIBUTION: 'Employer',
@@ -710,6 +710,9 @@ export default function InvestmentDetail() {
     isPFOnly ? { label: 'Interest Calc', value: 'Month-end balance (excluding same-month PF contributions) x rate/1200; rounded at FY end' } : null,
     isPPF && data.maturity_date ? { label: 'Maturity', value: formatDate(data.maturity_date) } : null,
     isPPF && data.opening_balance > 0 ? { label: 'Opening Balance', value: `₹${formatNumber(data.opening_balance, 2)}` } : null,
+    isBond && data.coupon_rate ? { label: 'Coupon Rate', value: `${formatNumber(data.coupon_rate, 4)}% p.a.` } : null,
+    isBond && data.coupon_frequency ? { label: 'Frequency', value: String(data.coupon_frequency || '').replace(/_/g, ' ') } : null,
+    isBond && data.maturity_date ? { label: 'Maturity Date', value: formatDate(data.maturity_date) } : null,
     isSGB && sgbDetails && sgbDetails.coupon_rate ? { label: 'Coupon Rate', value: `${sgbDetails.coupon_rate}% p.a.` } : null,
     isSGB && sgbDetails && sgbDetails.maturity_date ? { label: 'Maturity', value: formatDate(sgbDetails.maturity_date) } : null,
     isSGB && sgbDetails && sgbDetails.series ? { label: 'Series', value: sgbDetails.series } : null,

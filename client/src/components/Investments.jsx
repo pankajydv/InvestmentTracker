@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Row, Col, Card, Spinner, Form, Button } from 'react-bootstrap';
-import { getInvestments } from '../services/api';
+import { getCorporateActionSuggestionCount, getInvestments } from '../services/api';
 import { formatINR, formatPct, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
 import { PlusCircle, Filter, RefreshCw, Percent } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -15,12 +15,29 @@ export default function Investments() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [investments, setInvestments] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [pendingSuggestionCount, setPendingSuggestionCount] = useState(0);
   const typeFilter = searchParams.get('type') || '';
   const hideSold = settings.hideSoldInvestments;
 
   useEffect(() => {
     loadInvestments();
   }, [typeFilter, selectedId, selectedIds, hideSold]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadPendingCount = async () => {
+      try {
+        const data = await getCorporateActionSuggestionCount(selectedId || null);
+        if (!cancelled) setPendingSuggestionCount(Number(data?.count || 0));
+      } catch (_e) {
+        if (!cancelled) setPendingSuggestionCount(0);
+      }
+    };
+    loadPendingCount();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
 
   const loadInvestments = async () => {
     try {
@@ -73,8 +90,11 @@ export default function Investments() {
           <Link to="/interest-rates" className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
             <Percent size={16} /> Interest Rates
           </Link>
-          <Link to="/corporate-actions" className="btn btn-outline-primary btn-sm d-flex align-items-center gap-1">
+          <Link to="/corporate-actions" className="btn btn-outline-primary btn-sm d-flex align-items-center gap-1 position-relative">
             <RefreshCw size={16} /> Sync Corporate Actions
+            {pendingSuggestionCount > 0 && (
+              <span className="badge rounded-pill bg-danger">{pendingSuggestionCount}</span>
+            )}
           </Link>
           <Link to="/investments/add" className="btn btn-primary btn-sm d-flex align-items-center gap-1">
             <PlusCircle size={16} /> Add Investment

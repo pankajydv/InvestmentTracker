@@ -9,7 +9,7 @@ const { OFFERINGS, generateEsppSchedule } = require('../services/esppGrantServic
 const { parseOpenLots, parseClosedLots, reconcileVestTransactions } = require('../services/fidelityVestReconciler');
 const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisitionImportService');
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
-const { logAppInfo, logAppError } = require('../services/appLogger');
+const { logAppInfo, logAppWarn, logAppError } = require('../services/appLogger');
 const { quantizeForStorage, quantizeNullableForStorage } = require('../services/numberPrecision');
 
 const router = express.Router();
@@ -1663,19 +1663,17 @@ module.exports = function (db) {
 
   // ─── Corporate Actions: Preview ─────────────────────────────────────────────
   /**
-   * GET /api/stocks/corporate-actions/preview?portfolio_id=1&year=2019
+   * GET /api/stocks/corporate-actions/preview?portfolio_id=1
    * Fetch missing corporate actions (dividends, splits/bonus) for all stocks
-   * held in the portfolio during the given year.
+   * held in the portfolio during their active transaction window.
    */
   router.get('/corporate-actions/preview', async (req, res) => {
     try {
-      const { portfolio_id, year, asset_type } = req.query;
-      if (!year) return res.status(400).json({ error: 'year is required' });
-
-      const yearNum = parseInt(year);
+      const { portfolio_id, asset_type } = req.query;
       const portfolioId = portfolio_id ? parseInt(portfolio_id) : null;
       const assetType = asset_type === 'FOREIGN_STOCK' ? 'FOREIGN_STOCK' : 'INDIAN_STOCK';
       const currencySymbol = assetType === 'FOREIGN_STOCK' ? '$' : '₹';
+      const today = new Date().toISOString().split('T')[0];
 
       // Get all stock investments of the requested type (optionally scoped to portfolio) that have a ticker
       let investmentQuery;
@@ -1718,17 +1716,63 @@ module.exports = function (db) {
           WHERE investment_id = ?
           ORDER BY transaction_date ASC
         `).all(inv.id);
+        if (!allTxns.length) {
+          const warning = 'No transactions found for investment during corporate action preview';
+          errors.push({ investment: inv.name, error: warning });
+          logAppWarn('[Stocks] Corporate actions preview skipped investment with no transactions', {
+            investment_id: inv.id,
+            investment_name: inv.name,
+            portfolio_id: portfolioId,
+          });
+          continue;
+        }
+
+        const firstTxnDate = String(allTxns[0].transaction_date || '');
+        const lastTxnDate = String(allTxns[allTxns.length - 1].transaction_date || '');
+        let netUnits = 0;
+        for (const t of allTxns) {
+          if (CORPORATE_ACTION_UNIT_ADD_TYPES.includes(t.transaction_type)) {
+            netUnits += Number(t.units || 0);
+          } else if (CORPORATE_ACTION_UNIT_SUB_TYPES.includes(t.transaction_type)) {
+            netUnits -= Number(t.units || 0);
+          }
+        }
+        const exitDate = (netUnits <= 0 && lastTxnDate) ? lastTxnDate : today;
+        const windowStart = firstTxnDate;
+        const windowEnd = exitDate < today ? exitDate : today;
+
+        if (!windowStart || !windowEnd || windowStart > windowEnd) {
+          const warning = `Corporate action window is empty (start=${windowStart || 'null'}, end=${windowEnd || 'null'})`;
+          errors.push({ investment: inv.name, error: warning });
+          logAppWarn('[Stocks] Corporate actions preview skipped due to empty window', {
+            investment_id: inv.id,
+            investment_name: inv.name,
+            first_txn_date: firstTxnDate || null,
+            exit_date: exitDate || null,
+            window_start: windowStart || null,
+            window_end: windowEnd || null,
+            net_units: netUnits,
+            portfolio_id: portfolioId,
+          });
+          continue;
+        }
 
         // Fetch provider corporate actions (foreign dividends from NASDAQ, splits from Yahoo)
         const ticker = assetType === 'FOREIGN_STOCK'
           ? inv.ticker_symbol
           : (inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol));
-        let actions;
+        const fromYear = Number(String(windowStart).slice(0, 4));
+        const toYear = Number(String(windowEnd).slice(0, 4));
+        const actions = { dividends: [], splits: [], warnings: [] };
         try {
-          actions = await fetchCorporateActions(ticker, yearNum, { assetType });
-          const actionWarnings = Array.isArray(actions?.warnings) ? actions.warnings : [];
-          for (const warning of actionWarnings) {
-            errors.push({ investment: inv.name, error: warning });
+          for (let y = fromYear; y <= toYear; y += 1) {
+            const yearActions = await fetchCorporateActions(ticker, y, { assetType });
+            if (Array.isArray(yearActions?.dividends)) actions.dividends.push(...yearActions.dividends);
+            if (Array.isArray(yearActions?.splits)) actions.splits.push(...yearActions.splits);
+            const actionWarnings = Array.isArray(yearActions?.warnings) ? yearActions.warnings : [];
+            for (const warning of actionWarnings) {
+              errors.push({ investment: inv.name, error: warning });
+            }
           }
         } catch (e) {
           errors.push({ investment: inv.name, error: e.message });
@@ -1739,6 +1783,18 @@ module.exports = function (db) {
         const processPortfolios = portfolioId
           ? [portfolioId]
           : [...new Set(allTxns.filter(t => t.portfolio_id).map(t => t.portfolio_id))];
+        if (!processPortfolios.length) {
+          const warning = 'No portfolio found for investment while preparing corporate actions';
+          errors.push({ investment: inv.name, error: warning });
+          logAppWarn('[Stocks] Corporate actions preview found no portfolios to process', {
+            investment_id: inv.id,
+            investment_name: inv.name,
+            window_start: windowStart,
+            window_end: windowEnd,
+            portfolio_id: portfolioId,
+          });
+          continue;
+        }
 
         // When processing all portfolios, scope holdingAt to each portfolio
         const scopeByPortfolio = !portfolioId;
@@ -1797,8 +1853,8 @@ module.exports = function (db) {
              WHERE investment_id = ? AND transaction_date BETWEEN ? AND ?
                AND transaction_type IN ('DIVIDEND', 'SPLIT', 'BONUS')`;
         const existingActions = scopeByPortfolio
-          ? db.prepare(existingActionsQuery).all(inv.id, pid, `${yearNum}-01-01`, `${yearNum}-12-31`)
-          : db.prepare(existingActionsQuery).all(inv.id, `${yearNum}-01-01`, `${yearNum}-12-31`);
+          ? db.prepare(existingActionsQuery).all(inv.id, pid, windowStart, windowEnd)
+          : db.prepare(existingActionsQuery).all(inv.id, windowStart, windowEnd);
 
         // Track which existing actions are matched to Yahoo data
         const matchedExistingIds = new Set();
@@ -1815,6 +1871,7 @@ module.exports = function (db) {
             });
             continue;
           }
+          if (payoutDate < windowStart || payoutDate > windowEnd) continue;
 
           // Dividend entitlement calculated on previous day's holding (ex-date - 1)
           const prevDay = new Date(entitlementDate);
@@ -1906,6 +1963,7 @@ module.exports = function (db) {
 
         // Process splits
         for (const split of actions.splits) {
+          if (!split?.date || split.date < windowStart || split.date > windowEnd) continue;
           const existing = existingActions.find(e =>
             (e.transaction_type === 'SPLIT' || e.transaction_type === 'BONUS') &&
             e.transaction_date === split.date &&
@@ -2029,11 +2087,10 @@ module.exports = function (db) {
       corrections.sort((a, b) => a.transaction_date.localeCompare(b.transaction_date));
       deletions.sort((a, b) => a.transaction_date.localeCompare(b.transaction_date));
 
-      res.json({ suggestions, corrections, deletions, errors, year: yearNum });
+      res.json({ suggestions, corrections, deletions, errors });
     } catch (e) {
       logAppError('[Stocks] Corporate actions preview failed', {
         portfolio_id: Number(req.query?.portfolio_id || 0) || null,
-        year: Number(req.query?.year || 0) || null,
         asset_type: req.query?.asset_type || null,
         error: e.message,
       });
@@ -2181,6 +2238,306 @@ module.exports = function (db) {
         error: e.message,
       });
       res.status(500).json({ error: 'Failed to import corporate actions: ' + e.message });
+    }
+  });
+
+  router.get('/corporate-actions/suggestions/count', (req, res) => {
+    try {
+      const portfolioId = Number(req.query?.portfolio_id || 0);
+      const hasPortfolio = Number.isInteger(portfolioId) && portfolioId > 0;
+      const row = hasPortfolio
+        ? db.prepare(`
+            SELECT COUNT(*) AS count
+            FROM corporate_action_suggestions
+            WHERE status = 'pending'
+              AND (portfolio_id = ? OR portfolio_id IS NULL)
+          `).get(portfolioId)
+        : db.prepare(`
+            SELECT COUNT(*) AS count
+            FROM corporate_action_suggestions
+            WHERE status = 'pending'
+          `).get();
+      res.json({ count: Number(row?.count || 0) });
+    } catch (e) {
+      logAppError('[Stocks] Corporate action suggestion count failed', { error: e.message });
+      res.status(500).json({ error: 'Failed to fetch suggestion count: ' + e.message });
+    }
+  });
+
+  router.get('/corporate-actions/suggestions', (req, res) => {
+    try {
+      const status = String(req.query?.status || 'pending').toLowerCase();
+      const allowedStatus = new Set(['pending', 'accepted', 'rejected', 'applied']);
+      if (!allowedStatus.has(status)) {
+        return res.status(400).json({ error: 'Invalid status' });
+      }
+
+      const portfolioId = Number(req.query?.portfolio_id || 0);
+      const hasPortfolio = Number.isInteger(portfolioId) && portfolioId > 0;
+      const limitRaw = Number(req.query?.limit || 200);
+      const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 200;
+
+      const rows = hasPortfolio
+        ? db.prepare(`
+            SELECT
+              s.id,
+              s.source,
+              s.action,
+              s.status,
+              s.investment_id,
+              s.portfolio_id,
+              s.transaction_type,
+              s.transaction_date,
+              s.notes,
+              s.payload_json,
+              s.created_at,
+              s.updated_at,
+              s.resolved_at,
+              i.name AS investment_name
+            FROM corporate_action_suggestions s
+            LEFT JOIN investments i ON i.id = s.investment_id
+            WHERE s.status = ?
+              AND (s.portfolio_id = ? OR s.portfolio_id IS NULL)
+            ORDER BY s.created_at DESC, s.id DESC
+            LIMIT ?
+          `).all(status, portfolioId, limit)
+        : db.prepare(`
+            SELECT
+              s.id,
+              s.source,
+              s.action,
+              s.status,
+              s.investment_id,
+              s.portfolio_id,
+              s.transaction_type,
+              s.transaction_date,
+              s.notes,
+              s.payload_json,
+              s.created_at,
+              s.updated_at,
+              s.resolved_at,
+              i.name AS investment_name
+            FROM corporate_action_suggestions s
+            LEFT JOIN investments i ON i.id = s.investment_id
+            WHERE s.status = ?
+            ORDER BY s.created_at DESC, s.id DESC
+            LIMIT ?
+          `).all(status, limit);
+
+      const data = rows.map((row) => {
+        let payload = null;
+        try {
+          payload = JSON.parse(String(row.payload_json || '{}'));
+        } catch (_e) {
+          payload = null;
+        }
+        return {
+          id: Number(row.id),
+          source: row.source,
+          action: row.action,
+          status: row.status,
+          investment_id: Number(row.investment_id),
+          investment_name: row.investment_name || null,
+          portfolio_id: row.portfolio_id == null ? null : Number(row.portfolio_id),
+          transaction_type: row.transaction_type,
+          transaction_date: row.transaction_date,
+          notes: row.notes || null,
+          payload,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          resolved_at: row.resolved_at || null,
+        };
+      });
+
+      return res.json({ suggestions: data, status });
+    } catch (e) {
+      logAppError('[Stocks] Corporate action suggestion list failed', { error: e.message });
+      return res.status(500).json({ error: 'Failed to fetch suggestions: ' + e.message });
+    }
+  });
+
+  router.post('/corporate-actions/suggestions/resolve', (req, res) => {
+    try {
+      const ids = Array.isArray(req.body?.ids)
+        ? Array.from(new Set(req.body.ids.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0)))
+        : [];
+      const decision = String(req.body?.decision || '').toLowerCase();
+      if (!ids.length) return res.status(400).json({ error: 'ids are required' });
+      if (decision !== 'accept' && decision !== 'reject') {
+        return res.status(400).json({ error: "decision must be 'accept' or 'reject'" });
+      }
+
+      const placeholders = ids.map(() => '?').join(',');
+      const suggestionRows = db.prepare(`
+        SELECT id, action, status, payload_json
+        FROM corporate_action_suggestions
+        WHERE id IN (${placeholders})
+        ORDER BY id ASC
+      `).all(...ids);
+
+      const inferPortfolioId = (investmentId) => {
+        const row = db.prepare(`
+          SELECT portfolio_id
+          FROM transactions
+          WHERE investment_id = ? AND portfolio_id IS NOT NULL
+          ORDER BY transaction_date DESC, id DESC
+          LIMIT 1
+        `).get(investmentId);
+        return row ? row.portfolio_id : null;
+      };
+
+      const insertTxn = db.prepare(`
+        INSERT INTO transactions (investment_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, notes, broker, portfolio_id, exchange_rate_used, usd_amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const updateTxn = db.prepare(`
+        UPDATE transactions
+        SET transaction_date = ?, units = ?, price_per_unit = ?, amount = ?, notes = ?, broker = ?, portfolio_id = ?, exchange_rate_used = ?, usd_amount = ?
+        WHERE id = ?
+      `);
+
+      const markApplied = db.prepare(`
+        UPDATE corporate_action_suggestions
+        SET status = ?,
+            resolved_at = datetime('now'),
+            updated_at = datetime('now')
+        WHERE id = ?
+      `);
+
+      const dirtyCandidates = [];
+      let accepted = 0;
+      let rejected = 0;
+      let applied = 0;
+      let skipped = 0;
+
+      const runAll = db.transaction(() => {
+        for (const row of suggestionRows) {
+          if (row.status !== 'pending') {
+            skipped += 1;
+            continue;
+          }
+
+          if (decision === 'reject') {
+            markApplied.run('rejected', row.id);
+            rejected += 1;
+            continue;
+          }
+
+          let payload = null;
+          try {
+            payload = JSON.parse(String(row.payload_json || '{}'));
+          } catch (_e) {
+            skipped += 1;
+            continue;
+          }
+
+          const investmentId = Number(payload?.investmentId || 0);
+          const txType = String(payload?.transactionType || '');
+          const txDate = String(payload?.transactionDate || '');
+          const action = String(payload?.action || row.action || '').toLowerCase();
+          const next = payload?.next || {};
+
+          if (!Number.isInteger(investmentId) || investmentId <= 0 || !txType || !txDate) {
+            skipped += 1;
+            continue;
+          }
+
+          const portfolioId = payload?.portfolioId ?? inferPortfolioId(investmentId);
+          if (portfolioId == null) {
+            skipped += 1;
+            continue;
+          }
+
+          if (action === 'inserted') {
+            const duplicate = db.prepare(`
+              SELECT id
+              FROM transactions
+              WHERE investment_id = ?
+                AND portfolio_id = ?
+                AND transaction_type = ?
+                AND transaction_date = ?
+            `).get(investmentId, portfolioId, txType, txDate);
+
+            if (!duplicate) {
+              insertTxn.run(
+                investmentId,
+                txType,
+                txDate,
+                quantizeNullableForStorage(next.units),
+                quantizeNullableForStorage(next.pricePerUnit),
+                quantizeForStorage(next.amount || 0),
+                quantizeForStorage(0),
+                next.notes || null,
+                next.broker || null,
+                portfolioId,
+                quantizeNullableForStorage(next.fxRate),
+                quantizeNullableForStorage(next.usdAmount)
+              );
+              dirtyCandidates.push({
+                investment_id: investmentId,
+                portfolio_id: portfolioId,
+                transaction_date: txDate,
+              });
+              applied += 1;
+            } else {
+              skipped += 1;
+            }
+          } else if (action === 'updated') {
+            const recordId = Number(payload?.recordId || 0);
+            if (!Number.isInteger(recordId) || recordId <= 0) {
+              skipped += 1;
+              continue;
+            }
+
+            const existing = db.prepare(`
+              SELECT id, investment_id, portfolio_id, transaction_date, locked
+              FROM transactions
+              WHERE id = ?
+            `).get(recordId);
+
+            if (!existing || Number(existing.locked || 0) === 1) {
+              skipped += 1;
+              continue;
+            }
+
+            updateTxn.run(
+              txDate,
+              quantizeNullableForStorage(next.units),
+              quantizeNullableForStorage(next.pricePerUnit),
+              quantizeForStorage(next.amount || 0),
+              next.notes || null,
+              next.broker || null,
+              portfolioId,
+              quantizeNullableForStorage(next.fxRate),
+              quantizeNullableForStorage(next.usdAmount),
+              recordId
+            );
+            dirtyCandidates.push({
+              investment_id: investmentId,
+              portfolio_id: portfolioId,
+              transaction_date: txDate,
+            });
+            applied += 1;
+          } else {
+            skipped += 1;
+            continue;
+          }
+
+          markApplied.run('applied', row.id);
+          accepted += 1;
+        }
+      });
+
+      runAll();
+      if (dirtyCandidates.length) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'corporate-actions-suggestion-accept');
+      }
+
+      return res.json({ accepted, rejected, applied, skipped });
+    } catch (e) {
+      logAppError('[Stocks] Corporate action suggestion resolve failed', { error: e.message });
+      return res.status(500).json({ error: 'Failed to resolve suggestions: ' + e.message });
     }
   });
 

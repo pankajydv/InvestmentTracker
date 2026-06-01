@@ -421,15 +421,31 @@ export const deleteExpense = (id) =>
   fetchJSON(`/expenses/${id}`, { method: 'DELETE' });
 
 // Corporate Actions
-export const previewCorporateActions = (portfolioId, year, assetType) => {
+export const previewCorporateActions = (portfolioId, assetType) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);
-  params.set('year', year);
   if (assetType) params.set('asset_type', assetType);
   return fetchJSON(`/stocks/corporate-actions/preview?${params}`);
 };
 export const importCorporateActions = ({ transactions, corrections, deletions }) =>
   fetchJSON('/stocks/corporate-actions/import', { method: 'POST', body: JSON.stringify({ transactions, corrections, deletions }) });
+export const getCorporateActionSuggestionCount = (portfolioId) => {
+  const params = new URLSearchParams();
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/stocks/corporate-actions/suggestions/count${params.toString() ? `?${params}` : ''}`);
+};
+export const getCorporateActionSuggestions = ({ status = 'pending', portfolioId, limit } = {}) => {
+  const params = new URLSearchParams();
+  if (status) params.set('status', String(status));
+  if (portfolioId) params.set('portfolio_id', String(portfolioId));
+  if (Number.isFinite(Number(limit)) && Number(limit) > 0) params.set('limit', String(Math.floor(Number(limit))));
+  return fetchJSON(`/stocks/corporate-actions/suggestions${params.toString() ? `?${params}` : ''}`);
+};
+export const resolveCorporateActionSuggestions = ({ ids, decision }) =>
+  fetchJSON('/stocks/corporate-actions/suggestions/resolve', {
+    method: 'POST',
+    body: JSON.stringify({ ids, decision }),
+  });
 
 // Interest Rate Sync
 export const previewInterestRateSync = (assetType, portfolioId) => {

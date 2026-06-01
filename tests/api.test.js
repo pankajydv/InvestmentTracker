@@ -412,12 +412,13 @@ describe('Investments — Bonds', () => {
   it('POST creates a bond', async () => {
     const { status, body } = await api('POST', '/investments', {
       name: 'SGB 2024-25', asset_type: 'BOND',
-      face_value: 5000, coupon_frequency: 'SEMI_ANNUAL',
+      face_value: 5000, coupon_rate: 2.5, coupon_frequency: 'SEMI_ANNUAL',
       maturity_date: '2032-06-15',
     });
     assert.equal(status, 201);
     assert.equal(body.asset_type, 'BOND');
     assert.equal(body.face_value, 5000);
+    assert.equal(body.coupon_rate, 2.5);
     assert.equal(body.coupon_frequency, 'SEMI_ANNUAL');
   });
 });
@@ -946,9 +947,13 @@ describe('Corporate Actions — Preview', () => {
     mockUsdInrRate = async () => 80;
   });
 
-  it('Missing params return 400', async () => {
-    const { status } = await api('GET', '/stocks/corporate-actions/preview?portfolio_id=1');
-    assert.equal(status, 400);
+  it('Portfolio-only preview request succeeds', async () => {
+    const { status, body } = await api('GET', '/stocks/corporate-actions/preview?portfolio_id=1');
+    assert.equal(status, 200);
+    assert.ok(Array.isArray(body.suggestions));
+    assert.ok(Array.isArray(body.corrections));
+    assert.ok(Array.isArray(body.deletions));
+    assert.ok(Array.isArray(body.errors));
   });
 });
 

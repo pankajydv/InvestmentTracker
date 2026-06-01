@@ -892,7 +892,6 @@ async function hydrateStockSeriesForPhase2({
   let splitEvents = [];
   let splitCheckFailed = false;
   let splitRebuildTriggered = false;
-
   if (isSplitSupportedInstrumentType(instrumentType)) {
     const splitResult = investmentId
       ? await loadMergedSplitEventsForInvestment(investmentId, instrumentType, symbol, { includeStatus: true })
@@ -938,6 +937,18 @@ async function hydrateStockSeriesForPhase2({
   if (!hasCompleteCoverage(cachedRows, marketSessionDates) && typeof fetchRange === 'function' && marketSessionDates.length > 0) {
     const missingStart = getSeriesMissingStartDate(cachedRows, marketSessionDates);
     if (missingStart) {
+      if (typeof onInfo === 'function') {
+        onInfo(`[MarketCache][Hydrate] Cache miss detected; fetching from provider for ${symbol}`, {
+          investmentId,
+          instrumentType,
+          symbol,
+          requestedFromDate: start,
+          requestedToDate: end,
+          missingFromDate: missingStart,
+          cachedPointsBeforeFetch: cachedRows.length,
+        });
+      }
+
       const fetched = await fetchRange(missingStart, end);
       const normalizedFetched = mapFetchedRows(fetched)
         .map(normalizeCachePoint)
@@ -945,6 +956,17 @@ async function hydrateStockSeriesForPhase2({
 
       if (normalizedFetched.length > 0) {
         upsertPriceSeries(instrumentType, symbol, normalizedFetched, sourceLabel || null);
+      }
+
+      if (typeof onInfo === 'function') {
+        onInfo(`[MarketCache][Hydrate] Provider fetch completed for ${symbol}`, {
+          investmentId,
+          instrumentType,
+          symbol,
+          missingFromDate: missingStart,
+          requestedToDate: end,
+          fetchedPoints: normalizedFetched.length,
+        });
       }
     }
     cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
@@ -1093,6 +1115,8 @@ async function hydrateHistoricalPriceSeries({
   fetchRange,
   mapFetchedRows = (rows) => rows,
   sourceLabel = null,
+  onInfo = null,
+  contextMeta = null,
 }) {
   if (!instrumentType || !symbol) return [];
 
@@ -1123,6 +1147,18 @@ async function hydrateHistoricalPriceSeries({
     const cached = buildRowMap(cachedRows);
     const missingStart = marketSessionDates.find((date) => !cached.has(date) || cached.get(date)?.close == null);
     if (missingStart) {
+      if (typeof onInfo === 'function') {
+        onInfo(`[MarketCache][Hydrate] Cache miss detected; fetching from provider for ${symbol}`, {
+          instrumentType,
+          symbol,
+          requestedFromDate: start,
+          requestedToDate: end,
+          missingFromDate: missingStart,
+          cachedPointsBeforeFetch: cachedRows.length,
+          ...(contextMeta && typeof contextMeta === 'object' ? contextMeta : {}),
+        });
+      }
+
       const fetched = await fetchRange(missingStart, end);
       const normalizedFetched = mapFetchedRows(fetched)
         .map(normalizeCachePoint)
@@ -1141,6 +1177,17 @@ async function hydrateHistoricalPriceSeries({
             upsertPriceSeries(instrumentType, symbol, adjustedFetched, sourceLabel || null);
           }
         }
+      }
+
+      if (typeof onInfo === 'function') {
+        onInfo(`[MarketCache][Hydrate] Provider fetch completed for ${symbol}`, {
+          instrumentType,
+          symbol,
+          missingFromDate: missingStart,
+          requestedToDate: end,
+          fetchedPoints: normalizedFetched.length,
+          ...(contextMeta && typeof contextMeta === 'object' ? contextMeta : {}),
+        });
       }
     }
   }
@@ -1331,7 +1378,6 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
     }
   });
 
-  tx(effectivePoints);
 }
 
 function getInvestmentSeries(investmentId, fromDate, toDate) {

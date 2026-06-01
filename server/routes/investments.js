@@ -304,7 +304,7 @@ module.exports = function (db) {
       const {
         name, asset_type, ticker_symbol, amfi_code,
         account_number, currency, notes,
-        face_value, coupon_frequency, maturity_date,
+        face_value, coupon_rate, coupon_frequency, maturity_date,
       } = req.body;
 
       if (!name || !asset_type) {
@@ -312,11 +312,11 @@ module.exports = function (db) {
       }
 
       const result = db.prepare(`
-        INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_frequency, maturity_date, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO investments (name, asset_type, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_rate, coupon_frequency, maturity_date, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(name, asset_type, ticker_symbol || null, amfi_code || null,
         account_number || null,
-        currency || 'INR', face_value || null,
+        currency || 'INR', face_value || null, coupon_rate || null,
         coupon_frequency || null, maturity_date || null,
         notes || null);
 
@@ -340,7 +340,7 @@ module.exports = function (db) {
       const {
         name, ticker_symbol, amfi_code,
         account_number, currency, notes, portfolio_id,
-        face_value, coupon_frequency, maturity_date,
+        face_value, coupon_rate, coupon_frequency, maturity_date,
         display_name, isin_code, nps_fund_code,
       } = req.body;
 
@@ -354,7 +354,7 @@ module.exports = function (db) {
       const params = [];
 
       // Legacy fields: only update if provided (COALESCE pattern)
-      const coalesceFields = { name, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_frequency, maturity_date, notes };
+      const coalesceFields = { name, ticker_symbol, amfi_code, account_number, currency, face_value, coupon_rate, coupon_frequency, maturity_date, notes };
       for (const [col, val] of Object.entries(coalesceFields)) {
         sets.push(`${col} = COALESCE(?, ${col})`);
         params.push(val !== undefined ? val : null);

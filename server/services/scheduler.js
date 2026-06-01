@@ -1,6 +1,7 @@
 /**
  * Cron scheduler for daily price updates.
  * Intraday runs (9:25 AM–4:25 PM) focus on stocks (frequent updates).
+ * Early run (4:25 AM) seeds daily snapshots across asset types.
  * Final run (10:25 PM) updates all asset types after MF NAVs settle.
  */
 
@@ -529,16 +530,18 @@ function startScheduler(db) {
     });
   });
 
-  // Early-morning accrual run at 4:25 AM IST (all days) - PF/PPF/SSY only
+  // Early-morning seed run at 4:25 AM IST (all days) - all asset types.
+  // Market-linked assets are processed only on market-session days.
   cron.schedule('25 4 * * *', async () => {
-    console.log('[Scheduler] Running 4:25 AM accrual update (PF/PPF/SSY only)...');
+    console.log('[Scheduler] Running 4:25 AM seed update (all asset types, session-aware)...');
     try {
-      await runSchedulerCycle(db, 'Early morning accrual run (PF/PPF/SSY)', {
-        assetTypes: ['PF', 'PPF', 'SSY'],
+      await runSchedulerCycle(db, 'Early morning seed run (all types)', {
+        sessionOnlyForMarketLinked: true,
+        runTag: 'early_morning_seed',
       });
     } catch (e) {
-      console.error('[Scheduler] 4:25 AM accrual update failed:', e.message);
-      logAppError('[Scheduler] Early morning accrual run failed', { error: e.message });
+      console.error('[Scheduler] 4:25 AM seed update failed:', e.message);
+      logAppError('[Scheduler] Early morning seed run failed', { error: e.message });
     }
   }, {
     timezone: 'Asia/Kolkata',
@@ -561,7 +564,7 @@ function startScheduler(db) {
   });
 
   console.log('[Scheduler] Daily price updates scheduled:');
-  console.log('  - 4:25 AM IST (PF/PPF/SSY only, daily)');
+  console.log('  - 4:25 AM IST (all asset types; market-linked only on session days, daily)');
   console.log('  - 9:25 AM–4:25 PM IST (hourly, stocks only, weekdays)');
   console.log('  - 10:25 PM IST (all asset types, weekdays)');
   logAppInfo('[Scheduler] Scheduled jobs initialized', {

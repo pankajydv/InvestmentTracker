@@ -1016,7 +1016,7 @@ export default function AddInvestment() {
       const inv = await createInvestment({
         name: bondForm.name,
         asset_type: assetType,
-        interest_rate: parseFloat(bondForm.coupon_rate),
+        coupon_rate: parseFloat(bondForm.coupon_rate),
         face_value: parseFloat(bondForm.face_value) || 1000,
         coupon_frequency: bondForm.coupon_frequency,
         maturity_date: bondForm.maturity_date,

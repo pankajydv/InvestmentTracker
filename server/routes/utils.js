@@ -22,6 +22,15 @@ const UNIT_OUTFLOW_TYPES = new Set([
 ]);
 const LOCF_SOURCES = new Set(['LOCF']);
 const IPO_PRELISTING_CARRY_MAX_DAYS = 12;
+const MARKET_LINKED_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
+const MARKET_DATA_CUTOFF_MINUTES_IST = Object.freeze({
+  INDIAN_STOCK: 17 * 60 + 45,
+  FOREIGN_STOCK: 18 * 60 + 30,
+  SGB: 19 * 60,
+  MUTUAL_FUND: 23 * 60,
+  NPS: 23 * 60,
+  DEFAULT: 23 * 60,
+});
 
 const complianceJobStore = new Map();
 let complianceJobSeq = 0;
@@ -222,6 +231,63 @@ function isMarketSessionDate(isoDate, marketHolidaySet) {
   return true;
 }
 
+function getIstClock(now = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(now);
+  const values = {};
+  for (const part of parts) {
+    if (!part?.type || part.type === 'literal') continue;
+    values[part.type] = part.value;
+  }
+
+  const date = `${values.year}-${values.month}-${values.day}`;
+  const hour = Number(values.hour || 0);
+  const minute = Number(values.minute || 0);
+  return {
+    date,
+    minutes: (hour * 60) + minute,
+  };
+}
+
+function getMarketDataCutoffMinutesForAsset(assetType) {
+  return MARKET_DATA_CUTOFF_MINUTES_IST[assetType] ?? MARKET_DATA_CUTOFF_MINUTES_IST.DEFAULT;
+}
+
+function classifySameDayLocfState(scope, runDate, rowDate, rowPriceSource) {
+  if (!scope || !MARKET_LINKED_ASSET_TYPES.has(String(scope.asset_type || ''))) {
+    return { pending: false, overdue: false };
+  }
+  if (runDate !== rowDate) return { pending: false, overdue: false };
+  if (!LOCF_SOURCES.has(String(rowPriceSource || ''))) return { pending: false, overdue: false };
+
+  const istNow = getIstClock();
+  if (runDate !== istNow.date) return { pending: false, overdue: false };
+
+  const cutoffMinutes = getMarketDataCutoffMinutesForAsset(String(scope.asset_type || ''));
+  if (istNow.minutes < cutoffMinutes) {
+    return { pending: true, overdue: false };
+  }
+  return { pending: false, overdue: true };
+}
+
+function mergeComplianceReason(existingReason, nextReason) {
+  const left = String(existingReason || '').trim();
+  const right = String(nextReason || '').trim();
+  if (!left) return right || null;
+  if (!right) return left;
+  if (left === right) return left;
+  return `${left} | ${right}`;
+}
+
 function eachDate(fromDate, toDate) {
   const out = [];
   let d = new Date(`${fromDate}T00:00:00.000Z`);
@@ -355,7 +421,9 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       first_missing_date: null,
       missing_count: 0,
       unexpected_locf_count: 0,
+      pending_locf_count: 0,
       compliance_error_count: 0,
+      overdue_locf_count: 0,
       stale: false,
     };
   }
@@ -419,7 +487,9 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       first_missing_date: null,
       missing_count: 0,
       unexpected_locf_count: 0,
+      pending_locf_count: 0,
       compliance_error_count: ipoCarryComplianceErrorCount,
+      overdue_locf_count: 0,
       compliance_error_reason: ipoCarryComplianceErrorReason,
       stale: false,
     };
@@ -466,7 +536,9 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       first_missing_date: null,
       missing_count: 0,
       unexpected_locf_count: 0,
+      pending_locf_count: 0,
       compliance_error_count: ipoCarryComplianceErrorCount,
+      overdue_locf_count: 0,
       compliance_error_reason: ipoCarryComplianceErrorReason,
       stale: false,
     };
@@ -490,8 +562,11 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
 
   let missingCount = 0;
   let unexpectedLocfCount = 0;
+  let pendingLocfCount = 0;
+  let overdueLocfCount = 0;
   let firstMissingDate = null;
   let locfStreak = 0;
+  let complianceErrorReason = ipoCarryComplianceErrorReason;
   const latestExpectedDate = expectedDates[expectedDates.length - 1] || null;
   const unexpectedLocfStartDate = latestExpectedDate
     ? addDaysIso(latestExpectedDate, -(Math.max(1, Number(unexpectedLocfPolicy.recentWindowDays) || 180) - 1))
@@ -504,6 +579,19 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       if (!firstMissingDate) firstMissingDate = date;
       locfStreak = 0;
       continue;
+    }
+
+    if (date === runDate) {
+      const locfState = classifySameDayLocfState(scope, runDate, date, row.price_source);
+      if (locfState.pending) {
+        pendingLocfCount += 1;
+        locfStreak = 0;
+        continue;
+      }
+      if (locfState.overdue) {
+        overdueLocfCount += 1;
+        complianceErrorReason = mergeComplianceReason(complianceErrorReason, 'MARKET_DATA_NOT_SETTLED_AFTER_CUTOFF');
+      }
     }
 
     const isUnexpectedWindowDate = !unexpectedLocfStartDate || date >= unexpectedLocfStartDate;
@@ -529,8 +617,10 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
     first_missing_date: firstMissingDate,
     missing_count: missingCount,
     unexpected_locf_count: unexpectedLocfCount,
-    compliance_error_count: ipoCarryComplianceErrorCount,
-    compliance_error_reason: ipoCarryComplianceErrorReason,
+    pending_locf_count: pendingLocfCount,
+    overdue_locf_count: overdueLocfCount,
+    compliance_error_count: ipoCarryComplianceErrorCount + overdueLocfCount,
+    compliance_error_reason: complianceErrorReason,
     stale: !!latestExpectedDate && (!lastRowDate || lastRowDate < latestExpectedDate),
   };
 }
@@ -591,6 +681,8 @@ module.exports = function (db) {
         compliance_errors: details.reduce((sum, row) => sum + Number(row.compliance_error_count || 0), 0),
         missing_rows: details.reduce((sum, row) => sum + Number(row.missing_count || 0), 0),
         unexpected_locf: details.reduce((sum, row) => sum + Number(row.unexpected_locf_count || 0), 0),
+        pending_locf: details.reduce((sum, row) => sum + Number(row.pending_locf_count || 0), 0),
+        overdue_locf: details.reduce((sum, row) => sum + Number(row.overdue_locf_count || 0), 0),
         stale_scopes: details.filter((row) => row.stale).length,
       };
 

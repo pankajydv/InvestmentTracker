@@ -1,11 +1,12 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button, Dropdown, Modal, Form, Alert } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp } from 'lucide-react';
+import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing } from 'lucide-react';
 import { HolidaysListModal, HolidaysSyncModal } from './HolidaysMenuItems';
-import { triggerPriceUpdate, cancelPriceUpdate, exportData } from '../services/api';
+import { triggerPriceUpdate, cancelPriceUpdate, exportData, getCorporateActionSuggestionCount } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 import { useAppSettings } from '../context/AppSettingsContext';
+import { usePortfolio } from '../context/PortfolioContext';
 
 const PRIMARY_NAV_ITEMS = [
   { path: '/', label: 'Dashboard', shortLabel: 'Dashboard', icon: BarChart3 },
@@ -17,6 +18,7 @@ const PRIMARY_NAV_ITEMS = [
 
 export default function Navbar({ user, onLogout }) {
   const location = useLocation();
+  const { selectedId } = usePortfolio();
   const { settings, loading: settingsLoading, saving: settingsSaving, error: settingsError, saveSettings } = useAppSettings();
   const [updating, setUpdating] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -25,7 +27,24 @@ export default function Navbar({ user, onLogout }) {
   const [showSettings, setShowSettings] = useState(false);
   const [draftSettings, setDraftSettings] = useState(null);
   const [settingsMessage, setSettingsMessage] = useState('');
+  const [pendingCASuggestions, setPendingCASuggestions] = useState(0);
   const currentYear = new Date().getFullYear();
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadPending = async () => {
+      try {
+        const data = await getCorporateActionSuggestionCount(selectedId || null);
+        if (!cancelled) setPendingCASuggestions(Number(data?.count || 0));
+      } catch (_e) {
+        if (!cancelled) setPendingCASuggestions(0);
+      }
+    };
+    loadPending();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, location.pathname]);
 
   const openSettings = () => {
     setSettingsMessage('');
@@ -113,6 +132,20 @@ export default function Navbar({ user, onLogout }) {
                 <span className="d-lg-none d-none d-md-inline">{shortLabel}</span>
               </Nav.Link>
             ))}
+            <Nav.Link
+              as={Link}
+              to="/corporate-actions"
+              className={`d-flex align-items-center gap-1 rounded px-2 py-2 small fw-medium text-nowrap ${
+                location.pathname === '/corporate-actions' ? 'active-nav' : 'text-secondary'
+              }`}
+              title="Pending"
+            >
+              <BellRing size={16} />
+              <span className="d-none d-lg-inline">Pending</span>
+              {pendingCASuggestions > 0 && (
+                <span className="badge rounded-pill bg-danger">{pendingCASuggestions}</span>
+              )}
+            </Nav.Link>
           </Nav>
 
           <Dropdown align="end" className="ms-auto ms-1">

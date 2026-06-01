@@ -48,6 +48,10 @@ function isMarketSessionDate(dateIso, db, cache) {
   return !closed.has(dateIso);
 }
 
+function isMarketLinkedAssetType(assetType) {
+  return ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(assetType || ''));
+}
+
 function getPriorMarketSessionLocfStreak(db, investmentId, portfolioId, asOfDate, holidayCache) {
   const fromDate = addDaysIso(asOfDate, -90);
   const rows = db.prepare(`
@@ -130,11 +134,15 @@ function getProvidentValueAsOfDate(db, inv, date, portfolioId = null) {
  * @param {import('better-sqlite3').Database} db
  * @param {Object} [options]
  * @param {string[]} [options.assetTypes] - If provided, only update these asset types (e.g. ['MUTUAL_FUND'])
+ * @param {boolean} [options.sessionOnlyForMarketLinked] - Skip market-linked assets on non-market-session days
+ * @param {string} [options.runTag] - Optional label for logs/diagnostics
  */
 async function updateAllPrices(db, options = {}) {
   _cancelled = false;
   const today = new Date().toISOString().split('T')[0];
   const typeFilter = options.assetTypes;
+  const sessionOnlyForMarketLinked = options.sessionOnlyForMarketLinked === true;
+  const runTag = String(options.runTag || '').trim() || null;
   const label = typeFilter ? typeFilter.join(', ') : 'ALL';
   const runStartedAt = Date.now();
   console.log(`[${new Date().toISOString()}] Starting price update (${label}) for ${today}...`);
@@ -321,6 +329,15 @@ async function updateAllPrices(db, options = {}) {
   let heartbeatAt = Date.now();
   const marketHolidayCache = new Map();
   const warnedUnexpectedLocf = new Set();
+  const isMarketSessionToday = isMarketSessionDate(today, db, marketHolidayCache);
+
+  logAppInfo('[UpdatePrices] Run context', {
+    date: today,
+    runTag,
+    sessionOnlyForMarketLinked,
+    isMarketSessionToday,
+    assetFilter: typeFilter || null,
+  });
 
 
   for (const inv of investments) {
@@ -334,6 +351,18 @@ async function updateAllPrices(db, options = {}) {
     }
 
     try {
+      if (sessionOnlyForMarketLinked && !isMarketSessionToday && isMarketLinkedAssetType(inv.asset_type)) {
+        skippedCount += 1;
+        logAppInfo('[UpdatePrices] Skipped market-linked asset on non-session day', {
+          investmentId: inv.id,
+          investmentName: inv.name,
+          assetType: inv.asset_type,
+          date: today,
+          runTag,
+        });
+        continue;
+      }
+
       let pricePerUnit = 0;
       let priceSource = 'COMPUTED';
       let apiChange = null;

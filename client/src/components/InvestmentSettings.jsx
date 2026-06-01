@@ -111,6 +111,9 @@ export default function InvestmentSettings() {
 
   const handleSave = async (e) => {
     e.preventDefault();
+    const confirmed = window.confirm('Save changes to this investment settings record?');
+    if (!confirmed) return;
+
     try {
       setSaving(true);
       setError(null);
@@ -241,13 +244,11 @@ export default function InvestmentSettings() {
                   <Form.Control
                     type="text"
                     value={form.isin_code}
-                    readOnly
-                    disabled
-                    className="bg-light"
+                    onChange={(e) => setForm({ ...form, isin_code: e.target.value })}
                     placeholder="Auto-populated from imports"
                   />
                   <Form.Text className="text-muted">
-                    Universal security identifier. Set during import.
+                    Universal security identifier. Can be edited when needed.
                   </Form.Text>
                 </Form.Group>
               </Col>

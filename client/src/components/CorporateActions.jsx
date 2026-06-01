@@ -1,8 +1,15 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Button, Form, Alert, Spinner, Table } from 'react-bootstrap';
 import { ArrowLeft, CheckCircle, AlertTriangle, Trash2, Pencil, Plus, Info } from 'lucide-react';
-import { previewCorporateActions, importCorporateActions, previewInterestRateSync, importInterestRateSync } from '../services/api';
+import {
+  previewCorporateActions,
+  importCorporateActions,
+  previewInterestRateSync,
+  importInterestRateSync,
+  getCorporateActionSuggestions,
+  resolveCorporateActionSuggestions,
+} from '../services/api';
 import { formatNumber, formatDate } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 
@@ -24,7 +31,6 @@ export default function CorporateActions() {
   const navigate = useNavigate();
   const { portfolios, selectedId } = usePortfolio();
   const [assetType, setAssetType] = useState('INDIAN_STOCK');
-  const [year, setYear] = useState(new Date().getFullYear() - 1);
   const [loading, setLoading] = useState(false);
   const [suggestions, setSuggestions] = useState(null);
   const [corrections, setCorrections] = useState(null);
@@ -34,6 +40,12 @@ export default function CorporateActions() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [datasetVersion, setDatasetVersion] = useState('');
+  const [pendingSuggestions, setPendingSuggestions] = useState([]);
+  const [pendingLoading, setPendingLoading] = useState(false);
+  const [pendingError, setPendingError] = useState('');
+  const [pendingMessage, setPendingMessage] = useState('');
+  const [pendingChecked, setPendingChecked] = useState({});
+  const [pendingApplying, setPendingApplying] = useState(false);
 
   // Checked state per section
   const [checkedAdd, setCheckedAdd] = useState({});
@@ -42,15 +54,69 @@ export default function CorporateActions() {
 
   const isRateSync = RATE_TYPES.has(assetType);
 
-  const currentYear = new Date().getFullYear();
-  const years = [];
-  for (let y = currentYear; y >= 2010; y--) years.push(y);
-
   const clearPreview = () => {
     setSuggestions(null);
     setCorrections(null);
     setDeletions(null);
     setErrors([]);
+  };
+
+  const loadPendingSuggestions = async () => {
+    setPendingLoading(true);
+    setPendingError('');
+    try {
+      const data = await getCorporateActionSuggestions({
+        status: 'pending',
+        portfolioId: selectedId || null,
+        limit: 500,
+      });
+      const items = data?.suggestions || [];
+      setPendingSuggestions(items);
+      const initialChecked = {};
+      for (const item of items) initialChecked[item.id] = false;
+      setPendingChecked(initialChecked);
+    } catch (e) {
+      setPendingError(e.message || 'Failed to load pending suggestions');
+      setPendingSuggestions([]);
+      setPendingChecked({});
+    } finally {
+      setPendingLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadPendingSuggestions();
+  }, [selectedId]);
+
+  const selectedPendingIds = useMemo(
+    () => pendingSuggestions.filter((s) => pendingChecked[s.id]).map((s) => s.id),
+    [pendingSuggestions, pendingChecked]
+  );
+
+  const toggleAllPending = (checked) => {
+    const next = {};
+    for (const item of pendingSuggestions) next[item.id] = checked;
+    setPendingChecked(next);
+  };
+
+  const resolvePending = async (decision, ids) => {
+    if (!ids.length) return;
+    setPendingApplying(true);
+    setPendingError('');
+    setPendingMessage('');
+    try {
+      const data = await resolveCorporateActionSuggestions({ ids, decision });
+      if (decision === 'accept') {
+        setPendingMessage(`Accepted ${data.accepted || 0}, applied ${data.applied || 0}, skipped ${data.skipped || 0}.`);
+      } else {
+        setPendingMessage(`Rejected ${data.rejected || 0}.`);
+      }
+      await loadPendingSuggestions();
+    } catch (e) {
+      setPendingError(e.message || 'Failed to resolve suggestions');
+    } finally {
+      setPendingApplying(false);
+    }
   };
 
   const handleFetch = async () => {
@@ -73,7 +139,7 @@ export default function CorporateActions() {
         setCheckedFix(initFix);
         setCheckedDel(initDel);
       } else {
-        const data = await previewCorporateActions(selectedId || null, year, assetType);
+        const data = await previewCorporateActions(selectedId || null, assetType);
         setSuggestions(data.suggestions || []);
         setCorrections(data.corrections || []);
         setDeletions(data.deletions || []);
@@ -156,15 +222,129 @@ export default function CorporateActions() {
         <button onClick={() => navigate(-1)} className="btn btn-link btn-sm text-muted text-decoration-none d-flex align-items-center gap-1 mb-2 p-0">
           <ArrowLeft size={16} /> Back
         </button>
-        <h1 className="h4 fw-bold">Sync Corporate Actions</h1>
+        <h1 className="h4 fw-bold">Approvals</h1>
         <p className="text-muted small mb-0">
           {isRateSync
             ? `Sync ${assetType} interest rates from the reference dataset — add missing and correct wrong.`
-            : 'Fetch dividends, splits and bonus issues from Yahoo Finance — add missing, correct wrong, and remove invalid entries.'}
+            : 'Review and approve detected updates before they are applied.'}
         </p>
       </div>
 
       {error && <Alert variant="danger" className="small py-2">{error}</Alert>}
+
+      <Card className="shadow-sm">
+        <Card.Header className="bg-white d-flex align-items-center justify-content-between py-2">
+          <div className="small">
+            <strong>Pending</strong>
+            <span className="text-muted ms-2">({pendingSuggestions.length})</span>
+          </div>
+          <Button size="sm" variant="outline-secondary" onClick={loadPendingSuggestions} disabled={pendingLoading || pendingApplying}>
+            {pendingLoading ? 'Refreshing...' : 'Refresh'}
+          </Button>
+        </Card.Header>
+        <Card.Body className="pt-3 pb-2">
+          {pendingError && <Alert variant="danger" className="small py-2">{pendingError}</Alert>}
+          {pendingMessage && <Alert variant="success" className="small py-2">{pendingMessage}</Alert>}
+          {pendingLoading ? (
+            <div className="small text-muted">Loading pending suggestions...</div>
+          ) : pendingSuggestions.length === 0 ? (
+            <div className="small text-muted">No pending items.</div>
+          ) : (
+            <>
+              <div className="table-responsive">
+                <Table hover size="sm" className="mb-2 small">
+                  <thead className="table-light">
+                    <tr>
+                      <th className="px-3 py-2" style={{ width: 30 }}>
+                        <Form.Check
+                          type="checkbox"
+                          checked={selectedPendingIds.length > 0 && selectedPendingIds.length === pendingSuggestions.length}
+                          onChange={(e) => toggleAllPending(e.target.checked)}
+                        />
+                      </th>
+                      <th className="px-3 py-2">Date</th>
+                      <th className="px-3 py-2">Stock</th>
+                      <th className="px-3 py-2">Type</th>
+                      <th className="px-3 py-2">Action</th>
+                      <th className="px-3 py-2 text-end">Proposed Value</th>
+                      <th className="px-3 py-2">Details</th>
+                      <th className="px-3 py-2">Decision</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pendingSuggestions.map((item) => {
+                      const payload = item.payload || {};
+                      const next = payload.next || {};
+                      const isDividend = item.transaction_type === 'DIVIDEND';
+                      const proposedValue = isDividend
+                        ? `₹${formatNumber(next.amount ?? 0, 2)}`
+                        : `${formatNumber(next.units ?? 0, 4)} shares`;
+                      return (
+                        <tr key={item.id}>
+                          <td className="px-3 py-2">
+                            <Form.Check
+                              type="checkbox"
+                              checked={!!pendingChecked[item.id]}
+                              onChange={(e) => setPendingChecked((prev) => ({ ...prev, [item.id]: e.target.checked }))}
+                            />
+                          </td>
+                          <td className="px-3 py-2 text-nowrap">{formatDate(item.transaction_date)}</td>
+                          <td className="px-3 py-2 fw-medium">{item.investment_name || `Investment #${item.investment_id}`}</td>
+                          <td className="px-3 py-2"><TypeBadge type={item.transaction_type} /></td>
+                          <td className="px-3 py-2 text-capitalize">{item.action}</td>
+                          <td className="px-3 py-2 text-end fw-medium">{proposedValue}</td>
+                          <td className="px-3 py-2 text-muted">{next.notes || item.notes || '-'}</td>
+                          <td className="px-3 py-2">
+                            <div className="d-flex gap-2">
+                              <Button
+                                size="sm"
+                                variant="success"
+                                disabled={pendingApplying}
+                                onClick={() => resolvePending('accept', [item.id])}
+                              >
+                                Accept
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline-danger"
+                                disabled={pendingApplying}
+                                onClick={() => resolvePending('reject', [item.id])}
+                              >
+                                Reject
+                              </Button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </Table>
+              </div>
+              <div className="d-flex align-items-center justify-content-between">
+                <span className="small text-muted">{selectedPendingIds.length} selected</span>
+                <div className="d-flex gap-2">
+                  <Button
+                    size="sm"
+                    variant="success"
+                    disabled={pendingApplying || selectedPendingIds.length === 0}
+                    onClick={() => resolvePending('accept', selectedPendingIds)}
+                  >
+                    {pendingApplying ? 'Applying...' : `Accept Selected (${selectedPendingIds.length})`}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline-danger"
+                    disabled={pendingApplying || selectedPendingIds.length === 0}
+                    onClick={() => resolvePending('reject', selectedPendingIds)}
+                  >
+                    Reject Selected
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
+        </Card.Body>
+      </Card>
 
       {/* Controls */}
       <Card className="shadow-sm">
@@ -178,14 +358,6 @@ export default function CorporateActions() {
                 ))}
               </Form.Select>
             </Form.Group>
-            {!isRateSync && (
-              <Form.Group>
-                <Form.Label className="small fw-semibold">Year</Form.Label>
-                <Form.Select size="sm" value={year} onChange={(e) => setYear(parseInt(e.target.value))} style={{ width: 120 }}>
-                  {years.map(y => <option key={y} value={y}>{y}</option>)}
-                </Form.Select>
-              </Form.Group>
-            )}
             <div className="d-flex flex-column">
               <span className="small text-muted mb-1">Portfolio: <strong>{portfolioLabel}</strong></span>
               <Button size="sm" variant="primary" onClick={handleFetch} disabled={loading}>
@@ -222,7 +394,7 @@ export default function CorporateActions() {
         <Alert variant="info" className="small py-2">
           {isRateSync
             ? `All ${assetType} interest rates are up to date!`
-            : `No changes needed for ${year}. Everything is up to date!`}
+            : 'No changes needed. Everything is up to date!'}
         </Alert>
       )}
 

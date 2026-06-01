@@ -997,6 +997,42 @@ async function fetchCorporateActions(symbol, year, options = {}) {
 }
 
 /**
+ * Fetch dividend events in one range call.
+ * - FOREIGN_STOCK: NASDAQ once, filtered by payment date range
+ * - Others: Yahoo chart dividend events over the exact range
+ * @param {string} symbol
+ * @param {string} fromDate - ISO date YYYY-MM-DD
+ * @param {string} toDate - ISO date YYYY-MM-DD
+ * @param {{assetType?: string}} [options]
+ * @returns {Promise<{dividends: Array, warnings?: Array<string>}>}
+ */
+async function fetchDividendEventsForRange(symbol, fromDate, toDate, options = {}) {
+  const assetType = options.assetType || null;
+  const startIso = String(fromDate || '').split('T')[0];
+  const endIso = String(toDate || '').split('T')[0];
+  if (!symbol || !startIso || !endIso || startIso > endIso) {
+    return { dividends: [], warnings: [] };
+  }
+
+  if (assetType === 'FOREIGN_STOCK') {
+    const { dividends, warnings } = await _fetchNasdaqDividendsAll(symbol);
+    const filtered = dividends.filter((d) => {
+      const paymentDate = d?.payment_date || d?.date;
+      return paymentDate && paymentDate >= startIso && paymentDate <= endIso;
+    });
+    return { dividends: filtered, warnings };
+  }
+
+  const period1 = Math.floor(new Date(`${startIso}T00:00:00.000Z`).getTime() / 1000);
+  const period2 = Math.floor(new Date(`${endIso}T23:59:59.000Z`).getTime() / 1000);
+  const { dividends } = await _fetchChartEvents(symbol, period1, period2);
+  return {
+    dividends: (dividends || []).filter((d) => d?.date && d.date >= startIso && d.date <= endIso),
+    warnings: [],
+  };
+}
+
+/**
  * Fetch foreign-stock dividends from NASDAQ with record/payment dates.
  * Returns normalized rows with:
  * - date: payment date (for transaction posting)
@@ -1064,6 +1100,65 @@ function _fetchNasdaqDividends(symbol, year) {
 
           if (dividends.length === 0 && warnings.length === 0) {
             warnings.push(`No NASDAQ dividend rows found for ${symbol} in ${year}`);
+          }
+
+          dividends.sort((a, b) => a.date.localeCompare(b.date));
+          resolve({ dividends, warnings });
+        } catch (e) {
+          reject(new Error(`Failed to parse NASDAQ dividends for ${symbol}: ${e.message}`));
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+function _fetchNasdaqDividendsAll(symbol) {
+  const url = `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/dividends?assetclass=stocks`;
+
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) {
+            reject(new Error(`NASDAQ dividends API returned ${res.statusCode} for ${symbol}`));
+            return;
+          }
+
+          const json = JSON.parse(data);
+          const rows = json?.data?.dividends?.rows;
+          if (!Array.isArray(rows)) {
+            reject(new Error(`NASDAQ dividends data missing for ${symbol}`));
+            return;
+          }
+
+          const dividends = [];
+          const warnings = [];
+          for (const row of rows) {
+            const amount = _parseCurrencyAmount(row?.amount);
+            const exDate = _parseNasdaqDate(row?.exOrEffDate);
+            const recordDate = _parseNasdaqDate(row?.recordDate || row?.exOrEffDate);
+            const paymentDate = _parseNasdaqDate(row?.paymentDate);
+            const rowId = `ex=${row?.exOrEffDate || 'NA'}, record=${row?.recordDate || 'NA'}, pay=${row?.paymentDate || 'NA'}, amount=${row?.amount || 'NA'}`;
+
+            if (!(amount > 0)) {
+              warnings.push(`NASDAQ dividend row ignored due to non-cash/invalid amount (${rowId})`);
+              continue;
+            }
+            if (!paymentDate || !recordDate) {
+              warnings.push(`NASDAQ dividend row missing payment/record date (${rowId})`);
+              continue;
+            }
+
+            dividends.push({
+              date: paymentDate,
+              amount,
+              record_date: recordDate,
+              payment_date: paymentDate,
+              ex_date: exDate,
+            });
           }
 
           dividends.sort((a, b) => a.date.localeCompare(b.date));
@@ -1398,6 +1493,7 @@ module.exports = {
   fetchHistoricalStockPrice,
   fetchHistoricalOHLC,
   fetchCorporateActions,
+  fetchDividendEventsForRange,
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
   fetchHistoricalUSDToINRRange,

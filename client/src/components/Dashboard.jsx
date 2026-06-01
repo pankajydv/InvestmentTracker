@@ -233,8 +233,11 @@ function combineHealthStatuses(results) {
     counts: {
       scopes_checked: 0,
       issue_scopes: 0,
+      compliance_errors: 0,
       missing_rows: 0,
       unexpected_locf: 0,
+      pending_locf: 0,
+      overdue_locf: 0,
       stale_scopes: 0,
     },
     compliance: {
@@ -259,8 +262,11 @@ function combineHealthStatuses(results) {
     const counts = result.counts || {};
     merged.counts.scopes_checked += Number(counts.scopes_checked || 0);
     merged.counts.issue_scopes += Number(counts.issue_scopes || 0);
+    merged.counts.compliance_errors += Number(counts.compliance_errors || 0);
     merged.counts.missing_rows += Number(counts.missing_rows || 0);
     merged.counts.unexpected_locf += Number(counts.unexpected_locf || 0);
+    merged.counts.pending_locf += Number(counts.pending_locf || 0);
+    merged.counts.overdue_locf += Number(counts.overdue_locf || 0);
     merged.counts.stale_scopes += Number(counts.stale_scopes || 0);
 
     const compliance = result.compliance || {};
@@ -300,7 +306,7 @@ function combineHealthStatuses(results) {
     if (Array.isArray(result.issues)) merged.issues.push(...result.issues);
   }
 
-  if (merged.counts.missing_rows > 0) merged.status = 'error';
+  if (merged.counts.missing_rows > 0 || merged.counts.compliance_errors > 0) merged.status = 'error';
   else if (merged.counts.unexpected_locf > 0 || merged.counts.stale_scopes > 0) merged.status = 'warning';
 
   merged.issues.sort((a, b) => {
@@ -693,7 +699,7 @@ export default function Dashboard() {
               <AlertTriangle size={16} />
               <span className="fw-semibold">Daily values health warning</span>
               <span className="small">
-                Missing: {dailyHealth.counts?.missing_rows || 0} | Unexpected LOCF: {dailyHealth.counts?.unexpected_locf || 0} | Stale scopes: {dailyHealth.counts?.stale_scopes || 0}
+                Missing: {dailyHealth.counts?.missing_rows || 0} | Compliance errors: {dailyHealth.counts?.compliance_errors || 0} | Unexpected LOCF: {dailyHealth.counts?.unexpected_locf || 0} | Pending LOCF: {dailyHealth.counts?.pending_locf || 0} | Stale scopes: {dailyHealth.counts?.stale_scopes || 0}
               </span>
             </div>
             <Button
@@ -733,6 +739,7 @@ export default function Dashboard() {
                     <th>Portfolio</th>
                     <th>First Missing</th>
                     <th className="text-end">Missing</th>
+                    <th className="text-end">Compliance</th>
                     <th className="text-end">Unexpected LOCF</th>
                     <th>Last Row</th>
                   </tr>
@@ -748,6 +755,7 @@ export default function Dashboard() {
                       <td>{issue.portfolio_name || '-'}</td>
                       <td>{issue.first_missing_date || '-'}</td>
                       <td className="text-end">{issue.missing_count || 0}</td>
+                      <td className="text-end">{issue.compliance_error_count || 0}</td>
                       <td className="text-end">{issue.unexpected_locf_count || 0}</td>
                       <td>{issue.last_row_date || '-'}</td>
                     </tr>
