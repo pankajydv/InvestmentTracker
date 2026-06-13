@@ -26,7 +26,13 @@ const {
 const {
   quantizeForStorage,
 } = require('./numberPrecision');
+const { markScopeDirty } = require('./dirtyBackfillService');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Asset types covered by the generic LOCF-lag self-healing path.
+// FOREIGN_STOCK is intentionally excluded — it has a dedicated settlement-aware
+// reconcile path in the scheduler (ensureForeignReconcileScopes).
+const LOCF_LAG_RECONCILE_ASSET_TYPES = new Set(['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
 
 const DAY_CHANGE_MAX_PREVIOUS_SESSIONS = 3;
 const DAY_CHANGE_EPSILON_UNITS = 0.0001;
@@ -656,9 +662,10 @@ async function updateAllPrices(db, options = {}) {
           quantizeForStorage(dayChange)
         );
 
+        const assetType = String(inv.asset_type || '');
         if (
           priceSource === 'LOCF'
-          && ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(inv.asset_type || ''))
+          && (LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType) || assetType === 'FOREIGN_STOCK')
           && isMarketSessionDate(today, db, marketHolidayCache)
         ) {
           const priorStreak = getPriorMarketSessionLocfStreak(db, inv.id, pid, today, marketHolidayCache);
@@ -670,9 +677,23 @@ async function updateAllPrices(db, options = {}) {
               investmentId: inv.id,
               investmentName: inv.name,
               portfolioId: pid,
-              assetType: inv.asset_type,
+              assetType,
               date: today,
               streak: currentStreak,
+            });
+          }
+
+          // Enqueue a dirty scope for all lag-reconcile types so backfill
+          // re-processes this date once the real price arrives from the provider.
+          // FOREIGN_STOCK is excluded here — its settlement-aware reconcile path
+          // in ensureForeignReconcileScopes handles it each scheduler cycle.
+          if (LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType)) {
+            markScopeDirty(db, {
+              investmentId: inv.id,
+              portfolioId: pid,
+              dirtyFromDate: today,
+              reason: 'locf-lag-signal',
+              sourceEventId: `update-prices-locf:${today}`,
             });
           }
         }

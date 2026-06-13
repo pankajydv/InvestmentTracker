@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import { useParams, Link, useLocation } from 'react-router-dom';
-import { Card, Form, Button, Row, Col, Spinner, Alert, Table } from 'react-bootstrap';
+import { Card, Form, Button, Row, Col, Spinner, Alert, Table, Collapse } from 'react-bootstrap';
 import {
   getInvestment,
   updateInvestment,
@@ -8,9 +8,97 @@ import {
   createInvestmentSymbolHistory,
   updateInvestmentSymbolHistory,
   deleteInvestmentSymbolHistory,
+  getInvestmentHistoricalPrices,
+  getInvestmentFxRateCache,
+  getInvestments,
 } from '../services/api';
 import { ArrowLeft, Save } from 'lucide-react';
-import { ASSET_TYPE_LABELS } from '../utils/formatters';
+import { ASSET_TYPE_LABELS, formatNumber } from '../utils/formatters';
+
+const MARKET_DRIVEN_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'BOND']);
+
+function addDaysIso(date, days) {
+  const d = new Date(`${date}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+
+function minIsoDate(a, b) {
+  return a <= b ? a : b;
+}
+
+function isValidIsoDate(date) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(date || ''));
+}
+
+function calculateFxRateCacheDateRangeFromInvestments(investments = []) {
+  const today = new Date().toISOString().slice(0, 10);
+  const fsInvestments = (investments || []).filter(
+    (inv) => String(inv?.asset_type || '').toUpperCase() === 'FOREIGN_STOCK'
+  );
+
+  if (!fsInvestments.length) {
+    return { from: addDaysIso(today, -365), to: today, page: 1, pageSize: 365 };
+  }
+
+  const globalStarts = [];
+  const globalEnds = [];
+
+  for (const inv of fsInvestments) {
+    const txns = Array.isArray(inv?.transactions) ? inv.transactions : [];
+    const datedTxns = txns
+      .map((txn) => ({
+        date: String(txn?.transaction_date || '').slice(0, 10),
+        type: String(txn?.transaction_type || '').toUpperCase(),
+        units: Number(txn?.units || 0),
+      }))
+      .filter((txn) => isValidIsoDate(txn.date))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    if (!datedTxns.length) continue;
+    globalStarts.push(datedTxns[0].date);
+
+    let runningUnits = 0;
+    let latestExitDate = null;
+
+    for (const txn of datedTxns) {
+      if (txn.type === 'BUY' || txn.type === 'BONUS' || txn.type === 'RIGHTS' || txn.type === 'IPO' || txn.type === 'TRANSFER_IN' || txn.type === 'SPLIT' || txn.type === 'VEST' || txn.type === 'ESPP_PURCHASE') {
+        runningUnits += txn.units;
+      } else if (txn.type === 'SELL' || txn.type === 'REDEMPTION' || txn.type === 'TRANSFER_OUT') {
+        runningUnits -= txn.units;
+      }
+
+      if (runningUnits <= 1e-6) {
+        latestExitDate = txn.date;
+      }
+    }
+
+    const investmentEndDate = runningUnits > 1e-6
+      ? today
+      : (latestExitDate && latestExitDate < today ? latestExitDate : today);
+    globalEnds.push(investmentEndDate);
+  }
+
+  const from = globalStarts.length ? globalStarts.sort()[0] : addDaysIso(today, -365);
+  const to = globalEnds.length ? globalEnds.sort().slice(-1)[0] : today;
+  return { from, to, page: 1, pageSize: 365 };
+}
+
+function historyDefaultFilters(investment = null) {
+  const today = new Date().toISOString().slice(0, 10);
+  const latestExistingDate = String(investment?.latestValue?.date || '').slice(0, 10);
+  const to = /^\d{4}-\d{2}-\d{2}$/.test(latestExistingDate)
+    ? minIsoDate(latestExistingDate, today)
+    : today;
+
+  const earliestTxnDate = (investment?.transactions || [])
+    .map((txn) => String(txn?.transaction_date || '').slice(0, 10))
+    .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date))
+    .sort()[0];
+
+  const from = earliestTxnDate || addDaysIso(to, -365);
+  return { from, to, page: 1, pageSize: 365 };
+}
 
 export default function InvestmentSettings() {
   const { id } = useParams();
@@ -30,6 +118,16 @@ export default function InvestmentSettings() {
   const [historySuccess, setHistorySuccess] = useState('');
   const [isAddingHistory, setIsAddingHistory] = useState(false);
   const [editingHistoryId, setEditingHistoryId] = useState(null);
+  const [priceHistoryFilters, setPriceHistoryFilters] = useState(() => historyDefaultFilters());
+  const [priceHistoryLoading, setPriceHistoryLoading] = useState(false);
+  const [priceHistoryError, setPriceHistoryError] = useState('');
+  const [priceHistoryData, setPriceHistoryData] = useState(null);
+  const [priceHistoryExpanded, setPriceHistoryExpanded] = useState(false);
+  const [fxRateCacheFilters, setFxRateCacheFilters] = useState(() => historyDefaultFilters());
+  const [fxRateCacheLoading, setFxRateCacheLoading] = useState(false);
+  const [fxRateCacheError, setFxRateCacheError] = useState('');
+  const [fxRateCacheData, setFxRateCacheData] = useState(null);
+  const [fxRateCacheExpanded, setFxRateCacheExpanded] = useState(false);
   const [historyForm, setHistoryForm] = useState({
     symbol: '',
     isin_code: '',
@@ -49,6 +147,46 @@ export default function InvestmentSettings() {
   });
 
   useEffect(() => { loadData(); }, [id]);
+
+  const loadHistoricalPriceData = useCallback(async (filters = null) => {
+    const effectiveFilters = filters || priceHistoryFilters;
+    try {
+      setPriceHistoryLoading(true);
+      setPriceHistoryError('');
+      const result = await getInvestmentHistoricalPrices(id, {
+        from: effectiveFilters.from,
+        to: effectiveFilters.to,
+        page: effectiveFilters.page,
+        pageSize: effectiveFilters.pageSize,
+      });
+      setPriceHistoryData(result);
+    } catch (e) {
+      setPriceHistoryError(e.message || 'Failed to load historical prices');
+      setPriceHistoryData(null);
+    } finally {
+      setPriceHistoryLoading(false);
+    }
+  }, [id, priceHistoryFilters]);
+
+  const loadFxRateCacheData = useCallback(async (filters = null) => {
+    const effectiveFilters = filters || fxRateCacheFilters;
+    try {
+      setFxRateCacheLoading(true);
+      setFxRateCacheError('');
+      const result = await getInvestmentFxRateCache(id, {
+        from: effectiveFilters.from,
+        to: effectiveFilters.to,
+        page: effectiveFilters.page,
+        pageSize: effectiveFilters.pageSize,
+      });
+      setFxRateCacheData(result);
+    } catch (e) {
+      setFxRateCacheError(e.message || 'Failed to load FX rate cache');
+      setFxRateCacheData(null);
+    } finally {
+      setFxRateCacheLoading(false);
+    }
+  }, [id, fxRateCacheFilters]);
 
   const resetHistoryForm = () => {
     setIsAddingHistory(false);
@@ -104,6 +242,50 @@ export default function InvestmentSettings() {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!data?.id) return;
+    setPriceHistoryFilters(historyDefaultFilters(data));
+    setPriceHistoryData(null);
+    setPriceHistoryError('');
+    setPriceHistoryExpanded(false);
+  }, [data?.id]);
+
+  useEffect(() => {
+    if (!data?.id) return;
+    if (String(data.asset_type || '').toUpperCase() !== 'FOREIGN_STOCK') {
+      setFxRateCacheFilters(historyDefaultFilters(data));
+      setFxRateCacheData(null);
+      setFxRateCacheError('');
+      setFxRateCacheExpanded(false);
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const allFs = await getInvestments('FOREIGN_STOCK');
+        const details = await Promise.all(
+          (Array.isArray(allFs) ? allFs : []).map((inv) => getInvestment(inv.id).catch(() => inv))
+        );
+        if (cancelled) return;
+        const fxRange = calculateFxRateCacheDateRangeFromInvestments(details);
+        setFxRateCacheFilters(fxRange);
+      } catch (_) {
+        if (cancelled) return;
+        setFxRateCacheFilters(historyDefaultFilters(data));
+      } finally {
+        if (cancelled) return;
+        setFxRateCacheData(null);
+        setFxRateCacheError('');
+        setFxRateCacheExpanded(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [data?.id, data?.asset_type]);
 
   const handleStartAddHistory = () => {
     setHistoryError(null);
@@ -224,6 +406,7 @@ export default function InvestmentSettings() {
   const isMF = data.asset_type === 'MUTUAL_FUND';
   const isNPS = data.asset_type === 'NPS';
   const showSymbolHistory = data.asset_type === 'INDIAN_STOCK' || data.asset_type === 'MUTUAL_FUND';
+  const isMarketDriven = MARKET_DRIVEN_ASSET_TYPES.has(String(data.asset_type || '').toUpperCase());
 
   return (
     <div>
@@ -535,6 +718,430 @@ export default function InvestmentSettings() {
                 </Row>
               </Form>
             )}
+          </Card.Body>
+        </Card>
+      )}
+
+      {isMarketDriven && (
+        <Card className="shadow-sm mt-4">
+          <Card.Body>
+            <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
+              <div>
+                <h2 className="h6 fw-semibold mb-1">Historical Prices (DB Cache)</h2>
+                <div className="small text-muted">Cached market history for sparse-coverage troubleshooting.</div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline-secondary"
+                onClick={() => {
+                  const nextExpanded = !priceHistoryExpanded;
+                  setPriceHistoryExpanded(nextExpanded);
+                  if (nextExpanded && !priceHistoryData && !priceHistoryLoading) {
+                    loadHistoricalPriceData();
+                  }
+                }}
+                aria-expanded={priceHistoryExpanded}
+              >
+                {priceHistoryExpanded ? 'Hide Historical Prices' : 'Show Historical Prices'}
+              </Button>
+            </div>
+
+            <Collapse in={priceHistoryExpanded}>
+              <div>
+                <Form
+                  className="d-flex flex-wrap align-items-end gap-2 mb-3"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    loadHistoricalPriceData();
+                  }}
+                >
+                  <Form.Group>
+                    <Form.Label className="small mb-1">From</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="date"
+                      value={priceHistoryFilters.from}
+                      onChange={(e) => setPriceHistoryFilters((prev) => ({ ...prev, from: e.target.value, page: 1 }))}
+                    />
+                  </Form.Group>
+                  <Form.Group>
+                    <Form.Label className="small mb-1">To</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="date"
+                      value={priceHistoryFilters.to}
+                      onChange={(e) => setPriceHistoryFilters((prev) => ({ ...prev, to: e.target.value, page: 1 }))}
+                    />
+                  </Form.Group>
+                  <Form.Group>
+                    <Form.Label className="small mb-1">Rows per page</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="number"
+                      min="1"
+                      max="5000"
+                      value={priceHistoryFilters.pageSize}
+                      onChange={(e) => setPriceHistoryFilters((prev) => ({
+                        ...prev,
+                        pageSize: Math.max(1, Math.min(5000, Number(e.target.value || 365))),
+                        page: 1,
+                      }))}
+                      style={{ width: 110 }}
+                    />
+                  </Form.Group>
+                  <Form.Group>
+                    <Form.Label className="small mb-1">Page</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="number"
+                      min="1"
+                      value={priceHistoryFilters.page}
+                      onChange={(e) => setPriceHistoryFilters((prev) => ({
+                        ...prev,
+                        page: Math.max(1, Number(e.target.value || 1)),
+                      }))}
+                      style={{ width: 90 }}
+                    />
+                  </Form.Group>
+                  <Button
+                    size="sm"
+                    type="button"
+                    variant="outline-secondary"
+                    disabled={priceHistoryLoading}
+                    onClick={() => loadHistoricalPriceData(priceHistoryFilters)}
+                  >
+                    Go
+                  </Button>
+                  <Button size="sm" type="submit" variant="outline-primary" disabled={priceHistoryLoading}>
+                    {priceHistoryLoading ? 'Loading...' : 'Refresh'}
+                  </Button>
+                </Form>
+
+                {priceHistoryError && <div className="text-danger small mb-2">{priceHistoryError}</div>}
+
+                {priceHistoryData?.pagination && (
+                  <div className="d-flex flex-wrap align-items-center gap-2 small mb-3">
+                    <Button
+                      size="sm"
+                      variant="outline-secondary"
+                      disabled={priceHistoryLoading || !priceHistoryData.pagination.has_previous}
+                      onClick={() => {
+                        const nextFilters = { ...priceHistoryFilters, page: Math.max(1, priceHistoryFilters.page - 1) };
+                        setPriceHistoryFilters(nextFilters);
+                        loadHistoricalPriceData(nextFilters);
+                      }}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline-secondary"
+                      disabled={priceHistoryLoading || !priceHistoryData.pagination.has_next}
+                      onClick={() => {
+                        const nextFilters = { ...priceHistoryFilters, page: priceHistoryFilters.page + 1 };
+                        setPriceHistoryFilters(nextFilters);
+                        loadHistoricalPriceData(nextFilters);
+                      }}
+                    >
+                      Next
+                    </Button>
+                    <span className="rounded-3 px-2 py-1 bg-light">
+                      Page {priceHistoryData.pagination.page} of {priceHistoryData.pagination.total_pages}
+                    </span>
+                    <span className="rounded-3 px-2 py-1 bg-light">
+                      Showing {priceHistoryData.window?.displayed_from || '-'} to {priceHistoryData.window?.displayed_to || '-'}
+                    </span>
+                  </div>
+                )}
+
+                {priceHistoryData?.summary && (
+                  <div className="d-flex flex-wrap gap-2 small mb-3">
+                    <span className="rounded-3 px-2 py-1 bg-light">Coverage: {formatNumber(priceHistoryData.summary.coverage_pct, 2)}%</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Expected sessions: {priceHistoryData.summary.expected_sessions}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Missing sessions: {priceHistoryData.summary.missing_sessions}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Rows in window: {priceHistoryData.summary.rows_in_window}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Rows returned: {priceHistoryData.summary.rows_returned}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">First cached: {priceHistoryData.summary.first_cached_date || '-'}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Last cached: {priceHistoryData.summary.last_cached_date || '-'}</span>
+                  </div>
+                )}
+
+                {priceHistoryData?.missing_ranges?.length > 0 && (
+                  <div className="mb-3">
+                    <h3 className="h6 fw-semibold mb-2">Missing Session Ranges</h3>
+                    <div className="responsive-table">
+                      <Table size="sm" className="mb-0 align-middle">
+                        <thead>
+                          <tr>
+                            <th>From</th>
+                            <th>To</th>
+                            <th className="text-end">Days</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {priceHistoryData.missing_ranges.slice(0, 20).map((range, idx) => (
+                            <tr key={`${range.from}-${range.to}-${idx}`}>
+                              <td>{range.from}</td>
+                              <td>{range.to}</td>
+                              <td className="text-end">{range.days}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </Table>
+                    </div>
+                  </div>
+                )}
+
+                <h3 className="h6 fw-semibold mb-2">Cached Price Rows</h3>
+                {priceHistoryLoading ? (
+                  <div className="py-3 d-flex align-items-center gap-2 text-muted small">
+                    <Spinner animation="border" size="sm" /> Loading price history...
+                  </div>
+                ) : (
+                  <div className="responsive-table">
+                    <Table size="sm" className="mb-0 align-middle">
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th className="text-end">Close</th>
+                          <th className="text-end">Adj Close</th>
+                          <th className="text-end">Volume</th>
+                          <th>Source</th>
+                          <th>Symbol</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(priceHistoryData?.rows || []).length === 0 ? (
+                          <tr>
+                            <td colSpan={6} className="text-center text-muted py-3">No cached prices in selected window.</td>
+                          </tr>
+                        ) : (
+                          priceHistoryData.rows.map((row) => (
+                            <tr key={`${row.date}-${row.symbol}-${row.source}`}>
+                              <td>{row.date}</td>
+                              <td className="text-end">{row.close == null ? '-' : formatNumber(row.close, 4)}</td>
+                              <td className="text-end">{row.adj_close == null ? '-' : formatNumber(row.adj_close, 4)}</td>
+                              <td className="text-end">{row.volume == null ? '-' : formatNumber(row.volume, 0)}</td>
+                              <td>{row.source || '-'}</td>
+                              <td>{row.symbol || '-'}</td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </Table>
+                  </div>
+                )}
+              </div>
+            </Collapse>
+          </Card.Body>
+        </Card>
+      )}
+
+      {data?.asset_type === 'FOREIGN_STOCK' && (
+        <Card className="shadow-sm mt-4">
+          <Card.Body>
+            <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
+              <div>
+                <h2 className="h6 fw-semibold mb-1">FX Rate Cache (USD to INR)</h2>
+                <div className="small text-muted">Cached USD/INR exchange rates for foreign stock valuation.</div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline-secondary"
+                onClick={() => {
+                  const nextExpanded = !fxRateCacheExpanded;
+                  setFxRateCacheExpanded(nextExpanded);
+                  if (nextExpanded && !fxRateCacheData && !fxRateCacheLoading) {
+                    loadFxRateCacheData();
+                  }
+                }}
+                aria-expanded={fxRateCacheExpanded}
+              >
+                {fxRateCacheExpanded ? 'Hide FX Rates' : 'Show FX Rates'}
+              </Button>
+            </div>
+
+            <Collapse in={fxRateCacheExpanded}>
+              <div>
+                <Form
+                  className="d-flex flex-wrap align-items-end gap-2 mb-3"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    loadFxRateCacheData();
+                  }}
+                >
+                  <Form.Group>
+                    <Form.Label className="small mb-1">From</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="date"
+                      value={fxRateCacheFilters.from}
+                      onChange={(e) => setFxRateCacheFilters((prev) => ({ ...prev, from: e.target.value, page: 1 }))}
+                    />
+                  </Form.Group>
+                  <Form.Group>
+                    <Form.Label className="small mb-1">To</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="date"
+                      value={fxRateCacheFilters.to}
+                      onChange={(e) => setFxRateCacheFilters((prev) => ({ ...prev, to: e.target.value, page: 1 }))}
+                    />
+                  </Form.Group>
+                  <Form.Group>
+                    <Form.Label className="small mb-1">Rows per page</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="number"
+                      min="1"
+                      max="5000"
+                      value={fxRateCacheFilters.pageSize}
+                      onChange={(e) => setFxRateCacheFilters((prev) => ({
+                        ...prev,
+                        pageSize: Math.max(1, Math.min(5000, Number(e.target.value || 365))),
+                        page: 1,
+                      }))}
+                      style={{ width: 110 }}
+                    />
+                  </Form.Group>
+                  <Form.Group>
+                    <Form.Label className="small mb-1">Page</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="number"
+                      min="1"
+                      value={fxRateCacheFilters.page}
+                      onChange={(e) => setFxRateCacheFilters((prev) => ({
+                        ...prev,
+                        page: Math.max(1, Number(e.target.value || 1)),
+                      }))}
+                      style={{ width: 90 }}
+                    />
+                  </Form.Group>
+                  <Button
+                    size="sm"
+                    type="button"
+                    variant="outline-secondary"
+                    disabled={fxRateCacheLoading}
+                    onClick={() => loadFxRateCacheData(fxRateCacheFilters)}
+                  >
+                    Go
+                  </Button>
+                  <Button size="sm" type="submit" variant="outline-primary" disabled={fxRateCacheLoading}>
+                    {fxRateCacheLoading ? 'Loading...' : 'Refresh'}
+                  </Button>
+                </Form>
+
+                {fxRateCacheError && <div className="text-danger small mb-2">{fxRateCacheError}</div>}
+
+                {fxRateCacheData?.pagination && (
+                  <div className="d-flex flex-wrap align-items-center gap-2 small mb-3">
+                    <Button
+                      size="sm"
+                      variant="outline-secondary"
+                      disabled={fxRateCacheLoading || !fxRateCacheData.pagination.has_previous}
+                      onClick={() => {
+                        const nextFilters = { ...fxRateCacheFilters, page: Math.max(1, fxRateCacheFilters.page - 1) };
+                        setFxRateCacheFilters(nextFilters);
+                        loadFxRateCacheData(nextFilters);
+                      }}
+                    >
+                      Previous
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline-secondary"
+                      disabled={fxRateCacheLoading || !fxRateCacheData.pagination.has_next}
+                      onClick={() => {
+                        const nextFilters = { ...fxRateCacheFilters, page: fxRateCacheFilters.page + 1 };
+                        setFxRateCacheFilters(nextFilters);
+                        loadFxRateCacheData(nextFilters);
+                      }}
+                    >
+                      Next
+                    </Button>
+                    <span className="rounded-3 px-2 py-1 bg-light">
+                      Page {fxRateCacheData.pagination.page} of {fxRateCacheData.pagination.total_pages}
+                    </span>
+                    <span className="rounded-3 px-2 py-1 bg-light">
+                      Showing {fxRateCacheData.window?.displayed_from || '-'} to {fxRateCacheData.window?.displayed_to || '-'}
+                    </span>
+                  </div>
+                )}
+
+                {fxRateCacheData?.summary && (
+                  <div className="d-flex flex-wrap gap-2 small mb-3">
+                    <span className="rounded-3 px-2 py-1 bg-light">Coverage: {formatNumber(fxRateCacheData.summary.coverage_pct, 2)}%</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Expected sessions: {fxRateCacheData.summary.expected_sessions}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Missing sessions: {fxRateCacheData.summary.missing_sessions}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Rows in window: {fxRateCacheData.summary.rows_in_window}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Rows returned: {fxRateCacheData.summary.rows_returned}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">First cached: {fxRateCacheData.summary.first_cached_date || '-'}</span>
+                    <span className="rounded-3 px-2 py-1 bg-light">Last cached: {fxRateCacheData.summary.last_cached_date || '-'}</span>
+                  </div>
+                )}
+
+                {fxRateCacheData?.missing_ranges?.length > 0 && (
+                  <div className="mb-3">
+                    <h3 className="h6 fw-semibold mb-2">Missing Session Ranges</h3>
+                    <div className="responsive-table">
+                      <Table size="sm" className="mb-0 align-middle">
+                        <thead>
+                          <tr>
+                            <th>From</th>
+                            <th>To</th>
+                            <th className="text-end">Days</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {fxRateCacheData.missing_ranges.slice(0, 20).map((range, idx) => (
+                            <tr key={`${range.from}-${range.to}-${idx}`}>
+                              <td>{range.from}</td>
+                              <td>{range.to}</td>
+                              <td className="text-end">{range.days}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </Table>
+                    </div>
+                  </div>
+                )}
+
+                <h3 className="h6 fw-semibold mb-2">Cached FX Rates</h3>
+                {fxRateCacheLoading ? (
+                  <div className="py-3 d-flex align-items-center gap-2 text-muted small">
+                    <Spinner animation="border" size="sm" /> Loading FX rate cache...
+                  </div>
+                ) : (
+                  <div className="responsive-table">
+                    <Table size="sm" className="mb-0 align-middle">
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th className="text-end">USDINR</th>
+                          <th>Source</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(fxRateCacheData?.rows || []).length === 0 ? (
+                          <tr>
+                            <td colSpan={3} className="text-center text-muted py-3">No cached FX rates in selected window.</td>
+                          </tr>
+                        ) : (
+                          fxRateCacheData.rows.map((row) => (
+                            <tr key={`${row.date}-${row.source}`}>
+                              <td>{row.date}</td>
+                              <td className="text-end">{row.close == null ? '-' : formatNumber(row.close, 4)}</td>
+                              <td>{row.source || '-'}</td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </Table>
+                  </div>
+                )}
+              </div>
+            </Collapse>
           </Card.Body>
         </Card>
       )}

@@ -813,7 +813,8 @@ module.exports = function (db) {
             fmv_per_unit: fmvPerUnit != null ? Number(fmvPerUnit) : null,
             exchange_rate_used: fxRate != null ? Number(fxRate) : null,
           });
-        } catch (_) {
+        } catch (e) {
+          logAppError(`ESPP import: pricing lookup failed for ${investment.ticker_symbol || 'UNKNOWN'} on ${row.purchase_date}: ${e.message}`);
           pricingByDate.set(row.purchase_date, { fmv_per_unit: null, exchange_rate_used: null });
         }
       }
@@ -1428,7 +1429,8 @@ module.exports = function (db) {
             price_per_unit: pricePerUnit != null ? Number(pricePerUnit) : null,
             exchange_rate_used: fxRate != null ? Number(fxRate) : null,
           });
-        } catch (_) {
+        } catch (e) {
+          logAppError(`VEST import: pricing lookup failed for ${investment.ticker_symbol || 'UNKNOWN'} on ${row.vest_date}: ${e.message}`);
           pricingByDate.set(row.vest_date, { price_per_unit: null, exchange_rate_used: null });
         }
       }
@@ -1578,7 +1580,8 @@ module.exports = function (db) {
         if (investment.currency === 'USD') {
           try {
             fx = await fetchHistoricalUSDToINR(date);
-          } catch (_) {
+          } catch (e) {
+            logAppError(`VEST reconcile: FX lookup failed on ${date}: ${e.message}`);
             fx = null;
           }
         }
@@ -2000,7 +2003,10 @@ module.exports = function (db) {
             const prevDay = new Date(split.date);
             prevDay.setDate(prevDay.getDate() - 1);
             const prevDayStr = prevDay.toISOString().split('T')[0];
-            const ohlc = await fetchHistoricalOHLC(ticker, prevDayStr).catch(() => null);
+            const ohlc = await fetchHistoricalOHLC(ticker, prevDayStr).catch((e) => {
+              logAppError(`Corporate actions preview: OHLC lookup failed for ${ticker} on ${prevDayStr}: ${e.message}`);
+              return null;
+            });
             const lowPrice = ohlc?.low || 0;
             fractionalAmount = lowPrice > 0 ? Math.round(fractional * lowPrice * 100) / 100 : 0;
           }

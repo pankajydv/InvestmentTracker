@@ -116,8 +116,11 @@ Why this order:
 
 Scheduler windows (IST):
 
-- Weekdays 9:25 AM to 4:25 PM: stocks-focused runs
-- Weekdays 10:25 PM: all asset types
+- Daily 9:25 AM to 4:25 PM: Indian stocks and SGB runs
+- Daily 7:25 PM, 8:25 PM, 9:25 PM: Foreign Stocks intraday runs
+- Daily 10:25 PM: authoritative MF/NPS plus Foreign Stocks intraday refresh
+- Daily 12:01 AM: bootstrap all asset types
+- Daily 4:25 AM: authoritative Foreign Stocks previous-session finalization
 
 Self-healing compliance loop:
 

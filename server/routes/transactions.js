@@ -165,7 +165,8 @@ module.exports = function (db) {
       if (inv.currency === 'USD' && !resolvedRate) {
         try {
           resolvedRate = await fetchHistoricalUSDToINR(normalizedTransactionDate);
-        } catch (_) {
+        } catch (e) {
+          logAppError(`Transaction create: FX lookup failed on ${normalizedTransactionDate}: ${e.message}`);
           resolvedRate = null;
         }
       }

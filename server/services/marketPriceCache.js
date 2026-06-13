@@ -9,6 +9,7 @@ const splitEventCache = new Map();
 const SPLIT_EVENT_CACHE_TTL_MS = 10 * 60 * 1000;
 const LOCF_VOLUME_THRESHOLD = 10_000;
 const LOCF_WINDOW_SESSIONS = 20;
+const CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS = 3;
 const INVESTMENT_CACHE_MIGRATION_KEY = 'market_price_cache_unified_v3_symbol_is_provider_migrated';
 const MARKET_CACHE_ISO_DATE_MIGRATION_KEY = 'market_price_cache_iso_date_migrated_v1';
 
@@ -58,6 +59,17 @@ function ensureSchema() {
 
     CREATE INDEX IF NOT EXISTS idx_market_price_cache_inv_lookup
       ON market_price_cache(investment_id, date);
+
+    CREATE TABLE IF NOT EXISTS fx_rate_cache (
+      date TEXT PRIMARY KEY,
+      rate REAL NOT NULL,
+      source TEXT,
+      fetched_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_fx_rate_cache_date
+      ON fx_rate_cache(date);
 
     CREATE TABLE IF NOT EXISTS investment_split_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,6 +176,7 @@ function ensureSchema() {
 
   ensureInvestmentCacheMigration(conn);
   ensureMarketCacheIsoDateMigration(conn);
+  ensureFxRateCacheMigration(conn);
 
   conn.exec(`
     CREATE TRIGGER IF NOT EXISTS trg_market_price_cache_date_iso_insert
@@ -403,6 +416,73 @@ function ensureInvestmentCacheMigration(conn) {
   }
 }
 
+function ensureFxRateCacheMigration(conn) {
+  try {
+    const done = conn.prepare('SELECT value FROM config WHERE key = ?').get('fx_rate_cache_schema_migration_v1');
+    if (String(done?.value || '') === '1') return;
+
+    const cols = conn.prepare("PRAGMA table_info(fx_rate_cache)").all().map((row) => String(row.name || '').toLowerCase());
+    
+    // Check if old schema exists (has 'pair' column and 'id' as primary key instead of 'date' as primary key)
+    if (cols.includes('pair')) {
+      const tx = conn.transaction(() => {
+        // Backup existing data
+        const backup = conn.prepare(`
+          SELECT date, rate, source, fetched_at, updated_at
+          FROM fx_rate_cache
+        `).all();
+
+        console.log(`[PriceCache] FX rate cache migration: backing up ${backup.length} rows`);
+
+        // Drop old table
+        conn.exec(`DROP TABLE fx_rate_cache`);
+
+        // Create new table with correct schema
+        conn.exec(`
+          CREATE TABLE fx_rate_cache (
+            date TEXT PRIMARY KEY,
+            rate REAL NOT NULL,
+            source TEXT,
+            fetched_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_fx_rate_cache_date
+            ON fx_rate_cache(date);
+        `);
+
+        // Restore data (only insert if date is valid ISO format)
+        const insertStmt = conn.prepare(`
+          INSERT INTO fx_rate_cache (date, rate, source, fetched_at, updated_at)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+
+        let restored = 0;
+        for (const row of backup) {
+          if (row.date && /^\d{4}-\d{2}-\d{2}$/.test(String(row.date).trim())) {
+            insertStmt.run(row.date, row.rate, row.source, row.fetched_at, row.updated_at);
+            restored++;
+          }
+        }
+
+        console.log(`[PriceCache] FX rate cache migration: restored ${restored}/${backup.length} rows`);
+
+        // Mark migration as done
+        conn.prepare(`
+          INSERT INTO config (key, value, updated_at)
+          VALUES (?, '1', datetime('now'))
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        `).run('fx_rate_cache_schema_migration_v1');
+      });
+
+      tx();
+      console.log(`[PriceCache] FX rate cache schema migration completed successfully`);
+    }
+  } catch (err) {
+    console.warn(`[PriceCache] FX rate cache schema migration skipped: ${err.message}`);
+  }
+}
+
 function normalizeDate(date) {
   if (!date) return null;
   const raw = String(date).trim();
@@ -418,6 +498,10 @@ function normalizeDate(date) {
   if (dmySlash) return `${dmySlash[3]}-${dmySlash[2]}-${dmySlash[1]}`;
 
   return null;
+}
+
+function isFxInstrumentType(instrumentType) {
+  return String(instrumentType || '').trim().toUpperCase() === 'FX';
 }
 
 function getInvestmentHoldingWindows(conn, investmentId) {
@@ -616,7 +700,8 @@ function hasTransactionColumn(columnName) {
   try {
     const cols = conn.prepare('PRAGMA table_info(transactions)').all().map((c) => String(c.name || '').toLowerCase());
     return cols.includes(String(columnName || '').toLowerCase());
-  } catch (_) {
+  } catch (err) {
+    console.error(`[PriceCache] Failed to inspect transactions schema for column ${columnName}: ${err.message}`);
     return false;
   }
 }
@@ -644,7 +729,8 @@ function loadLinkedIndianStockInvestments(symbol) {
     `).all(upperSymbol, upperSymbol, symbolBase, symbolBase)
       .map((r) => Number(r.id))
       .filter((id) => Number.isInteger(id) && id > 0);
-  } catch (_) {
+  } catch (err) {
+    console.error(`[PriceCache] Failed to load linked investments for symbol ${upperSymbol}: ${err.message}`);
     return [];
   }
 }
@@ -871,12 +957,19 @@ function fetchYahooSplitEventsRange(symbol, fromDate, toDate, options = {}) {
           })).filter((r) => r.date && Number.isFinite(r.ratio) && r.ratio > 1);
           rows.sort((a, b) => a.date.localeCompare(b.date));
           resolve(includeStatus ? { rows, failed: false } : rows);
-        } catch (_) {
+        } catch (err) {
+          console.error(`[PriceCache] Failed to parse Yahoo split response for ${symbol}: ${err.message}`);
           resolve(includeStatus ? { rows: [], failed: true } : []);
         }
       });
-      res.on('error', () => resolve(includeStatus ? { rows: [], failed: true } : []));
-    }).on('error', () => resolve(includeStatus ? { rows: [], failed: true } : []));
+      res.on('error', (err) => {
+        console.error(`[PriceCache] Yahoo split request stream error for ${symbol}: ${err?.message || err}`);
+        resolve(includeStatus ? { rows: [], failed: true } : []);
+      });
+    }).on('error', (err) => {
+      console.error(`[PriceCache] Yahoo split request failed for ${symbol}: ${err?.message || err}`);
+      resolve(includeStatus ? { rows: [], failed: true } : []);
+    });
   });
 }
 
@@ -1067,7 +1160,8 @@ function getCachedSplitEventsFromRows(rows) {
         }))
         .filter((event) => event.date && Number.isFinite(event.ratio) && event.ratio > 1)
         .sort((a, b) => String(a.date).localeCompare(String(b.date)));
-    } catch (_) {
+    } catch (err) {
+      console.error(`[PriceCache] Failed to parse cached split history JSON for date ${row?.date || 'unknown'}: ${err.message}`);
       return [];
     }
   }
@@ -1157,6 +1251,26 @@ function getSparseMissingWindows(rows, marketSessionDates, instrumentType = null
   return windows;
 }
 
+function getHydrationMissingWindows(rows, marketSessionDates, instrumentType = null) {
+  if (!Array.isArray(marketSessionDates) || marketSessionDates.length === 0) return [];
+
+  const normalizedType = normalizeInstrumentType(instrumentType);
+  const sparseWindowTypes = new Set(['SGB', 'MUTUAL_FUND', 'NPS', 'FX']);
+  const useSparseWindows = sparseWindowTypes.has(normalizedType);
+
+  const sparseWindows = useSparseWindows
+    ? getSparseMissingWindows(rows, marketSessionDates, normalizedType, {
+      ignorePrefixUntilFirstCovered: normalizedType === 'SGB',
+    })
+    : [];
+
+  if (sparseWindows.length > 0) return sparseWindows;
+
+  const missingStart = getSeriesMissingStartDate(rows, marketSessionDates, normalizedType);
+  if (!missingStart) return [];
+  return [{ from: missingStart, to: marketSessionDates[marketSessionDates.length - 1] }];
+}
+
 function getFullSeries(instrumentType, symbol) {
   if (!instrumentType || !symbol) return [];
   const conn = getCacheDb();
@@ -1180,12 +1294,14 @@ async function hydrateStockSeriesForPhase2({
   sourceLabel = null,
   onWarn = null,
   onInfo = null,
+  freshnessSkipFromDate = null,
 }) {
   if (!instrumentType || !symbol) return [];
 
   const start = normalizeDate(fromDate);
   const end = normalizeDate(toDate);
   if (!start || !end) return [];
+  const normalizedFreshnessSkipFromDate = normalizeDate(freshnessSkipFromDate);
 
   const marketSessionDates = getMarketSessionDates(start, end, instrumentType);
   let splitEvents = [];
@@ -1217,7 +1333,7 @@ async function hydrateStockSeriesForPhase2({
         splitEvents
       );
       if (needsReverseAdjustmentWrite(fullCachedRows, adjustedRows)) {
-        upsertPriceSeries(instrumentType, symbol, adjustedRows, sourceLabel || null);
+        upsertPriceSeries(instrumentType, symbol, adjustedRows, sourceLabel || null, investmentId);
         splitRebuildTriggered = true;
       }
     }
@@ -1236,16 +1352,31 @@ async function hydrateStockSeriesForPhase2({
   if (!hasCompleteCoverage(cachedRows, marketSessionDates, instrumentType) && typeof fetchRange === 'function' && marketSessionDates.length > 0) {
     const missingStart = getSeriesMissingStartDate(cachedRows, marketSessionDates, instrumentType);
     if (missingStart) {
+      const suppressRecentMissing = !!(
+        normalizedFreshnessSkipFromDate
+        && missingStart >= normalizedFreshnessSkipFromDate
+      );
       if (typeof onInfo === 'function') {
-        onInfo(`[MarketCache][Hydrate] Cache miss detected; fetching from provider for ${symbol}`, {
-          investmentId,
-          instrumentType,
-          symbol,
-          requestedFromDate: start,
-          requestedToDate: end,
-          missingFromDate: missingStart,
-          cachedPointsBeforeFetch: cachedRows.length,
-        });
+        if (suppressRecentMissing) {
+          onInfo(
+            `[MarketCache] Recent provider-lag window for investment ${investmentId ?? 'unknown'} from ${missingStart} to ${end}; skipping missing report`,
+            {
+              investmentId,
+              fromDate: missingStart,
+              toDate: end,
+              freshnessSkipFromDate: normalizedFreshnessSkipFromDate,
+            }
+          );
+        } else {
+          onInfo(
+            `[MarketCache] Missing cache for investment ${investmentId ?? 'unknown'} from ${missingStart} to ${end}`,
+            {
+              investmentId,
+              fromDate: missingStart,
+              toDate: end,
+            }
+          );
+        }
       }
 
       const fetched = await fetchRange(missingStart, end);
@@ -1254,18 +1385,21 @@ async function hydrateStockSeriesForPhase2({
         .filter((point) => point && point.date >= missingStart && point.date <= end && point.close != null);
 
       if (normalizedFetched.length > 0) {
-        upsertPriceSeries(instrumentType, symbol, normalizedFetched, sourceLabel || null);
+        upsertPriceSeries(instrumentType, symbol, normalizedFetched, sourceLabel || null, investmentId);
       }
 
       if (typeof onInfo === 'function') {
-        onInfo(`[MarketCache][Hydrate] Provider fetch completed for ${symbol}`, {
-          investmentId,
-          instrumentType,
-          symbol,
-          missingFromDate: missingStart,
-          requestedToDate: end,
-          fetchedPoints: normalizedFetched.length,
-        });
+        if (!(suppressRecentMissing && normalizedFetched.length === 0)) {
+          onInfo(
+            `[MarketCache] Fetched ${normalizedFetched.length} points for investment ${investmentId ?? 'unknown'} from ${missingStart} to ${end}`,
+            {
+              investmentId,
+              fromDate: missingStart,
+              toDate: end,
+              fetchedPoints: normalizedFetched.length,
+            }
+          );
+        }
       }
     }
     cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
@@ -1278,14 +1412,41 @@ async function hydrateStockSeriesForPhase2({
       splitEvents
     );
     if (needsReverseAdjustmentWrite(cachedRows, adjustedCached)) {
-      upsertPriceSeries(instrumentType, symbol, adjustedCached, sourceLabel || null);
+      upsertPriceSeries(instrumentType, symbol, adjustedCached, sourceLabel || null, investmentId);
       cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
     }
   }
 
-  const locfPoints = buildLocfPoints(cachedRows, marketSessionDates, instrumentType);
+  const shortGapLocf = buildShortContiguousLocfPoints(cachedRows, marketSessionDates, {
+    maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
+    locfCutoffDate: normalizedFreshnessSkipFromDate,
+  });
+  if (shortGapLocf.points.length > 0) {
+    upsertPriceSeries(instrumentType, symbol, shortGapLocf.points, 'LOCF', investmentId);
+    cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
+    if (typeof onInfo === 'function') {
+      onInfo(
+        `[MarketCache][LOCF] Auto-filled short contiguous provider-miss sessions (<=${CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS})`,
+        {
+          investmentId,
+          instrumentType,
+          symbol,
+          filledSessions: shortGapLocf.filledSessions,
+          filledSegments: shortGapLocf.filledSegments,
+          unfilledShortSegments: shortGapLocf.unfilledShortSegments,
+        }
+      );
+    }
+  }
+
+  const locfCutoffDate = normalizedFreshnessSkipFromDate || null;
+  const locfPoints = buildLocfPoints(cachedRows, marketSessionDates, instrumentType, locfCutoffDate, (message, meta) => {
+    if (typeof onInfo === 'function') {
+      onInfo(`[MarketCache][LOCF] ${message}`, { ...meta, investmentId, instrumentType, symbol });
+    }
+  });
   if (locfPoints.length > 0) {
-    upsertPriceSeries(instrumentType, symbol, locfPoints, 'LOCF');
+    upsertPriceSeries(instrumentType, symbol, locfPoints, 'LOCF', investmentId);
     cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
   }
 
@@ -1303,12 +1464,20 @@ async function hydrateStockSeriesForPhase2({
   return cachedRows;
 }
 
-function buildLocfPoints(rows, marketSessionDates, instrumentType = null) {
+function buildLocfPoints(rows, marketSessionDates, instrumentType = null, locfCutoffDate = null, onSkip = null) {
   const cached = buildRowMap(rows);
   const providerBackedByDate = new Map();
   const dateToIndex = new Map();
   const hasLaterProviderByDate = new Map();
   const normalizedType = normalizeInstrumentType(instrumentType);
+
+  // Calculate cutoff: yesterday to avoid filling today/future dates
+  let cutoff = locfCutoffDate;
+  if (!cutoff) {
+    const yesterday = new Date(new Date().toISOString().split('T')[0]);
+    yesterday.setDate(yesterday.getDate() - 1);
+    cutoff = yesterday.toISOString().split('T')[0];
+  }
 
   const isProviderBackedRow = (row) => String(row?.source || '').toUpperCase() !== 'LOCF';
   for (const row of rows || []) {
@@ -1348,6 +1517,7 @@ function buildLocfPoints(rows, marketSessionDates, instrumentType = null) {
 
   const locf = [];
   let lastKnown = null;
+  const skippedDates = [];
 
   for (const date of marketSessionDates) {
     const row = cached.get(date);
@@ -1358,6 +1528,12 @@ function buildLocfPoints(rows, marketSessionDates, instrumentType = null) {
     }
 
     if (row && row.close != null) {
+      continue;
+    }
+
+    // Skip LOCF for recent dates (today and later)
+    if (date >= cutoff) {
+      skippedDates.push(date);
       continue;
     }
 
@@ -1375,7 +1551,121 @@ function buildLocfPoints(rows, marketSessionDates, instrumentType = null) {
     }
   }
 
+  // Log skipped recent dates
+  if (skippedDates.length > 0 && typeof onSkip === 'function') {
+    onSkip(`Skipped LOCF fill for recent dates (>= ${cutoff})`, { dates: skippedDates });
+  }
+
   return locf;
+}
+
+function buildShortContiguousLocfPoints(rows, marketSessionDates, options = {}) {
+  const maxGapSessions = Math.max(1, Number(options.maxGapSessions) || CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS);
+  const cached = buildRowMap(rows);
+  const providerBackedByDate = new Map();
+  const hasLaterProviderByDate = new Map();
+
+  const dateToIndex = new Map();
+  for (let i = 0; i < marketSessionDates.length; i += 1) {
+    dateToIndex.set(marketSessionDates[i], i);
+  }
+
+  const isProviderBackedRow = (row) => String(row?.source || '').toUpperCase() !== 'LOCF';
+  for (const row of rows || []) {
+    if (!row?.date || row.close == null) continue;
+    if (isProviderBackedRow(row)) providerBackedByDate.set(row.date, row);
+  }
+
+  let seenLaterProvider = false;
+  for (let i = marketSessionDates.length - 1; i >= 0; i -= 1) {
+    const date = marketSessionDates[i];
+    hasLaterProviderByDate.set(date, seenLaterProvider);
+    if (providerBackedByDate.has(date)) seenLaterProvider = true;
+  }
+
+  let cutoff = options.locfCutoffDate;
+  if (!cutoff) {
+    const yesterday = new Date(new Date().toISOString().split('T')[0]);
+    yesterday.setDate(yesterday.getDate() - 1);
+    cutoff = yesterday.toISOString().split('T')[0];
+  }
+
+  const segments = [];
+  let active = null;
+  for (const date of marketSessionDates) {
+    const row = cached.get(date);
+    if (row && row.close != null) {
+      active = null;
+      continue;
+    }
+    if (!active) {
+      active = [];
+      segments.push(active);
+    }
+    active.push(date);
+  }
+
+  const locf = [];
+  let filledSegments = 0;
+  let unfilledShortSegments = 0;
+
+  for (const segment of segments) {
+    if (!segment.length || segment.length > maxGapSessions) continue;
+
+    if (segment.some((d) => d >= cutoff)) {
+      unfilledShortSegments += 1;
+      continue;
+    }
+
+    const segmentEndDate = segment[segment.length - 1];
+    if (!hasLaterProviderByDate.get(segmentEndDate)) {
+      unfilledShortSegments += 1;
+      continue;
+    }
+
+    const firstIdx = dateToIndex.get(segment[0]);
+    if (!(Number.isInteger(firstIdx) && firstIdx > 0)) {
+      unfilledShortSegments += 1;
+      continue;
+    }
+
+    let anchorClose = null;
+    for (let i = firstIdx - 1; i >= 0; i -= 1) {
+      const prevDate = marketSessionDates[i];
+      const prevRow = providerBackedByDate.get(prevDate);
+      const prevClose = Number(prevRow?.close);
+      if (Number.isFinite(prevClose) && prevClose > 0) {
+        anchorClose = prevClose;
+        break;
+      }
+    }
+
+    if (!(Number.isFinite(anchorClose) && anchorClose > 0)) {
+      unfilledShortSegments += 1;
+      continue;
+    }
+
+    for (const date of segment) {
+      const existing = cached.get(date);
+      if (existing && existing.close != null) continue;
+      const point = {
+        date,
+        close: anchorClose,
+        adjClose: anchorClose,
+        source: 'LOCF',
+      };
+      cached.set(date, point);
+      locf.push(point);
+    }
+    filledSegments += 1;
+  }
+
+  return {
+    points: locf,
+    filledSessions: locf.length,
+    filledSegments,
+    unfilledShortSegments,
+  };
 }
 
 function nearlyEqual(a, b, epsilon = 1e-6) {
@@ -1419,14 +1709,19 @@ async function hydrateHistoricalPriceSeries({
   sourceLabel = null,
   onInfo = null,
   contextMeta = null,
+  freshnessSkipFromDate = null,
 }) {
   if (!instrumentType || !symbol) return [];
 
   const start = normalizeDate(fromDate);
   const end = normalizeDate(toDate);
   if (!start || !end) return [];
+  const normalizedFreshnessSkipFromDate = normalizeDate(freshnessSkipFromDate);
 
   const marketSessionDates = getMarketSessionDates(start, end, instrumentType);
+  const contextInvestmentId = Number.isFinite(Number(contextMeta?.investmentId))
+    ? Number(contextMeta.investmentId)
+    : null;
   let cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
   const splitEvents = isSplitSupportedInstrumentType(instrumentType)
     ? await loadMergedSplitEventsForSymbol(instrumentType, symbol)
@@ -1436,7 +1731,7 @@ async function hydrateHistoricalPriceSeries({
     const normalizedCached = cachedRows.map(normalizeCachePoint).filter(Boolean);
     const adjustedCached = maybeReverseAdjustPointsWithEvents(instrumentType, normalizedCached, splitEvents);
     if (needsReverseAdjustmentWrite(cachedRows, adjustedCached)) {
-      upsertPriceSeries(instrumentType, symbol, adjustedCached, sourceLabel || null);
+      upsertPriceSeries(instrumentType, symbol, adjustedCached, sourceLabel || null, contextInvestmentId);
       cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
     }
   }
@@ -1446,34 +1741,33 @@ async function hydrateHistoricalPriceSeries({
   }
 
   if (typeof fetchRange === 'function' && marketSessionDates.length > 0) {
-    const normalizedType = normalizeInstrumentType(instrumentType);
-    const sparseWindows = normalizedType === 'SGB'
-      ? getSparseMissingWindows(cachedRows, marketSessionDates, instrumentType, { ignorePrefixUntilFirstCovered: true })
-      : [];
-    const windows = sparseWindows.length > 0
-      ? sparseWindows
-      : (() => {
-        const missingStart = getSeriesMissingStartDate(cachedRows, marketSessionDates, instrumentType);
-        return missingStart ? [{ from: missingStart, to: end }] : [];
-      })();
+    const windows = getHydrationMissingWindows(cachedRows, marketSessionDates, instrumentType);
 
     if (windows.length > 0) {
       let totalFetchedPoints = 0;
+      let totalProcessedWindows = 0;
+      let totalSuppressedRecentWindows = 0;
       for (const window of windows) {
         if (!window?.from || !window?.to) continue;
+        totalProcessedWindows += 1;
+
+        const suppressRecentMissing = !!(
+          normalizedFreshnessSkipFromDate
+          && window.from >= normalizedFreshnessSkipFromDate
+        );
 
         if (typeof onInfo === 'function') {
-          onInfo(`[MarketCache][Hydrate] Cache miss detected; fetching from provider for ${symbol}`, {
-            instrumentType,
-            symbol,
-            requestedFromDate: start,
-            requestedToDate: end,
-            missingFromDate: window.from,
-            missingToDate: window.to,
-            cachedPointsBeforeFetch: cachedRows.length,
-            fetchMode: sparseWindows.length > 0 ? 'SPARSE_WINDOWS' : 'RANGE_TAIL',
-            ...(contextMeta && typeof contextMeta === 'object' ? contextMeta : {}),
-          });
+          const investmentIdFromMeta = contextMeta?.investmentId ?? null;
+          if (!suppressRecentMissing) {
+            onInfo(
+              `[MarketCache] Missing cache for investment ${investmentIdFromMeta ?? 'unknown'} from ${window.from} to ${window.to}`,
+              {
+                investmentId: investmentIdFromMeta,
+                fromDate: window.from,
+                toDate: window.to,
+              }
+            );
+          }
         }
 
         const fetched = await fetchRange(window.from, window.to);
@@ -1482,9 +1776,12 @@ async function hydrateHistoricalPriceSeries({
           .filter((point) => point && point.date >= window.from && point.date <= window.to && point.close != null);
 
         totalFetchedPoints += normalizedFetched.length;
+        if (suppressRecentMissing && normalizedFetched.length === 0) {
+          totalSuppressedRecentWindows += 1;
+        }
 
         if (normalizedFetched.length > 0) {
-          upsertPriceSeries(instrumentType, symbol, normalizedFetched, sourceLabel || null);
+          upsertPriceSeries(instrumentType, symbol, normalizedFetched, sourceLabel || null, contextInvestmentId);
           if (isSplitSupportedInstrumentType(instrumentType) && splitEvents.length > 0) {
             const newlyFetched = getSeries(instrumentType, symbol, window.from, window.to).filter((row) => row.close != null);
             const adjustedFetched = maybeReverseAdjustPointsWithEvents(
@@ -1493,31 +1790,61 @@ async function hydrateHistoricalPriceSeries({
               splitEvents
             );
             if (needsReverseAdjustmentWrite(newlyFetched, adjustedFetched)) {
-              upsertPriceSeries(instrumentType, symbol, adjustedFetched, sourceLabel || null);
+              upsertPriceSeries(instrumentType, symbol, adjustedFetched, sourceLabel || null, contextInvestmentId);
             }
           }
         }
       }
 
       if (typeof onInfo === 'function') {
-        onInfo(`[MarketCache][Hydrate] Provider fetch completed for ${symbol}`, {
-          instrumentType,
-          symbol,
-          requestedFromDate: start,
-          requestedToDate: end,
-          fetchWindows: windows.length,
-          fetchedPoints: totalFetchedPoints,
-          fetchMode: sparseWindows.length > 0 ? 'SPARSE_WINDOWS' : 'RANGE_TAIL',
-          ...(contextMeta && typeof contextMeta === 'object' ? contextMeta : {}),
-        });
+        const investmentIdFromMeta = contextMeta?.investmentId ?? null;
+        if (!(
+          totalProcessedWindows > 0
+          && totalSuppressedRecentWindows === totalProcessedWindows
+          && totalFetchedPoints === 0
+        )) {
+          onInfo(
+            `[MarketCache] Fetched ${totalFetchedPoints} points for investment ${investmentIdFromMeta ?? 'unknown'} from ${start} to ${end}`,
+            {
+              investmentId: investmentIdFromMeta,
+              fromDate: start,
+              toDate: end,
+              fetchedPoints: totalFetchedPoints,
+            }
+          );
+        }
       }
     }
   }
 
   const refreshed = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
-  const locfPoints = buildLocfPoints(refreshed, marketSessionDates, instrumentType);
+  const shortGapLocf = buildShortContiguousLocfPoints(refreshed, marketSessionDates, {
+    maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
+    locfCutoffDate: normalizedFreshnessSkipFromDate,
+  });
+  if (shortGapLocf.points.length > 0) {
+    upsertPriceSeries(instrumentType, symbol, shortGapLocf.points, 'LOCF', contextInvestmentId);
+    if (typeof onInfo === 'function') {
+      const investmentIdFromMeta = contextMeta?.investmentId ?? null;
+      onInfo(
+        `[MarketCache][LOCF] Auto-filled short contiguous provider-miss sessions (<=${CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS})`,
+        {
+          investmentId: investmentIdFromMeta,
+          instrumentType,
+          symbol,
+          filledSessions: shortGapLocf.filledSessions,
+          filledSegments: shortGapLocf.filledSegments,
+          unfilledShortSegments: shortGapLocf.unfilledShortSegments,
+        }
+      );
+    }
+  }
+
+  const postShortGapRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
+  const locfCutoffDate = normalizedFreshnessSkipFromDate || null;
+  const locfPoints = buildLocfPoints(postShortGapRows, marketSessionDates, instrumentType, locfCutoffDate);
   if (locfPoints.length > 0) {
-    upsertPriceSeries(instrumentType, symbol, locfPoints, 'LOCF');
+    upsertPriceSeries(instrumentType, symbol, locfPoints, 'LOCF', contextInvestmentId);
   }
 
   return getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
@@ -1528,6 +1855,23 @@ function upsertPricePoint(point) {
   const conn = getCacheDb();
   const normalizedDate = normalizeDate(point.date);
   if (!normalizedDate) return;
+  if (isFxInstrumentType(point.instrumentType)) {
+    const rate = Number(point.close);
+    if (!Number.isFinite(rate) || rate <= 0) return;
+    conn.prepare(`
+      INSERT INTO fx_rate_cache (date, rate, source, fetched_at, updated_at)
+      VALUES (?, ?, ?, datetime('now'), datetime('now'))
+      ON CONFLICT(date) DO UPDATE SET
+        rate = COALESCE(excluded.rate, fx_rate_cache.rate),
+        source = COALESCE(excluded.source, fx_rate_cache.source),
+        updated_at = datetime('now')
+    `).run(
+      normalizedDate,
+      rate,
+      point.source ?? null
+    );
+    return;
+  }
   const resolvedAdjClose = isStockInstrumentType(point.instrumentType)
     ? (point.adjClose ?? point.close ?? null)
     : (point.adjClose ?? null);
@@ -1566,17 +1910,40 @@ function upsertPricePoint(point) {
   );
 }
 
-function upsertPriceSeries(instrumentType, symbol, points, source = null) {
+function upsertPriceSeries(instrumentType, symbol, points, source = null, investmentId = null) {
   if (!instrumentType || !symbol || !Array.isArray(points) || points.length === 0) return;
   const conn = getCacheDb();
   const normalizedPoints = points.map(normalizeCachePoint).filter(Boolean);
+  if (isFxInstrumentType(instrumentType)) {
+    const stmtFx = conn.prepare(`
+      INSERT INTO fx_rate_cache (date, rate, source, fetched_at, updated_at)
+      VALUES (?, ?, ?, datetime('now'), datetime('now'))
+      ON CONFLICT(date) DO UPDATE SET
+        rate = COALESCE(excluded.rate, fx_rate_cache.rate),
+        source = COALESCE(excluded.source, fx_rate_cache.source),
+        updated_at = datetime('now')
+    `);
+    const txFx = conn.transaction((rows) => {
+      for (const p of rows) {
+        const d = normalizeDate(p.date);
+        const rate = Number(p.close);
+        if (!d || !Number.isFinite(rate) || rate <= 0) continue;
+        stmtFx.run(d, rate, p.source ?? source ?? null);
+      }
+    });
+
+    txFx(normalizedPoints);
+    return;
+  }
   const shouldAutofillAdjClose = isStockInstrumentType(instrumentType);
   const splitHistoryValueForRows = isSplitSupportedInstrumentType(instrumentType) ? null : undefined;
+  const invId = investmentId != null ? Number(investmentId) : null;
   const stmt = conn.prepare(`
     INSERT INTO market_price_cache (
-      instrument_type, symbol, date, open, high, low, close, adj_close, reverse_factor, split_history_json, volume, source, fetched_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      investment_id, instrument_type, symbol, date, open, high, low, close, adj_close, reverse_factor, split_history_json, volume, source, fetched_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     ON CONFLICT(instrument_type, symbol, date) DO UPDATE SET
+      investment_id = COALESCE(excluded.investment_id, market_price_cache.investment_id),
       open = COALESCE(excluded.open, market_price_cache.open),
       high = COALESCE(excluded.high, market_price_cache.high),
       low = COALESCE(excluded.low, market_price_cache.low),
@@ -1594,6 +1961,7 @@ function upsertPriceSeries(instrumentType, symbol, points, source = null) {
       const d = normalizeDate(p.date);
       if (!d) continue;
       stmt.run(
+        invId,
         instrumentType,
         symbol,
         d,
@@ -1616,6 +1984,15 @@ function upsertPriceSeries(instrumentType, symbol, points, source = null) {
 function getSeries(instrumentType, symbol, fromDate, toDate) {
   if (!instrumentType || !symbol) return [];
   const conn = getCacheDb();
+  if (isFxInstrumentType(instrumentType)) {
+    return conn.prepare(`
+      SELECT date, NULL AS open, NULL AS high, NULL AS low, rate AS close, NULL AS adj_close, 1 AS reverse_factor, NULL AS split_history_json, NULL AS volume, source
+      FROM fx_rate_cache
+      WHERE date >= ?
+        AND date <= ?
+      ORDER BY date ASC
+    `).all(normalizeDate(fromDate), normalizeDate(toDate));
+  }
   return conn.prepare(`
     SELECT date, open, high, low, close, adj_close, reverse_factor, split_history_json, volume, source
     FROM market_price_cache
@@ -1630,6 +2007,15 @@ function getSeries(instrumentType, symbol, fromDate, toDate) {
 function getNearestOnOrBefore(instrumentType, symbol, date) {
   if (!instrumentType || !symbol || !date) return null;
   const conn = getCacheDb();
+  if (isFxInstrumentType(instrumentType)) {
+    return conn.prepare(`
+      SELECT date, NULL AS open, NULL AS high, NULL AS low, rate AS close, NULL AS adj_close, NULL AS volume, source
+      FROM fx_rate_cache
+      WHERE date <= ?
+      ORDER BY date DESC
+      LIMIT 1
+    `).get(normalizeDate(date));
+  }
   return conn.prepare(`
     SELECT date, open, high, low, close, adj_close, volume, source
     FROM market_price_cache
@@ -1648,9 +2034,6 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
   if (!investmentSymbol) return;
   const normalizedPoints = points.map(normalizeCachePoint).filter(Boolean);
   if (!normalizedPoints.length) return;
-  const holdingWindows = getInvestmentHoldingWindows(conn, investmentId);
-  const effectivePoints = normalizedPoints.filter((p) => p?.date && isDateWithinHoldingWindows(p.date, holdingWindows));
-  if (!effectivePoints.length) return;
 
   const stmt = conn.prepare(`
     INSERT INTO market_price_cache (
@@ -1671,8 +2054,6 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
   `);
 
   const tx = conn.transaction((rows) => {
-    purgeInvestmentCacheOutsideHoldingWindows(conn, investmentId, holdingWindows);
-
     for (const p of rows) {
       const d = normalizeDate(p.date);
       if (!d) continue;
@@ -1692,7 +2073,7 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
     }
   });
 
-  tx(effectivePoints);
+  tx(normalizedPoints);
 
 }
 
@@ -1731,6 +2112,7 @@ module.exports = {
   getNearestOnOrBefore,
   getInvestmentNearestOnOrBefore,
   getMarketSessionDates,
+  getSeriesMissingStartDate,
   hydrateHistoricalPriceSeries,
   hydrateStockSeriesForPhase2,
 };

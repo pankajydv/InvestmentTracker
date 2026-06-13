@@ -73,6 +73,38 @@ export const updateInvestment = (id, data) =>
   fetchJSON(`/investments/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteInvestment = (id) =>
   fetchJSON(`/investments/${id}`, { method: 'DELETE' });
+export const getInvestmentHistoricalPrices = (id, {
+  from,
+  to,
+  limit,
+  page,
+  pageSize,
+} = {}) => {
+  const params = new URLSearchParams();
+  if (from) params.set('from', from);
+  if (to) params.set('to', to);
+  if (limit) params.set('limit', String(limit));
+  if (page) params.set('page', String(page));
+  if (pageSize) params.set('page_size', String(pageSize));
+  const qs = params.toString();
+  return fetchJSON(`/investments/${id}/historical-prices${qs ? `?${qs}` : ''}`);
+};
+export const getInvestmentFxRateCache = (id, {
+  from,
+  to,
+  limit,
+  page,
+  pageSize,
+} = {}) => {
+  const params = new URLSearchParams();
+  if (from) params.set('from', from);
+  if (to) params.set('to', to);
+  if (limit) params.set('limit', String(limit));
+  if (page) params.set('page', String(page));
+  if (pageSize) params.set('page_size', String(pageSize));
+  const qs = params.toString();
+  return fetchJSON(`/investments/${id}/fx-rate-cache${qs ? `?${qs}` : ''}`);
+};
 export const getInvestmentSymbolHistory = (id) =>
   fetchJSON(`/investments/${id}/symbol-history`);
 export const createInvestmentSymbolHistory = (id, data) =>

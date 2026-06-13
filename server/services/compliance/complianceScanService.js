@@ -6,8 +6,7 @@ const { getDb } = require('../../db/schema');
 const { getMarketHolidays, getWeekends } = require('../holidays/marketHolidayService');
 const { markScopeDirty } = require('../dirtyBackfillService');
 
-const COMPLIANCE_WATERMARK_KEY = 'compliance_scan_watermark';
-const COMPLIANCE_INVALID_FROM_KEY = 'compliance_invalid_from';
+const COMPLIANCE_SCAN_FLOOR_KEY = 'compliance_scan_floor';
 const COMPLIANCE_LAST_MODE_KEY = 'compliance_last_mode';
 const COMPLIANCE_LAST_RUN_DATE_KEY = 'compliance_last_run_date';
 const COMPLIANCE_LAST_GAPS_KEY = 'compliance_last_gaps_detected';
@@ -103,6 +102,10 @@ function getEarliestDirtyFromDate(db, runDate) {
   return parseIsoDate(row?.min_dirty_from);
 }
 
+function getComplianceScanFloor(db) {
+  return parseIsoDate(getConfigValue(db, COMPLIANCE_SCAN_FLOOR_KEY));
+}
+
 function resolveScanWindow(db, options = {}) {
   const runDate = parseIsoDate(options.runDate) || todayIso();
   const mode = String(options.mode || 'full').toLowerCase();
@@ -113,22 +116,19 @@ function resolveScanWindow(db, options = {}) {
       runDate,
       startDate: null,
       endDate: runDate,
-      watermark: parseIsoDate(getConfigValue(db, COMPLIANCE_WATERMARK_KEY)),
-      invalidFrom: parseIsoDate(getConfigValue(db, COMPLIANCE_INVALID_FROM_KEY)),
+      scanFloor: getComplianceScanFloor(db),
       dirtyFrom: getEarliestDirtyFromDate(db, runDate),
       lookbackDays: null,
     };
   }
 
-  const watermark = parseIsoDate(getConfigValue(db, COMPLIANCE_WATERMARK_KEY));
-  const invalidFrom = parseIsoDate(getConfigValue(db, COMPLIANCE_INVALID_FROM_KEY));
+  const scanFloor = getComplianceScanFloor(db);
   const dirtyFrom = getEarliestDirtyFromDate(db, runDate);
   const lookbackDays = Math.max(1, Number(options.lookbackDays || INCREMENTAL_LOOKBACK_DAYS));
   const lookbackStart = addDaysIso(runDate, -lookbackDays);
 
   let startDate = lookbackStart;
-  if (watermark) startDate = minIsoDate(startDate, addDaysIso(watermark, -1));
-  if (invalidFrom) startDate = minIsoDate(startDate, invalidFrom);
+  if (scanFloor) startDate = minIsoDate(startDate, scanFloor);
   if (dirtyFrom) startDate = minIsoDate(startDate, dirtyFrom);
 
   if (startDate > runDate) startDate = runDate;
@@ -138,8 +138,7 @@ function resolveScanWindow(db, options = {}) {
     runDate,
     startDate,
     endDate: runDate,
-    watermark,
-    invalidFrom,
+    scanFloor,
     dirtyFrom,
     lookbackDays,
   };
@@ -147,12 +146,17 @@ function resolveScanWindow(db, options = {}) {
 
 function persistComplianceState(db, window) {
   const nextDirtyFrom = getEarliestDirtyFromDate(db, window.endDate || window.runDate || todayIso());
-  upsertConfigValue(db, COMPLIANCE_WATERMARK_KEY, window.endDate || window.runDate || todayIso());
-  upsertConfigValue(db, COMPLIANCE_INVALID_FROM_KEY, nextDirtyFrom || '');
+  upsertConfigValue(db, COMPLIANCE_SCAN_FLOOR_KEY, nextDirtyFrom || '');
   return {
-    watermark: window.endDate || window.runDate || todayIso(),
-    invalidFrom: nextDirtyFrom || null,
+    scanFloor: nextDirtyFrom || null,
   };
+}
+
+function refreshComplianceScanFloor(db, runDate = todayIso()) {
+  const effectiveRunDate = parseIsoDate(runDate) || todayIso();
+  const nextDirtyFrom = getEarliestDirtyFromDate(db, effectiveRunDate);
+  upsertConfigValue(db, COMPLIANCE_SCAN_FLOOR_KEY, nextDirtyFrom || '');
+  return nextDirtyFrom || null;
 }
 
 function persistComplianceRunMeta(db, result) {
@@ -167,8 +171,7 @@ function getComplianceScanState(runDate = todayIso(), dbOverride = null) {
   const shouldCloseDb = !dbOverride;
   try {
     const effectiveRunDate = parseIsoDate(runDate) || todayIso();
-    const watermark = parseIsoDate(getConfigValue(db, COMPLIANCE_WATERMARK_KEY));
-    const invalidFrom = parseIsoDate(getConfigValue(db, COMPLIANCE_INVALID_FROM_KEY));
+    const scanFloor = getComplianceScanFloor(db);
     const dirtyFrom = getEarliestDirtyFromDate(db, effectiveRunDate);
     const lastMode = getConfigValue(db, COMPLIANCE_LAST_MODE_KEY) || null;
     const lastRunDate = parseIsoDate(getConfigValue(db, COMPLIANCE_LAST_RUN_DATE_KEY));
@@ -178,11 +181,10 @@ function getComplianceScanState(runDate = todayIso(), dbOverride = null) {
 
     return {
       runDate: effectiveRunDate,
-      watermark,
-      invalidFrom,
+      scanFloor,
       dirtyFrom,
       openGapCount: Number(openGapCount || 0),
-      hasBacklog: !!(dirtyFrom || invalidFrom || Number(openGapCount || 0) > 0),
+      hasBacklog: !!(dirtyFrom || scanFloor || Number(openGapCount || 0) > 0),
       lastScan: {
         mode: lastMode,
         runDate: lastRunDate,
@@ -490,7 +492,7 @@ function emitProgress(callback, payload) {
   try {
     callback(payload);
   } catch (_) {
-    // Progress reporting is best-effort and must not break scans.
+    console.error('[ComplianceScan] Error emitting progress callback');
   }
 }
 
@@ -539,11 +541,9 @@ function scanAndRepairComplianceGaps(options = {}) {
       startDate: window.startDate,
       endDate: window.endDate,
       lookbackDays: window.lookbackDays,
-      watermarkBefore: window.watermark,
-      invalidFromBefore: window.invalidFrom,
+      scanFloorBefore: window.scanFloor,
       dirtyFrom: window.dirtyFrom,
-      watermarkAfter: state.watermark,
-      invalidFromAfter: state.invalidFrom,
+      scanFloorAfter: state.scanFloor,
     },
     gapsDetected: gaps.length,
     repairsEnqueued: repairCount,
@@ -674,6 +674,7 @@ module.exports = {
   findAndRecordDailyValuesGaps,
   findAndRecordAllGaps,
   scanAndRepairComplianceGaps,
+  refreshComplianceScanFloor,
   getComplianceScanState,
   getOpenGaps,
   markGapResolved,

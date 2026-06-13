@@ -159,18 +159,6 @@ async function searchMutualFunds(query) {
  * @returns {Promise<Array<{date: string, nav: number}>>}
  */
 async function fetchMutualFundHistory(amfiCode) {
-  const today = isoDate(new Date());
-  const cached = getSeries('MUTUAL_FUND', amfiCode, '1900-01-01', today);
-  if (cached.length > 0) {
-    const latestCachedDate = cached[cached.length - 1].date;
-    if (latestCachedDate >= addDaysIso(today, -2)) {
-      return cached.map((d) => ({
-        date: d.date,
-        nav: Number(d.close),
-      }));
-    }
-  }
-
   return new Promise((resolve, reject) => {
     const url = `https://api.mfapi.in/mf/${amfiCode}`;
     https.get(url, (res) => {
@@ -184,12 +172,6 @@ async function fetchMutualFundHistory(amfiCode) {
               date: d.date,
               nav: parseFloat(d.nav),
             }));
-            upsertPriceSeries(
-              'MUTUAL_FUND',
-              amfiCode,
-              rows.map((r) => ({ date: r.date, close: r.nav, source: 'MFAPI' })),
-              'MFAPI'
-            );
             resolve(rows);
           } else {
             reject(new Error(`No history for scheme ${amfiCode}`));
@@ -645,7 +627,9 @@ async function fetchHistoricalUSDToINR(date) {
       upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rate, source: 'FBIL' });
       return rate;
     }
-  } catch (_) { /* fall through */ }
+  } catch (e) {
+    console.error(`fetchHistoricalUSDToINR: FBIL fetch failed for ${date}:`, e.message);
+  }
 
   // ── 2. Yahoo Finance historical USDINR=X ──────────────────────────────────
   try {
@@ -654,7 +638,9 @@ async function fetchHistoricalUSDToINR(date) {
       upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rate, source: 'YAHOO' });
       return rate;
     }
-  } catch (_) { /* fall through */ }
+  } catch (e) {
+    console.error(`fetchHistoricalUSDToINR: Yahoo fetch failed for ${date}:`, e.message);
+  }
 
   // ── 3. Current rate as fallback ───────────────────────────────────────────
   if (nearestCached && nearestCached.close != null) {
@@ -770,8 +756,8 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
     try {
       const m = await fetchFBILMonthlyRates(ym);
       monthRates.set(ym, m);
-    } catch (_) {
-      // If monthly FBIL fails, we will rely on fallback path for missing days.
+    } catch (e) {
+      console.error(`fetchHistoricalUSDToINRRange: FBIL monthly fetch failed for ${ym}:`, e.message);
     }
   }
 
@@ -808,8 +794,8 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
       await fetchHistoricalUSDToINR(day);
       successfulDays += 1;
       fallbackDays += 1;
-    } catch (_) {
-      // best effort for range fill
+    } catch (e) {
+      console.error(`fetchHistoricalUSDToINRRange: fallback failed for ${day}:`, e.message);
     }
   }
 
@@ -1073,8 +1059,14 @@ function searchStocks(query, market) {
           resolve([]);
         }
       });
-      res.on('error', () => resolve([]));
-    }).on('error', () => resolve([]));
+      res.on('error', (err) => {
+        console.error(`Stock search request stream error for "${query}":`, err?.message || err);
+        resolve([]);
+      });
+    }).on('error', (err) => {
+      console.error(`Stock search request failed for "${query}":`, err?.message || err);
+      resolve([]);
+    });
   });
 }
 
@@ -1110,8 +1102,14 @@ async function lookupTickerByISIN(isin) {
           resolve(null);
         }
       });
-      res.on('error', () => resolve(null));
-    }).on('error', () => resolve(null));
+      res.on('error', (err) => {
+        console.error(`ISIN lookup request stream error for ${isin}:`, err?.message || err);
+        resolve(null);
+      });
+    }).on('error', (err) => {
+      console.error(`ISIN lookup request failed for ${isin}:`, err?.message || err);
+      resolve(null);
+    });
   });
 }
 
@@ -1466,79 +1464,47 @@ function resolveAmfiCodeByISIN(isins) {
   });
 }
 
-// ─── SGB Price from NSE quote-equity API ─────────────────────────────────────
-
-// Reusable NSE session: cache the cookie for 30 minutes
-let _nseCookie = null;
-let _nseCookieExpiry = 0;
-
-async function getNSECookie() {
-  if (_nseCookie && Date.now() < _nseCookieExpiry) return _nseCookie;
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'www.nseindia.com',
-      path: '/api/marketStatus',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124',
-        'Accept': 'application/json',
-      }
-    }, res => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        _nseCookie = (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
-        _nseCookieExpiry = Date.now() + 30 * 60 * 1000;
-        resolve(_nseCookie);
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
+// ─── SGB Price from NSE historical trade provider ────────────────────────────
 
 /**
- * Fetch SGB price from NSE quote-equity API.
+ * Fetch SGB price from NSE historical trade provider used by backfill.
  * @param {string} symbol - NSE symbol e.g. 'SGBSEP28VI' or 'SGBJAN29IX'
  * @returns {Promise<{price: number, change: number, changePercent: number, previousClose: number}>}
  */
 async function fetchSGBPrice(symbol) {
-  const cookie = await getNSECookie();
-  // Small delay to avoid hammering NSE
-  await new Promise(r => setTimeout(r, 500));
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'www.nseindia.com',
-      path: '/api/quote-equity?symbol=' + encodeURIComponent(symbol),
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124',
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://www.nseindia.com/get-quotes/bonds?symbol=' + symbol,
-        'Cookie': cookie,
-      }
-    }, res => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          const pi = json.priceInfo;
-          if (!pi || !pi.lastPrice) {
-            return reject(new Error(`No price data from NSE for ${symbol}`));
-          }
-          resolve({
-            price: pi.lastPrice,
-            change: pi.change || 0,
-            changePercent: pi.pChange || 0,
-            previousClose: pi.previousClose || pi.close || pi.lastPrice,
-          });
-        } catch (e) {
-          reject(new Error(`Failed to parse NSE response for ${symbol}: ${e.message}`));
-        }
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
+  const cleanSymbol = String(symbol || '').trim();
+  if (!cleanSymbol) throw new Error('SGB symbol is required');
+
+  const { fetchSGBNseHistoricalRaw } = require('./sgbNseHistorical');
+
+  const toDate = isoDate(new Date());
+  const fromDate = addDaysIso(toDate, -10);
+  const rows = await fetchSGBNseHistoricalRaw(cleanSymbol, fromDate, toDate);
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error(`No price data from NSE historical trade for ${cleanSymbol}`);
+  }
+
+  const validRows = rows
+    .filter((row) => row?.date && Number.isFinite(Number(row.close)) && Number(row.close) > 0)
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+  if (validRows.length === 0) {
+    throw new Error(`No valid SGB price rows for ${cleanSymbol}`);
+  }
+
+  const latest = validRows[validRows.length - 1];
+  const previous = validRows.length > 1 ? validRows[validRows.length - 2] : null;
+  const price = Number(latest.close);
+  const previousClose = previous ? Number(previous.close) : price;
+  const change = price - previousClose;
+  const changePercent = previousClose > 0 ? (change / previousClose) * 100 : 0;
+
+  return {
+    price,
+    change: Math.round(change * 100) / 100,
+    changePercent: Math.round(changePercent * 100) / 100,
+    previousClose,
+  };
 }
 
 // ─── NPS NAV Fetching ─────────────────────────────────────────────────────────
@@ -1625,31 +1591,19 @@ async function fetchNPSHistory(npsFundCode, fromDate = null, toDate = null) {
   const from = normalizeNpsHistoryDate(fromDate) || '1900-01-01';
   const to = normalizeNpsHistoryDate(toDate) || isoDate(new Date());
 
-  const rows = await hydrateHistoricalPriceSeries({
-    instrumentType: 'NPS',
-    symbol: code,
-    fromDate: from,
-    toDate: to,
-    sourceLabel: 'NPSNAV',
-    fetchRange: async () => {
-      const json = await fetchNpsJson(`/api/historical/${encodeURIComponent(code)}`);
-      const data = Array.isArray(json?.data) ? json.data : [];
-      if (data.length === 0) {
-        throw new Error(`No history for NPS fund ${code}`);
-      }
-      return data;
-    },
-    mapFetchedRows: (data) => data
-      .map((r) => ({
-        date: parseNpsDateToIso(r?.date),
-        close: safeNum(r?.nav),
-        source: 'NPSNAV',
-      }))
-      .filter((r) => !!r.date && r.close != null && r.close > 0),
-  });
+  const json = await fetchNpsJson(`/api/historical/${encodeURIComponent(code)}`);
+  const data = Array.isArray(json?.data) ? json.data : [];
+  if (data.length === 0) {
+    throw new Error(`No history for NPS fund ${code}`);
+  }
 
-  return rows
-    .map((row) => ({ date: row.date, nav: safeNum(row.close) }))
+  return data
+    .map((r) => ({
+      date: parseNpsDateToIso(r?.date),
+      nav: safeNum(r?.nav),
+    }))
+    .filter((row) => row.date && row.nav != null && row.nav > 0)
+    .filter((row) => row.date >= from && row.date <= to)
     .filter((row) => row.date && row.nav != null && row.nav > 0)
     .sort((a, b) => a.date.localeCompare(b.date));
 }

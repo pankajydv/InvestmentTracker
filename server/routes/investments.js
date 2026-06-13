@@ -8,6 +8,7 @@ const {
   INVESTED_AMOUNT_INFLOW_TYPES_SQL,
 } = require('../constants/transactionTypes');
 const { markScopeDirty } = require('../services/dirtyBackfillService');
+const { getInvestmentSeries, getMarketSessionDates, getSeries } = require('../services/marketPriceCache');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -37,6 +38,52 @@ const CASH_OUTFLOW_TYPES = new Set(XIRR_CASH_OUTFLOW_TYPES);
 const CASH_INFLOW_TYPES = new Set(XIRR_CASH_INFLOW_TYPES);
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
+const MARKET_DRIVEN_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function parseDateOnly(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
+  const d = new Date(`${trimmed}T00:00:00.000Z`);
+  return Number.isNaN(d.getTime()) ? null : trimmed;
+}
+
+function addDaysIso(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+
+function toNumberOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function buildMissingRanges(missingDates) {
+  if (!Array.isArray(missingDates) || !missingDates.length) return [];
+  const ranges = [];
+  let start = missingDates[0];
+  let prev = missingDates[0];
+
+  for (let i = 1; i < missingDates.length; i += 1) {
+    const current = missingDates[i];
+    const expectedNext = addDaysIso(prev, 1);
+    if (current === expectedNext) {
+      prev = current;
+      continue;
+    }
+    ranges.push({ from: start, to: prev, days: 1 + Math.round((Date.parse(`${prev}T00:00:00.000Z`) - Date.parse(`${start}T00:00:00.000Z`)) / 86400000) });
+    start = current;
+    prev = current;
+  }
+
+  ranges.push({ from: start, to: prev, days: 1 + Math.round((Date.parse(`${prev}T00:00:00.000Z`) - Date.parse(`${start}T00:00:00.000Z`)) / 86400000) });
+  return ranges;
+}
 
 function isInternalXirrCashflow(assetType, transactionType) {
   const normalizedAssetType = String(assetType || '').toUpperCase();
@@ -114,6 +161,261 @@ function calculateXirr(flows) {
 }
 
 module.exports = function (db) {
+  router.get('/:id/historical-prices', (req, res) => {
+    try {
+      const investmentId = Number(req.params.id);
+      if (!Number.isInteger(investmentId) || investmentId <= 0) {
+        return res.status(400).json({ error: 'Invalid investment id' });
+      }
+
+      const investment = db.prepare(`
+        SELECT id, name, display_name, asset_type, ticker_symbol, amfi_code, nps_fund_code, isin_code
+        FROM investments
+        WHERE id = ?
+      `).get(investmentId);
+
+      if (!investment) {
+        return res.status(404).json({ error: 'Investment not found' });
+      }
+
+      if (!MARKET_DRIVEN_ASSET_TYPES.has(String(investment.asset_type || '').toUpperCase())) {
+        return res.status(400).json({
+          error: 'Historical market prices are available only for market-driven investments',
+          asset_type: investment.asset_type,
+        });
+      }
+
+      const today = todayIso();
+      const toDate = parseDateOnly(req.query.to) || today;
+      const fromDate = parseDateOnly(req.query.from) || addDaysIso(toDate, -365);
+      if (fromDate > toDate) {
+        return res.status(400).json({ error: 'from must be less than or equal to to' });
+      }
+
+      const pageRaw = Number(req.query.page);
+      const page = Number.isFinite(pageRaw) && pageRaw > 0
+        ? Math.floor(pageRaw)
+        : 1;
+
+      const pageSizeRaw = Number(req.query.page_size);
+      const legacyLimitRaw = Number(req.query.limit);
+      const pageSize = Number.isFinite(pageSizeRaw) && pageSizeRaw > 0
+        ? Math.min(Math.floor(pageSizeRaw), 5000)
+        : (Number.isFinite(legacyLimitRaw) && legacyLimitRaw > 0
+          ? Math.min(Math.floor(legacyLimitRaw), 5000)
+          : 365);
+
+      const rowsAll = getInvestmentSeries(investmentId, fromDate, toDate);
+      const totalRows = rowsAll.length;
+      const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+      const currentPage = Math.min(page, totalPages);
+
+      // Page 1 is the latest page (most recent rows), page N moves backwards in time.
+      const endExclusive = totalRows - ((currentPage - 1) * pageSize);
+      const startInclusive = Math.max(0, endExclusive - pageSize);
+      const pageRows = rowsAll.slice(startInclusive, Math.max(startInclusive, endExclusive));
+
+      const rowsLimited = pageRows.map((row) => ({
+        date: row.date,
+        open: toNumberOrNull(row.open),
+        high: toNumberOrNull(row.high),
+        low: toNumberOrNull(row.low),
+        close: toNumberOrNull(row.close),
+        adj_close: toNumberOrNull(row.adj_close),
+        volume: toNumberOrNull(row.volume),
+        source: row.source || null,
+        instrument_type: row.instrument_type || null,
+        symbol: row.symbol || null,
+      }));
+
+      const displayedFrom = rowsLimited.length ? rowsLimited[0].date : null;
+      const displayedTo = rowsLimited.length ? rowsLimited[rowsLimited.length - 1].date : null;
+
+      const instrumentType = String(investment.asset_type || '').toUpperCase();
+      const expectedSessions = getMarketSessionDates(fromDate, toDate, instrumentType);
+      const rowDateSet = new Set(rowsAll.map((row) => row.date));
+      const missingDates = expectedSessions.filter((date) => !rowDateSet.has(date));
+      const missingRanges = buildMissingRanges(missingDates);
+      const coveragePct = expectedSessions.length > 0
+        ? Number((((expectedSessions.length - missingDates.length) / expectedSessions.length) * 100).toFixed(2))
+        : 100;
+
+      const firstCachedDate = rowsAll.length ? rowsAll[0].date : null;
+      const lastCachedDate = rowsAll.length ? rowsAll[rowsAll.length - 1].date : null;
+
+      return res.json({
+        investment: {
+          id: investment.id,
+          name: investment.display_name || investment.name,
+          asset_type: investment.asset_type,
+          ticker_symbol: investment.ticker_symbol || null,
+          amfi_code: investment.amfi_code || null,
+          nps_fund_code: investment.nps_fund_code || null,
+          isin_code: investment.isin_code || null,
+        },
+        window: {
+          from: fromDate,
+          to: toDate,
+          page: currentPage,
+          page_size: pageSize,
+          displayed_from: displayedFrom,
+          displayed_to: displayedTo,
+        },
+        pagination: {
+          page: currentPage,
+          page_size: pageSize,
+          total_rows: totalRows,
+          total_pages: totalPages,
+          has_previous: currentPage > 1,
+          has_next: currentPage < totalPages,
+        },
+        summary: {
+          rows_returned: rowsLimited.length,
+          rows_in_window: rowsAll.length,
+          expected_sessions: expectedSessions.length,
+          missing_sessions: missingDates.length,
+          coverage_pct: coveragePct,
+          first_cached_date: firstCachedDate,
+          last_cached_date: lastCachedDate,
+          first_missing_date: missingDates[0] || null,
+          last_missing_date: missingDates.length ? missingDates[missingDates.length - 1] : null,
+          sparse: missingDates.length > 0,
+        },
+        missing_ranges: missingRanges,
+        rows: rowsLimited,
+      });
+    } catch (e) {
+      logAppError('[InvestmentHistory] Failed to fetch historical prices', {
+        investment_id: Number(req.params.id) || null,
+        error: e.message,
+      });
+      return res.status(500).json({ error: e.message || 'Failed to fetch historical prices' });
+    }
+  });
+
+  router.get('/:id/fx-rate-cache', (req, res) => {
+    try {
+      const investmentId = Number(req.params.id);
+      if (!Number.isInteger(investmentId) || investmentId <= 0) {
+        return res.status(400).json({ error: 'Invalid investment id' });
+      }
+
+      const investment = db.prepare(`
+        SELECT id, name, display_name, asset_type, ticker_symbol
+        FROM investments
+        WHERE id = ?
+      `).get(investmentId);
+
+      if (!investment) {
+        return res.status(404).json({ error: 'Investment not found' });
+      }
+
+      if (String(investment.asset_type || '').toUpperCase() !== 'FOREIGN_STOCK') {
+        return res.status(400).json({
+          error: 'FX rate cache is available only for foreign stock investments',
+          asset_type: investment.asset_type,
+        });
+      }
+
+      const today = todayIso();
+      const toDate = parseDateOnly(req.query.to) || today;
+      const fromDate = parseDateOnly(req.query.from) || addDaysIso(toDate, -365);
+      if (fromDate > toDate) {
+        return res.status(400).json({ error: 'from must be less than or equal to to' });
+      }
+
+      const pageRaw = Number(req.query.page);
+      const page = Number.isFinite(pageRaw) && pageRaw > 0
+        ? Math.floor(pageRaw)
+        : 1;
+
+      const pageSizeRaw = Number(req.query.page_size);
+      const legacyLimitRaw = Number(req.query.limit);
+      const pageSize = Number.isFinite(pageSizeRaw) && pageSizeRaw > 0
+        ? Math.min(Math.floor(pageSizeRaw), 5000)
+        : (Number.isFinite(legacyLimitRaw) && legacyLimitRaw > 0
+          ? Math.min(Math.floor(legacyLimitRaw), 5000)
+          : 365);
+
+      // Get FX rates from market price cache for USDINR=X
+      const fxRows = getSeries('FX', 'USDINR=X', fromDate, toDate);
+      const totalRows = fxRows.length;
+      const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+      const currentPage = Math.min(page, totalPages);
+
+      // Page 1 is latest, page N moves backwards in time
+      const endExclusive = totalRows - ((currentPage - 1) * pageSize);
+      const startInclusive = Math.max(0, endExclusive - pageSize);
+      const pageRows = fxRows.slice(startInclusive, Math.max(startInclusive, endExclusive));
+
+      const rowsLimited = pageRows.map((row) => ({
+        date: row.date,
+        close: toNumberOrNull(row.close),
+        volume: toNumberOrNull(row.volume),
+        source: row.source || null,
+      }));
+
+      const displayedFrom = rowsLimited.length ? rowsLimited[0].date : null;
+      const displayedTo = rowsLimited.length ? rowsLimited[rowsLimited.length - 1].date : null;
+
+      const expectedSessions = getMarketSessionDates(fromDate, toDate, 'FX');
+      const rowDateSet = new Set(fxRows.map((row) => row.date));
+      const missingDates = expectedSessions.filter((date) => !rowDateSet.has(date));
+      const missingRanges = buildMissingRanges(missingDates);
+      const coveragePct = expectedSessions.length > 0
+        ? Number((((expectedSessions.length - missingDates.length) / expectedSessions.length) * 100).toFixed(2))
+        : 100;
+
+      const firstCachedDate = fxRows.length ? fxRows[0].date : null;
+      const lastCachedDate = fxRows.length ? fxRows[fxRows.length - 1].date : null;
+
+      return res.json({
+        investment: {
+          id: investment.id,
+          name: investment.display_name || investment.name,
+          asset_type: investment.asset_type,
+          ticker_symbol: investment.ticker_symbol || null,
+        },
+        window: {
+          from: fromDate,
+          to: toDate,
+          page: currentPage,
+          page_size: pageSize,
+          displayed_from: displayedFrom,
+          displayed_to: displayedTo,
+        },
+        pagination: {
+          page: currentPage,
+          page_size: pageSize,
+          total_rows: totalRows,
+          total_pages: totalPages,
+          has_previous: currentPage > 1,
+          has_next: currentPage < totalPages,
+        },
+        summary: {
+          rows_returned: rowsLimited.length,
+          rows_in_window: fxRows.length,
+          expected_sessions: expectedSessions.length,
+          missing_sessions: missingDates.length,
+          coverage_pct: coveragePct,
+          first_cached_date: firstCachedDate,
+          last_cached_date: lastCachedDate,
+          first_missing_date: missingDates[0] || null,
+          last_missing_date: missingDates.length ? missingDates[missingDates.length - 1] : null,
+          sparse: missingDates.length > 0,
+        },
+        missing_ranges: missingRanges,
+        rows: rowsLimited,
+      });
+    } catch (e) {
+      logAppError('[InvestmentFxCache] Failed to fetch FX rate cache', {
+        investment_id: Number(req.params.id) || null,
+        error: e.message,
+      });
+      return res.status(500).json({ error: e.message || 'Failed to fetch FX rate cache' });
+    }
+  });
+
   // ─── Get all investments ──────────────────────────────────────────────
   router.get('/', (req, res) => {
     const { type, portfolio_id, hide_sold } = req.query;
@@ -563,7 +865,7 @@ module.exports = function (db) {
         const investmentId = Number(req.params.id);
         const historyId = Number(req.params.historyId);
 
-        const investment = db.prepare('SELECT id FROM investments WHERE id = ?').get(investmentId);
+        const investment = db.prepare('SELECT id, asset_type FROM investments WHERE id = ?').get(investmentId);
         if (!investment) {
           return res.status(404).json({ error: 'Investment not found' });
         }

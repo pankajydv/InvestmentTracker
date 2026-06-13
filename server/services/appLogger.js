@@ -23,10 +23,6 @@ function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
-function pad3(n) {
-  return String(n).padStart(3, '0');
-}
-
 function currentDateStamp() {
   const d = toIstDate();
   const y = d.getUTCFullYear();
@@ -37,20 +33,17 @@ function currentDateStamp() {
 
 function currentTimestampIst() {
   const d = toIstDate();
-  const y = d.getUTCFullYear();
-  const m = pad2(d.getUTCMonth() + 1);
-  const day = pad2(d.getUTCDate());
   const hh = pad2(d.getUTCHours());
   const mm = pad2(d.getUTCMinutes());
   const ss = pad2(d.getUTCSeconds());
-  const ms = pad3(d.getUTCMilliseconds());
-  return `${y}-${m}-${day}T${hh}:${mm}:${ss}.${ms}+05:30`;
+  return `${hh}:${mm}:${ss}`;
 }
 
 function safeStringify(value) {
   try {
     return JSON.stringify(value);
   } catch (_) {
+    console.error('[ERROR] [Logger] Failed to JSON stringify log meta payload');
     return String(value);
   }
 }
@@ -74,7 +67,7 @@ function pruneOldLogs() {
       }
     }
   } catch (_) {
-    // best-effort retention
+    console.error('[ERROR] [Logger] Failed while pruning old log files');
   }
 }
 
@@ -100,7 +93,7 @@ function writeLog(_prefix, level, message, meta = null) {
 
     pruneOldLogs();
   } catch (_) {
-    // best-effort logging only
+    console.error('[ERROR] [Logger] Failed to write application log entry');
   }
 }
 

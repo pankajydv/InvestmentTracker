@@ -1,6 +1,5 @@
 const express = require('express');
 const router = express.Router();
-const { ONE_DAY_CHANGE_POLICY, getOneDayChangePolicy } = require('../services/assetPolicy');
 const {
   ACQUIRED_UNITS_INFLOW_TYPES_SQL,
   DASHBOARD_RETURNS_INVESTED_TYPES_SQL,
@@ -20,9 +19,6 @@ const INTERNAL_BALANCE_ASSET_TYPES_SQL = "'PF','PPF','SSY'";
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
-const ONE_DAY_IGNORE_INDIAN_HOLIDAYS_ASSET_TYPES = new Set(['FOREIGN_STOCK']);
-const ONE_DAY_MAX_PREVIOUS_SESSIONS = 3;
-const ONE_DAY_EPSILON_UNITS = 0.001;
 
 function isInternalXirrCashflow(assetType, transactionType) {
   const normalizedAssetType = String(assetType || '').toUpperCase();
@@ -107,62 +103,6 @@ function diffIsoDays(startIso, endIso) {
   return Math.max(Math.floor((endMs - startMs) / 86400000), 1);
 }
 
-function addDaysIso(isoDate, days) {
-  const d = new Date(`${isoDate}T00:00:00.000Z`);
-  d.setUTCDate(d.getUTCDate() + Number(days || 0));
-  return d.toISOString().slice(0, 10);
-}
-
-function loadMarketHolidaySet(db, runDate) {
-  try {
-    const hasTable = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='market_holidays'").get();
-    if (!hasTable) return new Set();
-
-    const rows = runDate
-      ? db.prepare('SELECT date FROM market_holidays WHERE date <= ? ORDER BY date ASC').all(runDate)
-      : db.prepare('SELECT date FROM market_holidays ORDER BY date ASC').all();
-    return new Set(
-      rows
-        .map((row) => String(row.date || ''))
-        .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date))
-    );
-  } catch (_e) {
-    return new Set();
-  }
-}
-
-function isWeekendIso(isoDate) {
-  const dt = new Date(`${isoDate}T00:00:00.000Z`);
-  const day = dt.getUTCDay();
-  return day === 0 || day === 6;
-}
-
-function isMarketSessionDate(isoDate, marketHolidaySet) {
-  if (!isoDate) return false;
-  if (isWeekendIso(isoDate)) return false;
-  if (marketHolidaySet?.has(isoDate)) return false;
-  return true;
-}
-
-function isWithinPreviousMarketSessions(candidateIso, anchorIso, marketHolidaySet, maxSessions = ONE_DAY_MAX_PREVIOUS_SESSIONS) {
-  if (!candidateIso || !anchorIso || candidateIso >= anchorIso) return false;
-  if (!isMarketSessionDate(candidateIso, marketHolidaySet)) return false;
-
-  let cursor = addDaysIso(anchorIso, -1);
-  let seenSessions = 0;
-  while (cursor >= candidateIso) {
-    if (isMarketSessionDate(cursor, marketHolidaySet)) {
-      seenSessions += 1;
-      if (seenSessions > maxSessions) return false;
-    }
-    if (cursor === candidateIso) {
-      return seenSessions <= maxSessions;
-    }
-    cursor = addDaysIso(cursor, -1);
-  }
-  return false;
-}
-
 module.exports = function (db) {
 
   // ─── Portfolio Summary (Dashboard) ────────────────────────────────────
@@ -174,8 +114,6 @@ module.exports = function (db) {
     const includeSoldInReturns = hideSold ? includeSoldInReturnsRequested : true;
     const xirrModeRaw = String(req.query.xirr_mode || 'full').trim().toLowerCase();
     const xirrMode = xirrModeRaw === 'portfolio_only' ? 'portfolio_only' : 'full';
-    const oneDayDebugRaw = String(req.query.one_day_debug || '').trim().toLowerCase();
-    const includeOneDayDebug = oneDayDebugRaw === 'true' || oneDayDebugRaw === '1' || oneDayDebugRaw === 'yes';
 
     // Get latest portfolio snapshot
     let latest;
@@ -298,19 +236,12 @@ module.exports = function (db) {
           GROUP BY dv.investment_id, dv.date
         `).all();
 
-    // Create lookup maps for daily values for current request scope
+    // Create lookup map for latest daily values for current request scope
     const latestDvByInvestment = new Map();
-    const dvHistoryByInvestment = new Map();
     for (const dv of allDailyValuesRaw) {
       const key = `${dv.investment_id}_${portfolio_id || 'null'}`;
       if (dv.row_num === 1) {
         latestDvByInvestment.set(key, dv);
-      }
-      if (!dvHistoryByInvestment.has(key)) {
-        dvHistoryByInvestment.set(key, []);
-      }
-      if (dv.row_num <= 90) {
-        dvHistoryByInvestment.get(key).push(dv);
       }
     }
 
@@ -496,26 +427,7 @@ module.exports = function (db) {
       }
     }
 
-    const oneDayDebugSummary = includeOneDayDebug
-      ? {
-          enabled: true,
-          requestedWith: req.query.one_day_debug,
-          policyCounts: {
-            MARKET_SESSION: 0,
-            NAV_SNAPSHOT: 0,
-            ACCRUAL_SNAPSHOT: 0,
-            SNAPSHOT: 0,
-          },
-          noDailyValueCount: 0,
-          noPreviousRowCount: 0,
-          marketAnchoredCount: 0,
-          marketLatestFallbackCount: 0,
-          nonHeldExcludedCount: 0,
-          staleSnapshotExcludedCount: 0,
-        }
-      : null;
-
-    const marketHolidaySet = loadMarketHolidaySet(db, latest?.date || null);
+    const oneDayDebugSummary = null;
 
     const netFlowOnAnchorDate = portfolio_id
       ? db.prepare(`
@@ -563,11 +475,6 @@ module.exports = function (db) {
 
     // Phase 3: Use pre-fetched daily values - no more per-investment queries
     for (const inv of investments) {
-      const policy = getOneDayChangePolicy(inv.asset_type);
-      if (includeOneDayDebug) {
-        oneDayDebugSummary.policyCounts[policy] = (oneDayDebugSummary.policyCounts[policy] || 0) + 1;
-      }
-
       // Fully sold investments should not influence current 1-day change cards,
       // even when they are shown in tables. Keep internal balance products exempt.
       const totalUnits = Number(inv.total_units) || 0;
@@ -576,135 +483,23 @@ module.exports = function (db) {
       if (isNonHeldPosition) {
         inv.day_change = 0;
         inv.day_change_pct = 0;
-        if (includeOneDayDebug) {
-          oneDayDebugSummary.nonHeldExcludedCount += 1;
-          inv.one_day_debug = {
-            ...(inv.one_day_debug || {}),
-            policy,
-            reason: 'NON_HELD_POSITION_EXCLUDED',
-            totalUnits,
-          };
-        }
         continue;
       }
 
       const dvKey = `${inv.id}_${portfolio_id || 'null'}`;
       const latestRow = latestDvByInvestment.get(dvKey);
-      const marketRows = dvHistoryByInvestment.get(dvKey) || [];
-      const filteredMarketRows = marketRows.filter(r => 
-        !r.price_source || r.price_source !== 'LOCF'
-      );
 
       if (!latestRow) {
         inv.day_change = 0;
         inv.day_change_pct = 0;
-        if (includeOneDayDebug) {
-          oneDayDebugSummary.noDailyValueCount += 1;
-          inv.one_day_debug = {
-            policy,
-            reason: 'NO_DAILY_VALUE',
-          };
-        }
         continue;
       }
 
-      const useSessionAnchoring = policy === ONE_DAY_CHANGE_POLICY.MARKET_SESSION
-        || policy === ONE_DAY_CHANGE_POLICY.NAV_SNAPSHOT;
-      const normalizedAssetType = String(inv.asset_type || '').toUpperCase();
-      const effectiveMarketHolidaySet = ONE_DAY_IGNORE_INDIAN_HOLIDAYS_ASSET_TYPES.has(normalizedAssetType)
-        ? null
-        : marketHolidaySet;
-      let anchorRow = latestRow;
-      let anchoredToMarketSession = false;
-      let marketSessionRows = null;
-      if (useSessionAnchoring) {
-        marketSessionRows = filteredMarketRows.filter((row) =>
-          isMarketSessionDate(row.date, effectiveMarketHolidaySet)
-        );
-
-        if (marketSessionRows.length > 0) {
-          anchorRow = marketSessionRows[0];
-          anchoredToMarketSession = true;
-        }
-        if (includeOneDayDebug && policy === ONE_DAY_CHANGE_POLICY.MARKET_SESSION) {
-          if (anchoredToMarketSession) {
-            oneDayDebugSummary.marketAnchoredCount += 1;
-          } else {
-            oneDayDebugSummary.marketLatestFallbackCount += 1;
-          }
-        }
-      }
-
-      const previousCandidates = useSessionAnchoring
-        ? (marketSessionRows || []).filter((row) => row.date < anchorRow.date)
-        : marketRows.filter((row) => row.date < anchorRow.date);
-
-      const previousRow = previousCandidates.find((row) => {
-        const rowUnits = Number(row?.total_units || 0);
-        if (!isInternalBalanceAsset && Math.abs(rowUnits) <= ONE_DAY_EPSILON_UNITS) {
-          return false;
-        }
-        if (!useSessionAnchoring) {
-          return true;
-        }
-        return isWithinPreviousMarketSessions(row.date, anchorRow.date, effectiveMarketHolidaySet);
-      });
-
-      if (!previousRow) {
-        inv.day_change = 0;
-        inv.day_change_pct = 0;
-        if (includeOneDayDebug) {
-          oneDayDebugSummary.noPreviousRowCount += 1;
-          inv.one_day_debug = {
-            policy,
-            latestDate: latestRow.date,
-            anchorDate: anchorRow.date,
-            anchorPriceSource: anchorRow.price_source || null,
-            anchoredToMarketSession,
-            marketHolidayCount: effectiveMarketHolidaySet?.size || 0,
-            reason: 'NO_VALID_PREVIOUS_ROW_WITHIN_3_SESSIONS_OR_REENTRY',
-          };
-        }
-        continue;
-      }
-
-      const netFlow = portfolio_id
-        ? Number(netFlowOnAnchorDate.get(inv.id, portfolio_id, anchorRow.date)?.net_flow || 0)
-        : Number(netFlowOnAnchorDate.get(inv.id, anchorRow.date)?.net_flow || 0);
-      const netFlowRange = portfolio_id
-        ? Number(netFlowInRange.get(inv.id, portfolio_id, previousRow.date, anchorRow.date)?.net_flow || 0)
-        : Number(netFlowInRange.get(inv.id, previousRow.date, anchorRow.date)?.net_flow || 0);
-
-      const prevValue = Number(previousRow.current_value || 0);
-      const anchorValue = Number(anchorRow.current_value || 0);
-      const rawDayChange = policy === ONE_DAY_CHANGE_POLICY.ACCRUAL_SNAPSHOT
-        ? (anchorValue - prevValue - netFlowRange)
-        : (anchorValue - prevValue - netFlow);
-      const daySpan = diffIsoDays(previousRow.date, anchorRow.date);
-      const dayChange = policy === ONE_DAY_CHANGE_POLICY.ACCRUAL_SNAPSHOT
-        ? (rawDayChange / daySpan)
-        : rawDayChange;
-      const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
-
-      inv.day_change = dayChange;
-      inv.day_change_pct = dayChangePct;
-      if (includeOneDayDebug) {
-        inv.one_day_debug = {
-          policy,
-          latestDate: latestRow.date,
-          anchorDate: anchorRow.date,
-          previousDate: previousRow.date,
-          anchorPriceSource: anchorRow.price_source || null,
-          anchoredToMarketSession,
-          marketHolidayCount: effectiveMarketHolidaySet?.size || 0,
-          daySpan,
-          netFlow,
-          netFlowRange,
-          rawDayChange,
-          computedDayChange: dayChange,
-          computedDayChangePct: dayChangePct,
-        };
-      }
+      // Use stored day_change values from daily_values table (computed at 00:01, 09:25, 22:25 scheduler runs)
+      inv.day_change = Number(latestRow.day_change || 0);
+      inv.day_change_pct = latestRow.current_value > 0 
+        ? (inv.day_change / latestRow.current_value) * 100 
+        : 0;
     }
 
     // Add folio information for MF investments
@@ -739,15 +534,6 @@ module.exports = function (db) {
     if (latestSnapshotDate) {
       for (const inv of investments) {
         if (!inv.date || inv.date >= latestSnapshotDate) continue;
-        if (includeOneDayDebug) {
-          oneDayDebugSummary.staleSnapshotExcludedCount += 1;
-          inv.one_day_debug = {
-            ...(inv.one_day_debug || {}),
-            staleSnapshotExcluded: true,
-            staleSnapshotDate: inv.date,
-            summarySnapshotDate: latestSnapshotDate,
-          };
-        }
         inv.day_change = 0;
         inv.day_change_pct = 0;
       }
@@ -1045,13 +831,6 @@ module.exports = function (db) {
       totalExpenses: expenseTotals.total_expenses,
       xirrMode,
       lastUpdate: db.prepare("SELECT value FROM config WHERE key = 'last_price_update'").get()?.value,
-      oneDayDebug: includeOneDayDebug
-        ? {
-            ...oneDayDebugSummary,
-            marketHolidayCount: marketHolidaySet.size,
-            totalInvestments: investments.length,
-          }
-        : undefined,
     });
   });
 

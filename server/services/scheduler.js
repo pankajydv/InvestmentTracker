@@ -15,13 +15,11 @@ const {
   fetchMutualFundHistory,
   fetchHistoricalUSDToINR,
 } = require('./priceService');
-const { getSGBHistoricalPrices } = require('./sgbBhavcopy');
+const { getSGBNseHistoricalPrices } = require('./sgbNseHistorical');
 const { hydrateStockSeriesForPhase2 } = require('./marketPriceCache');
 const { todayIso } = require('./dateUtils');
 const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
-const { scanAndRepairComplianceGaps } = require('./compliance/complianceScanService');
-const { auditHistoricalPriceCoverage } = require('./historicalPriceAuditService');
-const { runHistoricalPriceRepairWorker } = require('./historicalPriceRepairWorkerService');
+const { scanAndRepairComplianceGaps, refreshComplianceScanFloor } = require('./compliance/complianceScanService');
 
 function parsePositiveIntEnv(name, fallback) {
   const parsed = Number(process.env[name]);
@@ -47,18 +45,17 @@ const ENABLE_INTRADAY_COMPLIANCE = String(process.env.ENABLE_INTRADAY_COMPLIANCE
 const ENABLE_STARTUP_COMPLIANCE = String(process.env.ENABLE_STARTUP_COMPLIANCE || 'false').toLowerCase() === 'true';
 const ENABLE_STARTUP_PREFLIGHT = String(process.env.ENABLE_STARTUP_PREFLIGHT || 'false').toLowerCase() === 'true';
 const NIGHTLY_MARKET_CACHE_WARM_DAYS = parseNonNegativeIntEnv('NIGHTLY_MARKET_CACHE_WARM_DAYS', 5);
-const ENABLE_HISTORICAL_PRICE_AUDIT = parseBooleanEnv('ENABLE_HISTORICAL_PRICE_AUDIT', true);
-const HISTORICAL_PRICE_AUDIT_DRY_RUN = false;
-const HISTORICAL_PRICE_AUDIT_WINDOW_DAYS = parsePositiveIntEnv('HISTORICAL_PRICE_AUDIT_WINDOW_DAYS', 5);
-const ENABLE_HISTORICAL_PRICE_REPAIR_WORKER = parseBooleanEnv('ENABLE_HISTORICAL_PRICE_REPAIR_WORKER', true);
-const HISTORICAL_PRICE_REPAIR_BATCH_SIZE = parsePositiveIntEnv('HISTORICAL_PRICE_REPAIR_BATCH_SIZE', 10);
-const HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS = parsePositiveIntEnv('HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS', 3);
 const ENABLE_FOREIGN_RECONCILE = parseBooleanEnv('ENABLE_FOREIGN_RECONCILE', true);
 const FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS = parsePositiveIntEnv('FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS', 10);
 const FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST = parseNonNegativeIntEnv('FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST', (4 * 60) + 25);
+// Days of recent daily_values to scan for LOCF rows when reconciling lagging NAV/price feeds.
+const LOCF_RECONCILE_LOOKBACK_DAYS = parsePositiveIntEnv('LOCF_RECONCILE_LOOKBACK_DAYS', 5);
+// Asset types covered by the generic LOCF-lag self-healing path in the scheduler.
+// Must stay in sync with LOCF_LAG_RECONCILE_ASSET_TYPES in updater.js.
+// FOREIGN_STOCK is intentionally excluded — handled by ensureForeignReconcileScopes.
+const LOCF_LAG_RECONCILE_ASSET_TYPES = ['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'];
 const EXITED_UNITS_EPSILON = 1e-6;
 
-let isHistoricalPriceRepairWorkerRunning = false;
 let isSchedulerCycleRunning = false;
 
 function addDays(isoDate, days) {
@@ -315,10 +312,10 @@ function ensureForeignReconcileScopes(db, runDate, label, catchUp = null) {
   const lookbackStart = addDays(settlementDate, -(Math.max(1, Number(FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS || 10)) - 1));
   const pendingDirtyByScope = resolvePendingForeignDirtyStartByScope(db, runDate);
   const locfStartByScope = resolveLocfSignalStartByScope(db, lookbackStart, settlementDate);
-  const complianceInvalidFrom = (() => {
-    const row = db.prepare("SELECT value FROM config WHERE key = 'compliance_invalid_from' LIMIT 1").get();
-    const value = String(row?.value || '');
-    return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
+  const complianceScanFloor = (() => {
+    const primary = db.prepare("SELECT value FROM config WHERE key = 'compliance_scan_floor' LIMIT 1").get();
+    const primaryValue = String(primary?.value || '');
+    return /^\d{4}-\d{2}-\d{2}$/.test(primaryValue) ? primaryValue : null;
   })();
 
   const watermarkCatchUpFrom = catchUp?.catchUpFrom && /^\d{4}-\d{2}-\d{2}$/.test(String(catchUp.catchUpFrom))
@@ -337,7 +334,7 @@ function ensureForeignReconcileScopes(db, runDate, label, catchUp = null) {
       pendingDirtyByScope.get(key),
       locfStartByScope.get(key),
       watermarkCatchUpFrom,
-      complianceInvalidFrom
+      complianceScanFloor
     );
     const boundedStart = maxIsoDate(mergedStart, lookbackStart);
     const finalStart = maxIsoDate(boundedStart, String(scope.min_txn_date || boundedStart));
@@ -347,7 +344,7 @@ function ensureForeignReconcileScopes(db, runDate, label, catchUp = null) {
     if (pendingDirtyByScope.has(key)) reasonParts.push('pending-dirty');
     if (locfStartByScope.has(key)) reasonParts.push('locf-signal');
     if (watermarkCatchUpFrom) reasonParts.push('watermark-catchup');
-    if (complianceInvalidFrom) reasonParts.push('compliance-invalid-from');
+    if (complianceScanFloor) reasonParts.push('compliance-scan-floor');
 
     const dirtyDate = markScopeDirty(db, {
       investmentId: scope.investment_id,
@@ -364,7 +361,7 @@ function ensureForeignReconcileScopes(db, runDate, label, catchUp = null) {
     settlementDate,
     lookbackStart,
     watermarkCatchUpFrom,
-    complianceInvalidFrom,
+    complianceScanFloor,
     activeScopes: activeScopes.length,
     pendingDirtySignals: pendingDirtyByScope.size,
     locfSignals: locfStartByScope.size,
@@ -376,12 +373,68 @@ function ensureForeignReconcileScopes(db, runDate, label, catchUp = null) {
     settlementDate,
     lookbackStart,
     watermarkCatchUpFrom,
-    complianceInvalidFrom,
+    complianceScanFloor,
     activeScopes: activeScopes.length,
     pendingDirtySignals: pendingDirtyByScope.size,
     locfSignals: locfStartByScope.size,
     enqueued,
   };
+}
+
+/**
+ * For investments in LOCF_LAG_RECONCILE_ASSET_TYPES whose daily_values carry a
+ * LOCF price source on recent market-session days, enqueue a dirty backfill scope
+ * starting from the first LOCF date so backfill will re-process those rows once
+ * the real NAV/price arrives from the provider (typically 1-2 days late).
+ *
+ * FOREIGN_STOCK is excluded — its settlement-aware reconcile path
+ * (ensureForeignReconcileScopes) handles it each scheduler cycle.
+ */
+function ensureMarketLinkedLocfReconcileScopes(db, runDate, label) {
+  const lookbackStart = addDays(runDate, -(LOCF_RECONCILE_LOOKBACK_DAYS - 1));
+
+  const placeholders = LOCF_LAG_RECONCILE_ASSET_TYPES.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT dv.investment_id, dv.portfolio_id, MIN(dv.date) AS locf_start
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE i.asset_type IN (${placeholders})
+      AND dv.portfolio_id IS NOT NULL
+      AND dv.price_source = 'LOCF'
+      AND date(dv.date) >= ?
+      AND date(dv.date) <= ?
+    GROUP BY dv.investment_id, dv.portfolio_id
+  `).all(...LOCF_LAG_RECONCILE_ASSET_TYPES, lookbackStart, runDate);
+
+  const locfByScope = new Map();
+  for (const row of rows) {
+    const locfDate = String(row.locf_start || '');
+    if (!isIsoWeekday(locfDate)) continue;
+    const key = `${row.investment_id}:${row.portfolio_id}`;
+    locfByScope.set(key, { investmentId: Number(row.investment_id), portfolioId: Number(row.portfolio_id), locfDate });
+  }
+
+  let enqueued = 0;
+  for (const { investmentId, portfolioId, locfDate } of locfByScope.values()) {
+    const dirtyDate = markScopeDirty(db, {
+      investmentId,
+      portfolioId,
+      dirtyFromDate: locfDate,
+      reason: 'locf-lag-reconcile',
+      sourceEventId: `locf-reconcile:${runDate}`,
+    });
+    if (dirtyDate) enqueued += 1;
+  }
+
+  logAppInfo(`[Scheduler] ${label}: Market-linked LOCF reconcile scopes prepared`, {
+    runDate,
+    lookbackStart,
+    assetTypes: LOCF_LAG_RECONCILE_ASSET_TYPES,
+    locfScopes: locfByScope.size,
+    enqueued,
+  });
+
+  return { lookbackStart, assetTypes: LOCF_LAG_RECONCILE_ASSET_TYPES, locfScopes: locfByScope.size, enqueued };
 }
 
 function fetchStockSeriesFromSource(symbol, startDate, endDate) {
@@ -541,7 +594,7 @@ async function warmRecentMarketCache(db, runDate, refreshDays, label) {
 
   for (const symbol of sgbSymbols) {
     try {
-      await getSGBHistoricalPrices(symbol, fromDate, runDate);
+      await getSGBNseHistoricalPrices(symbol, fromDate, runDate);
     } catch (_e) {
       errors += 1;
     }
@@ -696,15 +749,17 @@ async function runSchedulerCycle(db, label, options = {}) {
     options,
   });
 
-  logAppInfo(`[Scheduler] ${label}: Step 3/4 running catch-up + dirty preflight`, {
+  logAppInfo(`[Scheduler] ${label}: Step 3/4 running catch-up + dirty preflight (Backfill Step-1 Cache-Warm -> Step-2 CA -> Step-3 Recompute -> Step-4 Aggregate Refresh)`, {
     preflightRunDate,
   });
   const catchUp = ensureSchedulerCatchUpScopes(db, preflightRunDate, label);
   const foreignReconcile = ensureForeignReconcileScopes(db, preflightRunDate, label, catchUp);
+  const locfReconcile = ensureMarketLinkedLocfReconcileScopes(db, preflightRunDate, label);
   const preflight = await runDirtyBackfillPreflight(db, preflightRunDate);
-  logAppInfo(`[Scheduler] ${label}: Step 3/4 completed`, {
+  logAppInfo(`[Scheduler] ${label}: Step 3/4 completed (catch-up + backfill preflight)`, {
     catchUp,
     foreignReconcile,
+    locfReconcile,
     preflight,
   });
 
@@ -714,56 +769,14 @@ async function runSchedulerCycle(db, label, options = {}) {
       preflightRunDate,
       catchUp,
       foreignReconcile,
+      locfReconcile,
       preflight,
     });
-    return { preflightOnly: true, catchUp, foreignReconcile, preflight };
+    return { preflightOnly: true, catchUp, foreignReconcile, locfReconcile, preflight };
   }
 
   const warmRecentCacheDays = Number(options.warmRecentCacheDays || 0);
   let cacheWarm = null;
-  let historicalPriceAudit = null;
-  let historicalPriceRepair = null;
-
-  const runHistoricalPriceAudit = options.enableHistoricalPriceAudit !== false;
-  if (runHistoricalPriceAudit && ENABLE_HISTORICAL_PRICE_AUDIT) {
-    try {
-      historicalPriceAudit = await auditHistoricalPriceCoverage(db, {
-        runDate,
-        recentWindowDays: Number(options.historicalPriceAuditWindowDays || HISTORICAL_PRICE_AUDIT_WINDOW_DAYS),
-        dryRun: options.historicalPriceAuditDryRun !== false ? HISTORICAL_PRICE_AUDIT_DRY_RUN : false,
-        sourceEventId: `scheduler-audit:${runDate}:${label}`,
-      });
-      logAppInfo(`[Scheduler] ${label}: Historical price audit completed`, historicalPriceAudit);
-    } catch (auditError) {
-      logAppError(`[Scheduler] ${label}: Historical price audit failed`, {
-        error: auditError?.message || String(auditError),
-      });
-    }
-  }
-
-  const runHistoricalPriceRepairWorkerNow = options.enableHistoricalPriceRepairWorker !== false;
-  if (runHistoricalPriceRepairWorkerNow && ENABLE_HISTORICAL_PRICE_REPAIR_WORKER) {
-    if (isHistoricalPriceRepairWorkerRunning) {
-      logAppInfo(`[Scheduler] ${label}: Historical price repair worker already running, skipping this cycle`, {
-        batchSize: Number(options.historicalPriceRepairBatchSize || HISTORICAL_PRICE_REPAIR_BATCH_SIZE),
-      });
-    } else {
-      isHistoricalPriceRepairWorkerRunning = true;
-      try {
-        historicalPriceRepair = await runHistoricalPriceRepairWorker(db, {
-          batchSize: Number(options.historicalPriceRepairBatchSize || HISTORICAL_PRICE_REPAIR_BATCH_SIZE),
-          maxAttempts: Number(options.historicalPriceRepairMaxAttempts || HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS),
-          label,
-        });
-      } catch (repairError) {
-        logAppError(`[Scheduler] ${label}: Historical price repair worker failed`, {
-          error: repairError?.message || String(repairError),
-        });
-      } finally {
-        isHistoricalPriceRepairWorkerRunning = false;
-      }
-    }
-  }
 
   if (warmRecentCacheDays > 0) {
     cacheWarm = await warmRecentMarketCache(db, runDate, warmRecentCacheDays, label);
@@ -772,26 +785,25 @@ async function runSchedulerCycle(db, label, options = {}) {
   logAppInfo(`[Scheduler] ${label}: Step 4/4 running updateAllPrices`, {
     assetTypes: options.assetTypes || null,
     warmRecentCacheDays: warmRecentCacheDays > 0 ? warmRecentCacheDays : null,
-    historicalPriceAuditEnabled: runHistoricalPriceAudit && ENABLE_HISTORICAL_PRICE_AUDIT,
-    historicalPriceAuditDryRun: HISTORICAL_PRICE_AUDIT_DRY_RUN,
-    historicalPriceRepairWorkerEnabled: runHistoricalPriceRepairWorkerNow && ENABLE_HISTORICAL_PRICE_REPAIR_WORKER,
-    historicalPriceRepairBatchSize: HISTORICAL_PRICE_REPAIR_BATCH_SIZE,
+    historicalRepairMode: 'step1-generalized-only',
   });
   const result = await updateAllPrices(db, options);
+  const refreshedScanFloor = refreshComplianceScanFloor(db, runDate);
   logAppInfo(`[Scheduler] ${label}: Step 4/4 completed`, {
     runDate,
     preflightRunDate,
     catchUp,
     foreignReconcile,
+    locfReconcile,
     preflight,
-    historicalPriceAudit,
-    historicalPriceRepair,
     cacheWarm,
+    historicalRepairMode: 'step1-generalized-only',
     processed: result?.processed || 0,
     errors: result?.errors || 0,
     watermarkUpdated: !!result?.watermarkUpdated,
+    complianceScanFloor: refreshedScanFloor,
   });
-  return { catchUp, foreignReconcile, preflight, historicalPriceAudit, historicalPriceRepair, result };
+  return { catchUp, foreignReconcile, locfReconcile, preflight, result };
   } finally {
     isSchedulerCycleRunning = false;
   }
@@ -916,12 +928,7 @@ function startScheduler(db) {
     intradayRuns: 8,
     nightlyRun: '22:25',
     nightlyMarketCacheWarmDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
-    historicalPriceAuditEnabled: ENABLE_HISTORICAL_PRICE_AUDIT,
-    historicalPriceAuditWindowDays: HISTORICAL_PRICE_AUDIT_WINDOW_DAYS,
-    historicalPriceAuditDryRun: HISTORICAL_PRICE_AUDIT_DRY_RUN,
-    historicalPriceRepairWorkerEnabled: ENABLE_HISTORICAL_PRICE_REPAIR_WORKER,
-    historicalPriceRepairBatchSize: HISTORICAL_PRICE_REPAIR_BATCH_SIZE,
-    historicalPriceRepairMaxAttempts: HISTORICAL_PRICE_REPAIR_MAX_ATTEMPTS,
+    historicalRepairMode: 'step1-generalized-only',
     foreignReconcileEnabled: ENABLE_FOREIGN_RECONCILE,
     foreignReconcileMaxLookbackDays: FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS,
     foreignReconcileSettlementCutoffMinutesIst: FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST,

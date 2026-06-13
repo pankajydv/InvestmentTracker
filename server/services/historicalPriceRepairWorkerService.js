@@ -1,5 +1,5 @@
 const { fetchMutualFundHistory, fetchHistoricalOHLCRange, fetchHistoricalUSDToINRRange } = require('./priceService');
-const { getSGBHistoricalPrices } = require('./sgbBhavcopy');
+const { getSGBNseHistoricalPrices } = require('./sgbNseHistorical');
 const {
   claimPendingBatch,
   markCompleted,
@@ -71,8 +71,8 @@ async function processScope(scope) {
   }
 
   if (instrumentType === 'SGB') {
-    logAppInfo('[HistPriceRepairWorker] scope event: starting SGB bhavcopy fetch', fetchContext);
-    const points = await getSGBHistoricalPrices(symbol, fromDate, toDate);
+    logAppInfo('[HistPriceRepairWorker] scope event: starting SGB NSE historical fetch', fetchContext);
+    const points = await getSGBNseHistoricalPrices(symbol, fromDate, toDate);
     if (!points || points.size === 0) {
       throw new Error(`No SGB prices fetched for ${symbol} in range ${fromDate}..${toDate}`);
     }

@@ -518,7 +518,10 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
     if (isBalanceBased) {
       expected = true;
     } else {
-      expected = runningUnits > 0.000001 || hasTxn || unitsAfter > 0.000001;
+      // Only require daily rows when the scope has a non-zero position before or after the date.
+      // This avoids flagging pre-holding cash-only events (for example ESPP_CONTRIBUTION with zero units)
+      // as missing daily_values rows.
+      expected = runningUnits > 0.000001 || unitsAfter > 0.000001;
     }
 
     // Keep daily health strict for historical dates, but avoid flagging same-day
@@ -1233,7 +1236,8 @@ module.exports = function (db) {
       if (cfg.backfill_last_result) {
         try {
           lastResult = JSON.parse(cfg.backfill_last_result);
-        } catch (_) {
+        } catch (e) {
+          logAppError(`Backfill status: failed to parse backfill_last_result JSON: ${e.message}`);
           lastResult = { raw: cfg.backfill_last_result };
         }
       }
@@ -1242,7 +1246,8 @@ module.exports = function (db) {
       if (cfg.backfill_progress) {
         try {
           progress = JSON.parse(cfg.backfill_progress);
-        } catch (_) {
+        } catch (e) {
+          logAppError(`Backfill status: failed to parse backfill_progress JSON: ${e.message}`);
           progress = { raw: cfg.backfill_progress };
         }
       }

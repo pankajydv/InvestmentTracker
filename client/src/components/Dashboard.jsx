@@ -242,8 +242,7 @@ function combineHealthStatuses(results) {
     },
     compliance: {
       runDate: null,
-      watermark: null,
-      invalidFrom: null,
+      scanFloor: null,
       dirtyFrom: null,
       openGapCount: 0,
       hasBacklog: false,
@@ -280,11 +279,8 @@ function combineHealthStatuses(results) {
     );
     merged.compliance.hasBacklog = merged.compliance.hasBacklog || !!compliance.hasBacklog;
 
-    if (compliance.watermark && (!merged.compliance.watermark || compliance.watermark > merged.compliance.watermark)) {
-      merged.compliance.watermark = compliance.watermark;
-    }
-    if (compliance.invalidFrom && (!merged.compliance.invalidFrom || compliance.invalidFrom < merged.compliance.invalidFrom)) {
-      merged.compliance.invalidFrom = compliance.invalidFrom;
+    if (compliance.scanFloor && (!merged.compliance.scanFloor || compliance.scanFloor < merged.compliance.scanFloor)) {
+      merged.compliance.scanFloor = compliance.scanFloor;
     }
     if (compliance.dirtyFrom && (!merged.compliance.dirtyFrom || compliance.dirtyFrom < merged.compliance.dirtyFrom)) {
       merged.compliance.dirtyFrom = compliance.dirtyFrom;
@@ -658,8 +654,7 @@ export default function Dashboard() {
   const hasRecordedComplianceScan = !!(
     complianceSnapshot?.lastScan?.mode
     || complianceSnapshot?.lastScan?.runDate
-    || complianceSnapshot?.watermark
-    || complianceSnapshot?.invalidFrom
+    || complianceSnapshot?.scanFloor
   );
 
   return (
@@ -715,8 +710,7 @@ export default function Dashboard() {
             {hasRecordedComplianceScan ? (
               <>
                 Run {complianceSnapshot?.lastScan?.mode || '-'} on {complianceSnapshot?.lastScan?.runDate || '-'} |{' '}
-                Watermark {complianceSnapshot?.watermark || '-'} |{' '}
-                Invalid from {complianceSnapshot?.invalidFrom || '-'} |{' '}
+                Scan floor {complianceSnapshot?.scanFloor || '-'} |{' '}
                 Dirty from {complianceSnapshot?.dirtyFrom || '-'} |{' '}
                 Open gaps {complianceSnapshot?.openGapCount || 0} |{' '}
                 Backlog {complianceSnapshot?.hasBacklog ? 'yes' : 'no'}

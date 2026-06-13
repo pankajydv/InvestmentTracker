@@ -55,7 +55,8 @@ function readEnvDefaults() {
     const parsed = JSON.parse(raw);
     const envDefaults = parsed && typeof parsed.envDefaults === 'object' ? parsed.envDefaults : null;
     return { envDefaults, configPath };
-  } catch (_) {
+  } catch (err) {
+    console.error(`[EnvDefaults] Failed to read config ${configPath}: ${err.message}`);
     return { envDefaults: null, configPath };
   }
 }

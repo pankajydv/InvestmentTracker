@@ -83,7 +83,9 @@ module.exports = function (db) {
       let camsParsed = null;
       try {
         camsParsed = await parseCAMSCAS(req.file.buffer, password);
-      } catch (_) { /* not a CAMS CAS — fall through to CDSL */ }
+      } catch (e) {
+        logAppError(`CAS preview: CAMS parse failed, trying CDSL fallback: ${e.message}`);
+      }
 
       if (camsParsed && camsParsed.schemes && camsParsed.schemes.length > 0) {
         // ── CAMS/KFintech CAS (transaction history) ──
@@ -152,7 +154,9 @@ module.exports = function (db) {
       let cdslParsed = null;
       try {
         cdslParsed = await parseCAS(req.file.buffer, password);
-      } catch (_) { /* not a CDSL CAS — fall through to NSDL */ }
+      } catch (e) {
+        logAppError(`CAS preview: CDSL parse failed, trying NSDL fallback: ${e.message}`);
+      }
 
       if (cdslParsed && cdslParsed.mutualFunds.length > 0) {
         // Check which holdings already exist in DB for this portfolio
@@ -198,7 +202,9 @@ module.exports = function (db) {
       let nsdlParsed = null;
       try {
         nsdlParsed = await parseNSDLCAS(req.file.buffer, password);
-      } catch (_) { /* not an NSDL CAS either */ }
+      } catch (e) {
+        logAppError(`CAS preview: NSDL parse failed: ${e.message}`);
+      }
 
       if (nsdlParsed && nsdlParsed.mutualFunds.length > 0) {
         const existingInvestments = db.prepare(
