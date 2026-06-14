@@ -67,6 +67,16 @@ export default function MetricsFaq() {
             LOCF rows inside market_price_cache are treated as valid cache coverage and are not treated as missing coverage by themselves.
           </Accordion.Body>
         </Accordion.Item>
+        <Accordion.Item eventKey="6">
+          <Accordion.Header>How is Dashboard 1 Day Change shown when latest row is LOCF?</Accordion.Header>
+          <Accordion.Body>
+            For market-linked assets, dashboard 1-day change prefers the latest <strong>non-LOCF</strong> row when the latest row is LOCF.
+            <br />
+            The fallback is allowed only when that non-LOCF row is within <strong>4 market sessions</strong>; otherwise 1-day change is shown as <strong>0</strong>.
+            <br />
+            The dashboard also shows an <strong>as-of date</strong> for 1-day change. At aggregate levels, this can be shown as mixed when contributing investments have different as-of dates.
+          </Accordion.Body>
+        </Accordion.Item>
       </Accordion>
 
       <Card className="shadow-sm">

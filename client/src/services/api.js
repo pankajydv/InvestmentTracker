@@ -21,12 +21,15 @@ export const getCurrentUser = () => fetchJSON('/auth/me');
 export const logout = () => fetchJSON('/auth/logout', { method: 'POST' });
 
 // Dashboard
-export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInReturns, xirrMode } = {}) => {
+export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);
   if (hideSold) params.set('hide_sold', 'true');
   if (includeFullySoldInReturns) params.set('include_sold_in_returns', 'true');
   if (xirrMode) params.set('xirr_mode', String(xirrMode));
+  if (interval) params.set('interval', String(interval));
+  if (customFromDate) params.set('custom_from_date', String(customFromDate));
+  if (customToDate) params.set('custom_to_date', String(customToDate));
   return fetchJSON(`/dashboard/summary?${params}`);
 };
 export const getPerformance = (period, from, to, portfolioId) => {
@@ -61,9 +64,12 @@ export const getInvestments = (type, portfolioId, { hideSold } = {}) => {
   if (hideSold) params.set('hide_sold', 'true');
   return fetchJSON(`/investments?${params}`);
 };
-export const getInvestment = (id, portfolioId) => {
+export const getInvestment = (id, portfolioId, { interval, customFromDate, customToDate } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);
+  if (interval) params.set('interval', String(interval));
+  if (customFromDate) params.set('custom_from_date', String(customFromDate));
+  if (customToDate) params.set('custom_to_date', String(customToDate));
   const qs = params.toString();
   return fetchJSON(`/investments/${id}${qs ? `?${qs}` : ''}`);
 };
@@ -88,6 +94,24 @@ export const getInvestmentHistoricalPrices = (id, {
   if (pageSize) params.set('page_size', String(pageSize));
   const qs = params.toString();
   return fetchJSON(`/investments/${id}/historical-prices${qs ? `?${qs}` : ''}`);
+};
+export const getInvestmentDailyValues = (id, {
+  from,
+  to,
+  limit,
+  page,
+  pageSize,
+  portfolioId,
+} = {}) => {
+  const params = new URLSearchParams();
+  if (from) params.set('from', from);
+  if (to) params.set('to', to);
+  if (limit) params.set('limit', String(limit));
+  if (page) params.set('page', String(page));
+  if (pageSize) params.set('page_size', String(pageSize));
+  if (portfolioId) params.set('portfolio_id', String(portfolioId));
+  const qs = params.toString();
+  return fetchJSON(`/investments/${id}/daily-values${qs ? `?${qs}` : ''}`);
 };
 export const getInvestmentFxRateCache = (id, {
   from,

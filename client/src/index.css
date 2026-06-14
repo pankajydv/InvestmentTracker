@@ -66,6 +66,12 @@ tr:hover .row-actions {
   padding-right: 0.5rem !important;
 }
 
+.holdings-table th,
+.holdings-table td {
+  padding-left: 0.4rem !important;
+  padding-right: 0.4rem !important;
+}
+
 /* Type badge colors */
 .badge-buy { background-color: #dcfce7 !important; color: #15803d !important; }
 .badge-sell { background-color: #fee2e2 !important; color: #b91c1c !important; }

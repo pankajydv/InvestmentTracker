@@ -12,7 +12,6 @@ const {
   resolveAmfiCodeByISIN,
   fetchSGBPrice,
   fetchNPSNAV,
-  getMarketDataSourceForNSE,
 } = require('./priceService');
 const { calculatePfInterestPreview, calculatePfValueAsOfDate, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
 const { computeBondAccruedCoupon } = require('./bondAccrualService');
@@ -26,7 +25,8 @@ const {
 const {
   quantizeForStorage,
 } = require('./numberPrecision');
-const { markScopeDirty } = require('./dirtyBackfillService');
+const { markScopeDirty, runDailyBootstrapDirtyScopeEnqueue } = require('./dirtyBackfillService');
+const { todayIso, normalizeProviderDate } = require('./dateUtils');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Asset types covered by the generic LOCF-lag self-healing path.
@@ -119,6 +119,30 @@ function cancelUpdate() {
   _cancelled = true;
 }
 
+function resolvePriceSourceFromProviderDate({
+  providerDate,
+  runDate,
+  assetType,
+  investmentId,
+  investmentName,
+}) {
+  const normalizedProviderDate = normalizeProviderDate(providerDate);
+  if (!normalizedProviderDate) {
+    logAppWarn('[UpdatePrices][ProviderDateMissing] Provider response missing date; forcing LOCF', {
+      investmentId,
+      investmentName,
+      assetType,
+      runDate,
+    });
+    return { priceSource: 'LOCF', providerDate: null };
+  }
+
+  return {
+    priceSource: normalizedProviderDate === runDate ? 'LIVE' : 'LOCF',
+    providerDate: normalizedProviderDate,
+  };
+}
+
 function getProvidentValueAsOfDate(db, inv, date, portfolioId = null) {
   const portfolioFilter = portfolioId != null ? ' AND portfolio_id = ?' : '';
   const params = portfolioId != null ? [inv.id, date, portfolioId] : [inv.id, date];
@@ -170,9 +194,10 @@ function getProvidentValueAsOfDate(db, inv, date, portfolioId = null) {
  */
 async function updateAllPrices(db, options = {}) {
   _cancelled = false;
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayIso();
   const typeFilter = options.assetTypes;
   const sessionOnlyForMarketLinked = options.sessionOnlyForMarketLinked === true;
+  const reuseLiveTodayAssetTypes = new Set(Array.isArray(options.reuseLiveTodayAssetTypes) ? options.reuseLiveTodayAssetTypes : []);
   const runTag = String(options.runTag || '').trim() || null;
   const label = typeFilter ? typeFilter.join(', ') : 'ALL';
   const runStartedAt = Date.now();
@@ -389,6 +414,8 @@ async function updateAllPrices(db, options = {}) {
   const marketHolidayCache = new Map();
   const warnedUnexpectedLocf = new Set();
   const isMarketSessionToday = isMarketSessionDate(today, db, marketHolidayCache);
+  const touchedDates = new Set([today]);
+  const fxRateByDate = new Map([[today, usdToInr]]);
 
   logAppInfo('[UpdatePrices] Run context', {
     date: today,
@@ -396,7 +423,167 @@ async function updateAllPrices(db, options = {}) {
     sessionOnlyForMarketLinked,
     isMarketSessionToday,
     assetFilter: typeFilter || null,
+    reuseLiveTodayAssetTypes: Array.from(reuseLiveTodayAssetTypes),
   });
+
+  const getLivePriceForDate = db.prepare(`
+    SELECT price_per_unit
+    FROM daily_values
+    WHERE investment_id = ?
+      AND date = ?
+      AND price_source = 'LIVE'
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `);
+
+  async function getFxRateForDate(date) {
+    if (fxRateByDate.has(date)) return fxRateByDate.get(date);
+    try {
+      const fx = await fetchHistoricalUSDToINR(date);
+      fxRateByDate.set(date, fx);
+      return fx;
+    } catch (e) {
+      logAppWarn('[UpdatePrices] FX lookup fallback used for foreign snapshot backfill', {
+        date,
+        error: e?.message || String(e),
+        fallbackDate: today,
+        fallbackFx: usdToInr,
+      });
+      fxRateByDate.set(date, usdToInr);
+      return usdToInr;
+    }
+  }
+
+  function writeInvestmentSnapshotForDate(inv, asOfDate, resolvedPricePerUnit, resolvedPriceSource, fxRateForDate = usdToInr) {
+    const portfolioIds = getDistinctPortfolios.all(inv.id, asOfDate).map((r) => r.portfolio_id);
+    let wroteRows = 0;
+
+    for (const pid of portfolioIds) {
+      let totalUnits;
+      let investedAmount;
+      let realizedCashflow;
+      let currentValue;
+
+      if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF') {
+        currentValue = getProvidentValueAsOfDate(db, inv, asOfDate, pid);
+        totalUnits = 1;
+        investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, asOfDate).total;
+        realizedCashflow = getRealizedCashflowPortfolio(inv, pid, asOfDate);
+      } else {
+        const scopeOpenUnits = Number(getOpenUnitsPortfolio.get(inv.id, pid, asOfDate)?.total || 0);
+        if (scopeOpenUnits <= 0.0001) {
+          deleteTodaySnapshotForScope.run(inv.id, pid, asOfDate);
+          continue;
+        }
+
+        totalUnits = getTotalUnitsPortfolio.get(inv.id, pid, asOfDate).total;
+        investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, asOfDate).total;
+        realizedCashflow = getRealizedCashflowPortfolio(inv, pid, asOfDate);
+        if (inv.asset_type === 'FOREIGN_STOCK') {
+          currentValue = totalUnits * resolvedPricePerUnit * fxRateForDate;
+        } else if (inv.asset_type === 'BOND') {
+          const bondTransactions = getBondTransactionsPortfolio.all(inv.id, pid, asOfDate);
+          const accrual = computeBondAccruedCoupon({
+            investment: inv,
+            transactions: bondTransactions,
+            asOfDate,
+            dayCount: 365,
+          });
+
+          currentValue = totalUnits * resolvedPricePerUnit + Number(accrual?.accruedCoupon || 0);
+
+          if (accrual?.meta?.missingExpectedCouponPayment) {
+            logAppWarn('[UpdatePrices][BondAccrual] Expected coupon transaction missing on scheduled date', {
+              investmentId: inv.id,
+              investmentName: inv.name,
+              portfolioId: pid,
+              date: asOfDate,
+              couponFrequency: accrual?.meta?.couponFrequency || null,
+              expectedCouponDate: accrual?.meta?.expectedCouponDate || null,
+              lastCouponDate: accrual?.meta?.lastCouponDate || null,
+            });
+          }
+        } else {
+          currentValue = totalUnits * resolvedPricePerUnit;
+        }
+      }
+
+      const reinvestedType = inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF';
+      const realizedGain = inv.asset_type === 'PF'
+        ? realizedCashflow
+        : (reinvestedType ? 0 : realizedCashflow);
+      const profitLoss = reinvestedType
+        ? (currentValue - investedAmount)
+        : (currentValue + realizedGain - investedAmount);
+      const prevRows = getPrevRowsPortfolio.all(inv.id, pid, asOfDate);
+      const previousRow = prevRows.find((row) => {
+        const rowUnits = Number(row?.total_units || 0);
+        if (Math.abs(rowUnits) <= DAY_CHANGE_EPSILON_UNITS) return false;
+
+        if (!isMarketLinkedAssetType(inv.asset_type)) {
+          return true;
+        }
+
+        if (String(row?.price_source || '') === 'LOCF') return false;
+        return isWithinPreviousMarketSessions(row.date, asOfDate, db, marketHolidayCache);
+      });
+
+      const prevValue = Number(previousRow?.current_value || 0);
+      const netFlowToday = Number(getNetFlowTodayPortfolio.get(inv.id, pid, asOfDate)?.net_flow || 0);
+      const dayChange = previousRow
+        ? (currentValue - prevValue - netFlowToday)
+        : 0;
+
+      upsertDaily.run(
+        inv.id, pid, asOfDate,
+        quantizeForStorage(resolvedPricePerUnit),
+        quantizeForStorage(totalUnits),
+        quantizeForStorage(currentValue),
+        quantizeForStorage(investedAmount),
+        quantizeForStorage(realizedGain),
+        quantizeForStorage(profitLoss),
+        resolvedPriceSource,
+        quantizeForStorage(dayChange)
+      );
+
+      const assetType = String(inv.asset_type || '');
+      if (
+        asOfDate === today
+        && resolvedPriceSource === 'LOCF'
+        && (LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType) || assetType === 'FOREIGN_STOCK')
+        && isMarketSessionDate(today, db, marketHolidayCache)
+      ) {
+        const priorStreak = getPriorMarketSessionLocfStreak(db, inv.id, pid, today, marketHolidayCache);
+        const currentStreak = priorStreak + 1;
+        const warnKey = `${inv.id}:${pid}:${today}`;
+        if (currentStreak >= 3 && !warnedUnexpectedLocf.has(warnKey)) {
+          warnedUnexpectedLocf.add(warnKey);
+          logAppWarn('[UpdatePrices][LOCF] Unexpected LOCF streak reached threshold', {
+            investmentId: inv.id,
+            investmentName: inv.name,
+            portfolioId: pid,
+            assetType,
+            date: today,
+            streak: currentStreak,
+          });
+        }
+
+        if (LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType)) {
+          markScopeDirty(db, {
+            investmentId: inv.id,
+            portfolioId: pid,
+            dirtyFromDate: today,
+            reason: 'locf-lag-signal',
+            sourceEventId: `update-prices-locf:${today}`,
+          });
+        }
+      }
+
+      wroteRows += 1;
+    }
+
+    return wroteRows;
+  }
 
 
   for (const inv of investments) {
@@ -426,20 +613,39 @@ async function updateAllPrices(db, options = {}) {
       let priceSource = 'COMPUTED';
       let apiChange = null;
       let apiChangePct = null;
+      let providerDateForWriteback = null;
       
       console.log(`  [DEBUG] Processing ${inv.name} (id=${inv.id}, type=${inv.asset_type})`);
 
       switch (inv.asset_type) {
         case 'MUTUAL_FUND': {
-          if (inv.amfi_code) {
+          const reusedLivePrice = reuseLiveTodayAssetTypes.has(inv.asset_type)
+            ? Number(getLivePriceForDate.get(inv.id, today)?.price_per_unit || 0)
+            : 0;
+          if (reusedLivePrice > 0) {
+            pricePerUnit = reusedLivePrice;
+            priceSource = 'LIVE';
+            logAppInfo('[UpdatePrices] Reused existing LIVE price; skipped provider call', {
+              investmentId: inv.id,
+              investmentName: inv.name,
+              assetType: inv.asset_type,
+              date: today,
+              runTag,
+            });
+          } else if (inv.amfi_code) {
             const navData = await fetchMutualFundNAV(inv.amfi_code);
-            // Check if NAV date is today; if not, mark as LOCF (stale)
-            const mfNavIsStale = navData.date && navData.date !== today;
-            console.log(`  ${inv.name} (id=${inv.id}): MF NAV fetch returned nav=${navData.nav}, navDate=${navData.date}, stale=${mfNavIsStale}`);
+            const sourceDecision = resolvePriceSourceFromProviderDate({
+              providerDate: navData.date,
+              runDate: today,
+              assetType: inv.asset_type,
+              investmentId: inv.id,
+              investmentName: inv.name,
+            });
+            console.log(`  ${inv.name} (id=${inv.id}): MF NAV fetch returned nav=${navData.nav}, providerDate=${sourceDecision.providerDate}, priceSource=${sourceDecision.priceSource}`);
             pricePerUnit = navData.nav;
             apiChange = navData.change;
             apiChangePct = navData.changePercent;
-            priceSource = mfNavIsStale ? 'LOCF' : 'LIVE';
+            priceSource = sourceDecision.priceSource;
           } else {
             console.warn(`  ${inv.name}: No AMFI code, computing from transactions only`);
           }
@@ -453,12 +659,18 @@ async function updateAllPrices(db, options = {}) {
           await delay(500);
           const stockTicker = inv.ticker_symbol.includes('.') ? inv.ticker_symbol : toNSETicker(inv.ticker_symbol);
           const stockData = await fetchStockPrice(stockTicker);
+          const sourceDecision = resolvePriceSourceFromProviderDate({
+            providerDate: stockData.date,
+            runDate: today,
+            assetType: inv.asset_type,
+            investmentId: inv.id,
+            investmentName: inv.name,
+          });
           pricePerUnit = stockData.price;
           apiChange = stockData.change;
           apiChangePct = stockData.changePercent;
-          // NSE-traded stock; check if market was open today
-          priceSource = getMarketDataSourceForNSE(today);
-          console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, priceSource=${priceSource}`);
+          priceSource = sourceDecision.priceSource;
+          console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
           break;
         }
         case 'FOREIGN_STOCK': {
@@ -468,13 +680,19 @@ async function updateAllPrices(db, options = {}) {
           }
           await delay(500);
           const foreignData = await fetchStockPrice(inv.ticker_symbol);
+          const sourceDecision = resolvePriceSourceFromProviderDate({
+            providerDate: foreignData.date,
+            runDate: today,
+            assetType: inv.asset_type,
+            investmentId: inv.id,
+            investmentName: inv.name,
+          });
           pricePerUnit = foreignData.price;
           apiChange = foreignData.change;
           apiChangePct = foreignData.changePercent;
-          // Foreign stocks on various exchanges; use conservative NSE-hours check
-          // (doesn't account for exchange-specific times, but better than always LIVE)
-          priceSource = getMarketDataSourceForNSE(today);
-          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK price fetch returned price=${foreignData.price}, priceSource=${priceSource}`);
+          priceSource = sourceDecision.priceSource;
+          providerDateForWriteback = sourceDecision.providerDate;
+          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK price fetch returned price=${foreignData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
           break;
         }
         case 'BOND': {
@@ -485,12 +703,18 @@ async function updateAllPrices(db, options = {}) {
           if (inv.ticker_symbol) {
             try {
               const sgbData = await fetchSGBPrice(inv.ticker_symbol);
+              const sourceDecision = resolvePriceSourceFromProviderDate({
+                providerDate: sgbData.date,
+                runDate: today,
+                assetType: inv.asset_type,
+                investmentId: inv.id,
+                investmentName: inv.name,
+              });
               pricePerUnit = sgbData.price;
               apiChange = sgbData.change;
               apiChangePct = sgbData.changePercent;
-              // NSE-traded security; check if market was open today
-              priceSource = getMarketDataSourceForNSE(today);
-              console.log(`  ${inv.name} (id=${inv.id}): SGB price fetch returned price=${sgbData.price}, priceSource=${priceSource}`);
+              priceSource = sourceDecision.priceSource;
+              console.log(`  ${inv.name} (id=${inv.id}): SGB price fetch returned price=${sgbData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
             } catch (e) {
               console.warn(`  ${inv.name}: NSE price fetch failed (${e.message}), falling back to last known price`);
             }
@@ -522,6 +746,22 @@ async function updateAllPrices(db, options = {}) {
         }
         case 'NPS': {
           try {
+            const reusedLivePrice = reuseLiveTodayAssetTypes.has(inv.asset_type)
+              ? Number(getLivePriceForDate.get(inv.id, today)?.price_per_unit || 0)
+              : 0;
+            if (reusedLivePrice > 0) {
+              pricePerUnit = reusedLivePrice;
+              priceSource = 'LIVE';
+              logAppInfo('[UpdatePrices] Reused existing LIVE price; skipped provider call', {
+                investmentId: inv.id,
+                investmentName: inv.name,
+                assetType: inv.asset_type,
+                date: today,
+                runTag,
+              });
+              break;
+            }
+
             // Get last known NAV for realistic variation
             const lastKnownPrice = db.prepare(
               'SELECT price_per_unit FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1'
@@ -529,15 +769,18 @@ async function updateAllPrices(db, options = {}) {
             
             await delay(300); // Rate limiting for API calls
             const npsData = await fetchNPSNAV(inv.name, inv.nps_fund_code, lastKnownPrice);
-            // NPS NAVs are published after market close and may lag by 1–2 days.
-            // If the API's Last Updated date is not today, treat it as LOCF (carry-forward)
-            // so we don't falsely label stale data as LIVE.
-            const navIsStale = npsData.date && npsData.date !== today;
-            console.log(`  ${inv.name} (id=${inv.id}): NPS NAV fetch returned nav=${npsData.nav}, navDate=${npsData.date}, previousPrice=${lastKnownPrice}, change=${npsData.change}, stale=${navIsStale}`);
+            const sourceDecision = resolvePriceSourceFromProviderDate({
+              providerDate: npsData.date,
+              runDate: today,
+              assetType: inv.asset_type,
+              investmentId: inv.id,
+              investmentName: inv.name,
+            });
+            console.log(`  ${inv.name} (id=${inv.id}): NPS NAV fetch returned nav=${npsData.nav}, providerDate=${sourceDecision.providerDate}, previousPrice=${lastKnownPrice}, change=${npsData.change}, priceSource=${sourceDecision.priceSource}`);
             pricePerUnit = npsData.nav;
             apiChange = npsData.change;
             apiChangePct = npsData.changePercent;
-            priceSource = navIsStale ? 'LOCF' : 'LIVE';
+            priceSource = sourceDecision.priceSource;
           } catch (e) {
             console.warn(`  ${inv.name}: NPS NAV fetch failed (${e.message}), falling back to last known price`);
             // Fallback 1: use last valid stored daily value (exclude placeholder 99.99)
@@ -578,126 +821,29 @@ async function updateAllPrices(db, options = {}) {
         }
       }
 
-      // ...existing code for daily_values, rollups, etc...
-      const portfolioIds = getDistinctPortfolios.all(inv.id, today).map(r => r.portfolio_id);
-      for (const pid of portfolioIds) {
-        let totalUnits, investedAmount, realizedCashflow, currentValue;
-        if (inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF') {
-          currentValue = getProvidentValueAsOfDate(db, inv, today, pid);
-          totalUnits = 1;
-          investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
-          realizedCashflow = getRealizedCashflowPortfolio(inv, pid, today);
-        } else {
-          const scopeOpenUnits = Number(getOpenUnitsPortfolio.get(inv.id, pid, today)?.total || 0);
-          if (scopeOpenUnits <= 0.0001) {
-            deleteTodaySnapshotForScope.run(inv.id, pid, today);
-            continue;
-          }
-
-          totalUnits = getTotalUnitsPortfolio.get(inv.id, pid, today).total;
-          investedAmount = getInvestedAmountPortfolio.get(inv.id, pid, today).total;
-          realizedCashflow = getRealizedCashflowPortfolio(inv, pid, today);
-          if (inv.asset_type === 'FOREIGN_STOCK') {
-            currentValue = totalUnits * pricePerUnit * usdToInr;
-          } else if (inv.asset_type === 'BOND') {
-            const bondTransactions = getBondTransactionsPortfolio.all(inv.id, pid, today);
-            const accrual = computeBondAccruedCoupon({
-              investment: inv,
-              transactions: bondTransactions,
-              asOfDate: today,
-              dayCount: 365,
-            });
-
-            currentValue = totalUnits * pricePerUnit + Number(accrual?.accruedCoupon || 0);
-
-            if (accrual?.meta?.missingExpectedCouponPayment) {
-              logAppWarn('[UpdatePrices][BondAccrual] Expected coupon transaction missing on scheduled date', {
-                investmentId: inv.id,
-                investmentName: inv.name,
-                portfolioId: pid,
-                date: today,
-                couponFrequency: accrual?.meta?.couponFrequency || null,
-                expectedCouponDate: accrual?.meta?.expectedCouponDate || null,
-                lastCouponDate: accrual?.meta?.lastCouponDate || null,
-              });
-            }
-          } else {
-            currentValue = totalUnits * pricePerUnit;
-          }
-        }
-        const reinvestedType = inv.asset_type === 'PPF' || inv.asset_type === 'SSY' || inv.asset_type === 'PF';
-        const realizedGain = inv.asset_type === 'PF'
-          ? realizedCashflow
-          : (reinvestedType ? 0 : realizedCashflow);
-        const profitLoss = reinvestedType
-          ? (currentValue - investedAmount)
-          : (currentValue + realizedGain - investedAmount);
-        const prevRows = getPrevRowsPortfolio.all(inv.id, pid, today);
-        const previousRow = prevRows.find((row) => {
-          const rowUnits = Number(row?.total_units || 0);
-          if (Math.abs(rowUnits) <= DAY_CHANGE_EPSILON_UNITS) return false;
-
-          if (!isMarketLinkedAssetType(inv.asset_type)) {
-            return true;
-          }
-
-          if (String(row?.price_source || '') === 'LOCF') return false;
-          return isWithinPreviousMarketSessions(row.date, today, db, marketHolidayCache);
-        });
-
-        const prevValue = Number(previousRow?.current_value || 0);
-        const netFlowToday = Number(getNetFlowTodayPortfolio.get(inv.id, pid, today)?.net_flow || 0);
-        const dayChange = previousRow
-          ? (currentValue - prevValue - netFlowToday)
-          : 0;
-        upsertDaily.run(
-          inv.id, pid, today,
-          quantizeForStorage(pricePerUnit),
-          quantizeForStorage(totalUnits),
-          quantizeForStorage(currentValue),
-          quantizeForStorage(investedAmount),
-          quantizeForStorage(realizedGain),
-          quantizeForStorage(profitLoss),
-          priceSource,
-          quantizeForStorage(dayChange)
-        );
-
-        const assetType = String(inv.asset_type || '');
-        if (
-          priceSource === 'LOCF'
-          && (LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType) || assetType === 'FOREIGN_STOCK')
-          && isMarketSessionDate(today, db, marketHolidayCache)
-        ) {
-          const priorStreak = getPriorMarketSessionLocfStreak(db, inv.id, pid, today, marketHolidayCache);
-          const currentStreak = priorStreak + 1;
-          const warnKey = `${inv.id}:${pid}:${today}`;
-          if (currentStreak >= 3 && !warnedUnexpectedLocf.has(warnKey)) {
-            warnedUnexpectedLocf.add(warnKey);
-            logAppWarn('[UpdatePrices][LOCF] Unexpected LOCF streak reached threshold', {
-              investmentId: inv.id,
-              investmentName: inv.name,
-              portfolioId: pid,
-              assetType,
-              date: today,
-              streak: currentStreak,
-            });
-          }
-
-          // Enqueue a dirty scope for all lag-reconcile types so backfill
-          // re-processes this date once the real price arrives from the provider.
-          // FOREIGN_STOCK is excluded here — its settlement-aware reconcile path
-          // in ensureForeignReconcileScopes handles it each scheduler cycle.
-          if (LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType)) {
-            markScopeDirty(db, {
-              investmentId: inv.id,
-              portfolioId: pid,
-              dirtyFromDate: today,
-              reason: 'locf-lag-signal',
-              sourceEventId: `update-prices-locf:${today}`,
-            });
-          }
+      let providerDateRowsWritten = 0;
+      if (
+        inv.asset_type === 'FOREIGN_STOCK'
+        && providerDateForWriteback
+        && providerDateForWriteback < today
+        && /^\d{4}-\d{2}-\d{2}$/.test(providerDateForWriteback)
+      ) {
+        const providerFx = await getFxRateForDate(providerDateForWriteback);
+        providerDateRowsWritten = writeInvestmentSnapshotForDate(inv, providerDateForWriteback, pricePerUnit, 'LIVE', providerFx);
+        if (providerDateRowsWritten > 0) {
+          touchedDates.add(providerDateForWriteback);
+          logAppInfo('[UpdatePrices] Foreign provider-date snapshot refreshed', {
+            investmentId: inv.id,
+            investmentName: inv.name,
+            providerDate: providerDateForWriteback,
+            runDate: today,
+            rowsWritten: providerDateRowsWritten,
+            pricePerUnit,
+          });
         }
       }
+
+      writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, usdToInr);
       const combinedSnapshot = db.prepare(`
         SELECT
           COALESCE(SUM(current_value), 0) AS total_value,
@@ -759,11 +905,55 @@ async function updateAllPrices(db, options = {}) {
   // Update portfolio daily snapshots (per-portfolio + combined)
   logAppInfo('[UpdatePrices] Step 3/3 refreshing aggregate snapshots', {
     date: today,
+    touchedDates: Array.from(touchedDates).sort(),
     processed: successCount + errorCount + skippedCount,
     total: totalCount,
   });
-  updatePortfolioDaily(db, today);
-  updateAssetTypeDaily(db, today);
+  for (const dateToRefresh of Array.from(touchedDates).sort()) {
+    updatePortfolioDaily(db, dateToRefresh);
+    updateAssetTypeDaily(db, dateToRefresh);
+  }
+
+  // Resilient daily bootstrap: the first run that materializes today's records
+  // enqueues a small catch-up dirty window for all active tracked scopes.
+  // Claim/state management inside the helper ensures this is effectively once-per-day
+  // while still allowing retries if a prior attempt failed or got stuck.
+  let dailyBootstrapResult = null;
+  if (!_cancelled && successCount > 0) {
+    try {
+      dailyBootstrapResult = runDailyBootstrapDirtyScopeEnqueue(db, {
+        runDate: today,
+        lookbackDays: 2,
+        trigger: runTag || 'update-all-prices',
+      });
+
+      if (dailyBootstrapResult.attempted) {
+        logAppInfo('[UpdatePrices] Daily bootstrap dirty-scope enqueue completed', {
+          date: today,
+          runTag,
+          dirtyFromDate: dailyBootstrapResult.dirtyFromDate,
+          lookbackDays: dailyBootstrapResult.lookbackDays,
+          enqueued: dailyBootstrapResult.enqueued,
+          attempt: dailyBootstrapResult.attempt || null,
+          trigger: dailyBootstrapResult.trigger,
+        });
+      } else {
+        logAppInfo('[UpdatePrices] Daily bootstrap dirty-scope enqueue skipped', {
+          date: today,
+          runTag,
+          status: dailyBootstrapResult.status,
+          dirtyFromDate: dailyBootstrapResult.dirtyFromDate,
+          lookbackDays: dailyBootstrapResult.lookbackDays,
+        });
+      }
+    } catch (e) {
+      logAppError('[UpdatePrices] Daily bootstrap dirty-scope enqueue failed', {
+        date: today,
+        runTag,
+        error: e?.message || String(e),
+      });
+    }
+  }
 
   // Update last price update time
   db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'last_price_update'")
@@ -794,6 +984,8 @@ async function updateAllPrices(db, options = {}) {
     totalProcessed: successCount + errorCount + skippedCount,
     totalCount,
     watermarkUpdated,
+    dailyBootstrapStatus: dailyBootstrapResult?.status || null,
+    dailyBootstrapEnqueued: dailyBootstrapResult?.enqueued || 0,
     elapsedSec: Math.max(Math.round((Date.now() - runStartedAt) / 1000), 0),
   });
   return {
@@ -822,8 +1014,7 @@ function updatePortfolioDaily(db, date) {
       dv.portfolio_id,
       COALESCE(SUM(dv.current_value), 0) as total_value,
       COALESCE(SUM(dv.invested_amount), 0) as total_invested,
-      COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss,
-      COALESCE(SUM(dv.day_change), 0) as day_change
+      COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
     FROM daily_values dv
     INNER JOIN (
       SELECT investment_id, portfolio_id, MAX(date) as max_date
@@ -833,6 +1024,19 @@ function updatePortfolioDaily(db, date) {
     ) latest ON dv.investment_id = latest.investment_id
       AND dv.portfolio_id = latest.portfolio_id
       AND dv.date = latest.max_date
+    GROUP BY dv.portfolio_id
+  `).all(date);
+
+  // Day-change must be strictly as-of date (no stale carry-forward rows).
+  const dayChangeRows = db.prepare(`
+    SELECT
+      dv.portfolio_id,
+      COALESCE(SUM(dv.day_change), 0) as day_change
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE dv.date = ?
+      AND dv.portfolio_id IS NOT NULL
+      AND i.exclude_from_tracking != 1
     GROUP BY dv.portfolio_id
   `).all(date);
 
@@ -851,6 +1055,8 @@ function updatePortfolioDaily(db, date) {
   const keyOf = (portfolioId) => String(portfolioId);
   const totalsByPortfolio = new Map();
   for (const row of totalsRows) totalsByPortfolio.set(keyOf(row.portfolio_id), row);
+  const dayChangeByPortfolio = new Map();
+  for (const row of dayChangeRows) dayChangeByPortfolio.set(keyOf(row.portfolio_id), Number(row.day_change || 0));
   const prevByPortfolio = new Map();
   for (const row of previousRows) prevByPortfolio.set(keyOf(row.portfolio_id), Number(row.total_value || 0));
 
@@ -865,20 +1071,21 @@ function updatePortfolioDaily(db, date) {
   deleteRowsForDate.run(date);
 
   for (const pid of portfolioIds) {
-    const totals = totalsByPortfolio.get(keyOf(pid)) || {
+    const key = keyOf(pid);
+    const totals = totalsByPortfolio.get(key) || {
       total_value: 0,
       total_invested: 0,
       total_profit_loss: 0,
-      day_change: 0,
     };
+    const dayChange = dayChangeByPortfolio.get(key) || 0;
 
     const profitPct = totals.total_invested > 0
       ? (totals.total_profit_loss / totals.total_invested) * 100 : 0;
 
-    const prevValue = prevByPortfolio.has(keyOf(pid))
-      ? prevByPortfolio.get(keyOf(pid))
+    const prevValue = prevByPortfolio.has(key)
+      ? prevByPortfolio.get(key)
       : Number(totals.total_value || 0);
-    const dayChangePct = prevValue > 0 ? (totals.day_change / prevValue) * 100 : 0;
+    const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
 
     insertPortfolioDaily.run(
       pid,
@@ -887,7 +1094,7 @@ function updatePortfolioDaily(db, date) {
       quantizeForStorage(totals.total_invested),
       quantizeForStorage(totals.total_profit_loss),
       quantizeForStorage(profitPct),
-      quantizeForStorage(totals.day_change),
+      quantizeForStorage(dayChange),
       quantizeForStorage(dayChangePct)
     );
   }
@@ -925,8 +1132,7 @@ function updateAssetTypeDaily(db, date) {
       COALESCE(SUM(dv.invested_amount), 0) AS total_invested,
       COALESCE(SUM(dv.profit_loss), 0) AS total_profit_loss,
       COALESCE(SUM(dv.realized_proceeds), 0) AS total_realized_proceeds,
-      COALESCE(SUM(dv.current_value - (dv.invested_amount - dv.realized_proceeds)), 0) AS total_unrealized_gain,
-      COALESCE(SUM(dv.day_change), 0) AS day_change
+      COALESCE(SUM(dv.current_value - (dv.invested_amount - dv.realized_proceeds)), 0) AS total_unrealized_gain
     FROM daily_values dv
     JOIN investments i ON i.id = dv.investment_id
     INNER JOIN (
@@ -940,6 +1146,20 @@ function updateAssetTypeDaily(db, date) {
     WHERE i.exclude_from_tracking != 1
     GROUP BY dv.portfolio_id, i.asset_type
   `);
+
+  // Day-change must be strict as-of date per portfolio/asset_type.
+  const dayChangeRows = db.prepare(`
+    SELECT
+      dv.portfolio_id,
+      i.asset_type,
+      COALESCE(SUM(dv.day_change), 0) AS day_change
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE dv.date = ?
+      AND dv.portfolio_id IS NOT NULL
+      AND i.exclude_from_tracking != 1
+    GROUP BY dv.portfolio_id, i.asset_type
+  `).all(date);
 
   const previousRows = db.prepare(`
     SELECT atd.portfolio_id, atd.asset_type, atd.total_value
@@ -960,6 +1180,11 @@ function updateAssetTypeDaily(db, date) {
     previousTotals.set(prevKey(row.portfolio_id, row.asset_type), Number(row.total_value || 0));
   }
 
+  const dayChangeByBucket = new Map();
+  for (const row of dayChangeRows) {
+    dayChangeByBucket.set(prevKey(row.portfolio_id, row.asset_type), Number(row.day_change || 0));
+  }
+
   deleteRows.run(date);
   const rows = aggregateRows.all(date);
 
@@ -967,7 +1192,7 @@ function updateAssetTypeDaily(db, date) {
     const totalInvested = Number(row.total_invested || 0);
     const totalProfitLoss = Number(row.total_profit_loss || 0);
     const totalValue = Number(row.total_value || 0);
-    const dayChange = Number(row.day_change || 0);
+    const dayChange = dayChangeByBucket.get(prevKey(row.portfolio_id, row.asset_type)) || 0;
 
     const totalProfitLossPct = totalInvested > 0
       ? (totalProfitLoss / totalInvested) * 100

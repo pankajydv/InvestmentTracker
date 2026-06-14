@@ -70,12 +70,15 @@ function combineDashboardSummaries(results, selectedIds) {
   let firstXirrPct = null;
   let xirrPctSet = false;
   let xirrPctConsistent = true;
+  const firstRollupWarning = results.find((r) => r?.rollupWarning)?.rollupWarning || null;
   const portfolio = {
     total_value: 0,
     total_invested: 0,
     total_profit_loss: 0,
     total_realized_proceeds: 0,
     day_change: 0,
+    day_change_as_of_date: null,
+    day_change_as_of_mixed: false,
     xirr_pct: null,
   };
 
@@ -130,6 +133,9 @@ function combineDashboardSummaries(results, selectedIds) {
           total_units: 0,
           xirr_pct: inv.xirr_pct ?? null,
           _xirr_sources: inv.xirr_pct == null ? 0 : 1,
+          day_change_as_of_date: inv.day_change_as_of_date || null,
+          day_change_as_of_mixed: false,
+          day_change_uses_fallback: !!inv.day_change_uses_fallback,
         });
       }
 
@@ -143,6 +149,14 @@ function combineDashboardSummaries(results, selectedIds) {
       target.acquired_units += Number(inv.acquired_units) || 0;
       target.total_units += Number(inv.total_units) || 0;
       target.price_per_unit = Number(inv.price_per_unit) || target.price_per_unit || 0;
+      target.day_change_uses_fallback = target.day_change_uses_fallback || !!inv.day_change_uses_fallback;
+      const nextAsOf = inv.day_change_as_of_date || null;
+      if (target.day_change_as_of_date == null) {
+        target.day_change_as_of_date = nextAsOf;
+      } else if (nextAsOf == null || target.day_change_as_of_date !== nextAsOf) {
+        target.day_change_as_of_date = null;
+        target.day_change_as_of_mixed = true;
+      }
       if (inv.xirr_pct != null) {
         if (target._xirr_sources === 0) {
           target.xirr_pct = inv.xirr_pct;
@@ -186,6 +200,9 @@ function combineDashboardSummaries(results, selectedIds) {
         totalRealizedGain: 0,
         xirrPct: null,
         dayChange: 0,
+        dayChangeAsOfDate: null,
+        dayChangeAsOfMixed: false,
+        dayChangeFallbackCount: 0,
       };
     }
     byType[inv.asset_type].investments.push(inv);
@@ -204,6 +221,27 @@ function combineDashboardSummaries(results, selectedIds) {
       byType[inv.asset_type].totalRealizedGain += Number(inv.realized_proceeds) || 0;
     }
     byType[inv.asset_type].dayChange += Number(inv.day_change) || 0;
+    if (inv.day_change_uses_fallback) {
+      byType[inv.asset_type].dayChangeFallbackCount += 1;
+    }
+
+    const currentAsOf = inv.day_change_as_of_date || null;
+    if (byType[inv.asset_type].dayChangeAsOfDate == null) {
+      byType[inv.asset_type].dayChangeAsOfDate = currentAsOf;
+    } else if (currentAsOf == null || byType[inv.asset_type].dayChangeAsOfDate !== currentAsOf) {
+      byType[inv.asset_type].dayChangeAsOfDate = null;
+      byType[inv.asset_type].dayChangeAsOfMixed = true;
+    }
+  }
+
+  const portfolioAsOfDates = investments.map((inv) => inv.day_change_as_of_date).filter(Boolean);
+  const uniquePortfolioAsOfDates = [...new Set(portfolioAsOfDates)];
+  if (uniquePortfolioAsOfDates.length === 1) {
+    portfolio.day_change_as_of_date = uniquePortfolioAsOfDates[0];
+    portfolio.day_change_as_of_mixed = false;
+  } else if (uniquePortfolioAsOfDates.length > 1) {
+    portfolio.day_change_as_of_date = null;
+    portfolio.day_change_as_of_mixed = true;
   }
 
   const prevPortfolioValue = portfolio.total_value - portfolio.day_change;
@@ -220,6 +258,7 @@ function combineDashboardSummaries(results, selectedIds) {
     byType,
     portfolioCount: selectedIds.length,
     totalExpenses,
+    rollupWarning: firstRollupWarning,
     lastUpdate: results.map((r) => r.lastUpdate).filter(Boolean).sort().at(-1) || null,
   };
 }
@@ -382,6 +421,10 @@ export default function Dashboard() {
   const [complianceStatus, setComplianceStatus] = useState(null);
   const [complianceLoading, setComplianceLoading] = useState(false);
   const [showDetailTables, setShowDetailTables] = useState(false);
+  const [selectedInterval, setSelectedInterval] = useState('1D');
+  const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
+  const [customFromDate, setCustomFromDate] = useState('');
+  const [customToDate, setCustomToDate] = useState('');
   const loadRunRef = useRef(0);
   const selectedIdsKey = (selectedIds || []).join(',');
 
@@ -484,6 +527,9 @@ export default function Dashboard() {
           hideSold,
           includeFullySoldInReturns,
           xirrMode: 'portfolio_only',
+          interval: selectedInterval,
+          customFromDate: customFromDate || undefined,
+          customToDate: customToDate || undefined,
         });
         if (runId !== loadRunRef.current) return;
         setData(fastResult);
@@ -504,6 +550,9 @@ export default function Dashboard() {
           hideSold,
           includeFullySoldInReturns,
           xirrMode: 'full',
+          interval: selectedInterval,
+          customFromDate: customFromDate || undefined,
+          customToDate: customToDate || undefined,
         });
         if (runId !== loadRunRef.current) return;
         setData((prev) => {
@@ -516,6 +565,9 @@ export default function Dashboard() {
           hideSold,
           includeFullySoldInReturns,
           xirrMode: 'full',
+          interval: selectedInterval,
+          customFromDate: customFromDate || undefined,
+          customToDate: customToDate || undefined,
         });
         if (runId !== loadRunRef.current) return;
         setData(result);
@@ -556,7 +608,7 @@ export default function Dashboard() {
   if (error) return <ErrorMessage message={error} />;
   if (!data) return null;
 
-  const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses } = data;
+  const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses, rollupWarning, stalePricesWarning } = data;
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
   const totalRealizedGain = Number(portfolio.total_realized_proceeds) || 0;
@@ -642,7 +694,8 @@ export default function Dashboard() {
     });
   };
 
-  const tableColumnWidths = ['30%', '12%', '12%', '12%', '14%', '8%', '12%'];
+  const tableColumnWidths = ['30%', '11.5%', '11.5%', '11.5%', '11.5%', '9%', '15%'];
+  const tableColumnWidthsWithAsOfDate = ['26%', '10%', '10.5%', '10.5%', '10.5%', '10.5%', '9%', '13%'];
 
   const handleAllocationClick = (event, type) => {
     event.preventDefault();
@@ -686,6 +739,18 @@ export default function Dashboard() {
       )}
 
       <ComplianceWarning gaps={complianceGaps} loading={complianceLoading} />
+
+      {rollupWarning && (
+        <Alert variant="warning" className="py-2 mb-4">
+          <div className="d-flex align-items-center gap-2">
+            <AlertTriangle size={16} />
+            <span className="fw-semibold">Rollup date alignment warning</span>
+          </div>
+          <div className="small mt-1">
+            {rollupWarning.message} Latest rollup date: {rollupWarning.maxDate || '-'}; covered portfolios: {rollupWarning.portfoliosCovered || 0}/{rollupWarning.portfoliosTotal || 0}.
+          </div>
+        </Alert>
+      )}
 
       {dailyHealth && dailyHealth.status !== 'ok' && (
         <Alert variant={dailyHealth.status === 'error' ? 'danger' : 'warning'} className="py-2 mb-4">
@@ -761,6 +826,18 @@ export default function Dashboard() {
         </Alert>
       )}
 
+      {stalePricesWarning && (
+        <Alert variant="warning" className="py-2 mb-4">
+          <div className="d-flex align-items-center gap-2">
+            <AlertTriangle size={16} />
+            <span className="fw-semibold">Data is outdated</span>
+          </div>
+          <div className="small mt-1">
+            {stalePricesWarning.message}
+          </div>
+        </Alert>
+      )}
+
       {/* Portfolio Summary Cards */}
       <Row className="g-3 mb-4">
         <Col md={6} lg={4}>
@@ -778,20 +855,102 @@ export default function Dashboard() {
         <Col md={6} lg={4}>
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
-              <div className="d-flex align-items-center gap-2 text-muted small mb-1">
-                {portfolio.day_change >= 0 ? (
-                  <TrendingUp size={16} className="text-success" />
-                ) : (
-                  <TrendingDown size={16} className="text-danger" />
-                )}
-                1 Day Change
+              <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
+                <div className="d-flex align-items-center gap-2 text-muted small">
+                  {(data?.intervalXIRR?.interval_change ?? 0) >= 0 ? (
+                    <TrendingUp size={16} className="text-success" />
+                  ) : (
+                    <TrendingDown size={16} className="text-danger" />
+                  )}
+                  <span>
+                    {selectedInterval === 'CUSTOM'
+                      ? `${customFromDate} to ${customToDate}`
+                      : selectedInterval === '1D'
+                      ? '1 Day Change'
+                      : `${selectedInterval} Change`}
+                  </span>
+                </div>
+                <div style={{ fontSize: '0.85rem' }}>
+                  <select
+                    className="form-select form-select-sm"
+                    value={selectedInterval}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val === 'CUSTOM') {
+                        setShowCustomDatePicker(true);
+                      } else {
+                        setSelectedInterval(val);
+                        setShowCustomDatePicker(false);
+                      }
+                    }}
+                    disabled={!!stalePricesWarning}
+                    title={stalePricesWarning ? 'Please update prices first' : ''}
+                    style={{ maxWidth: '100px', fontSize: '0.85rem' }}
+                  >
+                    <option value="1D">1D</option>
+                    <option value="2D">2D</option>
+                    <option value="1W">1W</option>
+                    <option value="1M">1M</option>
+                    <option value="3M">3M</option>
+                    <option value="6M">6M</option>
+                    <option value="1Y">1Y</option>
+                    <option value="2Y">2Y</option>
+                    <option value="3Y">3Y</option>
+                    <option value="5Y">5Y</option>
+                    <option value="7Y">7Y</option>
+                    <option value="10Y">10Y</option>
+                    <option value="CUSTOM">Custom</option>
+                  </select>
+                </div>
               </div>
-              <div className={`fs-3 fw-bold ${profitColor(portfolio.day_change)}`}>
-                {formatINR(portfolio.day_change)}
+
+              {showCustomDatePicker && (
+                <div className="mb-2 p-2 bg-light rounded small">
+                  <div className="d-flex gap-2 mb-2">
+                    <input
+                      type="date"
+                      className="form-control form-control-sm"
+                      value={customFromDate}
+                      onChange={(e) => setCustomFromDate(e.target.value)}
+                      placeholder="From"
+                    />
+                    <input
+                      type="date"
+                      className="form-control form-control-sm"
+                      value={customToDate}
+                      onChange={(e) => setCustomToDate(e.target.value)}
+                      placeholder="To"
+                    />
+                  </div>
+                  <Button
+                    variant="sm"
+                    onClick={() => {
+                      setSelectedInterval('CUSTOM');
+                      setShowCustomDatePicker(false);
+                    }}
+                    className="w-100"
+                  >
+                    Apply
+                  </Button>
+                </div>
+              )}
+
+              <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
+                {formatINR(data?.intervalXIRR?.interval_change || 0)}
               </div>
-              <div className={`small ${profitColor(portfolio.day_change_pct)}`}>
-                {formatPct(portfolio.day_change_pct)}
+              <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
+                Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
               </div>
+              {data?.intervalXIRR?.xirr_pct != null && (
+                <div className={`small ${profitColor(data.intervalXIRR.xirr_pct)}`}>
+                  Annualized (XIRR): {formatPct(data.intervalXIRR.xirr_pct)}
+                </div>
+              )}
+              {data?.intervalXIRR?.confidence === 'error' && (
+                <div className="small text-warning" title={data.intervalXIRR.error}>
+                  ⚠ Error calculating XIRR
+                </div>
+              )}
             </Card.Body>
           </Card>
         </Col>
@@ -887,6 +1046,16 @@ export default function Dashboard() {
           ? (Number(info.totalProfitLoss || 0) / Number(info.totalInvested || 0)) * 100
           : 0;
         const totalCurrentInvested = (Number(info.totalInvested) || 0) - (Number(info.totalRealizedGain) || 0);
+        const showAsOfDateColumn = info.investments.some((inv) => !!inv.day_change_uses_fallback);
+        const sortColumns = getSortColumnsForType(type);
+        const tableColumns = showAsOfDateColumn
+          ? [
+              sortColumns[0],
+              { key: 'asOfDate', label: 'As of Date' },
+              ...sortColumns.slice(1),
+            ]
+          : sortColumns;
+        const columnWidths = showAsOfDateColumn ? tableColumnWidthsWithAsOfDate : tableColumnWidths;
 
         return (
         <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
@@ -901,25 +1070,26 @@ export default function Dashboard() {
             </div>
           </Card.Header>
           <div className="responsive-table">
-            <Table hover size="sm" className="mb-0 small" style={{ tableLayout: 'fixed' }}>
+            <Table hover size="sm" className="mb-0 small holdings-table" style={{ tableLayout: 'fixed' }}>
               <colgroup>
-                {tableColumnWidths.map((width, idx) => (
+                {columnWidths.map((width, idx) => (
                   <col key={`${type}-col-${idx}`} style={{ width }} />
                 ))}
               </colgroup>
               <thead className="table-light">
                 <tr>
-                  {getSortColumnsForType(type).map(col => {
+                  {tableColumns.map(col => {
                     const sc = sortConfigs[type];
+                    const isSortable = col.key !== 'asOfDate';
                     return (
                       <th
                         key={col.key}
                         className={`px-3${col.end ? ' text-end' : ''}`}
-                        style={{ cursor: 'pointer', userSelect: 'none' }}
-                        onClick={() => handleSort(type, col.key)}
+                        style={{ cursor: isSortable ? 'pointer' : 'default', userSelect: 'none' }}
+                        onClick={isSortable ? () => handleSort(type, col.key) : undefined}
                       >
                         <div>{col.label}
-                        {sc?.key === col.key && (
+                        {isSortable && sc?.key === col.key && (
                           <span className="ms-1" style={{ fontSize: '0.6rem' }}>
                             {sc.direction === 'desc' ? '▼' : '▲'}
                           </span>
@@ -950,6 +1120,13 @@ export default function Dashboard() {
                         ) : null}
                       </div>
                     </td>
+                    {showAsOfDateColumn ? (
+                      <td className="px-3 text-center">
+                        {inv.day_change_uses_fallback && inv.day_change_as_of_date
+                          ? formatDate(inv.day_change_as_of_date)
+                          : '-'}
+                      </td>
+                    ) : null}
                     <td className="px-3 text-end">
                       {(() => {
                         const acquiredUnits = Number(inv.acquired_units) || 0;
@@ -1007,6 +1184,15 @@ export default function Dashboard() {
                 {/* Total Row */}
                 <tr className="table-light fw-semibold">
                   <td className="px-3">Total</td>
+                  {showAsOfDateColumn ? (
+                    <td className="px-3 text-center">
+                      {info.dayChangeFallbackCount > 0
+                        ? (info.dayChangeAsOfMixed
+                          ? 'Mixed'
+                          : (info.dayChangeAsOfDate ? formatDate(info.dayChangeAsOfDate) : '-'))
+                        : '-'}
+                    </td>
+                  ) : null}
                   <td className="px-3 text-end">
                     {INTEREST_RATE_ASSET_TYPES.has(type) ? (
                       <>

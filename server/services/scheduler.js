@@ -17,7 +17,7 @@ const {
 } = require('./priceService');
 const { getSGBNseHistoricalPrices } = require('./sgbNseHistorical');
 const { hydrateStockSeriesForPhase2 } = require('./marketPriceCache');
-const { todayIso } = require('./dateUtils');
+const { todayIso, addDaysIso, eachDateIso, istDateFromUnixSeconds } = require('./dateUtils');
 const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
 const { scanAndRepairComplianceGaps, refreshComplianceScanFloor } = require('./compliance/complianceScanService');
 
@@ -59,9 +59,7 @@ const EXITED_UNITS_EPSILON = 1e-6;
 let isSchedulerCycleRunning = false;
 
 function addDays(isoDate, days) {
-  const d = new Date(`${isoDate}T00:00:00.000Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().split('T')[0];
+  return addDaysIso(isoDate, days);
 }
 
 function diffDays(startIso, endIso) {
@@ -71,14 +69,7 @@ function diffDays(startIso, endIso) {
 }
 
 function eachDate(fromDate, toDate) {
-  const out = [];
-  let d = new Date(`${fromDate}T00:00:00.000Z`);
-  const end = new Date(`${toDate}T00:00:00.000Z`);
-  while (d <= end) {
-    out.push(d.toISOString().split('T')[0]);
-    d.setUTCDate(d.getUTCDate() + 1);
-  }
-  return out;
+  return eachDateIso(fromDate, toDate);
 }
 
 function inferStockInstrumentType(symbol) {
@@ -471,7 +462,8 @@ function fetchStockSeriesFromSource(symbol, startDate, endDate) {
           for (let i = 0; i < timestamps.length; i += 1) {
             const close = closes[i];
             if (close == null) continue;
-            const d = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            const d = istDateFromUnixSeconds(timestamps[i]);
+            if (!d) continue;
             const closeNum = Number(close);
             if (!Number.isFinite(closeNum) || closeNum <= 0) continue;
 
@@ -852,8 +844,8 @@ function startScheduler(db) {
     });
   }
 
-  // Hourly intraday runs (9:25 AM–4:25 PM IST, weekdays) - stocks only
-  // These capture intraday stock price movements while MF NAVs are still static
+  // Hourly intraday runs (9:25 AM–4:25 PM IST, weekdays) - Indian market tradables.
+  // These capture intraday stock/SGB price movements while MF NAVs are still static.
   const intradayTimes = [
     '25 9 * * 1-5',    // 9:25 AM
     '25 10 * * 1-5',   // 10:25 AM
@@ -868,10 +860,10 @@ function startScheduler(db) {
   intradayTimes.forEach((cronTime, index) => {
     cron.schedule(cronTime, async () => {
       const hour = [9, 10, 11, 12, 13, 14, 15, 16][index];
-      console.log(`[Scheduler] Running ${hour}:25 intraday price update (stocks only)...`);
+      console.log(`[Scheduler] Running ${hour}:25 intraday price update (Indian stocks + SGB)...`);
       try {
         await runSchedulerCycle(db, `Intraday run ${hour}:25`, {
-          assetTypes: ['INDIAN_STOCK', 'FOREIGN_STOCK'],
+          assetTypes: ['INDIAN_STOCK', 'SGB'],
         });
         if (ENABLE_INTRADAY_COMPLIANCE) {
           await runComplianceScan(db, `Intraday run ${hour}:25`, { mode: 'incremental' });
@@ -879,6 +871,35 @@ function startScheduler(db) {
       } catch (e) {
         console.error(`[Scheduler] ${hour}:25 update failed:`, e.message);
         logAppError(`[Scheduler] Intraday run ${hour}:25 failed`, { error: e.message });
+      }
+    }, {
+      timezone: 'Asia/Kolkata',
+    });
+  });
+
+  // US-market tracking runs during the India evening window.
+  // Foreign stocks refresh through the US session, while MF/NPS participate
+  // only until today's record becomes LIVE so provider calls are avoided after settlement.
+  const usMarketTimes = [
+    '25 19 * * 1-5',  // 7:25 PM
+    '25 20 * * 1-5',  // 8:25 PM
+    '25 21 * * 1-5',  // 9:25 PM
+    '25 23 * * 1-5',  // 11:25 PM
+  ];
+
+  usMarketTimes.forEach((cronTime, index) => {
+    cron.schedule(cronTime, async () => {
+      const hour = [19, 20, 21, 23][index];
+      console.log(`[Scheduler] Running ${hour}:25 US-market update (foreign + conditional MF/NPS)...`);
+      try {
+        await runSchedulerCycle(db, `US-market run ${hour}:25`, {
+          assetTypes: ['FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS'],
+          reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
+          runTag: `us_market_${hour}_25`,
+        });
+      } catch (e) {
+        console.error(`[Scheduler] ${hour}:25 US-market update failed:`, e.message);
+        logAppError(`[Scheduler] US-market run ${hour}:25 failed`, { error: e.message });
       }
     }, {
       timezone: 'Asia/Kolkata',
@@ -908,6 +929,8 @@ function startScheduler(db) {
     try {
       await runSchedulerCycle(db, 'Final nightly run (all types)', {
         warmRecentCacheDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
+        reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
+        runTag: 'final_nightly',
       });
       await runComplianceScan(db, 'Final nightly run (all types)', { mode: 'full' });
     } catch (e) {
@@ -920,12 +943,14 @@ function startScheduler(db) {
 
   console.log('[Scheduler] Daily price updates scheduled:');
   console.log('  - 4:25 AM IST (all asset types; market-linked only on session days, daily)');
-  console.log('  - 9:25 AM–4:25 PM IST (hourly, stocks only, weekdays)');
+  console.log('  - 9:25 AM–4:25 PM IST (hourly, Indian stocks + SGB, weekdays)');
+  console.log('  - 7:25 PM, 8:25 PM, 9:25 PM, 11:25 PM IST (foreign stocks + conditional MF/NPS, weekdays)');
   console.log('  - 10:25 PM IST (all asset types, weekdays)');
   logAppInfo('[Scheduler] Scheduled jobs initialized', {
     timezone: 'Asia/Kolkata',
     earlyMorningAccrualRun: '04:25',
     intradayRuns: 8,
+    usMarketRuns: ['19:25', '20:25', '21:25', '23:25'],
     nightlyRun: '22:25',
     nightlyMarketCacheWarmDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
     historicalRepairMode: 'step1-generalized-only',

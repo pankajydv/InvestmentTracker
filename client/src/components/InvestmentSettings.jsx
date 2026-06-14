@@ -727,7 +727,7 @@ export default function InvestmentSettings() {
           <Card.Body>
             <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
               <div>
-                <h2 className="h6 fw-semibold mb-1">Historical Prices (DB Cache)</h2>
+                  <h2 className="h6 fw-semibold mb-1">Historical Prices</h2>
                 <div className="small text-muted">Cached market history for sparse-coverage troubleshooting.</div>
               </div>
               <Button

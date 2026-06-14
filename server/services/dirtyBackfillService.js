@@ -20,6 +20,12 @@ function normalizeDirtyDate(inputDate) {
   return parsed;
 }
 
+function addDaysIso(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+
 function mergeDelimitedValues(existingValue, nextValue, delimiter = ' | ') {
   const parts = [];
   const seen = new Set();
@@ -235,6 +241,168 @@ function markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourc
   }
 
   return count;
+}
+
+function parseJsonSafe(value) {
+  if (!value) return null;
+  try {
+    return JSON.parse(String(value));
+  } catch {
+    return null;
+  }
+}
+
+function runDailyBootstrapDirtyScopeEnqueue(db, options = {}) {
+  const runDate = normalizeDirtyDate(options.runDate) || todayIso();
+  const lookbackDays = Math.max(1, Math.floor(Number(options.lookbackDays) || 2));
+  const staleRunSeconds = Math.max(60, Math.floor(Number(options.staleRunSeconds) || 900));
+  const trigger = String(options.trigger || 'unknown').trim() || 'unknown';
+  const stateKey = 'daily_scope_bootstrap_state';
+  const dirtyFromDate = addDaysIso(runDate, -lookbackDays);
+  const nowIso = new Date().toISOString();
+
+  const claimTx = db.transaction(() => {
+    const row = db.prepare('SELECT value FROM config WHERE key = ? LIMIT 1').get(stateKey);
+    const state = parseJsonSafe(row?.value);
+
+    if (state?.runDate === runDate && state?.status === 'completed') {
+      return {
+        shouldRun: false,
+        reason: 'already-completed',
+        runDate,
+        dirtyFromDate,
+      };
+    }
+
+    if (state?.runDate === runDate && state?.status === 'running') {
+      const claimedAtMs = Date.parse(String(state?.claimedAt || ''));
+      const isFresh = Number.isFinite(claimedAtMs) && (Date.now() - claimedAtMs) < (staleRunSeconds * 1000);
+      if (isFresh) {
+        return {
+          shouldRun: false,
+          reason: 'already-running',
+          runDate,
+          dirtyFromDate,
+        };
+      }
+    }
+
+    const attempt = Number(state?.runDate === runDate ? state?.attempt : 0) + 1;
+    const nextState = {
+      status: 'running',
+      runDate,
+      dirtyFromDate,
+      lookbackDays,
+      trigger,
+      attempt,
+      claimedAt: nowIso,
+      updatedAt: nowIso,
+      staleRunSeconds,
+      lastResult: state?.lastResult || null,
+    };
+
+    db.prepare(`
+      INSERT INTO config (key, value, updated_at)
+      VALUES (?, ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = datetime('now')
+    `).run(stateKey, JSON.stringify(nextState));
+
+    return {
+      shouldRun: true,
+      reason: 'claimed',
+      runDate,
+      dirtyFromDate,
+      attempt,
+      trigger,
+      staleRunSeconds,
+    };
+  });
+
+  const claim = claimTx();
+  if (!claim.shouldRun) {
+    return {
+      runDate,
+      dirtyFromDate,
+      lookbackDays,
+      attempted: false,
+      status: claim.reason,
+      enqueued: 0,
+    };
+  }
+
+  try {
+    const reason = 'daily-bootstrap-catchup';
+    const sourceEventId = `daily-bootstrap:${runDate}`;
+    const enqueued = markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourceEventId);
+    const completedAt = new Date().toISOString();
+    const finalState = {
+      status: 'completed',
+      runDate,
+      dirtyFromDate,
+      lookbackDays,
+      trigger,
+      attempt: claim.attempt,
+      claimedAt: nowIso,
+      completedAt,
+      updatedAt: completedAt,
+      staleRunSeconds,
+      lastResult: {
+        status: 'completed',
+        enqueued,
+        completedAt,
+      },
+    };
+
+    db.prepare(`
+      INSERT INTO config (key, value, updated_at)
+      VALUES (?, ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = datetime('now')
+    `).run(stateKey, JSON.stringify(finalState));
+
+    return {
+      runDate,
+      dirtyFromDate,
+      lookbackDays,
+      attempted: true,
+      status: 'completed',
+      enqueued,
+      attempt: claim.attempt,
+      trigger,
+    };
+  } catch (error) {
+    const failedAt = new Date().toISOString();
+    const failedState = {
+      status: 'failed',
+      runDate,
+      dirtyFromDate,
+      lookbackDays,
+      trigger,
+      attempt: claim.attempt,
+      claimedAt: nowIso,
+      failedAt,
+      updatedAt: failedAt,
+      staleRunSeconds,
+      lastResult: {
+        status: 'failed',
+        error: error?.message || String(error),
+        failedAt,
+      },
+    };
+
+    db.prepare(`
+      INSERT INTO config (key, value, updated_at)
+      VALUES (?, ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = datetime('now')
+    `).run(stateKey, JSON.stringify(failedState));
+
+    throw error;
+  }
 }
 
 function getEarliestPendingDirtyDateForAssetType(db, assetType, runDate = todayIso()) {
@@ -509,6 +677,7 @@ module.exports = {
   markDirtyForAssetTypeFromDate,
   markDirtyFromTransactions,
   markScopeDirty,
+  runDailyBootstrapDirtyScopeEnqueue,
   runDirtyBackfillPreflight,
   setBackfillProgress,
 };

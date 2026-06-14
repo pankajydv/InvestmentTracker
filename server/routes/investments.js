@@ -39,6 +39,107 @@ const CASH_INFLOW_TYPES = new Set(XIRR_CASH_INFLOW_TYPES);
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MARKET_DRIVEN_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
+const MARKET_LINKED_DAY_CHANGE_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS']);
+const MAX_NON_LOCF_SESSION_LAG = 4;
+
+function isNonLocfSource(row) {
+  if (!row) return false;
+  if (row.has_non_locf != null) return Number(row.has_non_locf) > 0;
+  return String(row.price_source || '').toUpperCase() !== 'LOCF';
+}
+
+function sessionDistance(candidateDate, targetDate, assetType) {
+  if (!candidateDate || !targetDate) return Number.POSITIVE_INFINITY;
+  if (candidateDate > targetDate) return Number.POSITIVE_INFINITY;
+  const sessions = getMarketSessionDates(candidateDate, targetDate, assetType);
+  if (!Array.isArray(sessions) || sessions.length === 0) return Number.POSITIVE_INFINITY;
+  return Math.max(sessions.length - 1, 0);
+}
+
+function resolveDisplayDayChangeFromRows(rowsDesc, assetType) {
+  const latestRow = Array.isArray(rowsDesc) && rowsDesc.length ? rowsDesc[0] : null;
+  if (!latestRow) {
+    return {
+      dayChange: 0,
+      asOfDate: null,
+      usedFallback: false,
+      staleFallback: false,
+      latestCurrentValue: 0,
+    };
+  }
+
+  const normalizedType = String(assetType || '').toUpperCase();
+  const latestCurrentValue = Number(latestRow.current_value || 0);
+  if (!MARKET_LINKED_DAY_CHANGE_ASSET_TYPES.has(normalizedType)) {
+    return {
+      dayChange: Number(latestRow.day_change || 0),
+      asOfDate: latestRow.date || null,
+      usedFallback: false,
+      staleFallback: false,
+      latestCurrentValue,
+    };
+  }
+
+  if (isNonLocfSource(latestRow)) {
+    return {
+      dayChange: Number(latestRow.day_change || 0),
+      asOfDate: latestRow.date || null,
+      usedFallback: false,
+      staleFallback: false,
+      latestCurrentValue,
+    };
+  }
+
+  for (let idx = 1; idx < rowsDesc.length; idx += 1) {
+    const candidate = rowsDesc[idx];
+    if (!isNonLocfSource(candidate)) continue;
+    const lag = sessionDistance(candidate.date, latestRow.date, normalizedType);
+    if (lag <= MAX_NON_LOCF_SESSION_LAG) {
+      return {
+        dayChange: Number(candidate.day_change || 0),
+        asOfDate: candidate.date || null,
+        usedFallback: true,
+        staleFallback: false,
+        latestCurrentValue,
+      };
+    }
+    break;
+  }
+
+  return {
+    dayChange: 0,
+    asOfDate: null,
+    usedFallback: true,
+    staleFallback: true,
+    latestCurrentValue,
+  };
+}
+
+function getDayChangeRowsForInvestment(db, investmentId, portfolioId) {
+  const isPortfolioScoped = Number.isInteger(portfolioId) && portfolioId > 0;
+  if (isPortfolioScoped) {
+    return db.prepare(`
+      SELECT date, day_change, current_value, price_source
+      FROM daily_values
+      WHERE investment_id = ? AND portfolio_id = ?
+      ORDER BY date DESC, id DESC
+      LIMIT 120
+    `).all(investmentId, portfolioId);
+  }
+
+  return db.prepare(`
+    SELECT
+      date,
+      COALESCE(SUM(day_change), 0) AS day_change,
+      COALESCE(SUM(current_value), 0) AS current_value,
+      MAX(CASE WHEN UPPER(COALESCE(price_source, '')) != 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
+    FROM daily_values
+    WHERE investment_id = ? AND portfolio_id IS NOT NULL
+    GROUP BY date
+    ORDER BY date DESC
+    LIMIT 120
+  `).all(investmentId);
+}
 
 function todayIso() {
   return new Date().toISOString().slice(0, 10);
@@ -83,6 +184,214 @@ function buildMissingRanges(missingDates) {
 
   ranges.push({ from: start, to: prev, days: 1 + Math.round((Date.parse(`${prev}T00:00:00.000Z`) - Date.parse(`${start}T00:00:00.000Z`)) / 86400000) });
   return ranges;
+}
+
+function resolveIntervalDates(intervalParam, customFromDate, customToDate, latestDateInDb) {
+  if (customFromDate && customToDate) {
+    return {
+      from: customFromDate,
+      to: customToDate,
+      isCustom: true,
+    };
+  }
+
+  if (!latestDateInDb) {
+    return {
+      from: '2000-01-01',
+      to: '2000-01-01',
+      isCustom: false,
+    };
+  }
+
+  const d = new Date(`${latestDateInDb}T00:00:00.000Z`);
+  switch (String(intervalParam || '1D').toUpperCase()) {
+    case '1D':
+      d.setUTCDate(d.getUTCDate() - 1);
+      break;
+    case '2D':
+      d.setUTCDate(d.getUTCDate() - 2);
+      break;
+    case '1W':
+      d.setUTCDate(d.getUTCDate() - 7);
+      break;
+    case '1M':
+      d.setUTCMonth(d.getUTCMonth() - 1);
+      break;
+    case '3M':
+      d.setUTCMonth(d.getUTCMonth() - 3);
+      break;
+    case '6M':
+      d.setUTCMonth(d.getUTCMonth() - 6);
+      break;
+    case '1Y':
+      d.setUTCFullYear(d.getUTCFullYear() - 1);
+      break;
+    case '2Y':
+      d.setUTCFullYear(d.getUTCFullYear() - 2);
+      break;
+    case '3Y':
+      d.setUTCFullYear(d.getUTCFullYear() - 3);
+      break;
+    case '5Y':
+      d.setUTCFullYear(d.getUTCFullYear() - 5);
+      break;
+    case '7Y':
+      d.setUTCFullYear(d.getUTCFullYear() - 7);
+      break;
+    case '10Y':
+      d.setUTCFullYear(d.getUTCFullYear() - 10);
+      break;
+    default:
+      d.setUTCDate(d.getUTCDate() - 1);
+      break;
+  }
+
+  return {
+    from: d.toISOString().split('T')[0],
+    to: latestDateInDb,
+    isCustom: false,
+  };
+}
+
+function calculateInvestmentIntervalXirr(db, {
+  investmentId,
+  portfolioId,
+  assetType,
+  fromDate,
+  toDate,
+  isPresetOneDay,
+}) {
+  const isPortfolioScoped = Number.isInteger(portfolioId) && portfolioId > 0;
+
+  const opening = isPortfolioScoped
+    ? Number(db.prepare(`
+      SELECT COALESCE(current_value, 0) AS value
+      FROM daily_values
+      WHERE investment_id = ? AND portfolio_id = ? AND date <= ?
+      ORDER BY date DESC, id DESC
+      LIMIT 1
+    `).get(investmentId, portfolioId, fromDate)?.value || 0)
+    : Number(db.prepare(`
+      SELECT COALESCE(SUM(current_value), 0) AS value
+      FROM daily_values
+      WHERE investment_id = ?
+        AND portfolio_id IS NOT NULL
+        AND date = (
+          SELECT MAX(date)
+          FROM daily_values
+          WHERE investment_id = ? AND portfolio_id IS NOT NULL AND date <= ?
+        )
+    `).get(investmentId, investmentId, fromDate)?.value || 0);
+
+  const closing = isPortfolioScoped
+    ? Number(db.prepare(`
+      SELECT COALESCE(current_value, 0) AS value
+      FROM daily_values
+      WHERE investment_id = ? AND portfolio_id = ? AND date <= ?
+      ORDER BY date DESC, id DESC
+      LIMIT 1
+    `).get(investmentId, portfolioId, toDate)?.value || 0)
+    : Number(db.prepare(`
+      SELECT COALESCE(SUM(current_value), 0) AS value
+      FROM daily_values
+      WHERE investment_id = ?
+        AND portfolio_id IS NOT NULL
+        AND date = (
+          SELECT MAX(date)
+          FROM daily_values
+          WHERE investment_id = ? AND portfolio_id IS NOT NULL AND date <= ?
+        )
+    `).get(investmentId, investmentId, toDate)?.value || 0);
+
+  const txns = isPortfolioScoped
+    ? db.prepare(`
+      SELECT transaction_type, transaction_date, amount, fees, notes
+      FROM transactions
+      WHERE investment_id = ? AND portfolio_id = ?
+        AND DATE(transaction_date) >= ? AND DATE(transaction_date) <= ?
+      ORDER BY DATE(transaction_date) ASC
+    `).all(investmentId, portfolioId, fromDate, toDate)
+    : db.prepare(`
+      SELECT transaction_type, transaction_date, amount, fees, notes
+      FROM transactions
+      WHERE investment_id = ?
+        AND DATE(transaction_date) >= ? AND DATE(transaction_date) <= ?
+      ORDER BY DATE(transaction_date) ASC
+    `).all(investmentId, fromDate, toDate);
+
+  const flows = [];
+  if (opening !== 0) {
+    flows.push({ amount: -opening, date: new Date(`${fromDate}T00:00:00.000Z`) });
+  }
+
+  for (const txn of txns) {
+    const txnDate = new Date(txn.transaction_date);
+    if (Number.isNaN(txnDate.getTime())) continue;
+
+    const amount = Number(txn.amount) || 0;
+    const fees = Number(txn.fees) || 0;
+    let cashflow = 0;
+    const treatAsInternal = isInternalXirrCashflow(assetType, txn.transaction_type);
+    const treatAsAccrualOnly = isAccrualOnlyXirrCashflow(txn.transaction_type, txn.notes);
+
+    if (treatAsAccrualOnly) {
+      cashflow = 0;
+    } else if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+      cashflow = -(amount + fees);
+    } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
+      cashflow = amount - fees;
+    }
+
+    if (Math.abs(cashflow) > 1e-9) {
+      flows.push({ amount: cashflow, date: txnDate });
+    }
+  }
+
+  if (closing !== 0) {
+    flows.push({ amount: closing, date: new Date(`${toDate}T00:00:00.000Z`) });
+  }
+
+  let intervalChange = closing - opening;
+  let intervalChangePct = opening > 0 ? (intervalChange / opening) * 100 : 0;
+
+  if (isPresetOneDay) {
+    const rowsDesc = getDayChangeRowsForInvestment(db, investmentId, portfolioId);
+    const resolved = resolveDisplayDayChangeFromRows(rowsDesc, assetType);
+    intervalChange = Number(resolved.dayChange || 0);
+    intervalChangePct = Number(resolved.latestCurrentValue || 0) > 0
+      ? (intervalChange / Number(resolved.latestCurrentValue || 0)) * 100
+      : 0;
+  } else {
+    const summedIntervalChange = isPortfolioScoped
+      ? Number(db.prepare(`
+        SELECT COALESCE(SUM(day_change), 0) AS value
+        FROM daily_values
+        WHERE investment_id = ? AND portfolio_id = ?
+          AND date > ? AND date <= ?
+      `).get(investmentId, portfolioId, fromDate, toDate)?.value || 0)
+      : Number(db.prepare(`
+        SELECT COALESCE(SUM(day_change), 0) AS value
+        FROM daily_values
+        WHERE investment_id = ? AND portfolio_id IS NOT NULL
+          AND date > ? AND date <= ?
+      `).get(investmentId, fromDate, toDate)?.value || 0);
+
+    intervalChange = summedIntervalChange;
+    intervalChangePct = opening > 0 ? (intervalChange / opening) * 100 : 0;
+  }
+
+  const xirrRate = calculateXirr(flows);
+  return {
+    xirr_pct: xirrRate == null ? null : xirrRate * 100,
+    interval_change: intervalChange,
+    interval_change_pct: intervalChangePct,
+    opening_value: opening,
+    closing_value: closing,
+    confidence: xirrRate == null ? 'partial' : 'full',
+    error: null,
+    from_date: fromDate,
+    to_date: toDate,
+  };
 }
 
 function isInternalXirrCashflow(assetType, transactionType) {
@@ -211,9 +520,12 @@ module.exports = function (db) {
       const currentPage = Math.min(page, totalPages);
 
       // Page 1 is the latest page (most recent rows), page N moves backwards in time.
+      // Within each page, return rows in descending date order to match that model.
       const endExclusive = totalRows - ((currentPage - 1) * pageSize);
       const startInclusive = Math.max(0, endExclusive - pageSize);
-      const pageRows = rowsAll.slice(startInclusive, Math.max(startInclusive, endExclusive));
+      const pageRows = rowsAll
+        .slice(startInclusive, Math.max(startInclusive, endExclusive))
+        .reverse();
 
       const rowsLimited = pageRows.map((row) => ({
         date: row.date,
@@ -290,6 +602,167 @@ module.exports = function (db) {
         error: e.message,
       });
       return res.status(500).json({ error: e.message || 'Failed to fetch historical prices' });
+    }
+  });
+
+  router.get('/:id/daily-values', (req, res) => {
+    try {
+      const investmentId = Number(req.params.id);
+      if (!Number.isInteger(investmentId) || investmentId <= 0) {
+        return res.status(400).json({ error: 'Invalid investment id' });
+      }
+
+      const investment = db.prepare(`
+        SELECT id, name, display_name, asset_type, ticker_symbol, amfi_code, nps_fund_code, isin_code
+        FROM investments
+        WHERE id = ?
+      `).get(investmentId);
+
+      if (!investment) {
+        return res.status(404).json({ error: 'Investment not found' });
+      }
+
+      const today = todayIso();
+      const toDate = parseDateOnly(req.query.to) || today;
+      const fromDate = parseDateOnly(req.query.from) || addDaysIso(toDate, -365);
+      if (fromDate > toDate) {
+        return res.status(400).json({ error: 'from must be less than or equal to to' });
+      }
+
+      const pageRaw = Number(req.query.page);
+      const page = Number.isFinite(pageRaw) && pageRaw > 0
+        ? Math.floor(pageRaw)
+        : 1;
+
+      const pageSizeRaw = Number(req.query.page_size);
+      const legacyLimitRaw = Number(req.query.limit);
+      const pageSize = Number.isFinite(pageSizeRaw) && pageSizeRaw > 0
+        ? Math.min(Math.floor(pageSizeRaw), 5000)
+        : (Number.isFinite(legacyLimitRaw) && legacyLimitRaw > 0
+          ? Math.min(Math.floor(legacyLimitRaw), 5000)
+          : 365);
+
+      const portfolioIdRaw = req.query.portfolio_id;
+      const portfolioId = portfolioIdRaw == null || portfolioIdRaw === ''
+        ? null
+        : Number(portfolioIdRaw);
+      if (portfolioIdRaw != null && portfolioIdRaw !== '' && (!Number.isInteger(portfolioId) || portfolioId <= 0)) {
+        return res.status(400).json({ error: 'Invalid portfolio id' });
+      }
+
+      const filters = ['investment_id = ?', 'date >= ?', 'date <= ?'];
+      const params = [investmentId, fromDate, toDate];
+      if (portfolioId != null) {
+        filters.push('portfolio_id = ?');
+        params.push(portfolioId);
+      }
+
+      const whereClause = filters.join(' AND ');
+      const totalRows = Number(db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM daily_values
+        WHERE ${whereClause}
+      `).get(...params)?.count || 0);
+      const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+      const currentPage = Math.min(page, totalPages);
+      const offset = (currentPage - 1) * pageSize;
+
+      const rows = db.prepare(`
+        SELECT
+          id,
+          portfolio_id,
+          date,
+          price_per_unit,
+          total_units,
+          current_value,
+          invested_amount,
+          realized_proceeds,
+          profit_loss,
+          day_change,
+          price_source,
+          updated_at
+        FROM daily_values
+        WHERE ${whereClause}
+        ORDER BY date DESC, portfolio_id IS NULL DESC, portfolio_id ASC
+        LIMIT ? OFFSET ?
+      `).all(...params, pageSize, offset);
+
+      const rowsLimited = rows.map((row) => ({
+        id: row.id,
+        portfolio_id: row.portfolio_id == null ? null : Number(row.portfolio_id),
+        date: row.date,
+        price_per_unit: toNumberOrNull(row.price_per_unit),
+        total_units: toNumberOrNull(row.total_units),
+        current_value: toNumberOrNull(row.current_value),
+        invested_amount: toNumberOrNull(row.invested_amount),
+        realized_proceeds: toNumberOrNull(row.realized_proceeds),
+        profit_loss: toNumberOrNull(row.profit_loss),
+        day_change: toNumberOrNull(row.day_change),
+        price_source: row.price_source || null,
+        updated_at: row.updated_at || null,
+      }));
+
+      const displayedFrom = rowsLimited.length ? rowsLimited[0].date : null;
+      const displayedTo = rowsLimited.length ? rowsLimited[rowsLimited.length - 1].date : null;
+      const latestRowDate = db.prepare(`
+        SELECT date
+        FROM daily_values
+        WHERE ${whereClause}
+        ORDER BY date DESC, portfolio_id IS NULL DESC, portfolio_id ASC
+        LIMIT 1
+      `).get(...params)?.date || null;
+      const oldestRowDate = db.prepare(`
+        SELECT date
+        FROM daily_values
+        WHERE ${whereClause}
+        ORDER BY date ASC, portfolio_id IS NULL ASC, portfolio_id DESC
+        LIMIT 1
+      `).get(...params)?.date || null;
+
+      return res.json({
+        investment: {
+          id: investment.id,
+          name: investment.display_name || investment.name,
+          asset_type: investment.asset_type,
+          ticker_symbol: investment.ticker_symbol || null,
+          amfi_code: investment.amfi_code || null,
+          nps_fund_code: investment.nps_fund_code || null,
+          isin_code: investment.isin_code || null,
+        },
+        scope: {
+          portfolio_id: portfolioId,
+        },
+        window: {
+          from: fromDate,
+          to: toDate,
+          page: currentPage,
+          page_size: pageSize,
+          displayed_from: displayedFrom,
+          displayed_to: displayedTo,
+        },
+        pagination: {
+          page: currentPage,
+          page_size: pageSize,
+          total_rows: totalRows,
+          total_pages: totalPages,
+          has_previous: currentPage > 1,
+          has_next: currentPage < totalPages,
+        },
+        summary: {
+          rows_returned: rowsLimited.length,
+          rows_in_window: totalRows,
+          latest_row_date: latestRowDate,
+          oldest_row_date: oldestRowDate,
+        },
+        rows: rowsLimited,
+      });
+    } catch (e) {
+      logAppError('[InvestmentDailyValues] Failed to fetch daily values', {
+        investment_id: Number(req.params.id) || null,
+        portfolio_id: req.query.portfolio_id ? Number(req.query.portfolio_id) || null : null,
+        error: e.message,
+      });
+      return res.status(500).json({ error: e.message || 'Failed to fetch daily values' });
     }
   });
 
@@ -538,6 +1011,7 @@ module.exports = function (db) {
     const portfolioId = req.query.portfolio_id;
     const portfolioFilter = portfolioId ? ' AND portfolio_id = ?' : '';
     const portfolioParams = portfolioId ? [parseInt(portfolioId, 10)] : [];
+    const parsedPortfolioId = portfolioId ? parseInt(portfolioId, 10) : null;
     let latestValue;
     if (portfolioId) {
       latestValue = db.prepare(
@@ -598,12 +1072,44 @@ module.exports = function (db) {
       };
     }
 
+    const intervalParam = String(req.query.interval || '1D').trim().toUpperCase();
+    const customFromDate = parseDateOnly(req.query.custom_from_date);
+    const customToDate = parseDateOnly(req.query.custom_to_date);
+    const latestDateInScope = parsedPortfolioId
+      ? db.prepare(`
+        SELECT MAX(date) AS max_date
+        FROM daily_values
+        WHERE investment_id = ? AND portfolio_id = ?
+      `).get(inv.id, parsedPortfolioId)?.max_date
+      : db.prepare(`
+        SELECT MAX(date) AS max_date
+        FROM daily_values
+        WHERE investment_id = ? AND portfolio_id IS NOT NULL
+      `).get(inv.id)?.max_date;
+
+    const intervalWindow = resolveIntervalDates(intervalParam, customFromDate, customToDate, latestDateInScope);
+    const isPresetOneDay = !intervalWindow.isCustom && intervalParam === '1D';
+    const dayChangeRows = getDayChangeRowsForInvestment(db, inv.id, parsedPortfolioId);
+    const dayChangeResolved = resolveDisplayDayChangeFromRows(dayChangeRows, inv.asset_type);
+    const intervalXIRR = calculateInvestmentIntervalXirr(db, {
+      investmentId: inv.id,
+      portfolioId: parsedPortfolioId,
+      assetType: inv.asset_type,
+      fromDate: intervalWindow.from,
+      toDate: intervalWindow.to,
+      isPresetOneDay,
+    });
+
     res.json({
       ...inv,
       latestValue,
+      dayChangeDisplay: Number(dayChangeResolved.dayChange || 0),
+      dayChangeAsOfDate: dayChangeResolved.asOfDate || null,
+      dayChangeUsesFallback: !!dayChangeResolved.usedFallback,
       totalUnits: totals.total_units,
       totalInvested: totals.total_invested,
       saleProceeds: totals.sale_proceeds,
+      intervalXIRR,
       transactions,
       folio_summary,
       folio_options,

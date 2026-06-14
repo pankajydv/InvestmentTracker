@@ -16,15 +16,19 @@ const {
   getNearestOnOrBefore,
   hydrateHistoricalPriceSeries,
 } = require('./marketPriceCache');
+const {
+  normalizeProviderDate,
+  istDateFromUnixSeconds,
+  formatIstDate,
+  addDaysIso: addDaysIsoDate,
+} = require('./dateUtils');
 
 function isoDate(date) {
-  return new Date(date).toISOString().split('T')[0];
+  return formatIstDate(date);
 }
 
 function addDaysIso(dateIso, days) {
-  const d = new Date(`${dateIso}T00:00:00.000Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().split('T')[0];
+  return addDaysIsoDate(dateIso, days);
 }
 
 function inferStockInstrumentType(symbol) {
@@ -93,7 +97,7 @@ async function fetchMutualFundNAV(amfiCode) {
     const end = new Date();
     const start = new Date();
     start.setDate(end.getDate() - 10);
-    const fmt = d => d.toISOString().split('T')[0];
+    const fmt = d => formatIstDate(d);
     const url = `https://api.mfapi.in/mf/${amfiCode}?startDate=${fmt(start)}&endDate=${fmt(end)}`;
     https.get(url, (res) => {
       let data = '';
@@ -109,7 +113,7 @@ async function fetchMutualFundNAV(amfiCode) {
               ? (change / prevNav) * 100 : 0;
             resolve({
               nav: currentNav,
-              date: json.data[0].date,
+              date: normalizeProviderDate(json.data[0].date),
               schemeName: json.meta?.scheme_name || '',
               change: Math.round(change * 10000) / 10000,
               changePercent: Math.round(changePercent * 100) / 100,
@@ -219,6 +223,11 @@ async function fetchStockPrice(symbol) {
         change: quote.regularMarketChange || 0,
         changePercent: quote.regularMarketChangePercent || 0,
         previousClose: quote.regularMarketPreviousClose,
+        date: istDateFromUnixSeconds(quote.regularMarketTime)
+          || istDateFromUnixSeconds(quote.postMarketTime)
+          || normalizeProviderDate(quote.regularMarketTime)
+          || normalizeProviderDate(quote.postMarketTime)
+          || null,
       };
     } catch (libErr) {
       throw new Error(`Failed to fetch price for ${symbol}: ${directErr.message}`);
@@ -243,6 +252,9 @@ function fetchStockPriceDirect(symbol) {
             const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
             const change = meta.regularMarketPrice - prevClose;
             const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
+            const providerDate = istDateFromUnixSeconds(meta.regularMarketTime)
+              || istDateFromUnixSeconds(meta.currentTradingPeriod?.regular?.end)
+              || null;
             resolve({
               price: meta.regularMarketPrice,
               currency: meta.currency || 'INR',
@@ -250,6 +262,7 @@ function fetchStockPriceDirect(symbol) {
               change: Math.round(change * 100) / 100,
               changePercent: Math.round(changePct * 100) / 100,
               previousClose: prevClose,
+              date: providerDate,
             });
           } else {
             reject(new Error(`No price data for ${symbol}`));
@@ -289,7 +302,7 @@ async function fetchStockHistory(symbol, period = '1y') {
       const rows = result.quotes
         .filter(q => q.close != null)
         .map(q => ({
-          date: new Date(q.date).toISOString().split('T')[0],
+          date: formatIstDate(new Date(q.date)),
           price: q.close,
         }));
       upsertPriceSeries(
@@ -363,7 +376,8 @@ async function fetchHistoricalStockPrice(symbol, date) {
           for (let i = 0; i < timestamps.length; i += 1) {
             const close = closes[i];
             if (close == null) continue;
-            const pointDate = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            const pointDate = istDateFromUnixSeconds(timestamps[i]);
+            if (!pointDate) continue;
             parsedRows.push({ date: pointDate, close, source: 'YAHOO' });
             if (pointDate <= isoTarget && (!bestDate || pointDate > bestDate)) {
               bestDate = pointDate;
@@ -451,7 +465,8 @@ async function fetchHistoricalOHLC(symbol, date) {
             const c = closes[i];
             if (o == null || h == null || l == null || c == null) continue;
 
-            const pointDate = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            const pointDate = istDateFromUnixSeconds(timestamps[i]);
+            if (!pointDate) continue;
             parsedRows.push({ date: pointDate, open: o, high: h, low: l, close: c, source: 'YAHOO' });
             if (pointDate <= isoTarget && (!bestDate || pointDate > bestDate)) {
               bestDate = pointDate;
@@ -544,7 +559,8 @@ async function fetchHistoricalOHLCRange(symbol, fromDate, toDate) {
               const c = closes[i];
               if (o == null || h == null || l == null || c == null) continue;
 
-              const pointDate = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+              const pointDate = istDateFromUnixSeconds(timestamps[i]);
+              if (!pointDate) continue;
               if (pointDate < start || pointDate > end) continue;
               parsedRows.push({ date: pointDate, open: o, high: h, low: l, close: c, source: 'YAHOO' });
             }
@@ -922,7 +938,8 @@ async function _fetchYahooHistoricalUSDINR(date) {
           let bestRate = null;
           let bestDate = null;
           for (let i = 0; i < timestamps.length; i++) {
-            const d = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            const d = istDateFromUnixSeconds(timestamps[i]);
+            if (!d) continue;
             if (d <= isoTarget && closes[i] != null) {
               if (!bestDate || d > bestDate) {
                 bestDate = d;
@@ -1386,7 +1403,7 @@ function _fetchChartEvents(symbol, period1, period2, splitsOnly) {
           if (evts.dividends) {
             for (const [ts, div] of Object.entries(evts.dividends)) {
               dividends.push({
-                date: new Date(parseInt(ts) * 1000).toISOString().split('T')[0],
+                date: istDateFromUnixSeconds(parseInt(ts, 10)),
                 amount: div.amount,
               });
             }
@@ -1395,7 +1412,7 @@ function _fetchChartEvents(symbol, period1, period2, splitsOnly) {
           if (evts.splits) {
             for (const [ts, split] of Object.entries(evts.splits)) {
               splits.push({
-                date: new Date(parseInt(ts) * 1000).toISOString().split('T')[0],
+                date: istDateFromUnixSeconds(parseInt(ts, 10)),
                 numerator: split.numerator,
                 denominator: split.denominator,
               });
@@ -1504,6 +1521,7 @@ async function fetchSGBPrice(symbol) {
     change: Math.round(change * 100) / 100,
     changePercent: Math.round(changePercent * 100) / 100,
     previousClose,
+    date: normalizeProviderDate(latest.date),
   };
 }
 
@@ -1552,7 +1570,7 @@ async function fetchNPSNAV(schemeName, fundCode, lastPrice) {
   const detailed = await fetchNpsJson(`/api/detailed/${encodeURIComponent(code)}`);
   const nav = safeNum(detailed?.NAV);
   const oneDay = safeNum(detailed?.['1D']);
-  const updatedIso = parseNpsDateToIso(detailed?.['Last Updated']) || isoDate(new Date());
+  const updatedIso = parseNpsDateToIso(detailed?.['Last Updated']);
 
   if (nav == null || nav <= 0) {
     throw new Error(`Invalid NAV response for ${code}`);

@@ -1,10 +1,10 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
-import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal, Dropdown } from 'react-bootstrap';
-import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions } from '../services/api';
+import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal, Dropdown, Collapse } from 'react-bootstrap';
+import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions, getInvestmentDailyValues } from '../services/api';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
-import { ArrowLeft, Trash2, Plus, X, Settings, Pencil } from 'lucide-react';
+import { ArrowLeft, Trash2, Plus, X, Settings, Pencil, Wallet, PiggyBank, BarChart3, TrendingUp, TrendingDown } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
@@ -124,7 +124,22 @@ export default function InvestmentDetail() {
   const investmentsSearch = location.state?.investmentsSearch || '';
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [dailyValuesExpanded, setDailyValuesExpanded] = useState(false);
+  const [dailyValuesLoading, setDailyValuesLoading] = useState(false);
+  const [dailyValuesError, setDailyValuesError] = useState('');
+  const [dailyValuesData, setDailyValuesData] = useState(null);
+  const [dailyValuesShowMore, setDailyValuesShowMore] = useState(false);
+  const [dailyValuesFilters, setDailyValuesFilters] = useState({
+    from: '',
+    to: '',
+    page: 1,
+    pageSize: 365,
+  });
   const [showAddTxn, setShowAddTxn] = useState(false);
+  const [selectedInterval, setSelectedInterval] = useState('1D');
+  const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
+  const [customFromDate, setCustomFromDate] = useState('');
+  const [customToDate, setCustomToDate] = useState('');
   const [txnForm, setTxnForm] = useState({
     transaction_type: 'BUY',
     transaction_date: new Date().toISOString().split('T')[0],
@@ -148,7 +163,7 @@ export default function InvestmentDetail() {
     }
   }, [showAddTxn, txnTypes, txnForm.transaction_type]);
 
-  useEffect(() => { loadData(); }, [id, selectedId]);
+  useEffect(() => { loadData(); }, [id, selectedId, selectedInterval]);
 
   // Auto-fetch RBI rate when date or type changes for USD investments
   const fetchRBIRate = useCallback(async (date) => {
@@ -172,7 +187,11 @@ export default function InvestmentDetail() {
   const loadData = async () => {
     try {
       setLoading(true);
-      const result = await getInvestment(id, selectedId);
+      const result = await getInvestment(id, selectedId, {
+        interval: selectedInterval,
+        customFromDate: selectedInterval === 'CUSTOM' ? customFromDate : undefined,
+        customToDate: selectedInterval === 'CUSTOM' ? customToDate : undefined,
+      });
       setData(result);
     } catch (e) {
       console.error(e);
@@ -180,6 +199,32 @@ export default function InvestmentDetail() {
       setLoading(false);
     }
   };
+
+  const loadDailyValuesData = useCallback(async (filters = null) => {
+    const effectiveFilters = filters || dailyValuesFilters;
+    try {
+      setDailyValuesLoading(true);
+      setDailyValuesError('');
+      const result = await getInvestmentDailyValues(id, {
+        from: effectiveFilters.from,
+        to: effectiveFilters.to,
+        page: effectiveFilters.page,
+        pageSize: effectiveFilters.pageSize,
+        portfolioId: selectedId,
+      });
+      setDailyValuesData(result);
+    } catch (e) {
+      setDailyValuesError(e.message || 'Failed to load daily values');
+      setDailyValuesData(null);
+    } finally {
+      setDailyValuesLoading(false);
+    }
+  }, [id, selectedId, dailyValuesFilters]);
+
+  useEffect(() => {
+    if (!dailyValuesExpanded) return;
+    loadDailyValuesData();
+  }, [dailyValuesExpanded, loadDailyValuesData]);
 
   const handleDelete = async () => {
     if (!window.confirm('Delete this investment and all its data?')) return;
@@ -474,7 +519,14 @@ export default function InvestmentDetail() {
   const isMSFTStock = /MSFT/i.test(String(data.ticker_symbol || '')) || /microsoft/i.test(String(data.name || ''));
   const canImportEspp = isForeignUSD && isMSFTStock;
 
-  const absoluteReturnPct = data.latestValue?.profit_loss_pct ?? null;
+  const totalInvested = Number(data.totalInvested) || 0;
+  const currentValue = Number(data.latestValue?.current_value) || 0;
+  const saleProceeds = Number(data.saleProceeds) || 0;
+  const cumulativeValue = currentValue + saleProceeds;
+  const totalProfitLoss = cumulativeValue - totalInvested;
+  const absoluteReturnPct = totalInvested > 0
+    ? (totalProfitLoss / totalInvested) * 100
+    : null;
 
   const xirrCashflows = (data.transactions || []).reduce((acc, txn) => {
     const txnDate = new Date(txn.transaction_date);
@@ -498,7 +550,7 @@ export default function InvestmentDetail() {
     return acc;
   }, []);
 
-  const terminalValue = Number(data.latestValue?.current_value) || 0;
+  const terminalValue = currentValue;
   if (terminalValue > 0 && data.latestValue?.date) {
     const valuationDate = new Date(data.latestValue.date);
     if (!Number.isNaN(valuationDate.getTime())) {
@@ -508,8 +560,14 @@ export default function InvestmentDetail() {
 
   const xirrRate = calculateXirr(xirrCashflows);
   const xirrPct = xirrRate == null ? null : xirrRate * 100;
-  const cumulativeValue = (Number(data.latestValue?.current_value) || 0) + (Number(data.saleProceeds) || 0);
-  const realizedGain = Number(data.latestValue?.realized_proceeds ?? data.saleProceeds ?? 0);
+  const realizedGain = saleProceeds;
+  const detailDayChange = Number(data.dayChangeDisplay ?? data.latestValue?.day_change ?? 0);
+  const detailDayChangeAsOf = data.dayChangeAsOfDate || null;
+  const detailDayChangeUsesFallback = !!data.dayChangeUsesFallback;
+  const intervalMetrics = data.intervalXIRR || {};
+  const intervalChange = Number(intervalMetrics.interval_change || 0);
+  const intervalChangePct = Number(intervalMetrics.interval_change_pct || 0);
+  const intervalXirrPct = intervalMetrics.xirr_pct == null ? null : Number(intervalMetrics.xirr_pct);
   const todayIso = new Date().toISOString().split('T')[0];
   const placeholderVestCount = isForeignUSD
     ? (data.transactions || []).filter((txn) => txn.transaction_type === 'VEST'
@@ -720,9 +778,9 @@ export default function InvestmentDetail() {
     isSGB && sgbDetails && sgbDetails.accrued_interest > 0 ? { label: 'Accrued Interest', value: `₹${formatNumber(sgbDetails.accrued_interest, 2)}` } : null,
     !isPPF && data.latestValue
       ? {
-          label: '1D Change',
-          value: formatNumber(data.latestValue.day_change, 0),
-          color: profitColor(data.latestValue.day_change),
+          label: detailDayChangeAsOf ? `1D Change (As of ${formatDate(detailDayChangeAsOf)})` : '1D Change',
+          value: formatNumber(detailDayChange, 0),
+          color: profitColor(detailDayChange),
         }
       : null,
   ].filter(Boolean);
@@ -771,35 +829,151 @@ export default function InvestmentDetail() {
 
       {/* Summary Cards */}
       <Row className="g-3 mb-4">
-        <Col xs={6} md={4} lg={2}><SummaryCard label="Total Invested" value={formatINR(data.totalInvested)} /></Col>
-        <Col xs={6} md={4} lg={2}><SummaryCard label="Current Value" value={formatINR(data.latestValue?.current_value)} /></Col>
-        <Col xs={6} md={4} lg={2}><SummaryCard label="Cumulative Value" value={formatINR(cumulativeValue)} /></Col>
-        <Col xs={6} md={4} lg={2}>
-          <SummaryCard
-            label="Total P&L"
-            value={`${data.latestValue?.profit_loss >= 0 ? '+' : ''}${formatINR(data.latestValue?.profit_loss)}`}
-            color={profitColor(data.latestValue?.profit_loss)}
-          />
+        <Col md={6} lg={3}>
+          <Card className="shadow-sm h-100">
+            <Card.Body className="py-3">
+              <div className="d-flex align-items-center gap-2 text-muted small mb-1">
+                <Wallet size={16} /> Current Value
+              </div>
+              <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINR(currentValue)}</div>
+              <div className="text-muted small">Total Invested: {formatINR(totalInvested)}</div>
+              <div className="text-muted small">Cash Out (Realized Proceeds): {formatINR(realizedGain)}</div>
+            </Card.Body>
+          </Card>
         </Col>
-        <Col xs={6} md={4} lg={2}>
-          <SummaryCard
-            label="Cash Out (Realized Proceeds)"
-            value={`${realizedGain >= 0 ? '+' : ''}${formatINR(realizedGain)}`}
-            color={profitColor(realizedGain)}
-          />
+        <Col md={6} lg={3}>
+          <Card className="shadow-sm h-100">
+            <Card.Body className="py-3">
+              <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
+                <div className="d-flex align-items-center gap-2 text-muted small">
+                  {intervalChange >= 0 ? (
+                    <TrendingUp size={16} className="text-success" />
+                  ) : (
+                    <TrendingDown size={16} className="text-danger" />
+                  )}
+                  <span>
+                    {selectedInterval === 'CUSTOM'
+                      ? `${customFromDate} to ${customToDate}`
+                      : selectedInterval === '1D'
+                        ? '1 Day Change'
+                        : `${selectedInterval} Change`}
+                  </span>
+                </div>
+                <div style={{ fontSize: '0.85rem' }}>
+                  <select
+                    className="form-select form-select-sm"
+                    value={selectedInterval}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val === 'CUSTOM') {
+                        setShowCustomDatePicker(true);
+                      } else {
+                        setSelectedInterval(val);
+                        setShowCustomDatePicker(false);
+                      }
+                    }}
+                    style={{ maxWidth: '100px', fontSize: '0.85rem' }}
+                  >
+                    <option value="1D">1D</option>
+                    <option value="2D">2D</option>
+                    <option value="1W">1W</option>
+                    <option value="1M">1M</option>
+                    <option value="3M">3M</option>
+                    <option value="6M">6M</option>
+                    <option value="1Y">1Y</option>
+                    <option value="2Y">2Y</option>
+                    <option value="3Y">3Y</option>
+                    <option value="5Y">5Y</option>
+                    <option value="7Y">7Y</option>
+                    <option value="10Y">10Y</option>
+                    <option value="CUSTOM">Custom</option>
+                  </select>
+                </div>
+              </div>
+
+              {showCustomDatePicker && (
+                <div className="mb-2 p-2 bg-light rounded small">
+                  <div className="d-flex gap-2 mb-2">
+                    <input
+                      type="date"
+                      className="form-control form-control-sm"
+                      value={customFromDate}
+                      onChange={(e) => setCustomFromDate(e.target.value)}
+                      placeholder="From"
+                    />
+                    <input
+                      type="date"
+                      className="form-control form-control-sm"
+                      value={customToDate}
+                      onChange={(e) => setCustomToDate(e.target.value)}
+                      placeholder="To"
+                    />
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={() => {
+                      if (!customFromDate || !customToDate) return;
+                      setSelectedInterval('CUSTOM');
+                      setShowCustomDatePicker(false);
+                      loadData();
+                    }}
+                    className="w-100"
+                  >
+                    Apply
+                  </Button>
+                </div>
+              )}
+
+              <div className={`fw-bold ${profitColor(intervalChange)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
+                {formatINR(intervalChange)}
+              </div>
+              {selectedInterval === '1D' && (
+                <>
+                  <div className={`small ${profitColor(intervalChangePct)}`}>
+                    Change: {formatPct(intervalChangePct)}
+                  </div>
+                  {detailDayChangeUsesFallback && detailDayChangeAsOf && (
+                    <div className="small text-muted">
+                      As of {formatDate(detailDayChangeAsOf)}
+                    </div>
+                  )}
+                </>
+              )}
+              {selectedInterval !== '1D' && intervalXirrPct != null && (
+                <div className={`small ${profitColor(intervalXirrPct)}`}>
+                  Annualized (XIRR): {formatPct(intervalXirrPct)}
+                </div>
+              )}
+            </Card.Body>
+          </Card>
         </Col>
-        <Col xs={12} md={8} lg={2}>
-          <SummaryCard
-            label="Returns"
-            value={(
-              <span>
+        <Col md={6} lg={3}>
+          <Card className="shadow-sm h-100">
+            <Card.Body className="py-3">
+              <div className="d-flex align-items-center gap-2 text-muted small mb-1">
+                <BarChart3 size={16} /> Cumulative Value
+              </div>
+              <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINR(cumulativeValue)}</div>
+              <div className="text-muted small">Current + Cash Out</div>
+            </Card.Body>
+          </Card>
+        </Col>
+        <Col md={6} lg={3}>
+          <Card className="shadow-sm h-100">
+            <Card.Body className="py-3">
+              <div className="d-flex align-items-center gap-2 text-muted small mb-1">
+                <PiggyBank size={16} /> Total P&amp;L
+              </div>
+              <div className={`fw-bold ${profitColor(totalProfitLoss)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
+                {totalProfitLoss >= 0 ? '+' : ''}{formatINR(totalProfitLoss)}
+              </div>
+              <div className={`small ${profitColor(absoluteReturnPct)}`}>
                 <span>Abs: {formatPct(absoluteReturnPct)}</span>
                 <span className="mx-2 text-muted">|</span>
                 <span>XIRR: {xirrPct == null ? 'N/A' : formatPct(xirrPct)}</span>
-              </span>
-            )}
-            color={profitColor(absoluteReturnPct)}
-          />
+              </div>
+            </Card.Body>
+          </Card>
         </Col>
       </Row>
 
@@ -1167,6 +1341,206 @@ export default function InvestmentDetail() {
             </Table>
           </div>
         )}
+      </Card>
+
+      <Card className="shadow-sm mt-4">
+        <Card.Body>
+          <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
+            <div>
+              <h2 className="h6 fw-semibold mb-1">Daily Values</h2>
+              <div className="small text-muted">Stored daily snapshots for this investment in the current detail-page scope.</div>
+            </div>
+            <Button
+              size="sm"
+              variant="outline-secondary"
+              onClick={() => {
+                const nextExpanded = !dailyValuesExpanded;
+                setDailyValuesExpanded(nextExpanded);
+                if (nextExpanded && !dailyValuesData && !dailyValuesLoading) {
+                  loadDailyValuesData();
+                }
+              }}
+              aria-expanded={dailyValuesExpanded}
+            >
+              {dailyValuesExpanded ? 'Hide Daily Values' : 'Show Daily Values'}
+            </Button>
+          </div>
+
+          <Collapse in={dailyValuesExpanded}>
+            <div>
+              <Form
+                className="d-flex flex-wrap align-items-end gap-2 mb-3"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  loadDailyValuesData();
+                }}
+              >
+                <Form.Group>
+                  <Form.Label className="small mb-1">From</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="date"
+                    value={dailyValuesFilters.from}
+                    onChange={(e) => setDailyValuesFilters((prev) => ({ ...prev, from: e.target.value, page: 1 }))}
+                  />
+                </Form.Group>
+                <Form.Group>
+                  <Form.Label className="small mb-1">To</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="date"
+                    value={dailyValuesFilters.to}
+                    onChange={(e) => setDailyValuesFilters((prev) => ({ ...prev, to: e.target.value, page: 1 }))}
+                  />
+                </Form.Group>
+                <Form.Group>
+                  <Form.Label className="small mb-1">Rows per page</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    min="1"
+                    max="5000"
+                    value={dailyValuesFilters.pageSize}
+                    onChange={(e) => setDailyValuesFilters((prev) => ({
+                      ...prev,
+                      pageSize: Math.max(1, Math.min(5000, Number(e.target.value || 365))),
+                      page: 1,
+                    }))}
+                    style={{ width: 110 }}
+                  />
+                </Form.Group>
+                <Form.Group>
+                  <Form.Label className="small mb-1">Page</Form.Label>
+                  <Form.Control
+                    size="sm"
+                    type="number"
+                    min="1"
+                    value={dailyValuesFilters.page}
+                    onChange={(e) => setDailyValuesFilters((prev) => ({
+                      ...prev,
+                      page: Math.max(1, Number(e.target.value || 1)),
+                    }))}
+                    style={{ width: 90 }}
+                  />
+                </Form.Group>
+                <Button size="sm" type="submit" variant="outline-primary" disabled={dailyValuesLoading}>
+                  {dailyValuesLoading ? 'Loading...' : 'Refresh'}
+                </Button>
+              </Form>
+
+              {dailyValuesError && <div className="text-danger small mb-2">{dailyValuesError}</div>}
+
+              {dailyValuesData?.pagination && (
+                <div className="d-flex flex-wrap align-items-center gap-2 small mb-3">
+                  <Button
+                    size="sm"
+                    variant="outline-secondary"
+                    disabled={dailyValuesLoading || !dailyValuesData.pagination.has_previous}
+                    onClick={() => {
+                      const nextFilters = { ...dailyValuesFilters, page: Math.max(1, dailyValuesFilters.page - 1) };
+                      setDailyValuesFilters(nextFilters);
+                      loadDailyValuesData(nextFilters);
+                    }}
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline-secondary"
+                    disabled={dailyValuesLoading || !dailyValuesData.pagination.has_next}
+                    onClick={() => {
+                      const nextFilters = { ...dailyValuesFilters, page: dailyValuesFilters.page + 1 };
+                      setDailyValuesFilters(nextFilters);
+                      loadDailyValuesData(nextFilters);
+                    }}
+                  >
+                    Next
+                  </Button>
+                  <span className="rounded-3 px-2 py-1 bg-light">
+                    Page {dailyValuesData.pagination.page} of {dailyValuesData.pagination.total_pages}
+                  </span>
+                  <span className="rounded-3 px-2 py-1 bg-light">
+                    Latest shown: {dailyValuesData.window?.displayed_from || '-'}
+                  </span>
+                  <span className="rounded-3 px-2 py-1 bg-light">
+                    Oldest shown: {dailyValuesData.window?.displayed_to || '-'}
+                  </span>
+                </div>
+              )}
+
+              {dailyValuesData?.summary && (
+                <div className="d-flex flex-wrap gap-2 small mb-3">
+                  <span className="rounded-3 px-2 py-1 bg-light">Rows in window: {dailyValuesData.summary.rows_in_window}</span>
+                  <span className="rounded-3 px-2 py-1 bg-light">Rows returned: {dailyValuesData.summary.rows_returned}</span>
+                  <span className="rounded-3 px-2 py-1 bg-light">Latest row: {dailyValuesData.summary.latest_row_date || '-'}</span>
+                  <span className="rounded-3 px-2 py-1 bg-light">Oldest row: {dailyValuesData.summary.oldest_row_date || '-'}</span>
+                </div>
+              )}
+
+              <div className="d-flex justify-content-between align-items-center mb-2">
+                <h3 className="h6 fw-semibold mb-0">Daily Value Rows</h3>
+                <Button
+                  size="sm"
+                  variant="link"
+                  className="p-0 text-decoration-none"
+                  onClick={() => setDailyValuesShowMore((prev) => !prev)}
+                >
+                  {dailyValuesShowMore ? '<< Less fields' : 'More fields >>'}
+                </Button>
+              </div>
+              {dailyValuesLoading ? (
+                <div className="py-3 d-flex align-items-center gap-2 text-muted small">
+                  <Spinner animation="border" size="sm" /> Loading daily values...
+                </div>
+              ) : (
+                <div className="responsive-table">
+                  <Table size="sm" className="mb-0 align-middle small">
+                    <thead>
+                      <tr>
+                        <th>Date</th>
+                        {!selectedId && <th>Scope</th>}
+                        <th className="text-end">Price</th>
+                        <th className="text-end">Current Value</th>
+                        <th className="text-end">1D Change</th>
+                        <th>Source</th>
+                        {dailyValuesShowMore && <th className="text-end">Units</th>}
+                        {dailyValuesShowMore && <th className="text-end">Invested</th>}
+                        {dailyValuesShowMore && <th className="text-end">Realized</th>}
+                        {dailyValuesShowMore && <th className="text-end">P/L</th>}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(dailyValuesData?.rows || []).length === 0 ? (
+                        <tr>
+                          <td colSpan={
+                            selectedId
+                              ? (dailyValuesShowMore ? 9 : 5)
+                              : (dailyValuesShowMore ? 10 : 6)
+                          } className="text-center text-muted py-3">No daily values in selected window.</td>
+                        </tr>
+                      ) : (
+                        dailyValuesData.rows.map((row) => (
+                          <tr key={row.id}>
+                            <td>{row.date}</td>
+                            {!selectedId && <td>{row.portfolio_id == null ? 'All portfolios' : `Portfolio ${row.portfolio_id}`}</td>}
+                            <td className="text-end">{row.price_per_unit == null ? '-' : formatNumber(row.price_per_unit, 4)}</td>
+                            <td className="text-end">{row.current_value == null ? '-' : formatINR(row.current_value)}</td>
+                            <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINR(row.day_change)}</td>
+                            <td>{row.price_source || '-'}</td>
+                            {dailyValuesShowMore && <td className="text-end">{row.total_units == null ? '-' : formatNumber(row.total_units, 4)}</td>}
+                            {dailyValuesShowMore && <td className="text-end">{row.invested_amount == null ? '-' : formatINR(row.invested_amount)}</td>}
+                            {dailyValuesShowMore && <td className="text-end">{row.realized_proceeds == null ? '-' : formatINR(row.realized_proceeds)}</td>}
+                            {dailyValuesShowMore && <td className={`text-end ${profitColor(row.profit_loss)}`}>{row.profit_loss == null ? '-' : formatINR(row.profit_loss)}</td>}
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </Table>
+                </div>
+              )}
+            </div>
+          </Collapse>
+        </Card.Body>
       </Card>
 
       {/* Edit Transaction Modal */}
