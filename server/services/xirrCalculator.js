@@ -1,4 +1,109 @@
 const xirr = require('xirr');
+const { logAppWarn } = require('./appLogger');
+
+const XIRR_INFLOW_TYPES = new Set([
+  'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_IN', 'DIVIDEND',
+  'INTEREST', 'BONUS', 'RIGHTS', 'TRANSFER_OUT', 'SWITCH_OUT',
+]);
+
+const XIRR_OUTFLOW_TYPES = new Set([
+  'BUY', 'DEPOSIT', 'PURCHASE', 'INVESTMENT', 'TRANSFER_OUT', 'SWITCH_OUT',
+  'FEES', 'CHARGES', 'INSURANCE', 'TDS',
+]);
+
+function getScopedPortfolioDateBounds(db, portfolioId, requestedFrom, requestedTo) {
+  if (portfolioId) {
+    const row = db.prepare(`
+      SELECT
+        MIN(date) AS chosen_from,
+        MAX(date) AS chosen_to
+      FROM portfolio_daily
+      WHERE portfolio_id = ?
+        AND date >= ?
+        AND date <= ?
+    `).get(portfolioId, requestedFrom, requestedTo);
+    return {
+      from: row?.chosen_from || null,
+      to: row?.chosen_to || null,
+    };
+  }
+
+  const row = db.prepare(`
+    SELECT
+      MIN(date) AS chosen_from,
+      MAX(date) AS chosen_to
+    FROM portfolio_daily
+    WHERE portfolio_id IS NOT NULL
+      AND date >= ?
+      AND date <= ?
+  `).get(requestedFrom, requestedTo);
+
+  return {
+    from: row?.chosen_from || null,
+    to: row?.chosen_to || null,
+  };
+}
+
+function getPortfolioValueOnDate(db, portfolioId, date) {
+  if (!date) return 0;
+  if (portfolioId) {
+    return Number(db.prepare(`
+      SELECT COALESCE(total_value, 0) AS total_value
+      FROM portfolio_daily
+      WHERE portfolio_id = ? AND date = ?
+      LIMIT 1
+    `).get(portfolioId, date)?.total_value || 0);
+  }
+
+  return Number(db.prepare(`
+    SELECT COALESCE(SUM(total_value), 0) AS total_value
+    FROM portfolio_daily
+    WHERE portfolio_id IS NOT NULL AND date = ?
+  `).get(date)?.total_value || 0);
+}
+
+function sumPortfolioDayChange(db, portfolioId, fromDate, toDate) {
+  if (!fromDate || !toDate || fromDate > toDate) return 0;
+  if (portfolioId) {
+    return Number(db.prepare(`
+      SELECT COALESCE(SUM(day_change), 0) AS day_change
+      FROM portfolio_daily
+      WHERE portfolio_id = ?
+        AND date >= ?
+        AND date <= ?
+    `).get(portfolioId, fromDate, toDate)?.day_change || 0);
+  }
+
+  return Number(db.prepare(`
+    SELECT COALESCE(SUM(day_change), 0) AS day_change
+    FROM portfolio_daily
+    WHERE portfolio_id IS NOT NULL
+      AND date >= ?
+      AND date <= ?
+  `).get(fromDate, toDate)?.day_change || 0);
+}
+
+function sumScopedNetExternalFlows(db, portfolioId, fromDate, toDate) {
+  if (!fromDate || !toDate || fromDate > toDate) return 0;
+
+  const baseSql = `
+    SELECT COALESCE(SUM(CASE
+      WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+      WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+      WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
+      ELSE 0
+    END), 0) AS net_flow
+    FROM transactions
+    WHERE DATE(transaction_date) >= ?
+      AND DATE(transaction_date) <= ?
+  `;
+
+  if (portfolioId) {
+    return Number(db.prepare(`${baseSql} AND portfolio_id = ?`).get(fromDate, toDate, portfolioId)?.net_flow || 0);
+  }
+
+  return Number(db.prepare(`${baseSql} AND portfolio_id IS NOT NULL`).get(fromDate, toDate)?.net_flow || 0);
+}
 
 /**
  * Calculate XIRR for an interval.
@@ -33,66 +138,35 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
       toDate = latestDateInDb;
     }
 
-    // If fromDate is after toDate, swap or adjust
+    // If fromDate is after toDate, collapse to a 1-point window.
     if (fromDate > toDate) {
       fromDate = toDate;
     }
 
-    // Get opening/closing values using latest available rollup snapshots <= boundary dates.
-    let openingValue = 0;
-    let closingValue = 0;
-
-    if (portfolioId) {
-      const opening = db.prepare(`
-        SELECT total_value
-        FROM portfolio_daily
-        WHERE portfolio_id = ? AND date <= ?
-        ORDER BY date DESC
-        LIMIT 1
-      `).get(portfolioId, fromDate);
-
-      const closing = db.prepare(`
-        SELECT total_value
-        FROM portfolio_daily
-        WHERE portfolio_id = ? AND date <= ?
-        ORDER BY date DESC
-        LIMIT 1
-      `).get(portfolioId, toDate);
-
-      openingValue = Number(opening?.total_value || 0);
-      closingValue = Number(closing?.total_value || 0);
-    } else {
-      const openingDate = db.prepare(`
-        SELECT MAX(date) AS max_date
-        FROM portfolio_daily
-        WHERE portfolio_id IS NOT NULL AND date <= ?
-      `).get(fromDate)?.max_date || null;
-
-      const closingDate = db.prepare(`
-        SELECT MAX(date) AS max_date
-        FROM portfolio_daily
-        WHERE portfolio_id IS NOT NULL AND date <= ?
-      `).get(toDate)?.max_date || null;
-
-      const opening = openingDate
-        ? db.prepare(`
-            SELECT SUM(COALESCE(total_value, 0)) AS total_value
-            FROM portfolio_daily
-            WHERE portfolio_id IS NOT NULL AND date = ?
-          `).get(openingDate)
-        : null;
-
-      const closing = closingDate
-        ? db.prepare(`
-            SELECT SUM(COALESCE(total_value, 0)) AS total_value
-            FROM portfolio_daily
-            WHERE portfolio_id IS NOT NULL AND date = ?
-          `).get(closingDate)
-        : null;
-
-      openingValue = Number(opening?.total_value || 0);
-      closingValue = Number(closing?.total_value || 0);
+    // Non-1D intervals must snap strictly inside requested bounds.
+    const requestedFrom = fromDate;
+    const requestedTo = toDate;
+    const chosen = getScopedPortfolioDateBounds(db, portfolioId, requestedFrom, requestedTo);
+    if (!chosen.from || !chosen.to || chosen.from > chosen.to) {
+      return {
+        xirr_pct: null,
+        opening_value: 0,
+        closing_value: 0,
+        interval_change: 0,
+        interval_change_pct: 0,
+        confidence: 'no_data',
+        error: 'No portfolio snapshot data inside requested interval',
+        requested_from_date: requestedFrom,
+        requested_to_date: requestedTo,
+        from_date: null,
+        to_date: null,
+      };
     }
+    fromDate = chosen.from;
+    toDate = chosen.to;
+
+    const openingValue = getPortfolioValueOnDate(db, portfolioId, fromDate);
+    const closingValue = getPortfolioValueOnDate(db, portfolioId, toDate);
 
     // Get all transactions in interval (from_date to to_date, inclusive)
     let txnQuery = `
@@ -125,17 +199,6 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
 
     const transactions = db.prepare(txnQuery).all(...txnParams);
 
-    // Classify transactions as cash inflows or outflows
-    const INFLOW_TYPES = new Set([
-      'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_IN', 'DIVIDEND',
-      'INTEREST', 'BONUS', 'RIGHTS', 'TRANSFER_OUT', 'SWITCH_OUT'
-    ]);
-
-    const OUTFLOW_TYPES = new Set([
-      'BUY', 'DEPOSIT', 'PURCHASE', 'INVESTMENT', 'TRANSFER_OUT', 'SWITCH_OUT',
-      'FEES', 'CHARGES', 'INSURANCE', 'TDS'
-    ]);
-
     // Build cash flows for XIRR
     const cashFlows = [];
 
@@ -154,9 +217,9 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
 
       // Treat as outflow (negative) if it's a buy/invest/fee
       // Treat as inflow (positive) if it's a sell/dividend/interest
-      if (OUTFLOW_TYPES.has(txn.transaction_type)) {
+      if (XIRR_OUTFLOW_TYPES.has(txn.transaction_type)) {
         amount = -Math.abs(amount);
-      } else if (INFLOW_TYPES.has(txn.transaction_type)) {
+      } else if (XIRR_INFLOW_TYPES.has(txn.transaction_type)) {
         amount = Math.abs(amount);
       }
 
@@ -187,17 +250,41 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
           xirr_pct: null,
           opening_value: openingValue,
           closing_value: closingValue,
-          interval_change: closingValue - openingValue,
+          interval_change: sumPortfolioDayChange(db, portfolioId, fromDate, toDate),
           interval_change_pct: openingValue > 0
-            ? ((closingValue - openingValue) / openingValue) * 100
+            ? (sumPortfolioDayChange(db, portfolioId, fromDate, toDate) / openingValue) * 100
             : 0,
           confidence: 'no_xirr',
           error: `XIRR calculation failed: ${err.message}`,
+          requested_from_date: requestedFrom,
+          requested_to_date: requestedTo,
+          from_date: fromDate,
+          to_date: toDate,
         };
       }
     }
 
-    const intervalChange = closingValue - openingValue;
+    const intervalChange = sumPortfolioDayChange(db, portfolioId, fromDate, toDate);
+    const netFlow = sumScopedNetExternalFlows(db, portfolioId, fromDate, toDate);
+    const snapshotDerivedIntervalChange = closingValue - openingValue - netFlow;
+    const deviationAbs = Math.abs(intervalChange - snapshotDerivedIntervalChange);
+    const deviationThreshold = Math.max(1, Math.abs(intervalChange) * 0.0025);
+    if (deviationAbs > deviationThreshold) {
+      logAppWarn('[Interval][Portfolio] day_change and snapshot-flow interval deviation', {
+        portfolio_id: portfolioId || null,
+        requested_from_date: requestedFrom,
+        requested_to_date: requestedTo,
+        chosen_from_date: fromDate,
+        chosen_to_date: toDate,
+        opening_value: openingValue,
+        closing_value: closingValue,
+        net_external_cashflows: netFlow,
+        interval_change_from_day_change: intervalChange,
+        interval_change_from_snapshot_flow: snapshotDerivedIntervalChange,
+        deviation_abs: deviationAbs,
+        deviation_threshold: deviationThreshold,
+      });
+    }
 
     return {
       xirr_pct: xirrPct,
@@ -209,6 +296,10 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
         : 0,
       confidence: xirrPct !== null ? 'full' : 'partial',
       error: null,
+      requested_from_date: requestedFrom,
+      requested_to_date: requestedTo,
+      from_date: fromDate,
+      to_date: toDate,
     };
   } catch (err) {
     return {
@@ -219,6 +310,10 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
       interval_change_pct: 0,
       confidence: 'error',
       error: err.message,
+      requested_from_date: fromDate,
+      requested_to_date: toDate,
+      from_date: null,
+      to_date: null,
     };
   }
 }

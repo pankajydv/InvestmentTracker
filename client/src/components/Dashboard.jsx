@@ -29,7 +29,7 @@ function getDashboardCacheKey({
   targetPortfolioId,
   hideSold,
   includeFullySoldInReturns,
-  interval,
+  selectedInterval,
   customFromDate,
   customToDate,
 }) {
@@ -37,7 +37,7 @@ function getDashboardCacheKey({
     targetPortfolioId: targetPortfolioId ?? null,
     hideSold: !!hideSold,
     includeFullySoldInReturns: !!includeFullySoldInReturns,
-    interval: interval || '1D',
+    selectedInterval: selectedInterval || '1D',
     customFromDate: customFromDate || null,
     customToDate: customToDate || null,
   });
@@ -120,7 +120,6 @@ function combineDashboardSummaries(results, selectedIds) {
           totalProfitLoss: 0,
           totalRealizedGain: 0,
           xirrPct: null,
-          intervalChangeAmount: 0,
         };
       }
       byTypeTotals[type].totalValue += Number(info.totalValue) || 0;
@@ -128,7 +127,6 @@ function combineDashboardSummaries(results, selectedIds) {
       byTypeTotals[type].totalProfitLoss += Number(info.totalProfitLoss) || 0;
       byTypeTotals[type].totalRealizedGain += Number(info.totalRealizedGain) || 0;
       byTypeTotals[type].xirrPct = info.xirrPct ?? byTypeTotals[type].xirrPct;
-      byTypeTotals[type].intervalChangeAmount += Number(info.intervalChangeAmount) || 0;
     }
 
     for (const inv of result?.investments || []) {
@@ -212,7 +210,6 @@ function combineDashboardSummaries(results, selectedIds) {
         totalRealizedGain: 0,
         xirrPct: null,
         dayChange: 0,
-        intervalChangeAmount: 0,
         dayChangeAsOfDate: null,
         dayChangeAsOfMixed: false,
         dayChangeFallbackCount: 0,
@@ -227,7 +224,6 @@ function combineDashboardSummaries(results, selectedIds) {
       byType[inv.asset_type].totalProfitLoss = Number(totals.totalProfitLoss) || 0;
       byType[inv.asset_type].totalRealizedGain = Number(totals.totalRealizedGain) || 0;
       byType[inv.asset_type].xirrPct = totals.xirrPct ?? null;
-      byType[inv.asset_type].intervalChangeAmount = Number(totals.intervalChangeAmount) || 0;
     } else {
       byType[inv.asset_type].totalValue += Number(inv.current_value) || 0;
       byType[inv.asset_type].totalInvested += Number(inv.invested_amount) || 0;
@@ -435,11 +431,13 @@ export default function Dashboard() {
   const [complianceStatus, setComplianceStatus] = useState(null);
   const [complianceLoading, setComplianceLoading] = useState(false);
   const [showDetailTables, setShowDetailTables] = useState(false);
+  const [isIntervalSwitching, setIsIntervalSwitching] = useState(false);
   const [selectedInterval, setSelectedInterval] = useState('1D');
   const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
   const [customFromDate, setCustomFromDate] = useState('');
   const [customToDate, setCustomToDate] = useState('');
   const loadRunRef = useRef(0);
+  const lastLoadedIntervalSigRef = useRef(null);
   const selectedIdsKey = (selectedIds || []).join(',');
 
   const scrollToSection = useCallback((sectionId, { smooth = true, updateHash = true } = {}) => {
@@ -462,16 +460,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
-  }, [
-    selectedId,
-    selectedIdsKey,
-    hideSold,
-    includeFullySoldInReturns,
-    settingsLoading,
-    selectedInterval,
-    customFromDate,
-    customToDate,
-  ]);
+  }, [selectedId, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading, selectedInterval, customFromDate, customToDate]);
 
   useEffect(() => {
     if (settingsLoading) return undefined;
@@ -524,13 +513,18 @@ export default function Dashboard() {
   const loadData = async () => {
     const runId = ++loadRunRef.current;
     if (settingsLoading) return;
+    if (selectedInterval === 'CUSTOM' && (!customFromDate || !customToDate)) return;
+    const intervalSig = `${selectedInterval}|${customFromDate || ''}|${customToDate || ''}`;
+    const isIntervalRefresh = lastLoadedIntervalSigRef.current != null
+      && lastLoadedIntervalSigRef.current !== intervalSig;
+    if (isIntervalRefresh) setIsIntervalSwitching(true);
     const showBlockingLoader = !data;
     const targetPortfolioId = selectedIds.length > 1 ? null : selectedId;
     const cacheKey = getDashboardCacheKey({
       targetPortfolioId,
       hideSold,
       includeFullySoldInReturns,
-      interval: selectedInterval,
+      selectedInterval,
       customFromDate,
       customToDate,
     });
@@ -602,6 +596,7 @@ export default function Dashboard() {
       }
 
       setError(null);
+      lastLoadedIntervalSigRef.current = intervalSig;
     } catch (e) {
       if (runId !== loadRunRef.current) return;
       setError(e.message);
@@ -609,6 +604,7 @@ export default function Dashboard() {
       if (runId !== loadRunRef.current) return;
       setLoading(false);
       setRefreshing(false);
+      setIsIntervalSwitching(false);
     }
   };
 
@@ -701,7 +697,13 @@ export default function Dashboard() {
   const baseSortColumns = [
     { key: 'name', label: 'Name', subLabel: 'Folios / Identifier' },
     { key: 'price', label: 'Last Price', subLabel: 'Avg Cost / Unit', end: true },
-    { key: 'dayChange', label: '1 Day Change', subLabel: '% Change', end: true },
+    {
+      key: 'dayChange',
+      label: `${selectedInterval === 'CUSTOM' ? 'Custom' : selectedInterval} Change`,
+      subLabel: selectedInterval === '1D' ? '% Change' : '% Change p.a.',
+      end: true,
+    },
+    { key: 'totalCost', label: 'Net Invested', subLabel: 'Total Cost', end: true },
     { key: 'currentValue', label: 'Current Value', subLabel: 'Units Held', end: true },
     { key: 'portfolioPct', label: '% Portfolio', subLabel: '% within Type', end: true },
     { key: 'totalReturn', label: 'Total P&L', subLabel: 'Absolute | XIRR P&L%', end: true },
@@ -714,14 +716,13 @@ export default function Dashboard() {
       return {
         ...col,
         label: 'Interest Rate',
-        subLabel: 'Rate / Yield',
+        subLabel: 'As Of Date',
       };
     });
   };
 
-  const tableColumnWidths = ['36%', '13%', '13%', '13%', '10%', '15%'];
-  const tableColumnWidthsWithAsOfDate = ['31%', '10%', '12%', '12%', '12%', '9%', '14%'];
-  const mobileOptionalColumnKeys = new Set(['price', 'currentValue', 'portfolioPct']);
+  const tableColumnWidths = ['30%', '11.5%', '11.5%', '11.5%', '11.5%', '9%', '15%'];
+  const tableColumnWidthsWithAsOfDate = ['26%', '10%', '10.5%', '10.5%', '10.5%', '10.5%', '9%', '13%'];
 
   const handleAllocationClick = (event, type) => {
     event.preventDefault();
@@ -730,6 +731,7 @@ export default function Dashboard() {
 
   const complianceSnapshot = dailyHealth?.compliance || complianceStatus?.compliance || null;
   const sortedAssetEntries = sortAssetTypeEntries(byType);
+  const selectedIntervalLabel = selectedInterval === 'CUSTOM' ? 'Custom' : selectedInterval;
   const hasRecordedComplianceScan = !!(
     complianceSnapshot?.lastScan?.mode
     || complianceSnapshot?.lastScan?.runDate
@@ -961,17 +963,25 @@ export default function Dashboard() {
                 </div>
               )}
 
-              <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
-                {formatINR(data?.intervalXIRR?.interval_change || 0)}
-              </div>
-              {selectedInterval === '1D' ? (
-                <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
-                  Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
+              {isIntervalSwitching ? (
+                <div className="d-flex align-items-center gap-2 text-muted small py-2">
+                  <Spinner animation="border" size="sm" />
+                  Updating interval metrics...
                 </div>
               ) : (
-                <div className={`small ${profitColor(data?.intervalXIRR?.xirr_pct)}`}>
-                  Annualized (XIRR): {data?.intervalXIRR?.xirr_pct == null ? 'N/A' : formatPct(data.intervalXIRR.xirr_pct)}
-                </div>
+                <>
+                  <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
+                    {formatINR(data?.intervalXIRR?.interval_change || 0)}
+                  </div>
+                  <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
+                    Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
+                  </div>
+                  {data?.intervalXIRR?.xirr_pct != null && (
+                    <div className={`small ${profitColor(data.intervalXIRR.xirr_pct)}`}>
+                      Annualized (XIRR): {formatPct(data.intervalXIRR.xirr_pct)}
+                    </div>
+                  )}
+                </>
               )}
               {data?.intervalXIRR?.confidence === 'error' && (
                 <div className="small text-warning" title={data.intervalXIRR.error}>
@@ -1004,63 +1014,70 @@ export default function Dashboard() {
       <Card className="shadow-sm mb-4">
         <Card.Body>
           <h2 className="h6 fw-semibold mb-3">Asset Allocation</h2>
-          <Row className="g-4">
-            {sortedAssetEntries.map(([type, info]) => {
-              const dayChangeDenominator = Number(info.totalValue || 0) - Number(info.dayChange || 0);
-              const dayChangePct = dayChangeDenominator > 0
-                ? (Number(info.dayChange || 0) / dayChangeDenominator) * 100
-                : 0;
-              const isOneDay = selectedInterval === '1D';
-              const intervalLabel = selectedInterval === 'CUSTOM'
-                ? 'Custom Return'
-                : isOneDay
-                  ? 'Today'
-                  : `${selectedInterval} Return`;
-              const intervalAmount = isOneDay
-                ? Number(info.dayChange || 0)
-                : Number(
-                  info.intervalChangeAmount
-                  ?? info.intervalChange
-                  ?? info.interval_change
-                  ?? 0
-                );
+          <Row className="g-2">
+            {sortedAssetEntries.map(([type, info]) => (
+              <Col xs={6} md={4} lg={3} xl={2} key={type}>
+                {(() => {
+                  const intervalChangeBase = Number(info.totalValue || 0) - Number(info.dayChange || 0);
+                  const intervalChangePct = selectedInterval === '1D'
+                    ? (intervalChangeBase > 0
+                      ? (Number(info.dayChange || 0) / intervalChangeBase) * 100
+                      : 0)
+                    : Number(info.intervalChangePct ?? 0);
+                  const intervalPctSuffix = selectedInterval === '1D' ? '' : ' p.a.';
+                  const lifetimeClass = profitColor(info.totalProfitLoss);
+                  const intervalClass = profitColor(info.dayChange);
 
-              return (
-                <Col xs={6} md={4} lg={3} xxl={2} key={type}>
-                  <div
-                    className="rounded p-4 border asset-allocation-card"
-                    style={{ borderLeftColor: ASSET_TYPE_COLORS[type], borderLeftWidth: '4px', borderLeftStyle: 'solid' }}
+                  return (
+                <div
+                  className="rounded p-2 border asset-allocation-card"
+                  style={{ borderLeftColor: ASSET_TYPE_COLORS[type], borderLeftWidth: '4px', borderLeftStyle: 'solid' }}
+                >
+                  <a
+                    href={`#section-${type}`}
+                    className="text-decoration-underline fw-semibold"
+                    style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}
+                    onClick={(event) => handleAllocationClick(event, type)}
+                    title={ASSET_TYPE_FULL_NAMES[type]}
                   >
-                    <a
-                      href={`#section-${type}`}
-                      className="text-decoration-underline fw-semibold"
-                      style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}
-                      onClick={(event) => handleAllocationClick(event, type)}
-                      title={ASSET_TYPE_FULL_NAMES[type]}
-                    >
-                      {ASSET_TYPE_LABELS[type]} ↓
-                    </a>
-                    <div className="fw-semibold text-nowrap" style={{ fontSize: '1.05rem' }}>{formatINR(info.totalValue)}</div>
-                    <div className={`small ${profitColor(info.totalProfitLoss)}`} style={{ fontSize: '0.75rem' }}>
-                      Lifetime: {info.totalProfitLoss >= 0 ? '+' : ''}{formatINR(info.totalProfitLoss)}
-                    </div>
-                    <div className={`small ${profitColor(info.xirrPct)}`} style={{ fontSize: '0.7rem' }}>
-                      XIRR: {info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}
-                    </div>
-                    <div className={`small ${profitColor(intervalAmount)}`} style={{ fontSize: '0.7rem' }}>
-                      {intervalLabel}: {intervalAmount >= 0 ? '+' : ''}{formatINR(intervalAmount)}
-                    </div>
-                    <div className="small" style={{ fontSize: '0.7rem' }}>
-                      {isOneDay ? (
-                        <span className={profitColor(dayChangePct)}>Change: {formatPct(dayChangePct)}</span>
-                      ) : (
-                        <span className={profitColor(info.xirrPct)}>Change: {info.xirrPct == null ? 'N/A' : `${formatPct(info.xirrPct)} p.a.`}</span>
-                      )}
-                    </div>
+                    {ASSET_TYPE_LABELS[type]} ↓
+                  </a>
+                  <div className="fw-semibold text-nowrap" style={{ fontSize: '1.05rem' }}>{formatINR(info.totalValue)}</div>
+                  <div className="asset-metric-line">
+                    <span className="asset-metric-label">Lifetime:</span>
+                    <span className={`asset-metric-value ${lifetimeClass}`}>
+                      {info.totalProfitLoss >= 0 ? '+' : ''}{formatINR(info.totalProfitLoss)}
+                    </span>
+                    <span className="asset-metric-separator">·</span>
+                    <span className={`asset-metric-rate ${lifetimeClass}`}>
+                      {info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}
+                    </span>
                   </div>
-                </Col>
-              );
-            })}
+                  <div className="asset-metric-line">
+                    <span className="asset-metric-label">{selectedIntervalLabel}:</span>
+                    {isIntervalSwitching ? (
+                      <>
+                        <span className="asset-metric-value text-muted">Updating...</span>
+                        <span className="asset-metric-separator">·</span>
+                        <span className="asset-metric-rate text-muted">...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className={`asset-metric-value ${intervalClass}`}>
+                          {info.dayChange >= 0 ? '+' : ''}{formatINR(info.dayChange)}
+                        </span>
+                        <span className="asset-metric-separator">·</span>
+                        <span className={`asset-metric-rate ${intervalClass}`}>
+                          {formatPct(intervalChangePct)}{intervalPctSuffix}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </div>
+                  );
+                })()}
+              </Col>
+            ))}
           </Row>
         </Card.Body>
       </Card>
@@ -1100,12 +1117,16 @@ export default function Dashboard() {
           return !maxDate || inv.date > maxDate ? inv.date : maxDate;
         }, null);
         const dayChangeDenominator = Number(info.totalValue || 0) - Number(info.dayChange || 0);
-        const totalDayChangePct = dayChangeDenominator > 0
-          ? (Number(info.dayChange || 0) / dayChangeDenominator) * 100
-          : 0;
+        const totalDayChangePct = selectedInterval === '1D'
+          ? (dayChangeDenominator > 0
+            ? (Number(info.dayChange || 0) / dayChangeDenominator) * 100
+            : 0)
+          : Number(info.intervalChangePct ?? 0);
+        const dayChangePctSuffix = selectedInterval === '1D' ? '' : ' p.a.';
         const totalAbsPct = Number(info.totalInvested || 0) > 0
           ? (Number(info.totalProfitLoss || 0) / Number(info.totalInvested || 0)) * 100
           : 0;
+        const totalCurrentInvested = (Number(info.totalInvested) || 0) - (Number(info.totalRealizedGain) || 0);
         const showAsOfDateColumn = info.investments.some((inv) => !!inv.day_change_uses_fallback);
         const sortColumns = getSortColumnsForType(type);
         const tableColumns = showAsOfDateColumn
@@ -1132,12 +1153,8 @@ export default function Dashboard() {
           <div className="responsive-table">
             <Table hover size="sm" className="mb-0 small holdings-table" style={{ tableLayout: 'fixed' }}>
               <colgroup>
-                {tableColumns.map((col, idx) => (
-                  <col
-                    key={`${type}-col-${col.key}-${idx}`}
-                    className={mobileOptionalColumnKeys.has(col.key) ? 'holdings-col-optional' : ''}
-                    style={{ width: columnWidths[idx] }}
-                  />
+                {columnWidths.map((width, idx) => (
+                  <col key={`${type}-col-${idx}`} style={{ width }} />
                 ))}
               </colgroup>
               <thead className="table-light">
@@ -1148,7 +1165,7 @@ export default function Dashboard() {
                     return (
                       <th
                         key={col.key}
-                        className={`px-3${col.end ? ' text-end' : ''}${mobileOptionalColumnKeys.has(col.key) ? ' holdings-col-optional' : ''}`}
+                        className={`px-3${col.end ? ' text-end' : ''}`}
                         style={{ cursor: isSortable ? 'pointer' : 'default', userSelect: 'none' }}
                         onClick={isSortable ? () => handleSort(type, col.key) : undefined}
                       >
@@ -1162,6 +1179,9 @@ export default function Dashboard() {
                         {col.subLabel && (
                           <div className="text-muted fw-normal" style={{ fontSize: '0.68rem', lineHeight: 1.15 }}>
                             {col.subLabel}
+                            {isIntervalSwitching && col.key === 'dayChange' && (
+                              <Spinner animation="border" size="sm" className="ms-1" />
+                            )}
                           </div>
                         )}
                       </th>
@@ -1191,7 +1211,7 @@ export default function Dashboard() {
                           : '-'}
                       </td>
                     ) : null}
-                    <td className="px-3 text-end holdings-col-optional">
+                    <td className="px-3 text-end">
                       {(() => {
                         const acquiredUnits = Number(inv.acquired_units) || 0;
                         const avgCostText = acquiredUnits > 0.0001
@@ -1214,16 +1234,33 @@ export default function Dashboard() {
                       })()}
                     </td>
                     <td className="px-3 text-end">
-                      <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>
-                      <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>{formatPct(inv.day_change_pct)}</div>
+                      {isIntervalSwitching ? (
+                        <>
+                          <div className="fw-medium text-muted">...</div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
+                        </>
+                      ) : (
+                        <>
+                          <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>
+                          <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>
+                            {formatPct(inv.day_change_pct)}{dayChangePctSuffix}
+                          </div>
+                        </>
+                      )}
                     </td>
-                    <td className="px-3 text-end holdings-col-optional">
+                    <td className="px-3 text-end">
+                      <div className="fw-medium">{formatNumber((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
+                      <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                        {formatNumber(inv.invested_amount, 0)}
+                      </div>
+                    </td>
+                    <td className="px-3 text-end">
                       <div className="fw-medium">{formatNumber(inv.current_value, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                         {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
                       </div>
                     </td>
-                    <td className="px-3 text-end holdings-col-optional">
+                    <td className="px-3 text-end">
                       <div className="fw-medium">{(inv.portfolio_pct || 0).toFixed(2)}%</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                         {info.totalValue > 0 ? (((inv.current_value || 0) / info.totalValue) * 100).toFixed(2) : '0.00'}%
@@ -1251,7 +1288,7 @@ export default function Dashboard() {
                         : '-'}
                     </td>
                   ) : null}
-                  <td className="px-3 text-end holdings-col-optional">
+                  <td className="px-3 text-end">
                     {INTEREST_RATE_ASSET_TYPES.has(type) ? (
                       <>
                         <div className="fw-medium">-</div>
@@ -1273,16 +1310,33 @@ export default function Dashboard() {
                     )}
                   </td>
                   <td className="px-3 text-end">
-                    <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
-                    <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>{formatPct(totalDayChangePct)}</div>
+                    {isIntervalSwitching ? (
+                      <>
+                        <div className="fw-medium text-muted">...</div>
+                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
+                      </>
+                    ) : (
+                      <>
+                        <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
+                        <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>
+                          {formatPct(totalDayChangePct)}{dayChangePctSuffix}
+                        </div>
+                      </>
+                    )}
                   </td>
-                  <td className="px-3 text-end holdings-col-optional">
+                  <td className="px-3 text-end">
+                    <div className="fw-medium">{formatNumber(totalCurrentInvested, 0)}</div>
+                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                      {formatNumber(info.totalInvested, 0)}
+                    </div>
+                  </td>
+                  <td className="px-3 text-end">
                     <div className="fw-medium">{formatNumber(info.totalValue, 0)}</div>
                     <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                       {totalUnits > 0.0001 ? `${formatNumber(totalUnits, 4)} Units` : ''}
                     </div>
                   </td>
-                  <td className="px-3 text-end holdings-col-optional">
+                  <td className="px-3 text-end">
                     <div className="fw-medium">
                       {portfolio.total_value > 0 ? ((info.totalValue / portfolio.total_value) * 100).toFixed(2) : '0.00'}%
                     </div>
@@ -1302,7 +1356,7 @@ export default function Dashboard() {
           </div>
           <Card.Footer className="bg-white border-top-0 pt-0">
             <div className="small text-muted text-end">
-              Cash Out (Realized Proceeds): {info.totalRealizedGain >= 0 ? '+' : ''}{formatINR(info.totalRealizedGain || 0)}
+              Cash Proceeds: {info.totalRealizedGain >= 0 ? '+' : ''}{formatINR(info.totalRealizedGain || 0)}
             </div>
           </Card.Footer>
         </Card>

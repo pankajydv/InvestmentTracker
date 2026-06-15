@@ -18,30 +18,19 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Simple SVG to use as base (blue gradient with chart icon)
-const baseSvg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <defs>
-    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#0066cc;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#0052a3;stop-opacity:1" />
-    </linearGradient>
-  </defs>
-  <!-- Background -->
-  <rect width="512" height="512" fill="url(#grad1)"/>
-  <!-- Chart bars -->
-  <rect x="100" y="300" width="60" height="150" fill="white" opacity="0.9"/>
-  <rect x="200" y="200" width="60" height="250" fill="white" opacity="0.8"/>
-  <rect x="300" y="100" width="60" height="350" fill="white" opacity="0.7"/>
-</svg>`;
-
-const outputDir = path.join(__dirname, 'public', 'icons');
-const faviconPath = path.join(__dirname, 'public', 'favicon.svg');
+const outputDir = path.join(__dirname, '..', 'public', 'icons');
+const faviconPath = path.join(__dirname, '..', 'public', 'favicon.svg');
 
 // Check if Sharp is available, otherwise provide instructions
 async function generateWithSharp() {
   try {
     const sharp = (await import('sharp')).default;
+    if (!fs.existsSync(faviconPath)) {
+      console.error(`Missing source icon: ${faviconPath}`);
+      return;
+    }
+
+    const baseSvg = fs.readFileSync(faviconPath);
     
     const sizes = [
       { name: 'icon-192x192.png', size: 192 },
@@ -51,8 +40,7 @@ async function generateWithSharp() {
     ];
 
     sizes.forEach(({ name, size }) => {
-      const svgBuffer = Buffer.from(baseSvg);
-      sharp(svgBuffer)
+      sharp(baseSvg)
         .resize(size, size)
         .png()
         .toFile(path.join(outputDir, name), (err, info) => {

@@ -174,6 +174,7 @@ module.exports = function (db) {
 
       let importedCount = 0;
       let skippedCount = 0;
+      const dirtyCandidates = [];
 
       const importTxn = db.transaction(() => {
         // Find or create investment
@@ -219,6 +220,7 @@ module.exports = function (db) {
             Math.abs(t.amount),
             t.description || ''
           );
+          dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: t.date });
           existingKeys.add(key);
           importedCount++;
         }
@@ -227,6 +229,10 @@ module.exports = function (db) {
       });
 
       const investmentId = importTxn();
+
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'ppf-import', `account:${accountNumber}`);
+      }
 
       logAppInfo('[PPF/SSY] Import completed', {
         portfolio_id: portfolioId,

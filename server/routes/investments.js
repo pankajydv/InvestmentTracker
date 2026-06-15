@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { calculatePfInterestPreview, calculateSmallSavingsInterestPreview } = require('../services/pfInterestCalculator');
-const { logAppInfo, logAppError } = require('../services/appLogger');
+const { logAppInfo, logAppWarn, logAppError } = require('../services/appLogger');
 const {
   XIRR_CASH_OUTFLOW_TYPES,
   XIRR_CASH_INFLOW_TYPES,
@@ -263,6 +263,52 @@ function calculateInvestmentIntervalXirr(db, {
 }) {
   const isPortfolioScoped = Number.isInteger(portfolioId) && portfolioId > 0;
 
+  let chosenFromDate = fromDate;
+  let chosenToDate = toDate;
+
+  if (!isPresetOneDay) {
+    const bounds = isPortfolioScoped
+      ? db.prepare(`
+        SELECT
+          MIN(date) AS chosen_from,
+          MAX(date) AS chosen_to
+        FROM daily_values
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND date >= ?
+          AND date <= ?
+      `).get(investmentId, portfolioId, fromDate, toDate)
+      : db.prepare(`
+        SELECT
+          MIN(date) AS chosen_from,
+          MAX(date) AS chosen_to
+        FROM daily_values
+        WHERE investment_id = ?
+          AND portfolio_id IS NOT NULL
+          AND date >= ?
+          AND date <= ?
+      `).get(investmentId, fromDate, toDate);
+
+    if (!bounds?.chosen_from || !bounds?.chosen_to || bounds.chosen_from > bounds.chosen_to) {
+      return {
+        xirr_pct: null,
+        interval_change: 0,
+        interval_change_pct: 0,
+        opening_value: 0,
+        closing_value: 0,
+        confidence: 'no_data',
+        error: 'No daily snapshot data inside requested interval',
+        requested_from_date: fromDate,
+        requested_to_date: toDate,
+        from_date: null,
+        to_date: null,
+      };
+    }
+
+    chosenFromDate = bounds.chosen_from;
+    chosenToDate = bounds.chosen_to;
+  }
+
   const opening = isPortfolioScoped
     ? Number(db.prepare(`
       SELECT COALESCE(current_value, 0) AS value
@@ -270,7 +316,7 @@ function calculateInvestmentIntervalXirr(db, {
       WHERE investment_id = ? AND portfolio_id = ? AND date <= ?
       ORDER BY date DESC, id DESC
       LIMIT 1
-    `).get(investmentId, portfolioId, fromDate)?.value || 0)
+    `).get(investmentId, portfolioId, chosenFromDate)?.value || 0)
     : Number(db.prepare(`
       SELECT COALESCE(SUM(current_value), 0) AS value
       FROM daily_values
@@ -281,7 +327,7 @@ function calculateInvestmentIntervalXirr(db, {
           FROM daily_values
           WHERE investment_id = ? AND portfolio_id IS NOT NULL AND date <= ?
         )
-    `).get(investmentId, investmentId, fromDate)?.value || 0);
+    `).get(investmentId, investmentId, chosenFromDate)?.value || 0);
 
   const closing = isPortfolioScoped
     ? Number(db.prepare(`
@@ -290,7 +336,7 @@ function calculateInvestmentIntervalXirr(db, {
       WHERE investment_id = ? AND portfolio_id = ? AND date <= ?
       ORDER BY date DESC, id DESC
       LIMIT 1
-    `).get(investmentId, portfolioId, toDate)?.value || 0)
+    `).get(investmentId, portfolioId, chosenToDate)?.value || 0)
     : Number(db.prepare(`
       SELECT COALESCE(SUM(current_value), 0) AS value
       FROM daily_values
@@ -301,7 +347,7 @@ function calculateInvestmentIntervalXirr(db, {
           FROM daily_values
           WHERE investment_id = ? AND portfolio_id IS NOT NULL AND date <= ?
         )
-    `).get(investmentId, investmentId, toDate)?.value || 0);
+    `).get(investmentId, investmentId, chosenToDate)?.value || 0);
 
   const txns = isPortfolioScoped
     ? db.prepare(`
@@ -310,18 +356,18 @@ function calculateInvestmentIntervalXirr(db, {
       WHERE investment_id = ? AND portfolio_id = ?
         AND DATE(transaction_date) >= ? AND DATE(transaction_date) <= ?
       ORDER BY DATE(transaction_date) ASC
-    `).all(investmentId, portfolioId, fromDate, toDate)
+    `).all(investmentId, portfolioId, chosenFromDate, chosenToDate)
     : db.prepare(`
       SELECT transaction_type, transaction_date, amount, fees, notes
       FROM transactions
       WHERE investment_id = ?
         AND DATE(transaction_date) >= ? AND DATE(transaction_date) <= ?
       ORDER BY DATE(transaction_date) ASC
-    `).all(investmentId, fromDate, toDate);
+    `).all(investmentId, chosenFromDate, chosenToDate);
 
   const flows = [];
   if (opening !== 0) {
-    flows.push({ amount: -opening, date: new Date(`${fromDate}T00:00:00.000Z`) });
+    flows.push({ amount: -opening, date: new Date(`${chosenFromDate}T00:00:00.000Z`) });
   }
 
   for (const txn of txns) {
@@ -348,7 +394,7 @@ function calculateInvestmentIntervalXirr(db, {
   }
 
   if (closing !== 0) {
-    flows.push({ amount: closing, date: new Date(`${toDate}T00:00:00.000Z`) });
+    flows.push({ amount: closing, date: new Date(`${chosenToDate}T00:00:00.000Z`) });
   }
 
   let intervalChange = closing - opening;
@@ -367,17 +413,63 @@ function calculateInvestmentIntervalXirr(db, {
         SELECT COALESCE(SUM(day_change), 0) AS value
         FROM daily_values
         WHERE investment_id = ? AND portfolio_id = ?
-          AND date > ? AND date <= ?
-      `).get(investmentId, portfolioId, fromDate, toDate)?.value || 0)
+          AND date >= ? AND date <= ?
+      `).get(investmentId, portfolioId, chosenFromDate, chosenToDate)?.value || 0)
       : Number(db.prepare(`
         SELECT COALESCE(SUM(day_change), 0) AS value
         FROM daily_values
         WHERE investment_id = ? AND portfolio_id IS NOT NULL
-          AND date > ? AND date <= ?
-      `).get(investmentId, fromDate, toDate)?.value || 0);
+          AND date >= ? AND date <= ?
+      `).get(investmentId, chosenFromDate, chosenToDate)?.value || 0);
 
     intervalChange = summedIntervalChange;
     intervalChangePct = opening > 0 ? (intervalChange / opening) * 100 : 0;
+
+    const netFlow = isPortfolioScoped
+      ? Number(db.prepare(`
+        SELECT COALESCE(SUM(CASE
+          WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+          WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+          WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
+          ELSE 0
+        END), 0) AS net_flow
+        FROM transactions
+        WHERE investment_id = ? AND portfolio_id = ?
+          AND DATE(transaction_date) >= ? AND DATE(transaction_date) <= ?
+      `).get(investmentId, portfolioId, chosenFromDate, chosenToDate)?.net_flow || 0)
+      : Number(db.prepare(`
+        SELECT COALESCE(SUM(CASE
+          WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
+          WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+          WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
+          ELSE 0
+        END), 0) AS net_flow
+        FROM transactions
+        WHERE investment_id = ?
+          AND DATE(transaction_date) >= ? AND DATE(transaction_date) <= ?
+      `).get(investmentId, chosenFromDate, chosenToDate)?.net_flow || 0);
+
+    const snapshotDerivedIntervalChange = closing - opening - netFlow;
+    const deviationAbs = Math.abs(intervalChange - snapshotDerivedIntervalChange);
+    const deviationThreshold = Math.max(1, Math.abs(intervalChange) * 0.0025);
+    if (deviationAbs > deviationThreshold) {
+      logAppWarn('[Interval][Investment] day_change and snapshot-flow interval deviation', {
+        investment_id: investmentId,
+        portfolio_id: isPortfolioScoped ? portfolioId : null,
+        asset_type: assetType,
+        requested_from_date: fromDate,
+        requested_to_date: toDate,
+        chosen_from_date: chosenFromDate,
+        chosen_to_date: chosenToDate,
+        opening_value: opening,
+        closing_value: closing,
+        net_external_cashflows: netFlow,
+        interval_change_from_day_change: intervalChange,
+        interval_change_from_snapshot_flow: snapshotDerivedIntervalChange,
+        deviation_abs: deviationAbs,
+        deviation_threshold: deviationThreshold,
+      });
+    }
   }
 
   const xirrRate = calculateXirr(flows);
@@ -389,8 +481,10 @@ function calculateInvestmentIntervalXirr(db, {
     closing_value: closing,
     confidence: xirrRate == null ? 'partial' : 'full',
     error: null,
-    from_date: fromDate,
-    to_date: toDate,
+    requested_from_date: fromDate,
+    requested_to_date: toDate,
+    from_date: chosenFromDate,
+    to_date: chosenToDate,
   };
 }
 
@@ -816,10 +910,14 @@ module.exports = function (db) {
       const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
       const currentPage = Math.min(page, totalPages);
 
-      // Page 1 is latest, page N moves backwards in time
+      // Page 1 is latest, page N moves backwards in time.
+      // Keep row order within each page descending (latest -> oldest),
+      // matching historical-prices pagination semantics.
       const endExclusive = totalRows - ((currentPage - 1) * pageSize);
       const startInclusive = Math.max(0, endExclusive - pageSize);
-      const pageRows = fxRows.slice(startInclusive, Math.max(startInclusive, endExclusive));
+      const pageRows = fxRows
+        .slice(startInclusive, Math.max(startInclusive, endExclusive))
+        .reverse();
 
       const rowsLimited = pageRows.map((row) => ({
         date: row.date,
@@ -1814,6 +1912,7 @@ module.exports = function (db) {
       let inserted = 0;
       let updated = 0;
       let skipped = 0;
+      const dirtyCandidates = [];
       const appliedEntries = [];
 
       const runApply = db.transaction(() => {
@@ -1847,8 +1946,10 @@ module.exports = function (db) {
               if (shouldReplaceAllDateRows) {
                 replaceDayEntriesStmt.run(inv.id, targetPortfolioId, normalizeTransactionDate(entry.date));
                 insertStmt.run(inv.id, targetPortfolioId, normalizeTransactionDate(entry.date), entry.amount, note);
+                dirtyCandidates.push({ investment_id: inv.id, portfolio_id: targetPortfolioId, transaction_date: normalizeTransactionDate(entry.date) });
               } else {
                 updateStmt.run(entry.amount, note, entry.existing_id);
+                dirtyCandidates.push({ investment_id: inv.id, portfolio_id: targetPortfolioId, transaction_date: normalizeTransactionDate(entry.date) });
               }
             }
             updated += 1;
@@ -1857,6 +1958,7 @@ module.exports = function (db) {
           }
 
           if (!dryRun) insertStmt.run(inv.id, targetPortfolioId, normalizeTransactionDate(entry.date), entry.amount, note);
+          if (!dryRun) dirtyCandidates.push({ investment_id: inv.id, portfolio_id: targetPortfolioId, transaction_date: normalizeTransactionDate(entry.date) });
           inserted += 1;
           appliedEntries.push({ ...entry, result: dryRun ? 'would_insert' : 'inserted' });
         }
@@ -1867,6 +1969,10 @@ module.exports = function (db) {
       }
 
       runApply();
+
+      if (!dryRun && dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'reconcile-interest', `investment:${inv.id}`);
+      }
 
       logAppInfo('[Interest] Applied', {
         investment_id: Number(inv.id),

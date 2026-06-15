@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button, Dropdown, Modal, Form, Alert } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing } from 'lucide-react';
+import { BarChart3, PlusCircle, TrendingUp, List, ArrowLeftRight, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing } from 'lucide-react';
 import { HolidaysListModal, HolidaysSyncModal } from './HolidaysMenuItems';
 import { PWAInstallButton } from './PWAInstallButton';
 import { triggerPriceUpdate, cancelPriceUpdate, exportData, getCorporateActionSuggestionCount } from '../services/api';
@@ -13,7 +13,7 @@ const PRIMARY_NAV_ITEMS = [
   { path: '/', label: 'Dashboard', shortLabel: 'Dashboard', icon: BarChart3 },
   { path: '/investments', label: 'Investments', shortLabel: 'Investments', icon: List },
   { path: '/performance', label: 'Performance', shortLabel: 'Performance', icon: TrendingUp },
-  { path: '/transactions', label: 'Transactions', shortLabel: 'Transactions', icon: List },
+  { path: '/transactions', label: 'Transactions', shortLabel: 'Transactions', icon: ArrowLeftRight },
   { path: '/investments/add', label: 'Add Investment', shortLabel: 'Add', icon: PlusCircle },
 ];
 
@@ -75,10 +75,10 @@ export default function Navbar({ user, onLogout }) {
     }
   };
 
-  const handleUpdate = async (complianceMode = null) => {
+  const handleUpdate = async () => {
     setUpdating(true);
     try {
-      await triggerPriceUpdate(complianceMode ? { complianceMode } : undefined);
+      await triggerPriceUpdate();
       window.location.reload();
     } catch (e) {
       alert('Price update failed: ' + e.message);
@@ -149,11 +149,11 @@ export default function Navbar({ user, onLogout }) {
             </Nav.Link>
           </Nav>
 
-          <div className="d-flex align-items-center gap-2 ms-auto">
+          <div className="d-flex d-md-none align-items-center gap-2 me-2">
             <PWAInstallButton />
           </div>
 
-          <Dropdown align="end" className="ms-1">
+          <Dropdown align="end" className="ms-auto">
             <Dropdown.Toggle
               as="button"
               id="profile-menu"
@@ -234,22 +234,6 @@ export default function Navbar({ user, onLogout }) {
                   >
                     <RefreshCw size={14} />
                     Update Prices
-                  </Dropdown.Item>
-                  <Dropdown.Item
-                    onClick={() => handleUpdate('incremental')}
-                    className="d-flex align-items-center gap-2"
-                    title="Run update plus incremental compliance scan over recent/dirty window"
-                  >
-                    <RefreshCw size={14} />
-                    Update + Fast Compliance (recent window)
-                  </Dropdown.Item>
-                  <Dropdown.Item
-                    onClick={() => handleUpdate('full')}
-                    className="d-flex align-items-center gap-2"
-                    title="Run update plus full historical compliance scan"
-                  >
-                    <RefreshCw size={14} />
-                    Update + Deep Compliance (full history)
                   </Dropdown.Item>
                 </>
               )}

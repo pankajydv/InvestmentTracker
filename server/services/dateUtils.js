@@ -49,6 +49,12 @@ function istDateFromUnixSeconds(seconds) {
   return formatIstDate(new Date(n * 1000));
 }
 
+function utcDateFromUnixSeconds(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n)) return null;
+  return new Date(n * 1000).toISOString().slice(0, 10);
+}
+
 function addDaysIso(isoDate, days) {
   const normalized = toIsoDate(isoDate);
   if (!normalized) return null;
@@ -77,6 +83,7 @@ module.exports = {
   formatIstDate,
   normalizeProviderDate,
   istDateFromUnixSeconds,
+  utcDateFromUnixSeconds,
   addDaysIso,
   eachDateIso,
   todayIso,

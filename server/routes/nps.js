@@ -242,6 +242,7 @@ module.exports = function (db) {
       let importedCount = 0;
       let skippedCount = 0;
       const results = [];
+      const dirtyCandidates = [];
 
       const importTxn = db.transaction(() => {
         for (const scheme of schemes) {
@@ -281,6 +282,7 @@ module.exports = function (db) {
               t.broker || '',
               notes
             );
+            dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: t.date });
             existingKeys.add(key);
             importedCount++;
             schemeImported++;
@@ -291,6 +293,10 @@ module.exports = function (db) {
       });
 
       importTxn();
+
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'nps-import', `pran:${pran}`);
+      }
 
       logAppInfo('[NPS] Import completed', {
         portfolio_id: portfolioId,

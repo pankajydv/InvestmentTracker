@@ -19,6 +19,7 @@ const {
 const {
   normalizeProviderDate,
   istDateFromUnixSeconds,
+  utcDateFromUnixSeconds,
   formatIstDate,
   addDaysIso: addDaysIsoDate,
 } = require('./dateUtils');
@@ -229,6 +230,9 @@ async function fetchStockPrice(symbol) {
           || normalizeProviderDate(quote.regularMarketTime)
           || normalizeProviderDate(quote.postMarketTime)
           || null,
+        sourceDateUtc: utcDateFromUnixSeconds(quote.regularMarketTime)
+          || utcDateFromUnixSeconds(quote.postMarketTime)
+          || null,
       };
     } catch (libErr) {
       throw new Error(`Failed to fetch price for ${symbol}: ${directErr.message}`);
@@ -280,6 +284,9 @@ function fetchStockPriceDirect(symbol) {
               previousClose: prevClose,
               officialClose,
               date: providerDate,
+              sourceDateUtc: utcDateFromUnixSeconds(meta.regularMarketTime)
+                || utcDateFromUnixSeconds(meta.currentTradingPeriod?.regular?.end)
+                || null,
             });
           } else {
             reject(new Error(`No price data for ${symbol}`));

@@ -837,7 +837,7 @@ export default function InvestmentDetail() {
               </div>
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINR(currentValue)}</div>
               <div className="text-muted small">Total Invested: {formatINR(totalInvested)}</div>
-              <div className="text-muted small">Cash Out (Realized Proceeds): {formatINR(realizedGain)}</div>
+              <div className="text-muted small">Cash Proceeds: {formatINR(realizedGain)}</div>
             </Card.Body>
           </Card>
         </Col>

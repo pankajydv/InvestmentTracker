@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { getMarketSessionDates } = require('../services/marketPriceCache');
 const { calculateIntervalXIRR } = require('../services/xirrCalculator');
+const { logAppWarn } = require('../services/appLogger');
 const {
   ACQUIRED_UNITS_INFLOW_TYPES_SQL,
   DASHBOARD_RETURNS_INVESTED_TYPES_SQL,
@@ -122,9 +123,16 @@ function isNonLocfSource(row) {
 function sessionDistance(candidateDate, targetDate, assetType) {
   if (!candidateDate || !targetDate) return Number.POSITIVE_INFINITY;
   if (candidateDate > targetDate) return Number.POSITIVE_INFINITY;
-  const sessions = getMarketSessionDates(candidateDate, targetDate, assetType);
-  if (!Array.isArray(sessions) || sessions.length === 0) return Number.POSITIVE_INFINITY;
-  return Math.max(sessions.length - 1, 0);
+
+  const start = new Date(`${candidateDate}T00:00:00.000Z`);
+  if (!Number.isFinite(start.getTime())) return Number.POSITIVE_INFINITY;
+  start.setUTCDate(start.getUTCDate() + 1);
+  const strictStart = start.toISOString().slice(0, 10);
+
+  if (strictStart > targetDate) return 0;
+  const sessions = getMarketSessionDates(strictStart, targetDate, assetType);
+  if (!Array.isArray(sessions) || sessions.length === 0) return 0;
+  return sessions.length;
 }
 
 function resolveDisplayDayChangeFromRows(rowsDesc, assetType) {
@@ -216,6 +224,65 @@ function summarizeAsOfDates(items, selector) {
   if (!unique.length) return { asOfDate: null, mixed: false };
   if (unique.length === 1) return { asOfDate: unique[0], mixed: false };
   return { asOfDate: null, mixed: true };
+}
+
+function getClockInTimeZone(timeZone, now = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(now);
+  const values = {};
+  for (const part of parts) {
+    if (!part?.type || part.type === 'literal') continue;
+    values[part.type] = part.value;
+  }
+
+  const date = `${values.year}-${values.month}-${values.day}`;
+  const hour = Number(values.hour || 0);
+  const minute = Number(values.minute || 0);
+  return {
+    date,
+    minutes: (hour * 60) + minute,
+  };
+}
+
+function isClockWithinSession(minutes, openMinutes, closeMinutes) {
+  return Number.isFinite(minutes) && minutes >= openMinutes && minutes <= closeMinutes;
+}
+
+function getDashboardMarketState(now = new Date()) {
+  const indiaClock = getClockInTimeZone('Asia/Kolkata', now);
+  const usClock = getClockInTimeZone('America/New_York', now);
+
+  const indiaSessionDay = getMarketSessionDates(indiaClock.date, indiaClock.date, 'INDIAN_STOCK').length > 0;
+  const usSessionDay = getMarketSessionDates(usClock.date, usClock.date, 'FOREIGN_STOCK').length > 0;
+
+  const indiaOpen = indiaSessionDay && isClockWithinSession(indiaClock.minutes, (9 * 60) + 15, (15 * 60) + 30);
+  const usOpen = usSessionDay && isClockWithinSession(usClock.minutes, (9 * 60) + 30, (16 * 60));
+
+  return {
+    india: {
+      timeZone: 'Asia/Kolkata',
+      sessionDate: indiaClock.date,
+      isSessionDay: indiaSessionDay,
+      isOpen: indiaOpen,
+      sessionHours: '09:15-15:30',
+    },
+    us: {
+      timeZone: 'America/New_York',
+      sessionDate: usClock.date,
+      isSessionDay: usSessionDay,
+      isOpen: usOpen,
+      sessionHours: '09:30-16:00',
+    },
+  };
 }
 
 module.exports = function (db) {
@@ -347,8 +414,10 @@ module.exports = function (db) {
         closing_value: xirrResult.closing_value,
         confidence: xirrResult.confidence,
         error: xirrResult.error,
-        from_date: intervalFromDate,
-        to_date: intervalToDate,
+        requested_from_date: xirrResult.requested_from_date || intervalFromDate,
+        requested_to_date: xirrResult.requested_to_date || intervalToDate,
+        from_date: xirrResult.from_date || intervalFromDate,
+        to_date: xirrResult.to_date || intervalToDate,
       };
     } catch (err) {
       intervalXIRR = {
@@ -364,90 +433,82 @@ module.exports = function (db) {
       };
     }
 
-    // Interval card should use aggregated day_change from portfolio_daily across (from, to].
-    if (intervalToDate) {
+    // For preset 1D, align the card to strict day_change (not value-delta interval math).
+    const isPresetOneDay = !req.query.custom_from_date && !req.query.custom_to_date && intervalParam === '1D';
+    const marketState = getDashboardMarketState(new Date());
+    let oneDayCardSource = 'not_applicable';
+    let oneDayCardSourceReason = 'interval_not_1d';
+
+    if (isPresetOneDay) {
+      const anyTrackedMarketOpen = marketState.india.isOpen || marketState.us.isOpen;
+      oneDayCardSource = anyTrackedMarketOpen ? 'top_card' : 'table_derived';
+      oneDayCardSourceReason = anyTrackedMarketOpen ? 'market_open' : 'all_markets_closed';
+    }
+
+    if (isPresetOneDay && intervalToDate) {
       if (portfolio_id) {
-        const intervalAgg = db.prepare(`
-          SELECT SUM(COALESCE(day_change, 0)) AS interval_day_change
+        const latestOneDay = db.prepare(`
+          SELECT total_value, day_change
           FROM portfolio_daily
-          WHERE portfolio_id = ? AND date > ? AND date <= ?
-        `).get(portfolio_id, intervalFromDate, intervalToDate);
-
-        const openingSnapshot = db.prepare(`
-          SELECT total_value
-          FROM portfolio_daily
-          WHERE portfolio_id = ? AND date <= ?
-          ORDER BY date DESC
+          WHERE portfolio_id = ? AND date = ?
           LIMIT 1
-        `).get(portfolio_id, intervalFromDate);
+        `).get(portfolio_id, intervalToDate);
 
-        const closingSnapshot = db.prepare(`
+        const previousOneDay = db.prepare(`
           SELECT total_value
           FROM portfolio_daily
-          WHERE portfolio_id = ? AND date <= ?
+          WHERE portfolio_id = ? AND date < ?
           ORDER BY date DESC
           LIMIT 1
         `).get(portfolio_id, intervalToDate);
 
-        const openingValue = Number(openingSnapshot?.total_value || 0);
-        const closingValue = Number(closingSnapshot?.total_value || 0);
-        const intervalChange = Number(intervalAgg?.interval_day_change || 0);
+        const prevTotal = Number(previousOneDay?.total_value || 0);
+        const dayChange = Number(latestOneDay?.day_change || 0);
+        const latestTotal = Number(latestOneDay?.total_value || 0);
 
         intervalXIRR = {
           ...intervalXIRR,
-          interval_change: intervalChange,
-          interval_change_pct: openingValue > 0 ? (intervalChange / openingValue) * 100 : 0,
-          opening_value: openingValue,
-          closing_value: closingValue,
-          from_date: intervalFromDate,
+          interval_change: dayChange,
+          interval_change_pct: prevTotal > 0 ? (dayChange / prevTotal) * 100 : 0,
+          opening_value: prevTotal,
+          closing_value: latestTotal,
+          from_date: intervalToDate,
           to_date: intervalToDate,
         };
       } else {
-        const intervalAgg = db.prepare(`
-          SELECT SUM(COALESCE(day_change, 0)) AS interval_day_change
+        const latestOneDay = db.prepare(`
+          SELECT
+            SUM(COALESCE(total_value, 0)) AS total_value,
+            SUM(COALESCE(day_change, 0)) AS day_change
           FROM portfolio_daily
-          WHERE portfolio_id IS NOT NULL AND date > ? AND date <= ?
-        `).get(intervalFromDate, intervalToDate);
+          WHERE portfolio_id IS NOT NULL AND date = ?
+        `).get(intervalToDate);
 
-        const openingDate = db.prepare(`
-          SELECT MAX(date) AS max_date
+        const previousDate = db.prepare(`
+          SELECT MAX(date) AS prev_date
           FROM portfolio_daily
-          WHERE portfolio_id IS NOT NULL AND date <= ?
-        `).get(intervalFromDate)?.max_date || null;
+          WHERE portfolio_id IS NOT NULL AND date < ?
+        `).get(intervalToDate)?.prev_date || null;
 
-        const closingDate = db.prepare(`
-          SELECT MAX(date) AS max_date
-          FROM portfolio_daily
-          WHERE portfolio_id IS NOT NULL AND date <= ?
-        `).get(intervalToDate)?.max_date || null;
-
-        const openingSnapshot = openingDate
+        const previousOneDay = previousDate
           ? db.prepare(`
               SELECT SUM(COALESCE(total_value, 0)) AS total_value
               FROM portfolio_daily
               WHERE portfolio_id IS NOT NULL AND date = ?
-            `).get(openingDate)
+            `).get(previousDate)
           : null;
 
-        const closingSnapshot = closingDate
-          ? db.prepare(`
-              SELECT SUM(COALESCE(total_value, 0)) AS total_value
-              FROM portfolio_daily
-              WHERE portfolio_id IS NOT NULL AND date = ?
-            `).get(closingDate)
-          : null;
-
-        const openingValue = Number(openingSnapshot?.total_value || 0);
-        const closingValue = Number(closingSnapshot?.total_value || 0);
-        const intervalChange = Number(intervalAgg?.interval_day_change || 0);
+        const prevTotal = Number(previousOneDay?.total_value || 0);
+        const dayChange = Number(latestOneDay?.day_change || 0);
+        const latestTotal = Number(latestOneDay?.total_value || 0);
 
         intervalXIRR = {
           ...intervalXIRR,
-          interval_change: intervalChange,
-          interval_change_pct: openingValue > 0 ? (intervalChange / openingValue) * 100 : 0,
-          opening_value: openingValue,
-          closing_value: closingValue,
-          from_date: intervalFromDate,
+          interval_change: dayChange,
+          interval_change_pct: prevTotal > 0 ? (dayChange / prevTotal) * 100 : 0,
+          opening_value: prevTotal,
+          closing_value: latestTotal,
+          from_date: intervalToDate,
           to_date: intervalToDate,
         };
       }
@@ -844,50 +905,6 @@ module.exports = function (db) {
 
     const oneDayDebugSummary = null;
 
-    const netFlowOnAnchorDate = portfolio_id
-      ? db.prepare(`
-          SELECT COALESCE(SUM(CASE
-            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
-            WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
-            ELSE 0
-          END), 0) AS net_flow
-          FROM transactions
-          WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
-        `)
-      : db.prepare(`
-          SELECT COALESCE(SUM(CASE
-            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
-            WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
-            ELSE 0
-          END), 0) AS net_flow
-          FROM transactions
-          WHERE investment_id = ? AND date(transaction_date) = ?
-        `);
-
-    const netFlowInRange = portfolio_id
-      ? db.prepare(`
-          SELECT COALESCE(SUM(CASE
-            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
-            WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
-            ELSE 0
-          END), 0) AS net_flow
-          FROM transactions
-          WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) > ? AND date(transaction_date) <= ?
-        `)
-      : db.prepare(`
-          SELECT COALESCE(SUM(CASE
-            WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-            WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
-            WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
-            ELSE 0
-          END), 0) AS net_flow
-          FROM transactions
-          WHERE investment_id = ? AND date(transaction_date) > ? AND date(transaction_date) <= ?
-        `);
-
     // Phase 3: Use pre-fetched daily values - no more per-investment queries
     for (const inv of investments) {
       // Fully sold investments should not influence current 1-day change cards,
@@ -952,14 +969,130 @@ module.exports = function (db) {
     // Prevent stale scopes (commonly fully sold investments) from polluting 1-day totals.
     // If an investment's latest row is older than the dashboard snapshot date, its day change
     // reflects a historical day and should not be included in today's summary cards.
-    if (latestSnapshotDate) {
+    if (isPresetOneDay && latestSnapshotDate) {
       for (const inv of investments) {
         if (!inv.date || inv.date >= latestSnapshotDate) continue;
+
+        const normalizedType = String(inv.asset_type || '').toUpperCase();
+        const isLaggedMarketLinked = MARKET_LINKED_DAY_CHANGE_ASSET_TYPES.has(normalizedType)
+          && sessionDistance(inv.date, latestSnapshotDate, normalizedType) <= MAX_NON_LOCF_SESSION_LAG;
+        if (isLaggedMarketLinked) continue;
+
         inv.day_change = 0;
         inv.day_change_pct = 0;
         inv.day_change_as_of_date = null;
         inv.day_change_uses_fallback = false;
       }
+    }
+
+    // Non-1D intervals: replace per-investment 1-day values with interval-scoped sums.
+    if (!isPresetOneDay && intervalFromDate && intervalToDate) {
+      const findBoundsForInvestment = portfolio_id
+        ? db.prepare(`
+            SELECT
+              MIN(date) AS chosen_from,
+              MAX(date) AS chosen_to
+            FROM daily_values
+            WHERE investment_id = ?
+              AND portfolio_id = ?
+              AND date >= ?
+              AND date <= ?
+          `)
+        : db.prepare(`
+            SELECT
+              MIN(date) AS chosen_from,
+              MAX(date) AS chosen_to
+            FROM daily_values
+            WHERE investment_id = ?
+              AND portfolio_id IS NOT NULL
+              AND date >= ?
+              AND date <= ?
+          `);
+
+      const sumIntervalDayChangeForInvestment = portfolio_id
+        ? db.prepare(`
+            SELECT COALESCE(SUM(day_change), 0) AS interval_day_change
+            FROM daily_values
+            WHERE investment_id = ?
+              AND portfolio_id = ?
+              AND date >= ?
+              AND date <= ?
+          `)
+        : db.prepare(`
+            SELECT COALESCE(SUM(day_change), 0) AS interval_day_change
+            FROM daily_values
+            WHERE investment_id = ?
+              AND portfolio_id IS NOT NULL
+              AND date >= ?
+              AND date <= ?
+          `);
+
+      const openingValueForInvestment = portfolio_id
+        ? db.prepare(`
+            SELECT COALESCE(current_value, 0) AS current_value
+            FROM daily_values
+            WHERE investment_id = ?
+              AND portfolio_id = ?
+              AND date = ?
+            LIMIT 1
+          `)
+        : db.prepare(`
+            SELECT COALESCE(SUM(current_value), 0) AS current_value
+            FROM daily_values
+            WHERE investment_id = ?
+              AND portfolio_id IS NOT NULL
+              AND date = ?
+          `);
+
+      for (const inv of investments) {
+        const bounds = portfolio_id
+          ? findBoundsForInvestment.get(inv.id, portfolio_id, intervalFromDate, intervalToDate)
+          : findBoundsForInvestment.get(inv.id, intervalFromDate, intervalToDate);
+
+        const chosenFrom = bounds?.chosen_from || null;
+        const chosenTo = bounds?.chosen_to || null;
+        if (!chosenFrom || !chosenTo || chosenFrom > chosenTo) {
+          inv.day_change = 0;
+          inv.day_change_pct = 0;
+          inv.day_change_as_of_date = null;
+          inv.day_change_uses_fallback = false;
+          inv.interval_from_date = null;
+          inv.interval_to_date = null;
+          continue;
+        }
+
+        const intervalDayChange = portfolio_id
+          ? Number(sumIntervalDayChangeForInvestment.get(inv.id, portfolio_id, chosenFrom, chosenTo)?.interval_day_change || 0)
+          : Number(sumIntervalDayChangeForInvestment.get(inv.id, chosenFrom, chosenTo)?.interval_day_change || 0);
+
+        const openingValue = portfolio_id
+          ? Number(openingValueForInvestment.get(inv.id, portfolio_id, chosenFrom)?.current_value || 0)
+          : Number(openingValueForInvestment.get(inv.id, chosenFrom)?.current_value || 0);
+
+        inv.day_change = intervalDayChange;
+        inv.day_change_pct = openingValue > 0 ? (intervalDayChange / openingValue) * 100 : 0;
+        inv.day_change_as_of_date = chosenTo;
+        inv.day_change_uses_fallback = false;
+        inv.interval_from_date = chosenFrom;
+        inv.interval_to_date = chosenTo;
+      }
+    }
+
+    if (isPresetOneDay && oneDayCardSource === 'table_derived') {
+      const tableClosingValue = investments.reduce((sum, inv) => sum + (Number(inv.current_value) || 0), 0);
+      const tableIntervalChange = investments.reduce((sum, inv) => sum + (Number(inv.day_change) || 0), 0);
+      const tableOpeningValue = tableClosingValue - tableIntervalChange;
+      const tableAsOfDate = latestSnapshotDate || intervalToDate || null;
+
+      intervalXIRR = {
+        ...intervalXIRR,
+        interval_change: tableIntervalChange,
+        interval_change_pct: tableOpeningValue > 0 ? (tableIntervalChange / tableOpeningValue) * 100 : 0,
+        opening_value: tableOpeningValue,
+        closing_value: tableClosingValue,
+        from_date: tableAsOfDate,
+        to_date: tableAsOfDate,
+      };
     }
 
     const totalsSoldFilter = hideSold && !includeSoldInReturns
@@ -1078,7 +1211,6 @@ module.exports = function (db) {
           totalProfitLoss: Number(totals?.totalProfitLoss) || 0,
           totalRealizedGain: Number(totals?.totalRealizedGain) || 0,
           dayChange: 0,
-          intervalChangeAmount: 0,
           dayChangeAsOfDate: emptyAsOfSummary.asOfDate,
           dayChangeAsOfMixed: emptyAsOfSummary.mixed,
           dayChangeFallbackCount: 0,
@@ -1095,31 +1227,174 @@ module.exports = function (db) {
       const asOfSummary = summarizeAsOfDates(info.investments, (inv) => inv.day_change_as_of_date || null);
       info.dayChangeAsOfDate = asOfSummary.asOfDate;
       info.dayChangeAsOfMixed = asOfSummary.mixed;
+      info.intervalChangePct = null;
+      info.intervalFromDate = null;
+      info.intervalToDate = null;
     }
 
-    // Interval return for Asset Allocation cards:
-    // - Preset 1D: use latest display day_change (with existing as-of fallback logic)
-    // - Other intervals: sum intermediate day_change rows in (from_date, to_date]
-    const isOneDayInterval = !req.query.custom_from_date && !req.query.custom_to_date && intervalParam === '1D';
-    for (const info of Object.values(byType)) {
-      if (isOneDayInterval) {
-        info.intervalChangeAmount = Number(info.dayChange || 0);
-        continue;
-      }
+    // Non-1D: compute asset-type interval change from asset_type_daily using strict in-range bounds.
+    if (!isPresetOneDay && intervalFromDate && intervalToDate) {
+      const findBoundsForType = portfolio_id
+        ? db.prepare(`
+            SELECT
+              MIN(date) AS chosen_from,
+              MAX(date) AS chosen_to
+            FROM asset_type_daily
+            WHERE portfolio_id = ?
+              AND asset_type = ?
+              AND date >= ?
+              AND date <= ?
+          `)
+        : db.prepare(`
+            SELECT
+              MIN(date) AS chosen_from,
+              MAX(date) AS chosen_to
+            FROM asset_type_daily
+            WHERE portfolio_id IS NOT NULL
+              AND asset_type = ?
+              AND date >= ?
+              AND date <= ?
+          `);
 
-      let intervalSum = 0;
-      for (const inv of info.investments) {
-        const dvKey = `${inv.id}_${portfolio_id || 'null'}`;
-        const rowsDesc = dvRowsByInvestment.get(dvKey) || [];
-        for (const row of rowsDesc) {
-          const rowDate = String(row.date || '');
-          if (!rowDate) continue;
-          if (rowDate > intervalFromDate && rowDate <= intervalToDate) {
-            intervalSum += Number(row.day_change) || 0;
-          }
+      const sumIntervalDayChangeForType = portfolio_id
+        ? db.prepare(`
+            SELECT COALESCE(SUM(day_change), 0) AS interval_day_change
+            FROM asset_type_daily
+            WHERE portfolio_id = ?
+              AND asset_type = ?
+              AND date >= ?
+              AND date <= ?
+          `)
+        : db.prepare(`
+            SELECT COALESCE(SUM(day_change), 0) AS interval_day_change
+            FROM asset_type_daily
+            WHERE portfolio_id IS NOT NULL
+              AND asset_type = ?
+              AND date >= ?
+              AND date <= ?
+          `);
+
+      const openingValueForType = portfolio_id
+        ? db.prepare(`
+            SELECT COALESCE(total_value, 0) AS total_value
+            FROM asset_type_daily
+            WHERE portfolio_id = ?
+              AND asset_type = ?
+              AND date = ?
+            LIMIT 1
+          `)
+        : db.prepare(`
+            SELECT COALESCE(SUM(total_value), 0) AS total_value
+            FROM asset_type_daily
+            WHERE portfolio_id IS NOT NULL
+              AND asset_type = ?
+              AND date = ?
+          `);
+
+      const closingValueForType = portfolio_id
+        ? db.prepare(`
+            SELECT COALESCE(total_value, 0) AS total_value
+            FROM asset_type_daily
+            WHERE portfolio_id = ?
+              AND asset_type = ?
+              AND date = ?
+            LIMIT 1
+          `)
+        : db.prepare(`
+            SELECT COALESCE(SUM(total_value), 0) AS total_value
+            FROM asset_type_daily
+            WHERE portfolio_id IS NOT NULL
+              AND asset_type = ?
+              AND date = ?
+          `);
+
+      const netFlowForType = portfolio_id
+        ? db.prepare(`
+            SELECT COALESCE(SUM(CASE
+              WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(t.amount, 0)
+              WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(t.amount, 0)
+              WHEN t.transaction_type = 'TDS' THEN -ABS(COALESCE(t.amount, 0))
+              ELSE 0
+            END), 0) AS net_flow
+            FROM transactions t
+            JOIN investments i ON i.id = t.investment_id
+            WHERE t.portfolio_id = ?
+              AND i.asset_type = ?
+              AND DATE(t.transaction_date) >= ?
+              AND DATE(t.transaction_date) <= ?
+          `)
+        : db.prepare(`
+            SELECT COALESCE(SUM(CASE
+              WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(t.amount, 0)
+              WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(t.amount, 0)
+              WHEN t.transaction_type = 'TDS' THEN -ABS(COALESCE(t.amount, 0))
+              ELSE 0
+            END), 0) AS net_flow
+            FROM transactions t
+            JOIN investments i ON i.id = t.investment_id
+            WHERE t.portfolio_id IS NOT NULL
+              AND i.asset_type = ?
+              AND DATE(t.transaction_date) >= ?
+              AND DATE(t.transaction_date) <= ?
+          `);
+
+      for (const [assetTypeKey, info] of Object.entries(byType)) {
+        const bounds = portfolio_id
+          ? findBoundsForType.get(portfolio_id, assetTypeKey, intervalFromDate, intervalToDate)
+          : findBoundsForType.get(assetTypeKey, intervalFromDate, intervalToDate);
+
+        const chosenFrom = bounds?.chosen_from || null;
+        const chosenTo = bounds?.chosen_to || null;
+        if (!chosenFrom || !chosenTo || chosenFrom > chosenTo) {
+          info.dayChange = 0;
+          info.intervalChangePct = 0;
+          info.intervalFromDate = null;
+          info.intervalToDate = null;
+          continue;
+        }
+
+        const intervalDayChange = portfolio_id
+          ? Number(sumIntervalDayChangeForType.get(portfolio_id, assetTypeKey, chosenFrom, chosenTo)?.interval_day_change || 0)
+          : Number(sumIntervalDayChangeForType.get(assetTypeKey, chosenFrom, chosenTo)?.interval_day_change || 0);
+
+        const openingValue = portfolio_id
+          ? Number(openingValueForType.get(portfolio_id, assetTypeKey, chosenFrom)?.total_value || 0)
+          : Number(openingValueForType.get(assetTypeKey, chosenFrom)?.total_value || 0);
+
+        const closingValue = portfolio_id
+          ? Number(closingValueForType.get(portfolio_id, assetTypeKey, chosenTo)?.total_value || 0)
+          : Number(closingValueForType.get(assetTypeKey, chosenTo)?.total_value || 0);
+
+        const netFlow = portfolio_id
+          ? Number(netFlowForType.get(portfolio_id, assetTypeKey, chosenFrom, chosenTo)?.net_flow || 0)
+          : Number(netFlowForType.get(assetTypeKey, chosenFrom, chosenTo)?.net_flow || 0);
+
+        info.dayChange = intervalDayChange;
+        info.intervalChangePct = openingValue > 0 ? (intervalDayChange / openingValue) * 100 : 0;
+        info.intervalFromDate = chosenFrom;
+        info.intervalToDate = chosenTo;
+
+        const snapshotDerivedIntervalChange = closingValue - openingValue - netFlow;
+        const deviationAbs = Math.abs(intervalDayChange - snapshotDerivedIntervalChange);
+        const deviationThreshold = Math.max(1, Math.abs(intervalDayChange) * 0.0025);
+        if (deviationAbs > deviationThreshold) {
+          logAppWarn('[Interval][AssetType] day_change and snapshot-flow interval deviation', {
+            portfolio_id: portfolio_id ? Number(portfolio_id) : null,
+            asset_type: assetTypeKey,
+            requested_from_date: intervalFromDate,
+            requested_to_date: intervalToDate,
+            chosen_from_date: chosenFrom,
+            chosen_to_date: chosenTo,
+            opening_value: openingValue,
+            closing_value: closingValue,
+            net_external_cashflows: netFlow,
+            interval_change_from_day_change: intervalDayChange,
+            interval_change_from_snapshot_flow: snapshotDerivedIntervalChange,
+            deviation_abs: deviationAbs,
+            deviation_threshold: deviationThreshold,
+          });
         }
       }
-      info.intervalChangeAmount = intervalSum;
     }
 
     const totalInvestedByScope = byTypeTotals.reduce((sum, row) => sum + (Number(row.totalInvested) || 0), 0);
@@ -1277,6 +1552,14 @@ module.exports = function (db) {
       xirr_pct: xirrPct,
     };
 
+    const intervalMeta = {
+      selectedInterval: intervalParam,
+      isPresetOneDay,
+      oneDayCardSource,
+      oneDayCardSourceReason,
+      marketState,
+    };
+
     res.json({
       portfolio: portfolioSummary,
       investments,
@@ -1287,6 +1570,7 @@ module.exports = function (db) {
       stalePricesWarning,
       xirrMode,
       intervalXIRR,
+      intervalMeta,
       lastUpdate: db.prepare("SELECT value FROM config WHERE key = 'last_price_update'").get()?.value,
     });
   });

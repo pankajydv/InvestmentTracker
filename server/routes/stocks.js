@@ -378,6 +378,7 @@ module.exports = function (db) {
       let transactionsUpdated = 0;
       let transactionsSkipped = 0;
       const errors = [];
+      const dirtyCandidates = [];
 
       // Group trades by stock for investment resolution
       const stockMap = {};
@@ -456,12 +457,17 @@ module.exports = function (db) {
                 investmentId, portfolioId, trade.type, trade.tradeDate, trade.quantity,
                 trade.rate, amount, fees, broker || 'Unknown', notes
               );
+              dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: trade.tradeDate });
               transactionsCreated++;
             }
           }
         } catch (e) {
           errors.push(`${stock.security}: ${e.message}`);
         }
+      }
+
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'contract-notes-import', `broker:${broker}`);
       }
 
       res.json({

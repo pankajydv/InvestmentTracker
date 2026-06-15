@@ -318,6 +318,8 @@ module.exports = function (db) {
         VALUES (?, ?, ?, ?, ?, NULL, NULL, 0, ?)
       `);
 
+      const dirtyCandidates = [];
+
       const importTxn = db.transaction(() => {
         let importedCount = 0;
         let skippedCount = 0;
@@ -351,6 +353,7 @@ module.exports = function (db) {
               txn.amount,
               notes
             );
+            dirtyCandidates.push({ investment_id: invId, portfolio_id: portfolioId, transaction_date: txn.date });
             exactKeys.add(exactKey);
             if (txn.type === 'EPS_CONTRIBUTION') {
               epsMonthKeys.add(makeMonthKey(txn.date, txn.type, txn.amount));
@@ -365,6 +368,10 @@ module.exports = function (db) {
       });
 
       const result = importTxn();
+
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'pf-import', `uan:${uan}`);
+      }
 
       logAppInfo('[PF] Import completed', {
         portfolio_id: portfolioId,
@@ -438,6 +445,8 @@ module.exports = function (db) {
         VALUES (?, ?, ?, ?, ?, 0, ?)
       `);
 
+      const dirtyCandidates = [];
+
       const importTxn = db.transaction(() => {
         let insertedCount = 0;
         let epsInvestmentId = null;
@@ -457,12 +466,14 @@ module.exports = function (db) {
         // Employee contribution
         if (eeAmount > 0 && type !== 'EMPLOYER_CONTRIBUTION') {
           insertTransaction.run(pfInv.id, portfolioId, 'DEPOSIT', date, eeAmount, manualMainNote);
+          dirtyCandidates.push({ investment_id: pfInv.id, portfolio_id: portfolioId, transaction_date: date });
           insertedCount++;
         }
 
         // Employer contribution
         if (erAmount > 0 && type !== 'DEPOSIT') {
           insertTransaction.run(pfInv.id, portfolioId, 'EMPLOYER_CONTRIBUTION', date, erAmount, manualMainNote);
+          dirtyCandidates.push({ investment_id: pfInv.id, portfolio_id: portfolioId, transaction_date: date });
           insertedCount++;
         }
 
@@ -473,6 +484,7 @@ module.exports = function (db) {
           if (epsToInsert > 0) {
             const epsNote = `Derived from manual EPF split: Employee PF ${Number(eeAmount || 0).toFixed(2)} - Employer EPF ${Number(erAmount || 0).toFixed(2)} = EPS ${Number(epsToInsert).toFixed(2)}. A/c: ${accountRef}, From: ${statementLabel}, Note: ${baseManualNote}`;
             insertTransaction.run(epsInvestmentId, portfolioId, 'EPS_CONTRIBUTION', date, epsToInsert, epsNote);
+            dirtyCandidates.push({ investment_id: epsInvestmentId, portfolio_id: portfolioId, transaction_date: date });
             insertedCount++;
           }
         }
@@ -481,6 +493,10 @@ module.exports = function (db) {
       });
 
       const count = importTxn();
+
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'pf-manual-add', `account:${accountRef}`);
+      }
 
       logAppInfo('[PF] Manual transaction added', {
         portfolio_id: portfolioId,

@@ -3,6 +3,7 @@ const multer = require('multer');
 const { parseCAS } = require('../services/casParser');
 const { parseCAMSCAS } = require('../services/camsCasParser');
 const { parseNSDLCAS } = require('../services/nsdlCasParser');
+const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 const { logAppInfo, logAppError } = require('../services/appLogger');
 
 const router = express.Router();
@@ -295,6 +296,7 @@ module.exports = function (db) {
       let importedCount = 0;
       let skippedCount = 0;
       const results = [];
+      const dirtyCandidates = [];
 
       const importTxn = db.transaction(() => {
         for (const scheme of schemes) {
@@ -337,6 +339,7 @@ module.exports = function (db) {
               Math.abs(t.units || 0), t.price || 0, Math.abs(t.amount || 0),
               fees, 'CAMS CAS', notes, folio
             );
+            dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: t.date });
             existingKeys.add(key); // prevent duplicates within same import
             importedCount++;
             schemeImported++;
@@ -347,6 +350,10 @@ module.exports = function (db) {
       });
 
       importTxn();
+
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'cams-cas-import', `portfolio:${portfolioId}`);
+      }
 
       logAppInfo('[CAS] CAMS import completed', {
         portfolio_id: portfolioId,
@@ -408,6 +415,7 @@ module.exports = function (db) {
 
       const today = new Date().toISOString().split('T')[0];
       const results = [];
+      const dirtyCandidates = [];
 
       const importTxn = db.transaction(() => {
         for (const h of mfHoldings) {
@@ -442,6 +450,7 @@ module.exports = function (db) {
 
           if (units > 0 && amount > 0) {
             insertTransaction.run(investmentId, portfolio_id, today, units, pricePerUnit, amount, folio);
+            dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolio_id, transaction_date: today });
           }
 
           results.push({

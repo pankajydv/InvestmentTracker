@@ -185,7 +185,6 @@ export const triggerPriceUpdate = (options) => {
     payload.assetTypes = options;
   } else if (options && typeof options === 'object') {
     if (Array.isArray(options.assetTypes)) payload.assetTypes = options.assetTypes;
-    if (options.complianceMode) payload.compliance_mode = String(options.complianceMode);
   }
 
   return fetchJSON('/utils/update-prices', {
