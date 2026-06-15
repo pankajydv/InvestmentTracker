@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button, Dropdown, Modal, Form, Alert } from 'react-bootstrap';
 import { BarChart3, PlusCircle, TrendingUp, List, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing } from 'lucide-react';
 import { HolidaysListModal, HolidaysSyncModal } from './HolidaysMenuItems';
+import { PWAInstallButton } from './PWAInstallButton';
 import { triggerPriceUpdate, cancelPriceUpdate, exportData, getCorporateActionSuggestionCount } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 import { useAppSettings } from '../context/AppSettingsContext';
@@ -148,7 +149,11 @@ export default function Navbar({ user, onLogout }) {
             </Nav.Link>
           </Nav>
 
-          <Dropdown align="end" className="ms-auto ms-1">
+          <div className="d-flex align-items-center gap-2 ms-auto">
+            <PWAInstallButton />
+          </div>
+
+          <Dropdown align="end" className="ms-1">
             <Dropdown.Toggle
               as="button"
               id="profile-menu"

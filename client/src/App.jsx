@@ -7,6 +7,7 @@ import Navbar from './components/Navbar';
 import Login from './components/Login';
 import Dashboard from './components/Dashboard';
 import BackToTopButton from './components/BackToTopButton';
+import { useServiceWorker } from './hooks/useServiceWorker';
 import { getAuthConfig, getCurrentUser, loginWithGoogle, logout } from './services/api';
 
 const Investments = lazy(() => import('./components/Investments'));
@@ -39,6 +40,9 @@ export default function App() {
   const [authDisabled, setAuthDisabled] = useState(false);
   const [googleClientId, setGoogleClientId] = useState('');
   const [loginError, setLoginError] = useState('');
+
+  // Register service worker for PWA support
+  useServiceWorker();
 
   useEffect(() => {
     let mounted = true;

@@ -12,4 +12,16 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Ensure service worker is in root of dist
+        manualChunks: (id) => {
+          if (id.includes('serviceWorker')) {
+            return false; // Don't chunk service worker
+          }
+        },
+      },
+    },
+  },
 });
