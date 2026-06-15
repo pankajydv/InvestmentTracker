@@ -25,11 +25,21 @@ const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const DASHBOARD_CACHE_TTL_MS = 2 * 60 * 1000;
 const dashboardSummaryCache = new Map();
 
-function getDashboardCacheKey({ targetPortfolioId, hideSold, includeFullySoldInReturns }) {
+function getDashboardCacheKey({
+  targetPortfolioId,
+  hideSold,
+  includeFullySoldInReturns,
+  interval,
+  customFromDate,
+  customToDate,
+}) {
   return JSON.stringify({
     targetPortfolioId: targetPortfolioId ?? null,
     hideSold: !!hideSold,
     includeFullySoldInReturns: !!includeFullySoldInReturns,
+    interval: interval || '1D',
+    customFromDate: customFromDate || null,
+    customToDate: customToDate || null,
   });
 }
 
@@ -110,6 +120,7 @@ function combineDashboardSummaries(results, selectedIds) {
           totalProfitLoss: 0,
           totalRealizedGain: 0,
           xirrPct: null,
+          intervalChangeAmount: 0,
         };
       }
       byTypeTotals[type].totalValue += Number(info.totalValue) || 0;
@@ -117,6 +128,7 @@ function combineDashboardSummaries(results, selectedIds) {
       byTypeTotals[type].totalProfitLoss += Number(info.totalProfitLoss) || 0;
       byTypeTotals[type].totalRealizedGain += Number(info.totalRealizedGain) || 0;
       byTypeTotals[type].xirrPct = info.xirrPct ?? byTypeTotals[type].xirrPct;
+      byTypeTotals[type].intervalChangeAmount += Number(info.intervalChangeAmount) || 0;
     }
 
     for (const inv of result?.investments || []) {
@@ -200,6 +212,7 @@ function combineDashboardSummaries(results, selectedIds) {
         totalRealizedGain: 0,
         xirrPct: null,
         dayChange: 0,
+        intervalChangeAmount: 0,
         dayChangeAsOfDate: null,
         dayChangeAsOfMixed: false,
         dayChangeFallbackCount: 0,
@@ -214,6 +227,7 @@ function combineDashboardSummaries(results, selectedIds) {
       byType[inv.asset_type].totalProfitLoss = Number(totals.totalProfitLoss) || 0;
       byType[inv.asset_type].totalRealizedGain = Number(totals.totalRealizedGain) || 0;
       byType[inv.asset_type].xirrPct = totals.xirrPct ?? null;
+      byType[inv.asset_type].intervalChangeAmount = Number(totals.intervalChangeAmount) || 0;
     } else {
       byType[inv.asset_type].totalValue += Number(inv.current_value) || 0;
       byType[inv.asset_type].totalInvested += Number(inv.invested_amount) || 0;
@@ -448,7 +462,16 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadData();
-  }, [selectedId, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading]);
+  }, [
+    selectedId,
+    selectedIdsKey,
+    hideSold,
+    includeFullySoldInReturns,
+    settingsLoading,
+    selectedInterval,
+    customFromDate,
+    customToDate,
+  ]);
 
   useEffect(() => {
     if (settingsLoading) return undefined;
@@ -507,6 +530,9 @@ export default function Dashboard() {
       targetPortfolioId,
       hideSold,
       includeFullySoldInReturns,
+      interval: selectedInterval,
+      customFromDate,
+      customToDate,
     });
     const cachedSummary = getCachedDashboardSummary(cacheKey);
 
@@ -676,7 +702,6 @@ export default function Dashboard() {
     { key: 'name', label: 'Name', subLabel: 'Folios / Identifier' },
     { key: 'price', label: 'Last Price', subLabel: 'Avg Cost / Unit', end: true },
     { key: 'dayChange', label: '1 Day Change', subLabel: '% Change', end: true },
-    { key: 'totalCost', label: 'Net Invested', subLabel: 'Total Cost', end: true },
     { key: 'currentValue', label: 'Current Value', subLabel: 'Units Held', end: true },
     { key: 'portfolioPct', label: '% Portfolio', subLabel: '% within Type', end: true },
     { key: 'totalReturn', label: 'Total P&L', subLabel: 'Absolute | XIRR P&L%', end: true },
@@ -689,13 +714,14 @@ export default function Dashboard() {
       return {
         ...col,
         label: 'Interest Rate',
-        subLabel: 'As Of Date',
+        subLabel: 'Rate / Yield',
       };
     });
   };
 
-  const tableColumnWidths = ['30%', '11.5%', '11.5%', '11.5%', '11.5%', '9%', '15%'];
-  const tableColumnWidthsWithAsOfDate = ['26%', '10%', '10.5%', '10.5%', '10.5%', '10.5%', '9%', '13%'];
+  const tableColumnWidths = ['36%', '13%', '13%', '13%', '10%', '15%'];
+  const tableColumnWidthsWithAsOfDate = ['31%', '10%', '12%', '12%', '12%', '9%', '14%'];
+  const mobileOptionalColumnKeys = new Set(['price', 'currentValue', 'portfolioPct']);
 
   const handleAllocationClick = (event, type) => {
     event.preventDefault();
@@ -938,12 +964,13 @@ export default function Dashboard() {
               <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
                 {formatINR(data?.intervalXIRR?.interval_change || 0)}
               </div>
-              <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
-                Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
-              </div>
-              {data?.intervalXIRR?.xirr_pct != null && (
-                <div className={`small ${profitColor(data.intervalXIRR.xirr_pct)}`}>
-                  Annualized (XIRR): {formatPct(data.intervalXIRR.xirr_pct)}
+              {selectedInterval === '1D' ? (
+                <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
+                  Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
+                </div>
+              ) : (
+                <div className={`small ${profitColor(data?.intervalXIRR?.xirr_pct)}`}>
+                  Annualized (XIRR): {data?.intervalXIRR?.xirr_pct == null ? 'N/A' : formatPct(data.intervalXIRR.xirr_pct)}
                 </div>
               )}
               {data?.intervalXIRR?.confidence === 'error' && (
@@ -977,29 +1004,63 @@ export default function Dashboard() {
       <Card className="shadow-sm mb-4">
         <Card.Body>
           <h2 className="h6 fw-semibold mb-3">Asset Allocation</h2>
-          <Row className="g-3">
-            {sortedAssetEntries.map(([type, info]) => (
-              <Col xs={6} md key={type}>
-                <div
-                  className="rounded p-3 border"
-                  style={{ borderLeftColor: ASSET_TYPE_COLORS[type], borderLeftWidth: '4px', borderLeftStyle: 'solid' }}
-                >
-                  <a
-                    href={`#section-${type}`}
-                    className="text-decoration-underline fw-semibold"
-                    style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}
-                    onClick={(event) => handleAllocationClick(event, type)}
-                    title={ASSET_TYPE_FULL_NAMES[type]}
+          <Row className="g-4">
+            {sortedAssetEntries.map(([type, info]) => {
+              const dayChangeDenominator = Number(info.totalValue || 0) - Number(info.dayChange || 0);
+              const dayChangePct = dayChangeDenominator > 0
+                ? (Number(info.dayChange || 0) / dayChangeDenominator) * 100
+                : 0;
+              const isOneDay = selectedInterval === '1D';
+              const intervalLabel = selectedInterval === 'CUSTOM'
+                ? 'Custom Return'
+                : isOneDay
+                  ? 'Today'
+                  : `${selectedInterval} Return`;
+              const intervalAmount = isOneDay
+                ? Number(info.dayChange || 0)
+                : Number(
+                  info.intervalChangeAmount
+                  ?? info.intervalChange
+                  ?? info.interval_change
+                  ?? 0
+                );
+
+              return (
+                <Col xs={6} md={4} lg={3} xxl={2} key={type}>
+                  <div
+                    className="rounded p-4 border asset-allocation-card"
+                    style={{ borderLeftColor: ASSET_TYPE_COLORS[type], borderLeftWidth: '4px', borderLeftStyle: 'solid' }}
                   >
-                    {ASSET_TYPE_LABELS[type]} ↓
-                  </a>
-                  <div className="fw-semibold text-nowrap" style={{ fontSize: '1.05rem' }}>{formatINR(info.totalValue)}</div>
-                  <div className={profitColor(info.totalProfitLoss)} style={{ fontSize: '0.75rem' }}>
-                    {info.totalProfitLoss >= 0 ? '+' : ''}{formatINR(info.totalProfitLoss)}
+                    <a
+                      href={`#section-${type}`}
+                      className="text-decoration-underline fw-semibold"
+                      style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}
+                      onClick={(event) => handleAllocationClick(event, type)}
+                      title={ASSET_TYPE_FULL_NAMES[type]}
+                    >
+                      {ASSET_TYPE_LABELS[type]} ↓
+                    </a>
+                    <div className="fw-semibold text-nowrap" style={{ fontSize: '1.05rem' }}>{formatINR(info.totalValue)}</div>
+                    <div className={`small ${profitColor(info.totalProfitLoss)}`} style={{ fontSize: '0.75rem' }}>
+                      Lifetime: {info.totalProfitLoss >= 0 ? '+' : ''}{formatINR(info.totalProfitLoss)}
+                    </div>
+                    <div className={`small ${profitColor(info.xirrPct)}`} style={{ fontSize: '0.7rem' }}>
+                      XIRR: {info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}
+                    </div>
+                    <div className={`small ${profitColor(intervalAmount)}`} style={{ fontSize: '0.7rem' }}>
+                      {intervalLabel}: {intervalAmount >= 0 ? '+' : ''}{formatINR(intervalAmount)}
+                    </div>
+                    <div className="small" style={{ fontSize: '0.7rem' }}>
+                      {isOneDay ? (
+                        <span className={profitColor(dayChangePct)}>Change: {formatPct(dayChangePct)}</span>
+                      ) : (
+                        <span className={profitColor(info.xirrPct)}>Change: {info.xirrPct == null ? 'N/A' : `${formatPct(info.xirrPct)} p.a.`}</span>
+                      )}
+                    </div>
                   </div>
-                </div>
-              </Col>
-            ))}
+                </Col>
+              );
+            })}
           </Row>
         </Card.Body>
       </Card>
@@ -1045,7 +1106,6 @@ export default function Dashboard() {
         const totalAbsPct = Number(info.totalInvested || 0) > 0
           ? (Number(info.totalProfitLoss || 0) / Number(info.totalInvested || 0)) * 100
           : 0;
-        const totalCurrentInvested = (Number(info.totalInvested) || 0) - (Number(info.totalRealizedGain) || 0);
         const showAsOfDateColumn = info.investments.some((inv) => !!inv.day_change_uses_fallback);
         const sortColumns = getSortColumnsForType(type);
         const tableColumns = showAsOfDateColumn
@@ -1072,8 +1132,12 @@ export default function Dashboard() {
           <div className="responsive-table">
             <Table hover size="sm" className="mb-0 small holdings-table" style={{ tableLayout: 'fixed' }}>
               <colgroup>
-                {columnWidths.map((width, idx) => (
-                  <col key={`${type}-col-${idx}`} style={{ width }} />
+                {tableColumns.map((col, idx) => (
+                  <col
+                    key={`${type}-col-${col.key}-${idx}`}
+                    className={mobileOptionalColumnKeys.has(col.key) ? 'holdings-col-optional' : ''}
+                    style={{ width: columnWidths[idx] }}
+                  />
                 ))}
               </colgroup>
               <thead className="table-light">
@@ -1084,7 +1148,7 @@ export default function Dashboard() {
                     return (
                       <th
                         key={col.key}
-                        className={`px-3${col.end ? ' text-end' : ''}`}
+                        className={`px-3${col.end ? ' text-end' : ''}${mobileOptionalColumnKeys.has(col.key) ? ' holdings-col-optional' : ''}`}
                         style={{ cursor: isSortable ? 'pointer' : 'default', userSelect: 'none' }}
                         onClick={isSortable ? () => handleSort(type, col.key) : undefined}
                       >
@@ -1127,7 +1191,7 @@ export default function Dashboard() {
                           : '-'}
                       </td>
                     ) : null}
-                    <td className="px-3 text-end">
+                    <td className="px-3 text-end holdings-col-optional">
                       {(() => {
                         const acquiredUnits = Number(inv.acquired_units) || 0;
                         const avgCostText = acquiredUnits > 0.0001
@@ -1153,19 +1217,13 @@ export default function Dashboard() {
                       <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>
                       <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>{formatPct(inv.day_change_pct)}</div>
                     </td>
-                    <td className="px-3 text-end">
-                      <div className="fw-medium">{formatNumber((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
-                      <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {formatNumber(inv.invested_amount, 0)}
-                      </div>
-                    </td>
-                    <td className="px-3 text-end">
+                    <td className="px-3 text-end holdings-col-optional">
                       <div className="fw-medium">{formatNumber(inv.current_value, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                         {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
                       </div>
                     </td>
-                    <td className="px-3 text-end">
+                    <td className="px-3 text-end holdings-col-optional">
                       <div className="fw-medium">{(inv.portfolio_pct || 0).toFixed(2)}%</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                         {info.totalValue > 0 ? (((inv.current_value || 0) / info.totalValue) * 100).toFixed(2) : '0.00'}%
@@ -1193,7 +1251,7 @@ export default function Dashboard() {
                         : '-'}
                     </td>
                   ) : null}
-                  <td className="px-3 text-end">
+                  <td className="px-3 text-end holdings-col-optional">
                     {INTEREST_RATE_ASSET_TYPES.has(type) ? (
                       <>
                         <div className="fw-medium">-</div>
@@ -1218,19 +1276,13 @@ export default function Dashboard() {
                     <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
                     <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>{formatPct(totalDayChangePct)}</div>
                   </td>
-                  <td className="px-3 text-end">
-                    <div className="fw-medium">{formatNumber(totalCurrentInvested, 0)}</div>
-                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                      {formatNumber(info.totalInvested, 0)}
-                    </div>
-                  </td>
-                  <td className="px-3 text-end">
+                  <td className="px-3 text-end holdings-col-optional">
                     <div className="fw-medium">{formatNumber(info.totalValue, 0)}</div>
                     <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                       {totalUnits > 0.0001 ? `${formatNumber(totalUnits, 4)} Units` : ''}
                     </div>
                   </td>
-                  <td className="px-3 text-end">
+                  <td className="px-3 text-end holdings-col-optional">
                     <div className="fw-medium">
                       {portfolio.total_value > 0 ? ((info.totalValue / portfolio.total_value) * 100).toFixed(2) : '0.00'}%
                     </div>

@@ -40,6 +40,12 @@ body {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
   }
+
+  .holdings-table col.holdings-col-optional,
+  .holdings-table th.holdings-col-optional,
+  .holdings-table td.holdings-col-optional {
+    display: none;
+  }
 }
 
 /* Row actions: hidden by default, visible on hover */
@@ -70,6 +76,16 @@ tr:hover .row-actions {
 .holdings-table td {
   padding-left: 0.4rem !important;
   padding-right: 0.4rem !important;
+}
+
+.asset-allocation-card {
+  min-height: 168px;
+}
+
+.asset-allocation-card .fw-semibold.text-nowrap {
+  font-size: 1.2rem !important;
+  line-height: 1.2;
+  margin-top: 0.3rem;
 }
 
 /* Type badge colors */

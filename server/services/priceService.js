@@ -205,7 +205,7 @@ async function getYahooFinance() {
  * Fetch current stock price using Yahoo Finance v8 API (direct HTTP, no crumb needed).
  * Falls back to yahoo-finance2 library if direct approach fails.
  * @param {string} symbol - Ticker symbol (e.g., 'RELIANCE.NS' for NSE, 'AAPL' for US)
- * @returns {Promise<{price: number, currency: string, name: string, change: number, changePercent: number}>}
+ * @returns {Promise<{price: number, currency: string, name: string, change: number, changePercent: number, officialClose?: number|null}>}
  */
 async function fetchStockPrice(symbol) {
   // Try direct Yahoo Finance API first (more reliable, no crumb needed)
@@ -223,6 +223,7 @@ async function fetchStockPrice(symbol) {
         change: quote.regularMarketChange || 0,
         changePercent: quote.regularMarketChangePercent || 0,
         previousClose: quote.regularMarketPreviousClose,
+        officialClose: null,
         date: istDateFromUnixSeconds(quote.regularMarketTime)
           || istDateFromUnixSeconds(quote.postMarketTime)
           || normalizeProviderDate(quote.regularMarketTime)
@@ -247,7 +248,8 @@ function fetchStockPriceDirect(symbol) {
       res.on('end', () => {
         try {
           const json = JSON.parse(data);
-          const meta = json.chart?.result?.[0]?.meta;
+          const result = json.chart?.result?.[0];
+          const meta = result?.meta;
           if (meta && meta.regularMarketPrice) {
             const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
             const change = meta.regularMarketPrice - prevClose;
@@ -255,6 +257,20 @@ function fetchStockPriceDirect(symbol) {
             const providerDate = istDateFromUnixSeconds(meta.regularMarketTime)
               || istDateFromUnixSeconds(meta.currentTradingPeriod?.regular?.end)
               || null;
+            let officialClose = null;
+            const timestamps = Array.isArray(result?.timestamp) ? result.timestamp : [];
+            const closes = Array.isArray(result?.indicators?.quote?.[0]?.close)
+              ? result.indicators.quote[0].close
+              : [];
+            const points = Math.min(timestamps.length, closes.length);
+            for (let i = 0; i < points; i += 1) {
+              const pointDate = istDateFromUnixSeconds(timestamps[i]);
+              if (pointDate !== providerDate) continue;
+
+              const close = Number(closes[i]);
+              if (!Number.isFinite(close) || close <= 0) continue;
+              officialClose = close;
+            }
             resolve({
               price: meta.regularMarketPrice,
               currency: meta.currency || 'INR',
@@ -262,6 +278,7 @@ function fetchStockPriceDirect(symbol) {
               change: Math.round(change * 100) / 100,
               changePercent: Math.round(changePct * 100) / 100,
               previousClose: prevClose,
+              officialClose,
               date: providerDate,
             });
           } else {

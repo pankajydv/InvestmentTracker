@@ -666,11 +666,41 @@ async function updateAllPrices(db, options = {}) {
             investmentId: inv.id,
             investmentName: inv.name,
           });
-          pricePerUnit = stockData.price;
+          providerDateForWriteback = sourceDecision.providerDate;
+          const staleProviderDate = sourceDecision.providerDate && sourceDecision.providerDate < today;
+          if (staleProviderDate) {
+            const officialClose = Number(stockData.officialClose);
+            if (Number.isFinite(officialClose) && officialClose > 0) {
+              pricePerUnit = officialClose;
+            } else {
+              const carriedForward = db.prepare(`
+                SELECT price_per_unit
+                FROM daily_values
+                WHERE investment_id = ?
+                  AND date <= ?
+                ORDER BY date DESC
+                LIMIT 1
+              `).get(inv.id, sourceDecision.providerDate);
+              if (Number(carriedForward?.price_per_unit) > 0) {
+                pricePerUnit = Number(carriedForward.price_per_unit);
+              } else {
+                pricePerUnit = stockData.price;
+              }
+              logAppWarn('[UpdatePrices][INDIAN_STOCK] Missing provider-date official close; falling back to carry-forward/quote price', {
+                investmentId: inv.id,
+                investmentName: inv.name,
+                runDate: today,
+                providerDate: sourceDecision.providerDate,
+                fallbackPrice: pricePerUnit,
+              });
+            }
+          } else {
+            pricePerUnit = stockData.price;
+          }
           apiChange = stockData.change;
           apiChangePct = stockData.changePercent;
           priceSource = sourceDecision.priceSource;
-          console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
+          console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, effectivePrice=${pricePerUnit}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
           break;
         }
         case 'FOREIGN_STOCK': {
@@ -823,18 +853,21 @@ async function updateAllPrices(db, options = {}) {
 
       let providerDateRowsWritten = 0;
       if (
-        inv.asset_type === 'FOREIGN_STOCK'
+        (inv.asset_type === 'FOREIGN_STOCK' || inv.asset_type === 'INDIAN_STOCK')
         && providerDateForWriteback
         && providerDateForWriteback < today
         && /^\d{4}-\d{2}-\d{2}$/.test(providerDateForWriteback)
       ) {
-        const providerFx = await getFxRateForDate(providerDateForWriteback);
+        const providerFx = inv.asset_type === 'FOREIGN_STOCK'
+          ? await getFxRateForDate(providerDateForWriteback)
+          : usdToInr;
         providerDateRowsWritten = writeInvestmentSnapshotForDate(inv, providerDateForWriteback, pricePerUnit, 'LIVE', providerFx);
         if (providerDateRowsWritten > 0) {
           touchedDates.add(providerDateForWriteback);
-          logAppInfo('[UpdatePrices] Foreign provider-date snapshot refreshed', {
+          logAppInfo('[UpdatePrices] Provider-date snapshot refreshed', {
             investmentId: inv.id,
             investmentName: inv.name,
+            assetType: inv.asset_type,
             providerDate: providerDateForWriteback,
             runDate: today,
             rowsWritten: providerDateRowsWritten,

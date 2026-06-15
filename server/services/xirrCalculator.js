@@ -38,45 +38,61 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
       fromDate = toDate;
     }
 
-    // Get opening value (from_date)
-    let openingQuery = `
-      SELECT SUM(COALESCE(total_value, 0)) AS total_value
-      FROM portfolio_daily
-      WHERE date = ? AND portfolio_id IS NOT NULL
-    `;
-    let openingParams = [fromDate];
+    // Get opening/closing values using latest available rollup snapshots <= boundary dates.
+    let openingValue = 0;
+    let closingValue = 0;
 
     if (portfolioId) {
-      openingQuery = `
+      const opening = db.prepare(`
         SELECT total_value
         FROM portfolio_daily
-        WHERE portfolio_id = ? AND date = ?
-      `;
-      openingParams = [portfolioId, fromDate];
-    }
+        WHERE portfolio_id = ? AND date <= ?
+        ORDER BY date DESC
+        LIMIT 1
+      `).get(portfolioId, fromDate);
 
-    const opening = db.prepare(openingQuery).get(...openingParams);
-    const openingValue = Number(opening?.total_value || 0);
-
-    // Get closing value (last day of interval)
-    let closingQuery = `
-      SELECT SUM(COALESCE(total_value, 0)) AS total_value
-      FROM portfolio_daily
-      WHERE date = ? AND portfolio_id IS NOT NULL
-    `;
-    let closingParams = [toDate];
-
-    if (portfolioId) {
-      closingQuery = `
+      const closing = db.prepare(`
         SELECT total_value
         FROM portfolio_daily
-        WHERE portfolio_id = ? AND date = ?
-      `;
-      closingParams = [portfolioId, toDate];
-    }
+        WHERE portfolio_id = ? AND date <= ?
+        ORDER BY date DESC
+        LIMIT 1
+      `).get(portfolioId, toDate);
 
-    const closing = db.prepare(closingQuery).get(...closingParams);
-    const closingValue = Number(closing?.total_value || 0);
+      openingValue = Number(opening?.total_value || 0);
+      closingValue = Number(closing?.total_value || 0);
+    } else {
+      const openingDate = db.prepare(`
+        SELECT MAX(date) AS max_date
+        FROM portfolio_daily
+        WHERE portfolio_id IS NOT NULL AND date <= ?
+      `).get(fromDate)?.max_date || null;
+
+      const closingDate = db.prepare(`
+        SELECT MAX(date) AS max_date
+        FROM portfolio_daily
+        WHERE portfolio_id IS NOT NULL AND date <= ?
+      `).get(toDate)?.max_date || null;
+
+      const opening = openingDate
+        ? db.prepare(`
+            SELECT SUM(COALESCE(total_value, 0)) AS total_value
+            FROM portfolio_daily
+            WHERE portfolio_id IS NOT NULL AND date = ?
+          `).get(openingDate)
+        : null;
+
+      const closing = closingDate
+        ? db.prepare(`
+            SELECT SUM(COALESCE(total_value, 0)) AS total_value
+            FROM portfolio_daily
+            WHERE portfolio_id IS NOT NULL AND date = ?
+          `).get(closingDate)
+        : null;
+
+      openingValue = Number(opening?.total_value || 0);
+      closingValue = Number(closing?.total_value || 0);
+    }
 
     // Get all transactions in interval (from_date to to_date, inclusive)
     let txnQuery = `

@@ -1294,11 +1294,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
 
   const latestTxnDate = txRows.length ? txRows[txRows.length - 1].tx_date : null;
 
-  // Only delete portfolio-scoped rows
-  const deleteSql = 'DELETE FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date >= ? AND date <= ?';
-  const deleteParams = [inv.id, portfolioId, fromDate, toDate];
-  const deleteResult = db.prepare(deleteSql).run(...deleteParams);
-  const deletedRows = Number(deleteResult?.changes || 0);
+  // Keep rebuild non-destructive so day continuity is preserved across weekends/holidays.
+  // Rows are refreshed via UPSERT as each date is recomputed.
 
   const unitInflowTypes = new Set([
     'BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN',
@@ -1435,11 +1432,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       continue;
     }
 
-    // Align with scheduler session-only policy for market-linked assets.
-    // INDIAN_* uses India holidays+weekends from DB; FOREIGN_STOCK skips weekends only.
-    if (isMarketLinkedAsset && !isMarketSessionDate(date, db, cache, inv.asset_type)) {
-      continue;
-    }
+    // For market-linked assets, closed-market days are retained as LOCF rows
+    // by price resolution fallback paths in getPriceForDate().
 
     let price = 0;
     let priceSource = 'COMPUTED';
@@ -1605,7 +1599,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     ).run(inv.id);
   }
 
-  return written + deletedRows;
+  return written;
 }
 
 function holdingUnitsAtDate(db, investmentId, portfolioId, date, excludeSameDayTrading = false, excludeSameDayCorporateUnitAdds = false) {
