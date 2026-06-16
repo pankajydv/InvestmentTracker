@@ -1044,7 +1044,8 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
 
     const nearest = nearestOnOrBefore(series, date);
     if (nearest != null) {
-      return { price: Number(nearest), source: 'LOCF' };
+      const nearestDate = Array.from(series.keys()).filter(k => k <= date).sort().pop() || date;
+      return { price: Number(nearest), source: 'LOCF', effective_date: nearestDate };
     }
 
     // Fallback 1: nearest investment-level cache entry when in-memory range is sparse.
@@ -1480,24 +1481,28 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
         );
       }
     } else if (inv.asset_type === 'FOREIGN_STOCK') {
-      const fxKey = date;
+      // Session-aligned FX: use the stock's effective date (not the loop date) to pick FX rate.
+      // When stock is LOCF (no new quote on 'date'), its effective date is the last session with a LIVE price.
+      // This ensures day_change = 0 on LOCF days (no value change when no new price arrived).
+      const stockEffectiveDate = (priceSource === 'LOCF' && priced.effective_date) ? priced.effective_date : date;
+      const fxKey = stockEffectiveDate;
       // In-memory FX map is a DB-hydrated fast-path; fallback to DB cache when missing.
       let fxRate = cache.fx.get(fxKey);
       if (!(fxRate != null && Number.isFinite(Number(fxRate)) && Number(fxRate) > 0)) {
-        fxRate = getLocalFxRateOnOrBefore(date);
+        fxRate = getLocalFxRateOnOrBefore(stockEffectiveDate);
       }
       if (!(fxRate != null && Number.isFinite(Number(fxRate)) && Number(fxRate) > 0)) {
         if (isPhase3ProviderBlocked(cache, date)) {
           warnPhase3ProviderViolation(
             cache,
-            `fx-history:${date}`,
-            `[Backfill][Phase-3] Provider fetch blocked for USDINR=X ${date}; using local cache only`,
+            `fx-history:${stockEffectiveDate}`,
+            `[Backfill][Phase-3] Provider fetch blocked for USDINR=X ${stockEffectiveDate}; using local cache only`,
             { investmentId: inv.id, portfolioId, date }
           );
           fxRate = 0;
         } else {
-          fxRate = await fetchHistoricalUSDToINR(date).catch((err) => {
-            logBackfillError(`[Backfill][FX] USDINR history fetch failed for ${date}: ${err?.message || err}`);
+          fxRate = await fetchHistoricalUSDToINR(stockEffectiveDate).catch((err) => {
+            logBackfillError(`[Backfill][FX] USDINR history fetch failed for ${stockEffectiveDate}: ${err?.message || err}`);
             return 0;
           });
         }

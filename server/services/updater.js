@@ -8,6 +8,7 @@ const {
   fetchStockPrice,
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
+  fetchHistoricalUSDToINRAndEffectiveDate,
   toNSETicker,
   resolveAmfiCodeByISIN,
   fetchSGBPrice,
@@ -205,6 +206,9 @@ async function updateAllPrices(db, options = {}) {
   const typeFilter = options.assetTypes;
   const sessionOnlyForMarketLinked = options.sessionOnlyForMarketLinked === true;
   const reuseLiveTodayAssetTypes = new Set(Array.isArray(options.reuseLiveTodayAssetTypes) ? options.reuseLiveTodayAssetTypes : []);
+  const reuseLiveDateByAssetType = (options.reuseLiveDateByAssetType && typeof options.reuseLiveDateByAssetType === 'object')
+    ? options.reuseLiveDateByAssetType
+    : {};
   const runTag = String(options.runTag || '').trim() || null;
   const label = typeFilter ? typeFilter.join(', ') : 'ALL';
   const runStartedAt = Date.now();
@@ -220,8 +224,8 @@ async function updateAllPrices(db, options = {}) {
   investments = investments.filter(i => i.exclude_from_tracking !== 1);
 
   // Skip fully-sold investments (net units <= 0). Only provident/small-savings
-  // products are balance-based and should always be included.
-  const BALANCE_BASED_TYPES = new Set(['PPF', 'SSY', 'PF']);
+  // products and bonds are balance/accrual-based and should always be included.
+  const BALANCE_BASED_TYPES = new Set(['PPF', 'SSY', 'PF', 'BOND']);
   const openInvestmentIds = new Set(
     db.prepare(`
       SELECT investment_id FROM transactions
@@ -293,11 +297,14 @@ async function updateAllPrices(db, options = {}) {
 
   // Fetch USD/INR rate for foreign stocks and persist per-day FX cache when needed.
   let usdToInr = parseFloat(db.prepare("SELECT value FROM config WHERE key = 'usd_to_inr'").get()?.value || '83.5');
+  let usdToInrEffectiveDate = today; // Tracks the market session date of the FX rate
   if (hasForeignInScope) {
     try {
-      usdToInr = await fetchHistoricalUSDToINR(today);
+      const fxResult = await fetchHistoricalUSDToINRAndEffectiveDate(today);
+      usdToInr = fxResult.rate;
+      usdToInrEffectiveDate = fxResult.effective_date || today;
       db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'usd_to_inr'").run(String(usdToInr));
-      logAppInfo('[UpdatePrices] USD/INR rate refreshed', { usdToInr, source: 'historical_fx_cache' });
+      logAppInfo('[UpdatePrices] USD/INR rate refreshed', { usdToInr, usdToInrEffectiveDate, source: 'historical_fx_cache' });
     } catch (e) {
       console.warn('Could not update USD/INR historical rate, trying live rate. Using cached value if needed:', usdToInr);
       logAppError('[UpdatePrices] USD/INR historical refresh failed', { error: e.message, usdToInr });
@@ -423,6 +430,8 @@ async function updateAllPrices(db, options = {}) {
   const isMarketSessionToday = isMarketSessionDate(today, db, marketHolidayCache);
   const touchedDates = new Set([today]);
   const fxRateByDate = new Map([[today, usdToInr]]);
+  // Track effective (market session) dates for FX rates to enable session-aligned valuation
+  const fxEffectiveDateByDate = new Map([[today, usdToInrEffectiveDate]]);
 
   logAppInfo('[UpdatePrices] Run context', {
     date: today,
@@ -443,12 +452,20 @@ async function updateAllPrices(db, options = {}) {
     LIMIT 1
   `);
 
+  function resolveReuseLiveDate(assetType) {
+    const key = String(assetType || '').toUpperCase();
+    const candidate = String(reuseLiveDateByAssetType[key] || '').trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(candidate)) return candidate;
+    return today;
+  }
+
   async function getFxRateForDate(date) {
     if (fxRateByDate.has(date)) return fxRateByDate.get(date);
     try {
-      const fx = await fetchHistoricalUSDToINR(date);
-      fxRateByDate.set(date, fx);
-      return fx;
+      const fxResult = await fetchHistoricalUSDToINRAndEffectiveDate(date);
+      fxRateByDate.set(date, fxResult.rate);
+      fxEffectiveDateByDate.set(date, fxResult.effective_date || date);
+      return fxResult.rate;
     } catch (e) {
       logAppWarn('[UpdatePrices] FX lookup fallback used for foreign snapshot backfill', {
         date,
@@ -457,6 +474,7 @@ async function updateAllPrices(db, options = {}) {
         fallbackFx: usdToInr,
       });
       fxRateByDate.set(date, usdToInr);
+      fxEffectiveDateByDate.set(date, today);
       return usdToInr;
     }
   }
@@ -631,8 +649,9 @@ async function updateAllPrices(db, options = {}) {
 
       switch (inv.asset_type) {
         case 'MUTUAL_FUND': {
+          const reuseDate = resolveReuseLiveDate(inv.asset_type);
           const reusedLivePrice = reuseLiveTodayAssetTypes.has(inv.asset_type)
-            ? Number(getLivePriceForDate.get(inv.id, today)?.price_per_unit || 0)
+            ? Number(getLivePriceForDate.get(inv.id, reuseDate)?.price_per_unit || 0)
             : 0;
           if (reusedLivePrice > 0) {
             pricePerUnit = reusedLivePrice;
@@ -642,6 +661,7 @@ async function updateAllPrices(db, options = {}) {
               investmentName: inv.name,
               assetType: inv.asset_type,
               date: today,
+              reuseDate,
               runTag,
             });
           } else if (inv.amfi_code) {
@@ -758,8 +778,9 @@ async function updateAllPrices(db, options = {}) {
         }
         case 'NPS': {
           try {
+            const reuseDate = resolveReuseLiveDate(inv.asset_type);
             const reusedLivePrice = reuseLiveTodayAssetTypes.has(inv.asset_type)
-              ? Number(getLivePriceForDate.get(inv.id, today)?.price_per_unit || 0)
+              ? Number(getLivePriceForDate.get(inv.id, reuseDate)?.price_per_unit || 0)
               : 0;
             if (reusedLivePrice > 0) {
               pricePerUnit = reusedLivePrice;
@@ -769,6 +790,7 @@ async function updateAllPrices(db, options = {}) {
                 investmentName: inv.name,
                 assetType: inv.asset_type,
                 date: today,
+                reuseDate,
                 runTag,
               });
               break;
@@ -855,7 +877,18 @@ async function updateAllPrices(db, options = {}) {
         }
       }
 
-      writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, usdToInr);
+      // For FOREIGN_STOCK: use session-aligned FX (same market session as the stock price).
+      // If stock is LOCF (no new quote today), use FX from the stock's effective date to avoid
+      // spurious day_change caused purely by FX movement on a day with no stock price update.
+      let fxForToday = usdToInr;
+      if (inv.asset_type === 'FOREIGN_STOCK' && priceSource === 'LOCF') {
+        // providerDateForWriteback is the last LIVE date from the provider response.
+        // Fall back to yesterday if providerDateForWriteback is not set.
+        const fxAlignDate = providerDateForWriteback || addDaysIso(today, -1);
+        fxForToday = await getFxRateForDate(fxAlignDate);
+      }
+      writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, fxForToday);
+
       const combinedSnapshot = db.prepare(`
         SELECT
           COALESCE(SUM(current_value), 0) AS total_value,

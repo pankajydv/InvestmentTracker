@@ -701,7 +701,76 @@ async function fetchHistoricalUSDToINR(date) {
   return currentRate;
 }
 
-const fbilMonthlyCache = new Map();
+/**
+ * Fetch historical USD/INR exchange rate with effective date.
+ * Returns both the rate and the effective_date (when the rate became valid in the market).
+ * This is useful for session-aligned valuation where the stock and FX should be from the same market session.
+ * 
+ * Strategy:
+ *   1. Try FBIL (Financial Benchmarks India Ltd) — publishes the official RBI
+ *      reference rate. The public CSV endpoint returns the rate for a given date.
+ *   2. Fall back to Yahoo Finance historical chart for USDINR=X.
+ *   3. Fall back to the cached/live rate as a last resort.
+ *
+ * @param {string} date - ISO date string e.g. '2024-03-15'
+ * @returns {Promise<{rate: number, effective_date: string}>} Object with rate and effective_date (YYYY-MM-DD)
+ */
+async function fetchHistoricalUSDToINRAndEffectiveDate(date) {
+  if (!date) {
+    const currentRate = await fetchUSDToINR();
+    return { rate: Number(currentRate), effective_date: formatIstDate(new Date()) };
+  }
+
+  const exact = getSeries('FX', 'USDINR=X', date, date)
+    .find((row) => row?.date === date && row?.close != null);
+  if (exact && exact.close != null) {
+    return { rate: Number(exact.close), effective_date: exact.effective_date || exact.date };
+  }
+
+  const nearestCached = getNearestOnOrBefore('FX', 'USDINR=X', date);
+
+  // ── 1. FBIL reference rate ────────────────────────────────────────────────
+  try {
+    const rate = await _fetchFBILRate(date);
+    if (rate && rate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, effective_date: date, close: rate, source: 'FBIL' });
+      return { rate, effective_date: date };
+    }
+  } catch (e) {
+    console.error(`fetchHistoricalUSDToINRAndEffectiveDate: FBIL fetch failed for ${date}:`, e.message);
+  }
+
+  // ── 2. Yahoo Finance historical USDINR=X ──────────────────────────────────
+  try {
+    const rate = await _fetchYahooHistoricalUSDINR(date);
+    if (rate && rate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, effective_date: date, close: rate, source: 'YAHOO' });
+      return { rate, effective_date: date };
+    }
+  } catch (e) {
+    console.error(`fetchHistoricalUSDToINRAndEffectiveDate: Yahoo fetch failed for ${date}:`, e.message);
+  }
+
+  // ── 3. Current rate as fallback (LOCF) ────────────────────────────────────
+  if (nearestCached && nearestCached.close != null) {
+    const locfRate = Number(nearestCached.close);
+    if (Number.isFinite(locfRate) && locfRate > 0) {
+      const effectiveDate = nearestCached.effective_date || nearestCached.date;
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, effective_date: effectiveDate, close: locfRate, source: 'LOCF' });
+      return { rate: locfRate, effective_date: effectiveDate };
+    }
+  }
+
+  console.warn(`fetchHistoricalUSDToINRAndEffectiveDate: could not get rate for ${date}, using current rate`);
+  const currentRate = await fetchUSDToINR();
+  const today = formatIstDate(new Date());
+  if (Number.isFinite(Number(currentRate)) && Number(currentRate) > 0) {
+    upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, effective_date: today, close: Number(currentRate), source: 'YAHOO' });
+    return { rate: Number(currentRate), effective_date: today };
+  }
+
+  return { rate: Number(currentRate), effective_date: today };
+}
 
 function getYearMonth(dateIso) {
   const [year, month] = String(dateIso).split('-');
@@ -1663,6 +1732,7 @@ module.exports = {
   fetchDividendEventsForRange,
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
+  fetchHistoricalUSDToINRAndEffectiveDate,
   fetchHistoricalUSDToINRRange,
   calculatePPFValue,
   toNSETicker,

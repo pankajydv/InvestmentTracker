@@ -844,8 +844,9 @@ function startScheduler(db) {
     });
   }
 
-  // Hourly intraday runs (9:25 AM–4:25 PM IST, weekdays) - Indian market tradables.
-  // These capture intraday stock/SGB price movements while MF NAVs are still static.
+  // Hourly intraday runs (9:25 AM–4:25 PM IST, weekdays).
+  // Includes MF/NPS retry polling so delayed provider NAVs can be picked up earlier
+  // in the day; once yesterday's LIVE row exists, intraday provider calls are skipped.
   const intradayTimes = [
     '25 9 * * 1-5',    // 9:25 AM
     '25 10 * * 1-5',   // 10:25 AM
@@ -860,10 +861,18 @@ function startScheduler(db) {
   intradayTimes.forEach((cronTime, index) => {
     cron.schedule(cronTime, async () => {
       const hour = [9, 10, 11, 12, 13, 14, 15, 16][index];
-      console.log(`[Scheduler] Running ${hour}:25 intraday price update (Indian stocks + SGB)...`);
+      const runDate = todayIso();
+      const yesterday = addDays(runDate, -1);
+      console.log(`[Scheduler] Running ${hour}:25 intraday price update (Indian stocks + SGB + MF/NPS retries)...`);
       try {
         await runSchedulerCycle(db, `Intraday run ${hour}:25`, {
-          assetTypes: ['INDIAN_STOCK', 'SGB'],
+          assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS'],
+          reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
+          reuseLiveDateByAssetType: {
+            MUTUAL_FUND: yesterday,
+            NPS: yesterday,
+          },
+          runTag: `intraday_${hour}_25`,
         });
         if (ENABLE_INTRADAY_COMPLIANCE) {
           await runComplianceScan(db, `Intraday run ${hour}:25`, { mode: 'incremental' });
@@ -943,7 +952,7 @@ function startScheduler(db) {
 
   console.log('[Scheduler] Daily price updates scheduled:');
   console.log('  - 4:25 AM IST (all asset types; market-linked only on session days, daily)');
-  console.log('  - 9:25 AM–4:25 PM IST (hourly, Indian stocks + SGB, weekdays)');
+  console.log('  - 9:25 AM–4:25 PM IST (hourly, Indian stocks + SGB + MF/NPS retries, weekdays)');
   console.log('  - 7:25 PM, 8:25 PM, 9:25 PM, 11:25 PM IST (foreign stocks + conditional MF/NPS, weekdays)');
   console.log('  - 10:25 PM IST (all asset types, weekdays)');
   logAppInfo('[Scheduler] Scheduled jobs initialized', {
