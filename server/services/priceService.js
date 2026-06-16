@@ -40,6 +40,115 @@ function inferStockInstrumentType(symbol) {
 // ─── Market Hours & Staleness Helpers ─────────────────────────────────────────
 
 /**
+ * Advance dateIso by one calendar day at a time until we land on a US weekday.
+ * Used to map after-hours trading to the NEXT trading session date.
+ * @param {string} dateIso - YYYY-MM-DD
+ * @returns {string}
+ */
+function nextUsWeekday(dateIso) {
+  let cursor = addDaysIsoDate(dateIso, 1);
+  // Infinite-loop-safe: worst case is skipping a 2-day weekend.
+  for (let i = 0; i < 7; i += 1) {
+    const day = new Date(`${cursor}T00:00:00.000Z`).getUTCDay();
+    if (day !== 0 && day !== 6) return cursor;
+    cursor = addDaysIsoDate(cursor, 1);
+  }
+  return cursor;
+}
+
+/**
+ * Determine the canonical US trading date and best available price from a Yahoo Finance
+ * chart API response, correctly handling pre-market, regular, and after-hours sessions.
+ *
+ * Date attribution rules:
+ *  - Pre-market (4 AM–9:30 AM EST) and regular session (9:30 AM–4 PM EST)
+ *      → daily_values row for the US session date (regular.start → IST)
+ *  - After-hours (4 PM–8 PM EST)
+ *      → daily_values row for the NEXT US weekday (after-hours previews the next open)
+ *
+ * Session phase is detected by comparing current server time (UTC seconds) against
+ * the currentTradingPeriod boundaries returned by Yahoo — no timezone conversions needed.
+ *
+ * @param {object} meta - result.meta from Yahoo chart API
+ * @param {number[]} timestamps - result.timestamp candle start Unix seconds
+ * @param {number[]} closes - result.indicators.quote[0].close candle closes
+ * @returns {{ date, price, change, changePercent, officialClose, previousClose, sessionPhase, sessionDateIst } | null}
+ */
+function detectForeignStockSession(meta, timestamps, closes) {
+  if (!meta || !meta.regularMarketPrice) return null;
+
+  const tp = meta.currentTradingPeriod;
+  const regularStart = tp?.regular?.start;
+  const regularEnd   = tp?.regular?.end;
+  const postEnd      = tp?.post?.end;
+  const preStart     = tp?.pre?.start;
+  const preEnd       = tp?.pre?.end;
+
+  // Session phase: compare current UTC time against Yahoo's trading period boundaries.
+  const nowSec = Math.floor(Date.now() / 1000);
+  const inAfterHours = Number.isFinite(regularEnd) && Number.isFinite(postEnd)
+    && nowSec >= regularEnd && nowSec <= postEnd;
+  const inPreMarket = !inAfterHours
+    && Number.isFinite(preStart) && Number.isFinite(preEnd)
+    && nowSec >= preStart && nowSec < preEnd;
+
+  // US session date anchor: regular.start is 9:30 AM EST = 7:00 PM IST on the same calendar
+  // date as the US trading session.  IST conversion is safe here (no midnight crossing).
+  const sessionDateIst = regularStart ? istDateFromUnixSeconds(regularStart) : null;
+  if (!sessionDateIst) return null;
+
+  // After-hours data belongs to the NEXT trading session's daily_values row.
+  const providerDate = inAfterHours ? nextUsWeekday(sessionDateIst) : sessionDateIst;
+
+  // Best available price for the current session phase.
+  const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
+  const postPrice = Number(meta.postMarketPrice);
+  const prePrice  = Number(meta.preMarketPrice);
+  const preTime   = Number(meta.preMarketTime);
+  const regTime   = Number(meta.regularMarketTime);
+
+  let price, sessionPhase;
+  if (inAfterHours && Number.isFinite(postPrice) && postPrice > 0) {
+    price = postPrice;
+    sessionPhase = 'post';
+  } else if (inPreMarket && Number.isFinite(prePrice) && prePrice > 0 && preTime > regTime) {
+    price = prePrice;
+    sessionPhase = 'pre';
+  } else {
+    price = meta.regularMarketPrice;
+    sessionPhase = 'regular';
+  }
+
+  const change    = price - prevClose;
+  const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
+
+  // officialClose: the regular-session candle close for the session date.
+  // Used as the LIVE writeback price for the session date row when in after-hours.
+  let officialClose = null;
+  if (Array.isArray(timestamps) && Array.isArray(closes)) {
+    const points = Math.min(timestamps.length, closes.length);
+    for (let i = 0; i < points; i += 1) {
+      const pointDate = istDateFromUnixSeconds(timestamps[i]);
+      if (pointDate !== sessionDateIst) continue;
+      const c = Number(closes[i]);
+      if (!Number.isFinite(c) || c <= 0) continue;
+      officialClose = c;
+    }
+  }
+
+  return {
+    price,
+    change:          Math.round(change * 100) / 100,
+    changePercent:   Math.round(changePct * 100) / 100,
+    previousClose:   prevClose,
+    officialClose,
+    date:            providerDate,   // intended daily_values date
+    sessionDateIst,                  // actual US session date (for after-hours writeback)
+    sessionPhase,                    // 'pre' | 'regular' | 'post'
+  };
+}
+
+/**
  * Check if a date (YYYY-MM-DD) is a weekday (Mon-Fri), used for NSE trading day.
  * @param {string} dateIso - ISO date string (YYYY-MM-DD)
  * @returns {boolean}
@@ -225,14 +334,26 @@ async function fetchStockPrice(symbol) {
         changePercent: quote.regularMarketChangePercent || 0,
         previousClose: quote.regularMarketPreviousClose,
         officialClose: null,
-        date: istDateFromUnixSeconds(quote.regularMarketTime)
-          || istDateFromUnixSeconds(quote.postMarketTime)
-          || normalizeProviderDate(quote.regularMarketTime)
-          || normalizeProviderDate(quote.postMarketTime)
-          || null,
-        sourceDateUtc: utcDateFromUnixSeconds(quote.regularMarketTime)
-          || utcDateFromUnixSeconds(quote.postMarketTime)
-          || null,
+        sessionPhase: 'regular',
+        sessionDateIst: (() => {
+          // Use session start for correct US date; fall back to UTC of close (safe for US markets)
+          const tp = quote.currentTradingPeriod;
+          const s = tp?.regular?.start;
+          return s ? istDateFromUnixSeconds(s) : utcDateFromUnixSeconds(quote.regularMarketTime);
+        })(),
+        date: (() => {
+          const tp = quote.currentTradingPeriod;
+          const regularEnd = tp?.regular?.end;
+          const postEnd = tp?.post?.end;
+          const nowSec = Math.floor(Date.now() / 1000);
+          const sessionStart = tp?.regular?.start;
+          const sessionDateIst = sessionStart
+            ? istDateFromUnixSeconds(sessionStart)
+            : utcDateFromUnixSeconds(quote.regularMarketTime);
+          const inAH = Number.isFinite(regularEnd) && Number.isFinite(postEnd)
+            && nowSec >= regularEnd && nowSec <= postEnd;
+          return (inAH && sessionDateIst) ? nextUsWeekday(sessionDateIst) : sessionDateIst;
+        })(),
       };
     } catch (libErr) {
       throw new Error(`Failed to fetch price for ${symbol}: ${directErr.message}`);
@@ -255,38 +376,26 @@ function fetchStockPriceDirect(symbol) {
           const result = json.chart?.result?.[0];
           const meta = result?.meta;
           if (meta && meta.regularMarketPrice) {
-            const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
-            const change = meta.regularMarketPrice - prevClose;
-            const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
-            const providerDate = istDateFromUnixSeconds(meta.regularMarketTime)
-              || istDateFromUnixSeconds(meta.currentTradingPeriod?.regular?.end)
-              || null;
-            let officialClose = null;
             const timestamps = Array.isArray(result?.timestamp) ? result.timestamp : [];
             const closes = Array.isArray(result?.indicators?.quote?.[0]?.close)
               ? result.indicators.quote[0].close
               : [];
-            const points = Math.min(timestamps.length, closes.length);
-            for (let i = 0; i < points; i += 1) {
-              const pointDate = istDateFromUnixSeconds(timestamps[i]);
-              if (pointDate !== providerDate) continue;
-
-              const close = Number(closes[i]);
-              if (!Number.isFinite(close) || close <= 0) continue;
-              officialClose = close;
+            const sessionInfo = detectForeignStockSession(meta, timestamps, closes);
+            if (!sessionInfo) {
+              reject(new Error(`No price data for ${symbol}`));
+              return;
             }
             resolve({
-              price: meta.regularMarketPrice,
-              currency: meta.currency || 'INR',
-              name: meta.shortName || meta.longName || symbol,
-              change: Math.round(change * 100) / 100,
-              changePercent: Math.round(changePct * 100) / 100,
-              previousClose: prevClose,
-              officialClose,
-              date: providerDate,
-              sourceDateUtc: utcDateFromUnixSeconds(meta.regularMarketTime)
-                || utcDateFromUnixSeconds(meta.currentTradingPeriod?.regular?.end)
-                || null,
+              price:          sessionInfo.price,
+              currency:       meta.currency || 'USD',
+              name:           meta.shortName || meta.longName || symbol,
+              change:         sessionInfo.change,
+              changePercent:  sessionInfo.changePercent,
+              previousClose:  sessionInfo.previousClose,
+              officialClose:  sessionInfo.officialClose,
+              date:           sessionInfo.date,
+              sessionDateIst: sessionInfo.sessionDateIst,
+              sessionPhase:   sessionInfo.sessionPhase,
             });
           } else {
             reject(new Error(`No price data for ${symbol}`));
@@ -701,76 +810,7 @@ async function fetchHistoricalUSDToINR(date) {
   return currentRate;
 }
 
-/**
- * Fetch historical USD/INR exchange rate with effective date.
- * Returns both the rate and the effective_date (when the rate became valid in the market).
- * This is useful for session-aligned valuation where the stock and FX should be from the same market session.
- * 
- * Strategy:
- *   1. Try FBIL (Financial Benchmarks India Ltd) — publishes the official RBI
- *      reference rate. The public CSV endpoint returns the rate for a given date.
- *   2. Fall back to Yahoo Finance historical chart for USDINR=X.
- *   3. Fall back to the cached/live rate as a last resort.
- *
- * @param {string} date - ISO date string e.g. '2024-03-15'
- * @returns {Promise<{rate: number, effective_date: string}>} Object with rate and effective_date (YYYY-MM-DD)
- */
-async function fetchHistoricalUSDToINRAndEffectiveDate(date) {
-  if (!date) {
-    const currentRate = await fetchUSDToINR();
-    return { rate: Number(currentRate), effective_date: formatIstDate(new Date()) };
-  }
-
-  const exact = getSeries('FX', 'USDINR=X', date, date)
-    .find((row) => row?.date === date && row?.close != null);
-  if (exact && exact.close != null) {
-    return { rate: Number(exact.close), effective_date: exact.effective_date || exact.date };
-  }
-
-  const nearestCached = getNearestOnOrBefore('FX', 'USDINR=X', date);
-
-  // ── 1. FBIL reference rate ────────────────────────────────────────────────
-  try {
-    const rate = await _fetchFBILRate(date);
-    if (rate && rate > 0) {
-      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, effective_date: date, close: rate, source: 'FBIL' });
-      return { rate, effective_date: date };
-    }
-  } catch (e) {
-    console.error(`fetchHistoricalUSDToINRAndEffectiveDate: FBIL fetch failed for ${date}:`, e.message);
-  }
-
-  // ── 2. Yahoo Finance historical USDINR=X ──────────────────────────────────
-  try {
-    const rate = await _fetchYahooHistoricalUSDINR(date);
-    if (rate && rate > 0) {
-      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, effective_date: date, close: rate, source: 'YAHOO' });
-      return { rate, effective_date: date };
-    }
-  } catch (e) {
-    console.error(`fetchHistoricalUSDToINRAndEffectiveDate: Yahoo fetch failed for ${date}:`, e.message);
-  }
-
-  // ── 3. Current rate as fallback (LOCF) ────────────────────────────────────
-  if (nearestCached && nearestCached.close != null) {
-    const locfRate = Number(nearestCached.close);
-    if (Number.isFinite(locfRate) && locfRate > 0) {
-      const effectiveDate = nearestCached.effective_date || nearestCached.date;
-      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, effective_date: effectiveDate, close: locfRate, source: 'LOCF' });
-      return { rate: locfRate, effective_date: effectiveDate };
-    }
-  }
-
-  console.warn(`fetchHistoricalUSDToINRAndEffectiveDate: could not get rate for ${date}, using current rate`);
-  const currentRate = await fetchUSDToINR();
-  const today = formatIstDate(new Date());
-  if (Number.isFinite(Number(currentRate)) && Number(currentRate) > 0) {
-    upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, effective_date: today, close: Number(currentRate), source: 'YAHOO' });
-    return { rate: Number(currentRate), effective_date: today };
-  }
-
-  return { rate: Number(currentRate), effective_date: today };
-}
+const fbilMonthlyCache = new Map();
 
 function getYearMonth(dateIso) {
   const [year, month] = String(dateIso).split('-');
@@ -1732,7 +1772,6 @@ module.exports = {
   fetchDividendEventsForRange,
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
-  fetchHistoricalUSDToINRAndEffectiveDate,
   fetchHistoricalUSDToINRRange,
   calculatePPFValue,
   toNSETicker,

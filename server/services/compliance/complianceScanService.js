@@ -5,6 +5,7 @@ applyEnvDefaults();
 const { getDb } = require('../../db/schema');
 const { getMarketHolidays, getWeekends } = require('../holidays/marketHolidayService');
 const { markScopeDirty } = require('../dirtyBackfillService');
+const { LOCF_STREAK_WARN_SESSIONS, FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS } = require('../freshnessPolicy');
 
 const COMPLIANCE_SCAN_FLOOR_KEY = 'compliance_scan_floor';
 const COMPLIANCE_LAST_MODE_KEY = 'compliance_last_mode';
@@ -487,6 +488,107 @@ function findAndRecordDailyValuesGaps(db, options = {}) {
   return findAndRecordAllGaps(db, options);
 }
 
+/**
+ * Detect market-linked scopes whose recent daily_values are all LOCF (no LIVE row
+ * within the freshness window).  Emits a WARN log per scope and marks it dirty.
+ *
+ * @param {object} db
+ * @param {{ endDate?: string }} [options]
+ * @returns {{ issues: Array, repairsEnqueued: number }}
+ */
+function detectLocfQualityIssues(db, options = {}) {
+  const endDate = parseIsoDate(options.endDate) || todayIso();
+  // Generous calendar window: 3 sessions can span up to ~7 calendar days around holidays.
+  const lookbackDays = Math.max(1, Number(options.lookbackDays || Math.max(INCREMENTAL_LOOKBACK_DAYS, LOCF_STREAK_WARN_SESSIONS * 3)));
+  const startDate = addDaysIso(endDate, -lookbackDays);
+
+  const MARKET_LINKED_TYPES = ['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'FOREIGN_STOCK'];
+  const placeholders = MARKET_LINKED_TYPES.map(() => '?').join(',');
+
+  // Per-asset-type streak thresholds (generous calendar-day proxy for market sessions).
+  // FOREIGN_STOCK gets a higher tolerance (5 sessions × 2 = 10 days) because after-hours
+  // attribution naturally causes 1 LOCF per day boundary; US holidays also not mapped.
+  // Other assets use the standard 3 sessions × 2 = 6 days.
+  const fsStreakThreshold    = addDaysIso(endDate, -(FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS * 2));
+  const otherStreakThreshold = addDaysIso(endDate, -(LOCF_STREAK_WARN_SESSIONS * 2));
+
+  const rows = db.prepare(`
+    SELECT
+      dv.investment_id,
+      dv.portfolio_id,
+      i.asset_type,
+      i.name AS investment_name,
+      MAX(dv.date) AS latest_date,
+      -- last_live_date: most recent date with an official LIVE (regular-session) close.
+      -- PRE/POST are preliminary and count as non-live for streak detection.
+      MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) = 'LIVE' THEN dv.date END) AS last_non_locf_date,
+      SUM(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LIVE' THEN 1 ELSE 0 END) AS locf_count_in_window
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE i.asset_type IN (${placeholders})
+      AND i.is_active != 0
+      AND COALESCE(i.exclude_from_tracking, 0) != 1
+      AND dv.portfolio_id IS NOT NULL
+      AND date(dv.date) >= ?
+      AND date(dv.date) <= ?
+    GROUP BY dv.investment_id, dv.portfolio_id
+    HAVING last_non_locf_date IS NULL
+        OR last_non_locf_date < CASE WHEN i.asset_type = 'FOREIGN_STOCK' THEN ? ELSE ? END
+  `).all(...MARKET_LINKED_TYPES, startDate, endDate, fsStreakThreshold, otherStreakThreshold);
+
+  const issues = [];
+  let repairsEnqueued = 0;
+
+  for (const row of rows) {
+    const dirtyFrom = row.last_non_locf_date
+      ? addDaysIso(row.last_non_locf_date, 1)
+      : startDate;
+
+    issues.push({
+      investment_id: row.investment_id,
+      portfolio_id: row.portfolio_id,
+      asset_type: row.asset_type,
+      investment_name: row.investment_name,
+      latest_date: row.latest_date,
+      last_non_locf_date: row.last_non_locf_date,
+      locf_count_in_window: row.locf_count_in_window,
+      dirty_from: dirtyFrom,
+    });
+
+    console.warn(
+      `[ComplianceScan][LOCF-Quality][WARN] ${row.asset_type} inv=${row.investment_id}` +
+      ` (${row.investment_name}) portfolio=${row.portfolio_id}` +
+      ` latest=${row.latest_date} lastNonLocf=${row.last_non_locf_date || 'none'}` +
+      ` locfCount=${row.locf_count_in_window} dirtyFrom=${dirtyFrom}`
+    );
+
+    try {
+      const dirty = markScopeDirty(db, {
+        investmentId: row.investment_id,
+        portfolioId: row.portfolio_id,
+        dirtyFromDate: dirtyFrom,
+        reason: 'compliance-locf-quality',
+        sourceEventId: `compliance-locf:${endDate}`,
+      });
+      if (dirty) repairsEnqueued += 1;
+    } catch (e) {
+      console.error(
+        `[ComplianceScan][LOCF-Quality] Failed to mark scope dirty for inv=${row.investment_id}` +
+        ` portfolio=${row.portfolio_id}:`, e.message
+      );
+    }
+  }
+
+  if (issues.length > 0) {
+    console.warn(
+      `[ComplianceScan][LOCF-Quality] ${issues.length} scope(s) with LOCF streak` +
+      ` >= ${LOCF_STREAK_WARN_SESSIONS} market sessions; ${repairsEnqueued} dirty scope(s) enqueued.`
+    );
+  }
+
+  return { issues, repairsEnqueued };
+}
+
 function emitProgress(callback, payload) {
   if (typeof callback !== 'function') return;
   try {
@@ -526,10 +628,14 @@ function scanAndRepairComplianceGaps(options = {}) {
   });
 
   const repairCount = gaps.length > 0 ? repairDetectedGaps(db) : 0;
+
+  // Run LOCF quality scan (detects persistent LOCF streaks beyond threshold).
+  const qualityResult = detectLocfQualityIssues(db, { endDate: window.endDate || window.runDate });
+
   emitProgress(onProgress, {
     phase: 'persisting-state',
     percent: 90,
-    repairsEnqueued: repairCount,
+    repairsEnqueued: repairCount + qualityResult.repairsEnqueued,
   });
 
   const state = persistComplianceState(db, window);
@@ -546,7 +652,8 @@ function scanAndRepairComplianceGaps(options = {}) {
       scanFloorAfter: state.scanFloor,
     },
     gapsDetected: gaps.length,
-    repairsEnqueued: repairCount,
+    repairsEnqueued: repairCount + qualityResult.repairsEnqueued,
+    locfQualityIssues: qualityResult.issues.length,
     gaps,
   };
 
@@ -673,6 +780,7 @@ module.exports = {
   detectGapsForTable,
   findAndRecordDailyValuesGaps,
   findAndRecordAllGaps,
+  detectLocfQualityIssues,
   scanAndRepairComplianceGaps,
   refreshComplianceScanFloor,
   getComplianceScanState,

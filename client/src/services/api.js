@@ -244,6 +244,11 @@ export const getComplianceJobs = ({ active = false, limit } = {}) => {
 };
 export const getComplianceJob = (jobId) =>
   fetchJSON(`/utils/compliance-jobs/${encodeURIComponent(String(jobId || '').trim())}`);
+export const markDirtyScopesFromSelector = (payload) =>
+  fetchJSON('/utils/dirty-backfill-scopes/mark', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
 export const getInterestRates = () => fetchJSON('/utils/interest-rates');
 export const createInterestRate = (data) =>
   fetchJSON('/utils/interest-rates', { method: 'POST', body: JSON.stringify(data) });

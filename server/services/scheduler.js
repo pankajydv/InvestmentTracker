@@ -14,12 +14,14 @@ const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate, markS
 const {
   fetchMutualFundHistory,
   fetchHistoricalUSDToINR,
+  fetchHistoricalUSDToINRRange,
 } = require('./priceService');
 const { getSGBNseHistoricalPrices } = require('./sgbNseHistorical');
 const { hydrateStockSeriesForPhase2 } = require('./marketPriceCache');
 const { todayIso, addDaysIso, eachDateIso, istDateFromUnixSeconds } = require('./dateUtils');
 const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
 const { scanAndRepairComplianceGaps, refreshComplianceScanFloor } = require('./compliance/complianceScanService');
+const { DIRTY_SCOPE_LOOKBACK_SESSIONS } = require('./freshnessPolicy');
 
 function parsePositiveIntEnv(name, fallback) {
   const parsed = Number(process.env[name]);
@@ -51,9 +53,8 @@ const FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST = parseNonNegativeIntEnv('
 // Days of recent daily_values to scan for LOCF rows when reconciling lagging NAV/price feeds.
 const LOCF_RECONCILE_LOOKBACK_DAYS = parsePositiveIntEnv('LOCF_RECONCILE_LOOKBACK_DAYS', 5);
 // Asset types covered by the generic LOCF-lag self-healing path in the scheduler.
-// Must stay in sync with LOCF_LAG_RECONCILE_ASSET_TYPES in updater.js.
-// FOREIGN_STOCK is intentionally excluded — handled by ensureForeignReconcileScopes.
-const LOCF_LAG_RECONCILE_ASSET_TYPES = ['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'];
+// FOREIGN_STOCK is now included; its session check uses weekday-only (no holiday DB).
+const LOCF_LAG_RECONCILE_ASSET_TYPES = ['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'FOREIGN_STOCK'];
 const EXITED_UNITS_EPSILON = 1e-6;
 
 let isSchedulerCycleRunning = false;
@@ -378,8 +379,8 @@ function ensureForeignReconcileScopes(db, runDate, label, catchUp = null) {
  * starting from the first LOCF date so backfill will re-process those rows once
  * the real NAV/price arrives from the provider (typically 1-2 days late).
  *
- * FOREIGN_STOCK is excluded — its settlement-aware reconcile path
- * (ensureForeignReconcileScopes) handles it each scheduler cycle.
+ * All market-linked types including FOREIGN_STOCK are now covered here.
+ * FS uses weekday-only session logic (no India holiday DB dependency).
  */
 function ensureMarketLinkedLocfReconcileScopes(db, runDate, label) {
   const lookbackStart = addDays(runDate, -(LOCF_RECONCILE_LOOKBACK_DAYS - 1));
@@ -391,7 +392,7 @@ function ensureMarketLinkedLocfReconcileScopes(db, runDate, label) {
     JOIN investments i ON i.id = dv.investment_id
     WHERE i.asset_type IN (${placeholders})
       AND dv.portfolio_id IS NOT NULL
-      AND dv.price_source = 'LOCF'
+      AND dv.price_source IN ('LOCF', 'PRE', 'POST')
       AND date(dv.date) >= ?
       AND date(dv.date) <= ?
     GROUP BY dv.investment_id, dv.portfolio_id
@@ -603,13 +604,15 @@ async function warmRecentMarketCache(db, runDate, refreshDays, label) {
   }
 
   if (hasForeign) {
-    for (const d of dateRange) {
-      try {
-        await fetchHistoricalUSDToINR(d);
-      } catch (_e) {
-        errors += 1;
-      }
-      fxCalls += 1;
+    // Use range-based fetch instead of N per-date calls; fetchHistoricalUSDToINRRange batches
+    // FBIL monthly requests and falls back per-day only when needed.  It writes directly to
+    // fx_rate_cache so the result is available for the backfill prewarm path.
+    try {
+      await fetchHistoricalUSDToINRRange(fromDate, runDate);
+      fxCalls = 1;
+    } catch (_e) {
+      errors += 1;
+      fxCalls = 1;
     }
   }
 
@@ -682,6 +685,136 @@ function ensureSchedulerCatchUpScopes(db, runDate, label) {
 }
 
 /**
+ * Ensure active market-linked scopes are dirty-marked based on their freshness status
+ * within the recent rolling window (DIRTY_SCOPE_LOOKBACK_SESSIONS market sessions).
+ *
+ * Two modes:
+ *  forceAllScopes=true  (22:25 nightly): unconditionally mark ALL active scopes dirty from
+ *    the start of the lookback window so backfill repairs everything nightly.
+ *  forceAllScopes=false (all other runs): only mark dirty if the scope has any LOCF row or
+ *    is missing entirely from the window.
+ *
+ * Duplicate enqueues are safe — markScopeDirty coalesces to the earliest dirty_from_date.
+ *
+ * @param {object} db
+ * @param {string} runDate
+ * @param {string} label
+ * @param {{ forceAllScopes?: boolean }} [options]
+ */
+function ensureRollingFreshnessDirtyScopes(db, runDate, label, options = {}) {
+  const forceAllScopes = options.forceAllScopes === true;
+  // Calendar window: generous enough to encompass DIRTY_SCOPE_LOOKBACK_SESSIONS market sessions
+  // even around long weekends or back-to-back holidays.
+  const lookbackDays = DIRTY_SCOPE_LOOKBACK_SESSIONS * 2 + 3;
+  const windowStart = addDays(runDate, -lookbackDays);
+  const windowEnd = runDate;
+
+  const ALL_MARKET_LINKED_TYPES = ['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'FOREIGN_STOCK'];
+  const typePlaceholders = ALL_MARKET_LINKED_TYPES.map(() => '?').join(',');
+
+  // Active scopes: net positive units as of today.
+  const activeScopes = db.prepare(`
+    SELECT t.investment_id, t.portfolio_id, i.asset_type
+    FROM transactions t
+    JOIN investments i ON i.id = t.investment_id
+    WHERE i.asset_type IN (${typePlaceholders})
+      AND i.is_active != 0
+      AND COALESCE(i.exclude_from_tracking, 0) != 1
+      AND t.portfolio_id IS NOT NULL
+    GROUP BY t.investment_id, t.portfolio_id
+    HAVING SUM(CASE
+      WHEN t.transaction_type IN ('BUY','DEPOSIT','BONUS','SPLIT','IPO','TRANSFER_IN','SWITCH_IN','RIGHTS','EMPLOYER_CONTRIBUTION','VOLUNTARY_CONTRIBUTION','VEST','ESPP_PURCHASE') THEN COALESCE(t.units, 0)
+      WHEN t.transaction_type IN ('SELL','REDEMPTION','WITHDRAWAL','TRANSFER_OUT','SWITCH_OUT','CONSOLIDATION','CHARGES','AMC') THEN -COALESCE(t.units, 0)
+      ELSE 0
+    END) > 0.0001
+  `).all(...ALL_MARKET_LINKED_TYPES);
+
+  let enqueued = 0;
+  let skipped = 0;
+
+  if (forceAllScopes) {
+    // Nightly unconditional sweep: dirty every active scope from windowStart.
+    for (const scope of activeScopes) {
+      const dirtyDate = markScopeDirty(db, {
+        investmentId: scope.investment_id,
+        portfolioId: scope.portfolio_id,
+        dirtyFromDate: windowStart,
+        reason: 'rolling-freshness-nightly',
+        sourceEventId: `rolling-freshness-nightly:${runDate}`,
+      });
+      if (dirtyDate) enqueued += 1;
+      else skipped += 1;
+    }
+    logAppInfo(`[Scheduler] ${label}: Rolling freshness dirty scopes (nightly force)`, {
+      runDate,
+      windowStart,
+      activeScopes: activeScopes.length,
+      enqueued,
+      skipped,
+    });
+    return { windowStart, forceAllScopes, activeScopes: activeScopes.length, enqueued, skipped };
+  }
+
+  // Conditional: build coverage map for the window.
+  const coverageRows = db.prepare(`
+    SELECT
+      dv.investment_id,
+      dv.portfolio_id,
+      MIN(CASE WHEN dv.price_source IN ('LOCF', 'PRE', 'POST') THEN dv.date END) AS earliest_locf_date,
+      COUNT(CASE WHEN dv.price_source IN ('LOCF', 'PRE', 'POST') THEN 1 END) AS locf_count,
+      MAX(dv.date) AS latest_date
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE i.asset_type IN (${typePlaceholders})
+      AND dv.portfolio_id IS NOT NULL
+      AND date(dv.date) >= ?
+      AND date(dv.date) <= ?
+    GROUP BY dv.investment_id, dv.portfolio_id
+  `).all(...ALL_MARKET_LINKED_TYPES, windowStart, windowEnd);
+
+  const coverageMap = new Map();
+  for (const row of coverageRows) {
+    coverageMap.set(`${row.investment_id}:${row.portfolio_id}`, row);
+  }
+
+  const yesterday = addDays(runDate, -1);
+  for (const scope of activeScopes) {
+    const key = `${scope.investment_id}:${scope.portfolio_id}`;
+    const cov = coverageMap.get(key);
+    const missingFromWindow = !cov || String(cov.latest_date || '') < yesterday;
+    const hasLocf = cov && Number(cov.locf_count || 0) > 0;
+
+    if (!missingFromWindow && !hasLocf) {
+      skipped += 1;
+      continue;
+    }
+
+    const dirtyFrom = (cov?.earliest_locf_date && cov.earliest_locf_date < runDate)
+      ? cov.earliest_locf_date
+      : windowStart;
+
+    const dirtyDate = markScopeDirty(db, {
+      investmentId: scope.investment_id,
+      portfolioId: scope.portfolio_id,
+      dirtyFromDate: dirtyFrom,
+      reason: missingFromWindow ? 'rolling-freshness-missing' : 'rolling-freshness-locf',
+      sourceEventId: `rolling-freshness:${runDate}`,
+    });
+    if (dirtyDate) enqueued += 1;
+    else skipped += 1;
+  }
+
+  logAppInfo(`[Scheduler] ${label}: Rolling freshness dirty scopes (conditional)`, {
+    runDate,
+    windowStart,
+    activeScopes: activeScopes.length,
+    enqueued,
+    skipped,
+  });
+  return { windowStart, forceAllScopes, activeScopes: activeScopes.length, enqueued, skipped };
+}
+
+/**
  * Core scheduler cycle: catch-up gap detection → dirty backfill preflight → price update.
  * Exported so it can be triggered from the API (manual "Update Prices" in the UI) in addition
  * to the cron jobs.
@@ -689,8 +822,10 @@ function ensureSchedulerCatchUpScopes(db, runDate, label) {
  * @param {object} db   - better-sqlite3 database instance
  * @param {string} label - descriptive label for logging
  * @param {object} [options]
- * @param {boolean} [options.skipPriceUpdate] - run preflight only, skip actual price fetch
- * @param {string[]} [options.assetTypes]     - restrict price update to these asset types
+ * @param {boolean} [options.skipPriceUpdate]          - run preflight only, skip actual price fetch
+ * @param {string[]} [options.assetTypes]              - restrict price update to these asset types
+ * @param {boolean} [options.forceFreshnessAllScopes]  - unconditionally mark all active scopes dirty (use at 22:25)
+ * @param {string}  [options.complianceScanMode]       - 'full'|'incremental' (falsy = skip compliance step)
  */
 async function runSchedulerCycle(db, label, options = {}) {
   if (isSchedulerCycleRunning) {
@@ -703,11 +838,26 @@ async function runSchedulerCycle(db, label, options = {}) {
   isSchedulerCycleRunning = true;
   try {
   const runDate = todayIso();
-  logAppInfo(`[Scheduler] ${label}: Step 1/4 scheduler cycle started`, {
+  const preflightRunDate = runDate;
+
+  // ── Step 1/6: Rolling freshness dirty scopes ──────────────────────────────
+  // Mark active scopes dirty if they have any LOCF or missing rows in the recent
+  // lookback window.  At 22:25 (forceFreshnessAllScopes=true), mark ALL active
+  // scopes dirty unconditionally so backfill heals everything nightly.
+  logAppInfo(`[Scheduler] ${label}: Step 1/6 rolling freshness dirty scopes`, {
+    runDate,
+    forceFreshnessAllScopes: !!options.forceFreshnessAllScopes,
+  });
+  const rollingFreshness = ensureRollingFreshnessDirtyScopes(db, runDate, label, {
+    forceAllScopes: !!options.forceFreshnessAllScopes,
+  });
+  logAppInfo(`[Scheduler] ${label}: Step 1/6 completed`, { rollingFreshness });
+
+  // ── Step 2/6: Scheduler cycle started (context snapshot) ─────────────────
+  logAppInfo(`[Scheduler] ${label}: Step 2/6 scheduler cycle started`, {
     runDate,
     options,
   });
-  const preflightRunDate = runDate;
 
   const dirtyInvestments = db.prepare(`
     SELECT id, name, asset_type, dirty_from_date
@@ -726,7 +876,8 @@ async function runSchedulerCycle(db, label, options = {}) {
     LIMIT 100
   `).all(preflightRunDate);
 
-  logAppInfo(`[Scheduler] ${label}: Step 2/4 dirty scope snapshot`, {
+  // ── Step 3/6: Dirty scope snapshot ───────────────────────────────────────
+  logAppInfo(`[Scheduler] ${label}: Step 3/6 dirty scope snapshot`, {
     preflightRunDate,
     dirtyInvestmentCount: dirtyInvestments.length,
     pendingScopeCount: pendingScopes.length,
@@ -741,30 +892,30 @@ async function runSchedulerCycle(db, label, options = {}) {
     options,
   });
 
-  logAppInfo(`[Scheduler] ${label}: Step 3/4 running catch-up + dirty preflight (Backfill Step-1 Cache-Warm -> Step-2 CA -> Step-3 Recompute -> Step-4 Aggregate Refresh)`, {
+  // ── Step 4/6: Catch-up + dirty preflight ─────────────────────────────────
+  logAppInfo(`[Scheduler] ${label}: Step 4/6 running catch-up + dirty preflight (Backfill Step-1 Cache-Warm -> Step-2 CA -> Step-3 Recompute -> Step-4 Aggregate Refresh)`, {
     preflightRunDate,
   });
   const catchUp = ensureSchedulerCatchUpScopes(db, preflightRunDate, label);
-  const foreignReconcile = ensureForeignReconcileScopes(db, preflightRunDate, label, catchUp);
   const locfReconcile = ensureMarketLinkedLocfReconcileScopes(db, preflightRunDate, label);
   const preflight = await runDirtyBackfillPreflight(db, preflightRunDate);
-  logAppInfo(`[Scheduler] ${label}: Step 3/4 completed (catch-up + backfill preflight)`, {
+  logAppInfo(`[Scheduler] ${label}: Step 4/6 completed (catch-up + backfill preflight)`, {
     catchUp,
-    foreignReconcile,
     locfReconcile,
     preflight,
   });
 
   if (options.skipPriceUpdate) {
-    logAppInfo(`[Scheduler] ${label}: Step 4/4 skipped price update (preflight-only)`, {
+    logAppInfo(`[Scheduler] ${label}: Step 5/6 skipped price update (preflight-only)`, {
       runDate,
       preflightRunDate,
+      rollingFreshness,
       catchUp,
       foreignReconcile,
       locfReconcile,
       preflight,
     });
-    return { preflightOnly: true, catchUp, foreignReconcile, locfReconcile, preflight };
+    return { preflightOnly: true, rollingFreshness, catchUp, locfReconcile, preflight };
   }
 
   const warmRecentCacheDays = Number(options.warmRecentCacheDays || 0);
@@ -774,18 +925,19 @@ async function runSchedulerCycle(db, label, options = {}) {
     cacheWarm = await warmRecentMarketCache(db, runDate, warmRecentCacheDays, label);
   }
 
-  logAppInfo(`[Scheduler] ${label}: Step 4/4 running updateAllPrices`, {
+  // ── Step 5/6: Price update ────────────────────────────────────────────────
+  logAppInfo(`[Scheduler] ${label}: Step 5/6 running updateAllPrices`, {
     assetTypes: options.assetTypes || null,
     warmRecentCacheDays: warmRecentCacheDays > 0 ? warmRecentCacheDays : null,
     historicalRepairMode: 'step1-generalized-only',
   });
   const result = await updateAllPrices(db, options);
   const refreshedScanFloor = refreshComplianceScanFloor(db, runDate);
-  logAppInfo(`[Scheduler] ${label}: Step 4/4 completed`, {
+  logAppInfo(`[Scheduler] ${label}: Step 5/6 completed`, {
     runDate,
     preflightRunDate,
+    rollingFreshness,
     catchUp,
-    foreignReconcile,
     locfReconcile,
     preflight,
     cacheWarm,
@@ -795,7 +947,23 @@ async function runSchedulerCycle(db, label, options = {}) {
     watermarkUpdated: !!result?.watermarkUpdated,
     complianceScanFloor: refreshedScanFloor,
   });
-  return { catchUp, foreignReconcile, locfReconcile, preflight, result };
+
+  // ── Step 6/6: Compliance scan ─────────────────────────────────────────────
+  let complianceResult = null;
+  const complianceScanMode = options.complianceScanMode || null;
+  if (complianceScanMode) {
+    logAppInfo(`[Scheduler] ${label}: Step 6/6 running compliance scan`, { mode: complianceScanMode });
+    complianceResult = await runComplianceScan(db, label, { mode: complianceScanMode });
+    logAppInfo(`[Scheduler] ${label}: Step 6/6 completed`, {
+      gapsDetected: complianceResult?.gapsDetected || 0,
+      repairsEnqueued: complianceResult?.repairsEnqueued || 0,
+      locfQualityIssues: complianceResult?.locfQualityIssues || 0,
+    });
+  } else {
+    logAppInfo(`[Scheduler] ${label}: Step 6/6 compliance scan skipped (no mode specified)`);
+  }
+
+  return { rollingFreshness, catchUp, locfReconcile, preflight, result, complianceResult };
   } finally {
     isSchedulerCycleRunning = false;
   }
@@ -844,39 +1012,31 @@ function startScheduler(db) {
     });
   }
 
-  // Hourly intraday runs (9:25 AM–4:25 PM IST, weekdays).
-  // Includes MF/NPS retry polling so delayed provider NAVs can be picked up earlier
-  // in the day; once yesterday's LIVE row exists, intraday provider calls are skipped.
+  // Hourly intraday runs (9:25 AM–4:25 PM IST, ALL days).
+  // Captures Indian session and US pre-market data (US pre-market runs 1:30 PM–7 PM IST).
+  // MF/NPS reuse existing LIVE rows so provider calls are skipped when already fresh.
   const intradayTimes = [
-    '25 9 * * 1-5',    // 9:25 AM
-    '25 10 * * 1-5',   // 10:25 AM
-    '25 11 * * 1-5',   // 11:25 AM
-    '25 12 * * 1-5',   // 12:25 PM
-    '25 13 * * 1-5',   // 1:25 PM
-    '25 14 * * 1-5',   // 2:25 PM
-    '25 15 * * 1-5',   // 3:25 PM
-    '25 16 * * 1-5',   // 4:25 PM
+    '25 9 * * *',    // 9:25 AM
+    '25 10 * * *',   // 10:25 AM
+    '25 11 * * *',   // 11:25 AM
+    '25 12 * * *',   // 12:25 PM
+    '25 13 * * *',   // 1:25 PM
+    '25 14 * * *',   // 2:25 PM
+    '25 15 * * *',   // 3:25 PM
+    '25 16 * * *',   // 4:25 PM
   ];
 
   intradayTimes.forEach((cronTime, index) => {
     cron.schedule(cronTime, async () => {
       const hour = [9, 10, 11, 12, 13, 14, 15, 16][index];
-      const runDate = todayIso();
-      const yesterday = addDays(runDate, -1);
-      console.log(`[Scheduler] Running ${hour}:25 intraday price update (Indian stocks + SGB + MF/NPS retries)...`);
+      console.log(`[Scheduler] Running ${hour}:25 intraday price update (Indian stocks + SGB + MF/NPS + FS pre-market)...`);
       try {
         await runSchedulerCycle(db, `Intraday run ${hour}:25`, {
-          assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS'],
+          assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
           reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
-          reuseLiveDateByAssetType: {
-            MUTUAL_FUND: yesterday,
-            NPS: yesterday,
-          },
           runTag: `intraday_${hour}_25`,
+          complianceScanMode: ENABLE_INTRADAY_COMPLIANCE ? 'incremental' : null,
         });
-        if (ENABLE_INTRADAY_COMPLIANCE) {
-          await runComplianceScan(db, `Intraday run ${hour}:25`, { mode: 'incremental' });
-        }
       } catch (e) {
         console.error(`[Scheduler] ${hour}:25 update failed:`, e.message);
         logAppError(`[Scheduler] Intraday run ${hour}:25 failed`, { error: e.message });
@@ -886,14 +1046,14 @@ function startScheduler(db) {
     });
   });
 
-  // US-market tracking runs during the India evening window.
-  // Foreign stocks refresh through the US session, while MF/NPS participate
-  // only until today's record becomes LIVE so provider calls are avoided after settlement.
+  // US-market tracking runs (7:25 PM–11:25 PM IST, ALL days).
+  // Covers US regular session hours (9:30 AM–4 PM EDT = 7 PM–1:30 AM IST).
+  // Running on weekends keeps preflight/dirty-scope active even when US is closed.
   const usMarketTimes = [
-    '25 19 * * 1-5',  // 7:25 PM
-    '25 20 * * 1-5',  // 8:25 PM
-    '25 21 * * 1-5',  // 9:25 PM
-    '25 23 * * 1-5',  // 11:25 PM
+    '25 19 * * *',  // 7:25 PM
+    '25 20 * * *',  // 8:25 PM
+    '25 21 * * *',  // 9:25 PM
+    '25 23 * * *',  // 11:25 PM
   ];
 
   usMarketTimes.forEach((cronTime, index) => {
@@ -915,6 +1075,26 @@ function startScheduler(db) {
     });
   });
 
+  // Midnight day-rollover sweep (00:01 AM IST, ALL days).
+  // Fires just after IST date changes.  US regular session is still open at this time
+  // (~2:31 PM EDT) so FOREIGN_STOCK gets an intraday refresh while other types get
+  // their dirty-scope and preflight work done for the new IST date.
+  cron.schedule('1 0 * * *', async () => {
+    console.log('[Scheduler] Running 00:01 AM day-rollover sweep (all types)...');
+    try {
+      await runSchedulerCycle(db, 'Midnight day-rollover sweep', {
+        assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
+        reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
+        runTag: 'midnight_rollover',
+      });
+    } catch (e) {
+      console.error('[Scheduler] 00:01 AM midnight rollover failed:', e.message);
+      logAppError('[Scheduler] Midnight day-rollover sweep failed', { error: e.message });
+    }
+  }, {
+    timezone: 'Asia/Kolkata',
+  });
+
   // Early-morning seed run at 4:25 AM IST (all days) - all asset types.
   // Market-linked assets are processed only on market-session days.
   cron.schedule('25 4 * * *', async () => {
@@ -932,16 +1112,20 @@ function startScheduler(db) {
     timezone: 'Asia/Kolkata',
   });
 
-  // Final run at 10:25 PM IST (after MF NAVs settle) - all asset types
-  cron.schedule('25 22 * * 1-5', async () => {
+  // Final run at 10:25 PM IST (after MF NAVs settle) — all asset types, ALL days.
+  // forceFreshnessAllScopes=true: unconditionally mark all active scopes dirty from the
+  // 5-session rolling window so backfill heals any LOCF/missing rows every night.
+  // complianceScanMode='full': run the full compliance + LOCF-quality scan as Step 6.
+  cron.schedule('25 22 * * *', async () => {
     console.log('[Scheduler] Running 10:25 PM final price update (all asset types)...');
     try {
       await runSchedulerCycle(db, 'Final nightly run (all types)', {
         warmRecentCacheDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
         reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
+        forceFreshnessAllScopes: true,
+        complianceScanMode: 'full',
         runTag: 'final_nightly',
       });
-      await runComplianceScan(db, 'Final nightly run (all types)', { mode: 'full' });
     } catch (e) {
       console.error('[Scheduler] Final nightly update failed:', e.message);
       logAppError('[Scheduler] Final nightly run failed', { error: e.message });

@@ -31,6 +31,7 @@ const { updateAggregateDailyRange } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
 const { toIsoDate, todayIso } = require('./dateUtils');
 const { logBackfillInfo, logBackfillWarn, logBackfillError } = require('./appLogger');
+const { LOCF_STREAK_WARN_SESSIONS } = require('./freshnessPolicy');
 const { getMarketHolidays, getWeekends } = require('./holidays/marketHolidayService');
 const {
   INVESTED_AMOUNT_INFLOW_TYPES,
@@ -1044,8 +1045,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
 
     const nearest = nearestOnOrBefore(series, date);
     if (nearest != null) {
-      const nearestDate = Array.from(series.keys()).filter(k => k <= date).sort().pop() || date;
-      return { price: Number(nearest), source: 'LOCF', effective_date: nearestDate };
+      return { price: Number(nearest), source: 'LOCF' };
     }
 
     // Fallback 1: nearest investment-level cache entry when in-memory range is sparse.
@@ -1481,28 +1481,24 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
         );
       }
     } else if (inv.asset_type === 'FOREIGN_STOCK') {
-      // Session-aligned FX: use the stock's effective date (not the loop date) to pick FX rate.
-      // When stock is LOCF (no new quote on 'date'), its effective date is the last session with a LIVE price.
-      // This ensures day_change = 0 on LOCF days (no value change when no new price arrived).
-      const stockEffectiveDate = (priceSource === 'LOCF' && priced.effective_date) ? priced.effective_date : date;
-      const fxKey = stockEffectiveDate;
+      const fxKey = date;
       // In-memory FX map is a DB-hydrated fast-path; fallback to DB cache when missing.
       let fxRate = cache.fx.get(fxKey);
       if (!(fxRate != null && Number.isFinite(Number(fxRate)) && Number(fxRate) > 0)) {
-        fxRate = getLocalFxRateOnOrBefore(stockEffectiveDate);
+        fxRate = getLocalFxRateOnOrBefore(date);
       }
       if (!(fxRate != null && Number.isFinite(Number(fxRate)) && Number(fxRate) > 0)) {
         if (isPhase3ProviderBlocked(cache, date)) {
           warnPhase3ProviderViolation(
             cache,
-            `fx-history:${stockEffectiveDate}`,
-            `[Backfill][Phase-3] Provider fetch blocked for USDINR=X ${stockEffectiveDate}; using local cache only`,
+            `fx-history:${date}`,
+            `[Backfill][Phase-3] Provider fetch blocked for USDINR=X ${date}; using local cache only`,
             { investmentId: inv.id, portfolioId, date }
           );
           fxRate = 0;
         } else {
-          fxRate = await fetchHistoricalUSDToINR(stockEffectiveDate).catch((err) => {
-            logBackfillError(`[Backfill][FX] USDINR history fetch failed for ${stockEffectiveDate}: ${err?.message || err}`);
+          fxRate = await fetchHistoricalUSDToINR(date).catch((err) => {
+            logBackfillError(`[Backfill][FX] USDINR history fetch failed for ${date}: ${err?.message || err}`);
             return 0;
           });
         }
@@ -1558,7 +1554,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       if (priceSource === 'LOCF') {
         if (locfMarketStreak === 0) locfStreakStartDate = date;
         locfMarketStreak += 1;
-        if (locfMarketStreak === 3) {
+        if (locfMarketStreak >= LOCF_STREAK_WARN_SESSIONS) {
           logBackfillWarn('[Backfill][LOCF] Unexpected LOCF streak reached threshold', {
             investmentId: inv.id,
             investmentName: inv.name,
@@ -3801,18 +3797,26 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
     const fxExact = loadSeriesMapFromLocalCache('FX', 'USDINR=X', fxStart, fxEnd, (row) => row.close);
     const fxSessionDates = getMarketSessionDates(fxStart, fxEnd, 'FOREIGN_STOCK');
     let carry = getLocalFxRateOnOrBefore(fxStart);
+    // Don't persist LOCF to fx_rate_cache for the most recent date (let the provider populate it).
+    // We still carry forward in-memory so ongoing backfill calculations have a rate to use.
+    const fxLocfPersistCutoff = addDays(fxEnd, -1);
     const fxLocfPoints = [];
     for (const d of fxSessionDates) {
       const exact = fxExact.get(d);
       if (exact != null && Number.isFinite(Number(exact)) && Number(exact) > 0) {
         carry = Number(exact);
       } else if (carry != null && Number.isFinite(Number(carry)) && Number(carry) > 0) {
-        fxLocfPoints.push({
-          date: d,
-          close: Number(carry),
-          source: 'LOCF',
-        });
+        // Only persist LOCF for historical dates; leave recent dates to the provider fetch.
+        if (d <= fxLocfPersistCutoff) {
+          fxLocfPoints.push({
+            date: d,
+            close: Number(carry),
+            source: 'LOCF',
+          });
+        }
       }
+      // Always populate in-memory cache for any date in the window so backfill
+      // calculations have a carry-forward rate even for the most recent sessions.
       if (carry != null && Number.isFinite(Number(carry)) && Number(carry) > 0) {
         cache.fx.set(d, Number(carry));
       }

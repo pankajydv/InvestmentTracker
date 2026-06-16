@@ -1,3 +1,5 @@
+const { LOCF_STREAK_WARN_SESSIONS } = require('./freshnessPolicy');
+
 const ONE_DAY_CHANGE_POLICY = Object.freeze({
   MARKET_SESSION: 'MARKET_SESSION',
   NAV_SNAPSHOT: 'NAV_SNAPSHOT',
@@ -6,13 +8,13 @@ const ONE_DAY_CHANGE_POLICY = Object.freeze({
 });
 
 const UNEXPECTED_LOCF_POLICY = Object.freeze({
-  STRICT: { thresholdSessions: 5, recentWindowDays: 180 },
-  INDIAN_STOCK: { thresholdSessions: 5, recentWindowDays: 180 },
-  FOREIGN_STOCK: { thresholdSessions: 5, recentWindowDays: 180 },
-  SGB: { thresholdSessions: 5, recentWindowDays: 365 },
-  MUTUAL_FUND: { thresholdSessions: 5, recentWindowDays: 180 },
-  NPS: { thresholdSessions: 5, recentWindowDays: 180 },
-  SNAPSHOT: { thresholdSessions: 5, recentWindowDays: 180 },
+  STRICT:        { thresholdSessions: LOCF_STREAK_WARN_SESSIONS, recentWindowDays: 180 },
+  INDIAN_STOCK:  { thresholdSessions: LOCF_STREAK_WARN_SESSIONS, recentWindowDays: 180 },
+  FOREIGN_STOCK: { thresholdSessions: LOCF_STREAK_WARN_SESSIONS, recentWindowDays: 180 },
+  SGB:           { thresholdSessions: LOCF_STREAK_WARN_SESSIONS, recentWindowDays: 365 },
+  MUTUAL_FUND:   { thresholdSessions: LOCF_STREAK_WARN_SESSIONS, recentWindowDays: 180 },
+  NPS:           { thresholdSessions: LOCF_STREAK_WARN_SESSIONS, recentWindowDays: 180 },
+  SNAPSHOT:      { thresholdSessions: LOCF_STREAK_WARN_SESSIONS, recentWindowDays: 180 },
 });
 
 function getOneDayChangePolicy(assetType) {

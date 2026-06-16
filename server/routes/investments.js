@@ -9,6 +9,7 @@ const {
 } = require('../constants/transactionTypes');
 const { markScopeDirty } = require('../services/dirtyBackfillService');
 const { getInvestmentSeries, getMarketSessionDates, getSeries } = require('../services/marketPriceCache');
+const { DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS } = require('../services/freshnessPolicy');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -40,7 +41,7 @@ const CASH_INFLOW_TYPES = new Set(XIRR_CASH_INFLOW_TYPES);
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MARKET_DRIVEN_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
 const MARKET_LINKED_DAY_CHANGE_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS']);
-const MAX_NON_LOCF_SESSION_LAG = 4;
+const MAX_NON_LOCF_SESSION_LAG = DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS;
 
 function isNonLocfSource(row) {
   if (!row) return false;

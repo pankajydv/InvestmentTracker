@@ -62,7 +62,6 @@ function ensureSchema() {
 
     CREATE TABLE IF NOT EXISTS fx_rate_cache (
       date TEXT PRIMARY KEY,
-      effective_date TEXT,
       rate REAL NOT NULL,
       source TEXT,
       fetched_at TEXT DEFAULT (datetime('now')),
@@ -71,8 +70,6 @@ function ensureSchema() {
 
     CREATE INDEX IF NOT EXISTS idx_fx_rate_cache_date
       ON fx_rate_cache(date);
-    CREATE INDEX IF NOT EXISTS idx_fx_rate_cache_effective_date
-      ON fx_rate_cache(effective_date);
 
     CREATE TABLE IF NOT EXISTS investment_split_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,7 +177,6 @@ function ensureSchema() {
   ensureInvestmentCacheMigration(conn);
   ensureMarketCacheIsoDateMigration(conn);
   ensureFxRateCacheMigration(conn);
-  ensureFxRateCacheEffectiveDateMigration(conn);
 
   conn.exec(`
     CREATE TRIGGER IF NOT EXISTS trg_market_price_cache_date_iso_insert
@@ -445,7 +441,6 @@ function ensureFxRateCacheMigration(conn) {
         conn.exec(`
           CREATE TABLE fx_rate_cache (
             date TEXT PRIMARY KEY,
-            effective_date TEXT,
             rate REAL NOT NULL,
             source TEXT,
             fetched_at TEXT DEFAULT (datetime('now')),
@@ -454,20 +449,18 @@ function ensureFxRateCacheMigration(conn) {
 
           CREATE INDEX IF NOT EXISTS idx_fx_rate_cache_date
             ON fx_rate_cache(date);
-          CREATE INDEX IF NOT EXISTS idx_fx_rate_cache_effective_date
-            ON fx_rate_cache(effective_date);
         `);
 
         // Restore data (only insert if date is valid ISO format)
         const insertStmt = conn.prepare(`
-          INSERT INTO fx_rate_cache (date, effective_date, rate, source, fetched_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?)
+          INSERT INTO fx_rate_cache (date, rate, source, fetched_at, updated_at)
+          VALUES (?, ?, ?, ?, ?)
         `);
 
         let restored = 0;
         for (const row of backup) {
           if (row.date && /^\d{4}-\d{2}-\d{2}$/.test(String(row.date).trim())) {
-            insertStmt.run(row.date, row.date, row.rate, row.source, row.fetched_at, row.updated_at);
+            insertStmt.run(row.date, row.rate, row.source, row.fetched_at, row.updated_at);
             restored++;
           }
         }
@@ -487,51 +480,6 @@ function ensureFxRateCacheMigration(conn) {
     }
   } catch (err) {
     console.warn(`[PriceCache] FX rate cache schema migration skipped: ${err.message}`);
-  }
-}
-
-function ensureFxRateCacheEffectiveDateMigration(conn) {
-  try {
-    const done = conn.prepare('SELECT value FROM config WHERE key = ?').get('fx_rate_cache_schema_migration_v2_effective_date');
-    if (String(done?.value || '') === '1') return;
-
-    const cols = conn.prepare("PRAGMA table_info(fx_rate_cache)").all().map((row) => String(row.name || '').toLowerCase());
-    
-    // Check if effective_date column doesn't exist
-    if (!cols.includes('effective_date')) {
-      const tx = conn.transaction(() => {
-        console.log(`[PriceCache] Adding effective_date column to fx_rate_cache`);
-        
-        // Add effective_date column
-        conn.exec(`
-          ALTER TABLE fx_rate_cache ADD COLUMN effective_date TEXT;
-        `);
-
-        // Update all existing rows to set effective_date = date
-        conn.prepare(`
-          UPDATE fx_rate_cache SET effective_date = date WHERE effective_date IS NULL
-        `).run();
-
-        // Create index on effective_date
-        conn.exec(`
-          CREATE INDEX IF NOT EXISTS idx_fx_rate_cache_effective_date
-            ON fx_rate_cache(effective_date);
-        `);
-
-        // Mark migration as done
-        conn.prepare(`
-          INSERT INTO config (key, value, updated_at)
-          VALUES (?, '1', datetime('now'))
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-        `).run('fx_rate_cache_schema_migration_v2_effective_date');
-
-        console.log(`[PriceCache] FX rate cache effective_date migration completed successfully`);
-      });
-
-      tx();
-    }
-  } catch (err) {
-    console.warn(`[PriceCache] FX rate cache effective_date migration failed: ${err.message}`);
   }
 }
 
@@ -1910,18 +1858,15 @@ function upsertPricePoint(point) {
   if (isFxInstrumentType(point.instrumentType)) {
     const rate = Number(point.close);
     if (!Number.isFinite(rate) || rate <= 0) return;
-    const effectiveDate = point.effective_date ? normalizeDate(point.effective_date) : normalizedDate;
     conn.prepare(`
-      INSERT INTO fx_rate_cache (date, effective_date, rate, source, fetched_at, updated_at)
-      VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+      INSERT INTO fx_rate_cache (date, rate, source, fetched_at, updated_at)
+      VALUES (?, ?, ?, datetime('now'), datetime('now'))
       ON CONFLICT(date) DO UPDATE SET
-        effective_date = COALESCE(excluded.effective_date, fx_rate_cache.effective_date),
         rate = COALESCE(excluded.rate, fx_rate_cache.rate),
         source = COALESCE(excluded.source, fx_rate_cache.source),
         updated_at = datetime('now')
     `).run(
       normalizedDate,
-      effectiveDate,
       rate,
       point.source ?? null
     );
@@ -1971,10 +1916,9 @@ function upsertPriceSeries(instrumentType, symbol, points, source = null, invest
   const normalizedPoints = points.map(normalizeCachePoint).filter(Boolean);
   if (isFxInstrumentType(instrumentType)) {
     const stmtFx = conn.prepare(`
-      INSERT INTO fx_rate_cache (date, effective_date, rate, source, fetched_at, updated_at)
-      VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))
+      INSERT INTO fx_rate_cache (date, rate, source, fetched_at, updated_at)
+      VALUES (?, ?, ?, datetime('now'), datetime('now'))
       ON CONFLICT(date) DO UPDATE SET
-        effective_date = COALESCE(excluded.effective_date, fx_rate_cache.effective_date),
         rate = COALESCE(excluded.rate, fx_rate_cache.rate),
         source = COALESCE(excluded.source, fx_rate_cache.source),
         updated_at = datetime('now')
@@ -1982,10 +1926,9 @@ function upsertPriceSeries(instrumentType, symbol, points, source = null, invest
     const txFx = conn.transaction((rows) => {
       for (const p of rows) {
         const d = normalizeDate(p.date);
-        const effDate = p.effective_date ? normalizeDate(p.effective_date) : d;
         const rate = Number(p.close);
         if (!d || !Number.isFinite(rate) || rate <= 0) continue;
-        stmtFx.run(d, effDate, rate, p.source ?? source ?? null);
+        stmtFx.run(d, rate, p.source ?? source ?? null);
       }
     });
 
@@ -2043,7 +1986,7 @@ function getSeries(instrumentType, symbol, fromDate, toDate) {
   const conn = getCacheDb();
   if (isFxInstrumentType(instrumentType)) {
     return conn.prepare(`
-      SELECT date, effective_date, NULL AS open, NULL AS high, NULL AS low, rate AS close, NULL AS adj_close, 1 AS reverse_factor, NULL AS split_history_json, NULL AS volume, source
+      SELECT date, NULL AS open, NULL AS high, NULL AS low, rate AS close, NULL AS adj_close, 1 AS reverse_factor, NULL AS split_history_json, NULL AS volume, source
       FROM fx_rate_cache
       WHERE date >= ?
         AND date <= ?
@@ -2066,7 +2009,7 @@ function getNearestOnOrBefore(instrumentType, symbol, date) {
   const conn = getCacheDb();
   if (isFxInstrumentType(instrumentType)) {
     return conn.prepare(`
-      SELECT date, effective_date, NULL AS open, NULL AS high, NULL AS low, rate AS close, NULL AS adj_close, NULL AS volume, source
+      SELECT date, NULL AS open, NULL AS high, NULL AS low, rate AS close, NULL AS adj_close, NULL AS volume, source
       FROM fx_rate_cache
       WHERE date <= ?
       ORDER BY date DESC

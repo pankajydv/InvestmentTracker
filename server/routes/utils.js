@@ -6,7 +6,7 @@ const XLSX = require('xlsx');
 const { searchMutualFunds, fetchStockPrice, toNSETicker, searchStocks } = require('../services/priceService');
 const { updateAllPrices, cancelUpdate } = require('../services/updater');
 const { runSchedulerCycle } = require('../services/scheduler');
-const { getPendingDirtyScopes, markDirtyForAssetTypeFromDate, markDirtyFromTransactions, runDirtyBackfillPreflight } = require('../services/dirtyBackfillService');
+const { getPendingDirtyScopes, markDirtyForAssetTypeFromDate, markDirtyFromTransactions, runDirtyBackfillPreflight, markDirtyScopesFromSelector } = require('../services/dirtyBackfillService');
 const { ONE_DAY_CHANGE_POLICY, getOneDayChangePolicy, getUnexpectedLocfPolicy } = require('../services/assetPolicy');
 const { getComplianceScanState, scanAndRepairComplianceGaps } = require('../services/compliance/complianceScanService');
 const { todayIso } = require('../services/backfillService');
@@ -1212,6 +1212,135 @@ module.exports = function (db) {
       res.json({ run_date: runDate, pending_count: pending.length, pending });
     } catch (e) {
       res.status(500).json({ error: e.message || 'Failed to fetch dirty scopes' });
+    }
+  });
+
+  // ─── Mark dirty scopes from generic selector + date strategy ──────────
+  router.post('/dirty-backfill-scopes/mark', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const dryRun = body.dry_run === true;
+      const executeNow = body.execute_now === true;
+      const runDate = parseDateOnly(body.run_date) || todayIso();
+
+      const selector = body.selector || {};
+      const dateStrategy = body.date_strategy || { type: 'scope_first_transaction' };
+      const reason = body.reason || 'manual-mark-dirty-scope';
+      const sourceEventId = body.source_event_id || `manual:${new Date().toISOString()}`;
+
+      logAppInfo('[UI] Mark dirty scopes requested', {
+        dry_run: dryRun,
+        execute_now: executeNow,
+        run_date: runDate,
+        selector,
+        date_strategy: dateStrategy,
+      });
+
+      // Validate selector inputs
+      if (selector.portfolio_ids) {
+        if (!Array.isArray(selector.portfolio_ids)) {
+          return res.status(400).json({ error: 'selector.portfolio_ids must be an array' });
+        }
+        for (const pid of selector.portfolio_ids) {
+          if (!Number.isInteger(pid) || pid <= 0) {
+            return res.status(400).json({ error: 'selector.portfolio_ids must contain positive integers' });
+          }
+        }
+      }
+
+      if (selector.investment_ids) {
+        if (!Array.isArray(selector.investment_ids)) {
+          return res.status(400).json({ error: 'selector.investment_ids must be an array' });
+        }
+        for (const iid of selector.investment_ids) {
+          if (!Number.isInteger(iid) || iid <= 0) {
+            return res.status(400).json({ error: 'selector.investment_ids must contain positive integers' });
+          }
+        }
+      }
+
+      if (selector.asset_types) {
+        if (!Array.isArray(selector.asset_types)) {
+          return res.status(400).json({ error: 'selector.asset_types must be an array' });
+        }
+        const validAssetTypes = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'PPF', 'SSY', 'PF', 'CASH']);
+        for (const at of selector.asset_types) {
+          if (!validAssetTypes.has(String(at).toUpperCase())) {
+            return res.status(400).json({ error: `Invalid asset_type: ${at}` });
+          }
+        }
+      }
+
+      // Validate date strategy
+      const strategyType = String(dateStrategy.type || 'scope_first_transaction').toLowerCase();
+      if (!['fixed_date', 'scope_first_transaction', 'max_of_fixed_and_scope_first'].includes(strategyType)) {
+        return res.status(400).json({ error: `Invalid date_strategy.type: ${dateStrategy.type}` });
+      }
+
+      if (strategyType === 'fixed_date' && !parseDateOnly(dateStrategy.from_date)) {
+        return res.status(400).json({ error: 'date_strategy.type=fixed_date requires from_date (YYYY-MM-DD)' });
+      }
+
+      // In dry-run mode, return what would be enqueued without writing
+      if (dryRun) {
+        const { buildSelectorMatches, computeScopeDatesFromStrategy } = require('../services/dirtyBackfillService');
+        const matches = buildSelectorMatches(db, selector);
+        const scopesWithDates = computeScopeDatesFromStrategy(db, matches, dateStrategy);
+
+        logAppInfo('[UI] Mark dirty scopes dry-run', {
+          matched_count: matches.length,
+          scopes_count: scopesWithDates.length,
+        });
+
+        return res.json({
+          success: true,
+          dry_run: true,
+          run_date: runDate,
+          matched_count: matches.length,
+          scopes_count: scopesWithDates.length,
+          scopes: scopesWithDates.slice(0, 100),
+          message: scopesWithDates.length > 100 ? `Showing first 100 of ${scopesWithDates.length} scopes` : undefined,
+        });
+      }
+
+      // Perform actual marking
+      const { markDirtyScopesFromSelector } = require('../services/dirtyBackfillService');
+      const result = markDirtyScopesFromSelector(db, selector, dateStrategy, {
+        reason,
+        sourceEventId,
+        runDate,
+      });
+
+      logAppInfo('[UI] Mark dirty scopes completed', {
+        matched_count: result.matched_count,
+        enqueued_count: result.enqueued_count,
+        errors_count: result.errors.length,
+      });
+
+      // Execute preflight if requested
+      if (executeNow && result.enqueued_count > 0) {
+        const preflight = await runDirtyBackfillPreflight(db, runDate);
+        logAppInfo('[UI] Mark dirty scopes executed preflight', { ...preflight });
+        return res.json({
+          success: true,
+          matched_count: result.matched_count,
+          enqueued_count: result.enqueued_count,
+          errors: result.errors,
+          executed_now: true,
+          preflight_result: preflight,
+        });
+      }
+
+      res.json({
+        success: true,
+        matched_count: result.matched_count,
+        enqueued_count: result.enqueued_count,
+        errors: result.errors,
+        executed_now: false,
+      });
+    } catch (e) {
+      logAppError('[UI] Mark dirty scopes failed', { error: e.message });
+      return res.status(500).json({ error: e.message || 'Failed to mark dirty scopes' });
     }
   });
 

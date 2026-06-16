@@ -165,7 +165,7 @@ function initializeDb(db) {
       invested_amount REAL NOT NULL, -- Total amount invested till date
       realized_proceeds REAL DEFAULT 0, -- Cumulative cash out (realized proceeds)
       profit_loss REAL NOT NULL,   -- current_value - invested_amount
-      price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED')),
+      price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED', 'PRE', 'POST')),
       day_change REAL DEFAULT 0,   -- Change from previous day
       updated_at TEXT DEFAULT (datetime('now')),
       FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
@@ -2136,6 +2136,122 @@ function initializeDb(db) {
     }
   } else if (!hasMigrationRecord(db, dailyValuesConstraintMigrationId) && !hasIlliquidCarryInConstraint) {
     recordMigration(db, dailyValuesConstraintMigrationId, 'skipped', 'constraint already excludes ILLIQUID_CARRY');
+  }
+
+  // ── Migration: add PRE and POST to daily_values.price_source CHECK constraint ──
+  // Required to store FOREIGN_STOCK pre-market ('PRE') and after-hours ('POST') prices
+  // as distinct, upgradeable sources rather than collapsing them to 'LIVE'.
+  const dailyValuesPrepPostMigrationId = '20260616-daily-values-price-source-add-pre-post';
+  const currentDvTableSql = String(
+    db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_values'").get()?.sql || ''
+  );
+  const needsPrePostConstraint = !currentDvTableSql.includes("'PRE'");
+
+  if (requireMigrationsEnabled(
+    dailyValuesPrepPostMigrationId,
+    needsPrePostConstraint,
+    "daily_values.price_source CHECK does not include 'PRE'/'POST'"
+  )) {
+    const dvColsPrePost = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
+    const beforeCountPrePost = getTableCount(db, 'daily_values');
+    const updatedAtExprPP = dvColsPrePost.has('updated_at')
+      ? (dvColsPrePost.has('created_at')
+        ? "COALESCE(updated_at, created_at, datetime('now'))"
+        : "COALESCE(updated_at, datetime('now'))")
+      : (dvColsPrePost.has('created_at') ? "COALESCE(created_at, datetime('now'))" : "datetime('now')");
+    const priceSourceExprPP = dvColsPrePost.has('price_source')
+      ? "CASE WHEN price_source IN ('LIVE','LOCF','COMPUTED','PRE','POST') THEN price_source ELSE 'LIVE' END"
+      : "'LIVE'";
+    const realizedProceedsExprPP = dvColsPrePost.has('realized_proceeds') ? 'COALESCE(realized_proceeds, 0)' : '0';
+    const dayChangeExprPP = dvColsPrePost.has('day_change') ? 'COALESCE(day_change, 0)' : '0';
+
+    // Automatic backup before migration to prevent data loss
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const dbFilePath = process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'investments.db');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('Z')[0];
+      const backupPath = dbFilePath.replace(/\.db$/, `.db.backup-pre-pre-post-${timestamp}`);
+      if (fs.existsSync(dbFilePath)) {
+        fs.copyFileSync(dbFilePath, backupPath);
+        logAppInfo(`[Schema Migration] Automatic backup created: ${path.basename(backupPath)}`);
+      }
+    } catch (backupErr) {
+      logAppWarn(`[Schema Migration] Automatic backup failed (migration will proceed): ${backupErr.message}`);
+    }
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE daily_values_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          investment_id INTEGER NOT NULL,
+          portfolio_id INTEGER,
+          date TEXT NOT NULL,
+          price_per_unit REAL,
+          total_units REAL,
+          current_value REAL NOT NULL,
+          invested_amount REAL NOT NULL,
+          realized_proceeds REAL DEFAULT 0,
+          profit_loss REAL NOT NULL,
+          price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED', 'PRE', 'POST')),
+          day_change REAL DEFAULT 0,
+          updated_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
+          UNIQUE(investment_id, portfolio_id, date)
+        )
+      `);
+      db.exec(`
+        INSERT INTO daily_values_new (
+          id, investment_id, portfolio_id, date, price_per_unit, total_units,
+          current_value, invested_amount, realized_proceeds, profit_loss,
+          price_source, day_change, updated_at
+        )
+        SELECT
+          id, investment_id, portfolio_id, date, price_per_unit, total_units,
+          current_value, invested_amount, ${realizedProceedsExprPP}, profit_loss,
+          ${priceSourceExprPP}, ${dayChangeExprPP}, ${updatedAtExprPP}
+        FROM daily_values
+      `);
+      db.exec('DROP TABLE daily_values');
+      db.exec('ALTER TABLE daily_values_new RENAME TO daily_values');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON daily_values(portfolio_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON daily_values(investment_id, portfolio_id, date DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date DESC)');
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_insert
+        BEFORE INSERT ON daily_values WHEN NEW.portfolio_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null'); END;
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_update
+        BEFORE UPDATE OF portfolio_id ON daily_values WHEN NEW.portfolio_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null'); END;
+      `);
+      db.exec('COMMIT');
+      db.exec('PRAGMA foreign_keys = ON');
+      const afterCountPrePost = getTableCount(db, 'daily_values');
+      ensureRowCountPreserved({
+        before: beforeCountPrePost, after: afterCountPrePost,
+        table: 'daily_values', migrationName: dailyValuesPrepPostMigrationId,
+      });
+      assertDbIntegrity(db, dailyValuesPrepPostMigrationId);
+      recordMigration(
+        db, dailyValuesPrepPostMigrationId, 'applied',
+        `rows before=${beforeCountPrePost}, after=${afterCountPrePost}; added PRE/POST to price_source CHECK`
+      );
+    } catch (e) {
+      db.exec('ROLLBACK');
+      db.exec('PRAGMA foreign_keys = ON');
+      throw e;
+    }
+  } else if (!hasMigrationRecord(db, dailyValuesPrepPostMigrationId) && !needsPrePostConstraint) {
+    recordMigration(db, dailyValuesPrepPostMigrationId, 'skipped', "constraint already includes 'PRE'/'POST'");
   }
 
   // ── Migration: add investments.last_active_date ───────────────────────────

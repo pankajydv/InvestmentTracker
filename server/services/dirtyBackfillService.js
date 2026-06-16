@@ -668,14 +668,213 @@ function markNPSInvestmentsDirtyFromTransactions(db) {
   }
 }
 
+/**
+ * Build a list of matched (investment_id, portfolio_id) pairs based on a selector.
+ * selector = { portfolio_ids?, asset_types?, investment_ids?, include_inactive?, include_excluded? }
+ * returns array of { investment_id, portfolio_id }
+ */
+function buildSelectorMatches(db, selector = {}) {
+  const portfolioIds = Array.isArray(selector.portfolio_ids) ? selector.portfolio_ids : [];
+  const assetTypes = Array.isArray(selector.asset_types) ? selector.asset_types : [];
+  const investmentIds = Array.isArray(selector.investment_ids) ? selector.investment_ids : [];
+  const includeInactive = selector.include_inactive === true;
+  const includeExcluded = selector.include_excluded === true;
+
+  // Build WHERE clause filters
+  const filters = [];
+  const args = [];
+
+  // Investment filter
+  if (investmentIds.length > 0) {
+    const placeholders = investmentIds.map(() => '?').join(',');
+    filters.push(`i.id IN (${placeholders})`);
+    args.push(...investmentIds);
+  }
+
+  // Asset type filter
+  if (assetTypes.length > 0) {
+    const placeholders = assetTypes.map(() => '?').join(',');
+    filters.push(`i.asset_type IN (${placeholders})`);
+    args.push(...assetTypes);
+  }
+
+  // Active/excluded filters
+  if (!includeInactive) {
+    filters.push('COALESCE(i.is_active, 1) != 0');
+  }
+  if (!includeExcluded) {
+    filters.push('COALESCE(i.exclude_from_tracking, 0) != 1');
+  }
+
+  const whereClause = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
+
+  // Portfolio filter is applied in the transaction join
+  let portfolioFilter = '';
+  let portfolioArgs = [];
+  if (portfolioIds.length > 0) {
+    const placeholders = portfolioIds.map(() => '?').join(',');
+    portfolioFilter = `AND t.portfolio_id IN (${placeholders})`;
+    portfolioArgs = portfolioIds;
+  }
+
+  const query = `
+    SELECT DISTINCT i.id AS investment_id, t.portfolio_id
+    FROM investments i
+    LEFT JOIN transactions t ON t.investment_id = i.id
+    ${whereClause}
+    ${portfolioFilter ? `${portfolioFilter}` : ''}
+    WHERE t.portfolio_id IS NOT NULL
+    ORDER BY i.id ASC, t.portfolio_id ASC
+  `;
+
+  // Reconstruct WHERE clause properly
+  const finalQuery = `
+    SELECT DISTINCT i.id AS investment_id, t.portfolio_id
+    FROM investments i
+    LEFT JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id IS NOT NULL
+    ${whereClause}
+    ${portfolioFilter}
+    ORDER BY i.id ASC, t.portfolio_id ASC
+  `;
+
+  return db.prepare(finalQuery).all(...args, ...portfolioArgs);
+}
+
+/**
+ * Compute dirty_from_date for a set of matched scopes based on date_strategy.
+ * strategy = { type: 'fixed_date' | 'scope_first_transaction' | 'max_of_fixed_and_scope_first', from_date? }
+ * Returns array of { investment_id, portfolio_id, dirty_from_date }
+ */
+function computeScopeDatesFromStrategy(db, matches, strategy = {}) {
+  const strategyType = String(strategy.type || 'scope_first_transaction').toLowerCase();
+  const fromDate = normalizeDirtyDate(strategy.from_date);
+
+  if (!matches || matches.length === 0) {
+    return [];
+  }
+
+  if (strategyType === 'fixed_date') {
+    if (!fromDate) {
+      throw new Error('date_strategy.type=fixed_date requires from_date');
+    }
+    // All scopes use the same from_date
+    return matches.map((m) => ({
+      investment_id: m.investment_id,
+      portfolio_id: m.portfolio_id,
+      dirty_from_date: fromDate,
+    }));
+  }
+
+  if (strategyType === 'scope_first_transaction' || strategyType === 'max_of_fixed_and_scope_first') {
+    // Fetch MIN(transaction_date) per investment-portfolio
+    const result = [];
+    const txnQuery = db.prepare(`
+      SELECT MIN(date(transaction_date)) AS min_txn_date
+      FROM transactions
+      WHERE investment_id = ? AND portfolio_id = ?
+    `);
+
+    for (const match of matches) {
+      const txnRow = txnQuery.get(match.investment_id, match.portfolio_id);
+      let scopeFirstDate = normalizeDirtyDate(txnRow?.min_txn_date);
+
+      if (!scopeFirstDate) {
+        // No transactions for this scope; skip it
+        continue;
+      }
+
+      let dirtyFromDate = scopeFirstDate;
+      if (strategyType === 'max_of_fixed_and_scope_first' && fromDate) {
+        dirtyFromDate = maxDate(scopeFirstDate, fromDate);
+      }
+
+      result.push({
+        investment_id: match.investment_id,
+        portfolio_id: match.portfolio_id,
+        dirty_from_date: dirtyFromDate,
+      });
+    }
+
+    return result;
+  }
+
+  throw new Error(`Unknown date_strategy.type: ${strategyType}`);
+}
+
+function maxDate(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return a >= b ? a : b;
+}
+
+/**
+ * Mark dirty scopes from a generic selector and date strategy.
+ * This is the main entry point for manual scope marking.
+ * Returns { matched_count, enqueued_count, scopes: [...], errors: [...] }
+ */
+function markDirtyScopesFromSelector(db, selector = {}, dateStrategy = {}, metadata = {}) {
+  const reason = metadata.reason || 'manual-mark-dirty-scope';
+  const sourceEventId = metadata.sourceEventId || `manual:${new Date().toISOString()}`;
+  const runDate = normalizeDirtyDate(metadata.runDate) || todayIso();
+
+  const errors = [];
+  const matched = [];
+  const enqueued = [];
+
+  try {
+    const matches = buildSelectorMatches(db, selector);
+    matched.push(...matches);
+
+    const scopesWithDates = computeScopeDatesFromStrategy(db, matches, dateStrategy);
+
+    for (const scope of scopesWithDates) {
+      try {
+        const dirtyDate = markScopeDirty(db, {
+          investmentId: scope.investment_id,
+          portfolioId: scope.portfolio_id,
+          dirtyFromDate: scope.dirty_from_date,
+          reason,
+          sourceEventId,
+        });
+
+        if (dirtyDate) {
+          enqueued.push({
+            investment_id: scope.investment_id,
+            portfolio_id: scope.portfolio_id,
+            dirty_from_date: dirtyDate,
+          });
+        }
+      } catch (e) {
+        errors.push({
+          investment_id: scope.investment_id,
+          portfolio_id: scope.portfolio_id,
+          error: e.message,
+        });
+      }
+    }
+  } catch (e) {
+    errors.push({ scope: 'selector', error: e.message });
+  }
+
+  return {
+    matched_count: matched.length,
+    enqueued_count: enqueued.length,
+    scopes: enqueued,
+    errors,
+  };
+}
+
 module.exports = {
+  buildSelectorMatches,
   clearBackfillProgress,
+  computeScopeDatesFromStrategy,
   getPendingDirtyScopes,
   getEarliestPendingDirtyDateForAssetType,
   markAllTrackedInvestmentsDirtyFromDate,
   markActiveTrackedForeignScopesDirtyFromDate,
   markDirtyForAssetTypeFromDate,
   markDirtyFromTransactions,
+  markDirtyScopesFromSelector,
   markScopeDirty,
   runDailyBootstrapDirtyScopeEnqueue,
   runDirtyBackfillPreflight,

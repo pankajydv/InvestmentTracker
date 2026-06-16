@@ -8,7 +8,6 @@ const {
   fetchStockPrice,
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
-  fetchHistoricalUSDToINRAndEffectiveDate,
   toNSETicker,
   resolveAmfiCodeByISIN,
   fetchSGBPrice,
@@ -28,12 +27,12 @@ const {
 } = require('./numberPrecision');
 const { markScopeDirty, runDailyBootstrapDirtyScopeEnqueue } = require('./dirtyBackfillService');
 const { todayIso, normalizeProviderDate } = require('./dateUtils');
+const { LOCF_STREAK_WARN_SESSIONS, FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS } = require('./freshnessPolicy');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // Asset types covered by the generic LOCF-lag self-healing path.
-// FOREIGN_STOCK is intentionally excluded — it has a dedicated settlement-aware
-// reconcile path in the scheduler (ensureForeignReconcileScopes).
-const LOCF_LAG_RECONCILE_ASSET_TYPES = new Set(['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
+// FOREIGN_STOCK is now included; its session boundaries are weekday-only (no holiday DB).
+const LOCF_LAG_RECONCILE_ASSET_TYPES = new Set(['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'FOREIGN_STOCK']);
 
 const DAY_CHANGE_MAX_PREVIOUS_SESSIONS = 3;
 const DAY_CHANGE_EPSILON_UNITS = 0.0001;
@@ -53,17 +52,10 @@ function getMarketClosedSetForYear(year, db, cache) {
   return cache.get(year);
 }
 
-function isMarketSessionDate(dateIso, db, cache, assetType = null) {
+function isMarketSessionDate(dateIso, db, cache) {
   const d = new Date(`${dateIso}T00:00:00.000Z`);
   const day = d.getUTCDay();
   if (day === 0 || day === 6) return false;
-
-  const normalizedType = String(assetType || '').toUpperCase();
-  if (normalizedType === 'FOREIGN_STOCK' || normalizedType === 'FX') {
-    // Foreign-market sessions should not be filtered by India holiday calendars.
-    return true;
-  }
-
   const closed = getMarketClosedSetForYear(d.getUTCFullYear(), db, cache);
   return !closed.has(dateIso);
 }
@@ -72,14 +64,30 @@ function isMarketLinkedAssetType(assetType) {
   return ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(assetType || ''));
 }
 
-function isWithinPreviousMarketSessions(candidateIso, anchorIso, db, holidayCache, assetType = null, maxSessions = DAY_CHANGE_MAX_PREVIOUS_SESSIONS) {
+// FOREIGN_STOCK uses weekday-only market sessions (US holidays are not in our holiday DB).
+function isIsoWeekday(dateIso) {
+  if (!dateIso) return false;
+  const day = new Date(`${dateIso}T00:00:00.000Z`).getUTCDay();
+  return day !== 0 && day !== 6;
+}
+
+function isWithinPreviousMarketSessions(candidateIso, anchorIso, db, holidayCache, maxSessions = DAY_CHANGE_MAX_PREVIOUS_SESSIONS, assetType = null) {
   if (!candidateIso || !anchorIso || candidateIso >= anchorIso) return false;
-  if (!isMarketSessionDate(candidateIso, db, holidayCache, assetType)) return false;
+  // FOREIGN_STOCK: weekday-only (US holidays not in our holiday DB).
+  const isForeign = String(assetType || '').toUpperCase() === 'FOREIGN_STOCK';
+  if (isForeign) {
+    if (!isIsoWeekday(candidateIso)) return false;
+  } else {
+    if (!isMarketSessionDate(candidateIso, db, holidayCache)) return false;
+  }
 
   let cursor = addDaysIso(anchorIso, -1);
   let seenSessions = 0;
   while (cursor >= candidateIso) {
-    if (isMarketSessionDate(cursor, db, holidayCache, assetType)) {
+    const isSession = isForeign
+      ? isIsoWeekday(cursor)
+      : isMarketSessionDate(cursor, db, holidayCache);
+    if (isSession) {
       seenSessions += 1;
       if (seenSessions > maxSessions) return false;
     }
@@ -93,6 +101,7 @@ function isWithinPreviousMarketSessions(candidateIso, anchorIso, db, holidayCach
 
 function getPriorMarketSessionLocfStreak(db, investmentId, portfolioId, asOfDate, holidayCache, assetType = null) {
   const fromDate = addDaysIso(asOfDate, -90);
+  const isForeign = String(assetType || '').toUpperCase() === 'FOREIGN_STOCK';
   const rows = db.prepare(`
     SELECT date, price_source
     FROM daily_values
@@ -107,9 +116,12 @@ function getPriorMarketSessionLocfStreak(db, investmentId, portfolioId, asOfDate
   let cursor = addDaysIso(asOfDate, -1);
   let streak = 0;
   while (cursor >= fromDate) {
-    if (isMarketSessionDate(cursor, db, holidayCache, assetType)) {
+    const isSession = isForeign
+      ? isIsoWeekday(cursor)
+      : isMarketSessionDate(cursor, db, holidayCache);
+    if (isSession) {
       const source = byDate.get(cursor);
-      if (source === 'LOCF') {
+      if (source === 'LOCF' || source === 'PRE' || source === 'POST') {
         streak += 1;
       } else {
         break;
@@ -206,9 +218,6 @@ async function updateAllPrices(db, options = {}) {
   const typeFilter = options.assetTypes;
   const sessionOnlyForMarketLinked = options.sessionOnlyForMarketLinked === true;
   const reuseLiveTodayAssetTypes = new Set(Array.isArray(options.reuseLiveTodayAssetTypes) ? options.reuseLiveTodayAssetTypes : []);
-  const reuseLiveDateByAssetType = (options.reuseLiveDateByAssetType && typeof options.reuseLiveDateByAssetType === 'object')
-    ? options.reuseLiveDateByAssetType
-    : {};
   const runTag = String(options.runTag || '').trim() || null;
   const label = typeFilter ? typeFilter.join(', ') : 'ALL';
   const runStartedAt = Date.now();
@@ -224,8 +233,8 @@ async function updateAllPrices(db, options = {}) {
   investments = investments.filter(i => i.exclude_from_tracking !== 1);
 
   // Skip fully-sold investments (net units <= 0). Only provident/small-savings
-  // products and bonds are balance/accrual-based and should always be included.
-  const BALANCE_BASED_TYPES = new Set(['PPF', 'SSY', 'PF', 'BOND']);
+  // products are balance-based and should always be included.
+  const BALANCE_BASED_TYPES = new Set(['PPF', 'SSY', 'PF']);
   const openInvestmentIds = new Set(
     db.prepare(`
       SELECT investment_id FROM transactions
@@ -297,14 +306,11 @@ async function updateAllPrices(db, options = {}) {
 
   // Fetch USD/INR rate for foreign stocks and persist per-day FX cache when needed.
   let usdToInr = parseFloat(db.prepare("SELECT value FROM config WHERE key = 'usd_to_inr'").get()?.value || '83.5');
-  let usdToInrEffectiveDate = today; // Tracks the market session date of the FX rate
   if (hasForeignInScope) {
     try {
-      const fxResult = await fetchHistoricalUSDToINRAndEffectiveDate(today);
-      usdToInr = fxResult.rate;
-      usdToInrEffectiveDate = fxResult.effective_date || today;
+      usdToInr = await fetchHistoricalUSDToINR(today);
       db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'usd_to_inr'").run(String(usdToInr));
-      logAppInfo('[UpdatePrices] USD/INR rate refreshed', { usdToInr, usdToInrEffectiveDate, source: 'historical_fx_cache' });
+      logAppInfo('[UpdatePrices] USD/INR rate refreshed', { usdToInr, source: 'historical_fx_cache' });
     } catch (e) {
       console.warn('Could not update USD/INR historical rate, trying live rate. Using cached value if needed:', usdToInr);
       logAppError('[UpdatePrices] USD/INR historical refresh failed', { error: e.message, usdToInr });
@@ -430,8 +436,6 @@ async function updateAllPrices(db, options = {}) {
   const isMarketSessionToday = isMarketSessionDate(today, db, marketHolidayCache);
   const touchedDates = new Set([today]);
   const fxRateByDate = new Map([[today, usdToInr]]);
-  // Track effective (market session) dates for FX rates to enable session-aligned valuation
-  const fxEffectiveDateByDate = new Map([[today, usdToInrEffectiveDate]]);
 
   logAppInfo('[UpdatePrices] Run context', {
     date: today,
@@ -452,20 +456,12 @@ async function updateAllPrices(db, options = {}) {
     LIMIT 1
   `);
 
-  function resolveReuseLiveDate(assetType) {
-    const key = String(assetType || '').toUpperCase();
-    const candidate = String(reuseLiveDateByAssetType[key] || '').trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(candidate)) return candidate;
-    return today;
-  }
-
   async function getFxRateForDate(date) {
     if (fxRateByDate.has(date)) return fxRateByDate.get(date);
     try {
-      const fxResult = await fetchHistoricalUSDToINRAndEffectiveDate(date);
-      fxRateByDate.set(date, fxResult.rate);
-      fxEffectiveDateByDate.set(date, fxResult.effective_date || date);
-      return fxResult.rate;
+      const fx = await fetchHistoricalUSDToINR(date);
+      fxRateByDate.set(date, fx);
+      return fx;
     } catch (e) {
       logAppWarn('[UpdatePrices] FX lookup fallback used for foreign snapshot backfill', {
         date,
@@ -474,7 +470,6 @@ async function updateAllPrices(db, options = {}) {
         fallbackFx: usdToInr,
       });
       fxRateByDate.set(date, usdToInr);
-      fxEffectiveDateByDate.set(date, today);
       return usdToInr;
     }
   }
@@ -549,8 +544,11 @@ async function updateAllPrices(db, options = {}) {
           return true;
         }
 
-        if (String(row?.price_source || '') === 'LOCF') return false;
-        return isWithinPreviousMarketSessions(row.date, asOfDate, db, marketHolidayCache, inv.asset_type);
+        // Exclude carry-forward and preliminary FS session-phase rows from day-change baseline.
+        // PRE/POST will be upgraded to LIVE by a later regular-session run.
+        const src = String(row?.price_source || '');
+        if (src === 'LOCF' || src === 'PRE' || src === 'POST') return false;
+        return isWithinPreviousMarketSessions(row.date, asOfDate, db, marketHolidayCache, DAY_CHANGE_MAX_PREVIOUS_SESSIONS, inv.asset_type);
       });
 
       const prevValue = Number(previousRow?.current_value || 0);
@@ -572,16 +570,26 @@ async function updateAllPrices(db, options = {}) {
       );
 
       const assetType = String(inv.asset_type || '');
+      const isForeignStock = assetType === 'FOREIGN_STOCK';
+      // FOREIGN_STOCK session check: weekday-only (no India holiday DB).
+      const isTodaySession = isForeignStock
+        ? isIsoWeekday(today)
+        : isMarketSessionDate(today, db, marketHolidayCache);
+      // LOCF streak threshold differs: FS allows up to 5 (after-hours attribution means 1
+      // structural LOCF per day boundary is expected).
+      const locfWarnThreshold = isForeignStock
+        ? FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS
+        : LOCF_STREAK_WARN_SESSIONS;
       if (
         asOfDate === today
         && resolvedPriceSource === 'LOCF'
-        && (LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType) || assetType === 'FOREIGN_STOCK')
-        && isMarketSessionDate(today, db, marketHolidayCache, assetType)
+        && LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType)
+        && isTodaySession
       ) {
         const priorStreak = getPriorMarketSessionLocfStreak(db, inv.id, pid, today, marketHolidayCache, assetType);
         const currentStreak = priorStreak + 1;
         const warnKey = `${inv.id}:${pid}:${today}`;
-        if (currentStreak >= 3 && !warnedUnexpectedLocf.has(warnKey)) {
+        if (currentStreak >= locfWarnThreshold && !warnedUnexpectedLocf.has(warnKey)) {
           warnedUnexpectedLocf.add(warnKey);
           logAppWarn('[UpdatePrices][LOCF] Unexpected LOCF streak reached threshold', {
             investmentId: inv.id,
@@ -622,11 +630,7 @@ async function updateAllPrices(db, options = {}) {
     }
 
     try {
-      if (sessionOnlyForMarketLinked && isMarketLinkedAssetType(inv.asset_type)) {
-        const isMarketSessionForAsset = isMarketSessionDate(today, db, marketHolidayCache, inv.asset_type);
-        if (isMarketSessionForAsset) {
-          // Continue as normal on valid session days.
-        } else {
+      if (sessionOnlyForMarketLinked && !isMarketSessionToday && isMarketLinkedAssetType(inv.asset_type)) {
         skippedCount += 1;
         logAppInfo('[UpdatePrices] Skipped market-linked asset on non-session day', {
           investmentId: inv.id,
@@ -636,7 +640,6 @@ async function updateAllPrices(db, options = {}) {
           runTag,
         });
         continue;
-        }
       }
 
       let pricePerUnit = 0;
@@ -644,14 +647,16 @@ async function updateAllPrices(db, options = {}) {
       let apiChange = null;
       let apiChangePct = null;
       let providerDateForWriteback = null;
+      // FOREIGN_STOCK after-hours: also write the regular session close for the session date.
+      let foreignSessionDateForWriteback = null;
+      let foreignSessionOfficialClose = 0;
       
       console.log(`  [DEBUG] Processing ${inv.name} (id=${inv.id}, type=${inv.asset_type})`);
 
       switch (inv.asset_type) {
         case 'MUTUAL_FUND': {
-          const reuseDate = resolveReuseLiveDate(inv.asset_type);
           const reusedLivePrice = reuseLiveTodayAssetTypes.has(inv.asset_type)
-            ? Number(getLivePriceForDate.get(inv.id, reuseDate)?.price_per_unit || 0)
+            ? Number(getLivePriceForDate.get(inv.id, today)?.price_per_unit || 0)
             : 0;
           if (reusedLivePrice > 0) {
             pricePerUnit = reusedLivePrice;
@@ -661,7 +666,6 @@ async function updateAllPrices(db, options = {}) {
               investmentName: inv.name,
               assetType: inv.asset_type,
               date: today,
-              reuseDate,
               runTag,
             });
           } else if (inv.amfi_code) {
@@ -678,6 +682,7 @@ async function updateAllPrices(db, options = {}) {
             apiChange = navData.change;
             apiChangePct = navData.changePercent;
             priceSource = sourceDecision.priceSource;
+            providerDateForWriteback = sourceDecision.providerDate;
           } else {
             console.warn(`  ${inv.name}: No AMFI code, computing from transactions only`);
           }
@@ -698,11 +703,41 @@ async function updateAllPrices(db, options = {}) {
             investmentId: inv.id,
             investmentName: inv.name,
           });
-          pricePerUnit = stockData.price;
+          providerDateForWriteback = sourceDecision.providerDate;
+          const staleProviderDate = sourceDecision.providerDate && sourceDecision.providerDate < today;
+          if (staleProviderDate) {
+            const officialClose = Number(stockData.officialClose);
+            if (Number.isFinite(officialClose) && officialClose > 0) {
+              pricePerUnit = officialClose;
+            } else {
+              const carriedForward = db.prepare(`
+                SELECT price_per_unit
+                FROM daily_values
+                WHERE investment_id = ?
+                  AND date <= ?
+                ORDER BY date DESC
+                LIMIT 1
+              `).get(inv.id, sourceDecision.providerDate);
+              if (Number(carriedForward?.price_per_unit) > 0) {
+                pricePerUnit = Number(carriedForward.price_per_unit);
+              } else {
+                pricePerUnit = stockData.price;
+              }
+              logAppWarn('[UpdatePrices][INDIAN_STOCK] Missing provider-date official close; falling back to carry-forward/quote price', {
+                investmentId: inv.id,
+                investmentName: inv.name,
+                runDate: today,
+                providerDate: sourceDecision.providerDate,
+                fallbackPrice: pricePerUnit,
+              });
+            }
+          } else {
+            pricePerUnit = stockData.price;
+          }
           apiChange = stockData.change;
           apiChangePct = stockData.changePercent;
           priceSource = sourceDecision.priceSource;
-          console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
+          console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, effectivePrice=${pricePerUnit}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
           break;
         }
         case 'FOREIGN_STOCK': {
@@ -713,7 +748,7 @@ async function updateAllPrices(db, options = {}) {
           await delay(500);
           const foreignData = await fetchStockPrice(inv.ticker_symbol);
           const sourceDecision = resolvePriceSourceFromProviderDate({
-            providerDate: foreignData.sourceDateUtc || foreignData.date,
+            providerDate: foreignData.date,
             runDate: today,
             assetType: inv.asset_type,
             investmentId: inv.id,
@@ -724,7 +759,25 @@ async function updateAllPrices(db, options = {}) {
           apiChangePct = foreignData.changePercent;
           priceSource = sourceDecision.priceSource;
           providerDateForWriteback = sourceDecision.providerDate;
-          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK price fetch returned price=${foreignData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
+          // After-hours: remember session date + official close so we can write a LIVE
+          // snapshot for the session date (the row the regular close belongs to).
+          if (foreignData.sessionPhase === 'post'
+            && foreignData.sessionDateIst
+            && foreignData.sessionDateIst < today
+            && Number(foreignData.officialClose) > 0
+          ) {
+            foreignSessionDateForWriteback = foreignData.sessionDateIst;
+            foreignSessionOfficialClose = Number(foreignData.officialClose);
+          }
+          // Refine LIVE to PRE or POST so the source label reflects data quality.
+          // PRE = pre-market price; will be overwritten to LIVE when regular session closes.
+          // POST = after-hours price attributed to next session; overwritten when that session closes.
+          // LOCF source is preserved as-is (no data was fetched).
+          if (priceSource === 'LIVE') {
+            if (foreignData.sessionPhase === 'pre') priceSource = 'PRE';
+            else if (foreignData.sessionPhase === 'post') priceSource = 'POST';
+          }
+          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK price fetch returned price=${foreignData.price}, providerDate=${sourceDecision.providerDate}, sessionPhase=${foreignData.sessionPhase || 'regular'}, priceSource=${priceSource}`);
           break;
         }
         case 'BOND': {
@@ -778,9 +831,8 @@ async function updateAllPrices(db, options = {}) {
         }
         case 'NPS': {
           try {
-            const reuseDate = resolveReuseLiveDate(inv.asset_type);
             const reusedLivePrice = reuseLiveTodayAssetTypes.has(inv.asset_type)
-              ? Number(getLivePriceForDate.get(inv.id, reuseDate)?.price_per_unit || 0)
+              ? Number(getLivePriceForDate.get(inv.id, today)?.price_per_unit || 0)
               : 0;
             if (reusedLivePrice > 0) {
               pricePerUnit = reusedLivePrice;
@@ -790,7 +842,6 @@ async function updateAllPrices(db, options = {}) {
                 investmentName: inv.name,
                 assetType: inv.asset_type,
                 date: today,
-                reuseDate,
                 runTag,
               });
               break;
@@ -815,6 +866,7 @@ async function updateAllPrices(db, options = {}) {
             apiChange = npsData.change;
             apiChangePct = npsData.changePercent;
             priceSource = sourceDecision.priceSource;
+            providerDateForWriteback = sourceDecision.providerDate;
           } catch (e) {
             console.warn(`  ${inv.name}: NPS NAV fetch failed (${e.message}), falling back to last known price`);
             // Fallback 1: use last valid stored daily value (exclude placeholder 99.99)
@@ -856,19 +908,42 @@ async function updateAllPrices(db, options = {}) {
       }
 
       let providerDateRowsWritten = 0;
+      // FOREIGN_STOCK after-hours: write the official regular-session close for the session date.
+      if (inv.asset_type === 'FOREIGN_STOCK'
+        && foreignSessionDateForWriteback
+        && foreignSessionOfficialClose > 0
+        && foreignSessionDateForWriteback < today
+        && /^\d{4}-\d{2}-\d{2}$/.test(foreignSessionDateForWriteback)
+      ) {
+        const sessionFx = await getFxRateForDate(foreignSessionDateForWriteback);
+        const sessionRows = writeInvestmentSnapshotForDate(inv, foreignSessionDateForWriteback, foreignSessionOfficialClose, 'LIVE', sessionFx);
+        if (sessionRows > 0) {
+          touchedDates.add(foreignSessionDateForWriteback);
+          logAppInfo('[UpdatePrices] FOREIGN_STOCK after-hours: session-date snapshot written with official close', {
+            investmentId: inv.id,
+            investmentName: inv.name,
+            sessionDate: foreignSessionDateForWriteback,
+            officialClose: foreignSessionOfficialClose,
+            runDate: today,
+          });
+        }
+      }
       if (
-        inv.asset_type === 'FOREIGN_STOCK'
+        (inv.asset_type === 'FOREIGN_STOCK' || inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'MUTUAL_FUND' || inv.asset_type === 'NPS')
         && providerDateForWriteback
         && providerDateForWriteback < today
         && /^\d{4}-\d{2}-\d{2}$/.test(providerDateForWriteback)
       ) {
-        const providerFx = await getFxRateForDate(providerDateForWriteback);
+        const providerFx = inv.asset_type === 'FOREIGN_STOCK'
+          ? await getFxRateForDate(providerDateForWriteback)
+          : usdToInr;
         providerDateRowsWritten = writeInvestmentSnapshotForDate(inv, providerDateForWriteback, pricePerUnit, 'LIVE', providerFx);
         if (providerDateRowsWritten > 0) {
           touchedDates.add(providerDateForWriteback);
-          logAppInfo('[UpdatePrices] Foreign provider-date snapshot refreshed', {
+          logAppInfo('[UpdatePrices] Provider-date snapshot refreshed', {
             investmentId: inv.id,
             investmentName: inv.name,
+            assetType: inv.asset_type,
             providerDate: providerDateForWriteback,
             runDate: today,
             rowsWritten: providerDateRowsWritten,
@@ -877,18 +952,7 @@ async function updateAllPrices(db, options = {}) {
         }
       }
 
-      // For FOREIGN_STOCK: use session-aligned FX (same market session as the stock price).
-      // If stock is LOCF (no new quote today), use FX from the stock's effective date to avoid
-      // spurious day_change caused purely by FX movement on a day with no stock price update.
-      let fxForToday = usdToInr;
-      if (inv.asset_type === 'FOREIGN_STOCK' && priceSource === 'LOCF') {
-        // providerDateForWriteback is the last LIVE date from the provider response.
-        // Fall back to yesterday if providerDateForWriteback is not set.
-        const fxAlignDate = providerDateForWriteback || addDaysIso(today, -1);
-        fxForToday = await getFxRateForDate(fxAlignDate);
-      }
-      writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, fxForToday);
-
+      writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, usdToInr);
       const combinedSnapshot = db.prepare(`
         SELECT
           COALESCE(SUM(current_value), 0) AS total_value,

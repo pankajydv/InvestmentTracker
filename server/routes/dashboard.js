@@ -3,6 +3,7 @@ const router = express.Router();
 const { getMarketSessionDates } = require('../services/marketPriceCache');
 const { calculateIntervalXIRR } = require('../services/xirrCalculator');
 const { logAppWarn } = require('../services/appLogger');
+const { DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS } = require('../services/freshnessPolicy');
 const {
   ACQUIRED_UNITS_INFLOW_TYPES_SQL,
   DASHBOARD_RETURNS_INVESTED_TYPES_SQL,
@@ -29,7 +30,7 @@ const MARKET_LINKED_DAY_CHANGE_ASSET_TYPES = new Set([
   'MUTUAL_FUND',
   'NPS',
 ]);
-const MAX_NON_LOCF_SESSION_LAG = 4;
+const MAX_NON_LOCF_SESSION_LAG = DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS;
 
 function isInternalXirrCashflow(assetType, transactionType) {
   const normalizedAssetType = String(assetType || '').toUpperCase();
