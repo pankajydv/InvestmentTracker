@@ -7,12 +7,12 @@ export function formatINR(amount, decimals = 0) {
   const abs = Math.abs(amount);
   const sign = amount < 0 ? '-' : '';
 
-  // Use Indian numbering system (Lakh, Crore)
+  // Use Indian numbering system (L for Lakh, Cr for Crore)
   if (abs >= 10000000) {
     return `${sign}₹${(abs / 10000000).toFixed(2)} Cr`;
   }
   if (abs >= 100000) {
-    return `${sign}₹${(abs / 100000).toFixed(2)} Lakh`;
+    return `${sign}₹${(abs / 100000).toFixed(2)} L`;
   }
 
   return `${sign}₹${abs.toLocaleString('en-IN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;

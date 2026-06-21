@@ -23,6 +23,7 @@ const ASSET_TYPE_DISPLAY_ORDER = {
 
 const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const DASHBOARD_CACHE_TTL_MS = 2 * 60 * 1000;
+const MOBILE_BREAKPOINT_PX = 768;
 const dashboardSummaryCache = new Map();
 
 function getDashboardCacheKey({
@@ -436,6 +437,9 @@ export default function Dashboard() {
   const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
   const [customFromDate, setCustomFromDate] = useState('');
   const [customToDate, setCustomToDate] = useState('');
+  const [isMobile, setIsMobile] = useState(
+    () => (typeof window !== 'undefined' ? window.innerWidth < MOBILE_BREAKPOINT_PX : false),
+  );
   const loadRunRef = useRef(0);
   const lastLoadedIntervalSigRef = useRef(null);
   const selectedIdsKey = (selectedIds || []).join(',');
@@ -493,6 +497,16 @@ export default function Dashboard() {
     });
     return () => window.cancelAnimationFrame(raf);
   }, [data, scrollToSection]);
+
+  useEffect(() => {
+    const updateIsMobile = () => {
+      setIsMobile(window.innerWidth < MOBILE_BREAKPOINT_PX);
+    };
+
+    updateIsMobile();
+    window.addEventListener('resize', updateIsMobile);
+    return () => window.removeEventListener('resize', updateIsMobile);
+  }, []);
 
   const loadComplianceStatus = async () => {
     try {
@@ -661,6 +675,12 @@ export default function Dashboard() {
     return `${value < 0 ? '-' : ''}${symbol}${formatNumber(Math.abs(value), decimals)}`;
   };
 
+  const formatAsOfDate = (dateValue) => {
+    const formatted = formatDate(dateValue);
+    if (!isMobile || !formatted) return formatted;
+    return formatted.replace(/-\d{4}$/, '');
+  };
+
   const handleSort = (type, key) => {
     setSortConfigs(prev => {
       const cur = prev[type] || { key: null, direction: 'asc' };
@@ -709,6 +729,19 @@ export default function Dashboard() {
     { key: 'totalReturn', label: 'Total P&L', subLabel: 'Absolute | XIRR P&L%', end: true },
   ];
 
+  const mobileSortColumns = [
+    { key: 'name', label: 'Name', subLabel: 'Folios / Identifier' },
+    { key: 'asOfDate', label: 'As Of', subLabel: 'Date' },
+    { key: 'price', label: 'Last Price', subLabel: 'Avg Cost / Unit', end: true },
+    {
+      key: 'dayChange',
+      label: '1D',
+      subLabel: '% Change',
+      end: true,
+    },
+    { key: 'totalReturn', label: 'Total P&L', subLabel: 'Abs | XIRR', end: true },
+  ];
+
   const getSortColumnsForType = (type) => {
     if (!INTEREST_RATE_ASSET_TYPES.has(type)) return baseSortColumns;
     return baseSortColumns.map((col) => {
@@ -723,6 +756,7 @@ export default function Dashboard() {
 
   const tableColumnWidths = ['30%', '11.5%', '11.5%', '11.5%', '11.5%', '9%', '15%'];
   const tableColumnWidthsWithAsOfDate = ['26%', '10%', '10.5%', '10.5%', '10.5%', '10.5%', '9%', '13%'];
+  const mobileTableColumnWidths = ['31%', '14%', '17%', '16%', '22%'];
 
   const handleAllocationClick = (event, type) => {
     event.preventDefault();
@@ -731,7 +765,7 @@ export default function Dashboard() {
 
   const complianceSnapshot = dailyHealth?.compliance || complianceStatus?.compliance || null;
   const sortedAssetEntries = sortAssetTypeEntries(byType);
-  const selectedIntervalLabel = selectedInterval === 'CUSTOM' ? 'Custom' : selectedInterval;
+  const selectedIntervalLabel = selectedInterval === 'CUSTOM' ? 'Cust' : selectedInterval;
   const hasRecordedComplianceScan = !!(
     complianceSnapshot?.lastScan?.mode
     || complianceSnapshot?.lastScan?.runDate
@@ -1044,7 +1078,7 @@ export default function Dashboard() {
                   </a>
                   <div className="fw-semibold text-nowrap" style={{ fontSize: '1.05rem' }}>{formatINR(info.totalValue)}</div>
                   <div className="asset-metric-line">
-                    <span className="asset-metric-label">Lifetime:</span>
+                    <span className="asset-metric-label">LT:</span>
                     <span className={`asset-metric-value ${lifetimeClass}`}>
                       {info.totalProfitLoss >= 0 ? '+' : ''}{formatINR(info.totalProfitLoss)}
                     </span>
@@ -1129,14 +1163,17 @@ export default function Dashboard() {
         const totalCurrentInvested = (Number(info.totalInvested) || 0) - (Number(info.totalRealizedGain) || 0);
         const showAsOfDateColumn = info.investments.some((inv) => !!inv.day_change_uses_fallback);
         const sortColumns = getSortColumnsForType(type);
-        const tableColumns = showAsOfDateColumn
+        const desktopColumns = showAsOfDateColumn
           ? [
               sortColumns[0],
               { key: 'asOfDate', label: 'As of Date' },
               ...sortColumns.slice(1),
             ]
           : sortColumns;
-        const columnWidths = showAsOfDateColumn ? tableColumnWidthsWithAsOfDate : tableColumnWidths;
+        const tableColumns = isMobile ? mobileSortColumns : desktopColumns;
+        const columnWidths = isMobile
+          ? mobileTableColumnWidths
+          : (showAsOfDateColumn ? tableColumnWidthsWithAsOfDate : tableColumnWidths);
 
         return (
         <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
@@ -1165,7 +1202,7 @@ export default function Dashboard() {
                     return (
                       <th
                         key={col.key}
-                        className={`px-3${col.end ? ' text-end' : ''}`}
+                        className={`px-3 holdings-col-${col.key}${col.end ? ' text-end' : ''}`}
                         style={{ cursor: isSortable ? 'pointer' : 'default', userSelect: 'none' }}
                         onClick={isSortable ? () => handleSort(type, col.key) : undefined}
                       >
@@ -1192,27 +1229,35 @@ export default function Dashboard() {
               <tbody>
                 {sortInvestments(type, info.investments).map((inv) => (
                   <tr key={inv.id}>
-                    <td className="px-3">
-                      <Link to={`/investments/${inv.id}`} className="fw-medium text-decoration-none">
-                        {inv.name}
-                      </Link>
-                      <div className="d-flex align-items-center gap-2 mt-1">
-                        {inv.asset_type === 'MUTUAL_FUND' && inv.open_folios_count !== undefined ? (
-                          <span className="text-muted" style={{ fontSize: '0.7rem' }}>Folios: {inv.open_folios_count}</span>
-                        ) : inv.amfi_code ? (
-                          <span className="text-muted" style={{ fontSize: '0.7rem' }}>{inv.amfi_code}</span>
-                        ) : null}
-                      </div>
-                    </td>
-                    {showAsOfDateColumn ? (
-                      <td className="px-3 text-center">
-                        {inv.day_change_uses_fallback && inv.day_change_as_of_date
-                          ? formatDate(inv.day_change_as_of_date)
-                          : '-'}
-                      </td>
-                    ) : null}
-                    <td className="px-3 text-end">
-                      {(() => {
+                    {tableColumns.map((col) => {
+                      if (col.key === 'name') {
+                        return (
+                          <td key={`${inv.id}-name`} className="px-3 holdings-col-name">
+                            <Link to={`/investments/${inv.id}`} className="fw-medium text-decoration-none">
+                              {inv.name}
+                            </Link>
+                            <div className="d-flex align-items-center gap-2 mt-1">
+                              {inv.asset_type === 'MUTUAL_FUND' && inv.open_folios_count !== undefined ? (
+                                <span className="text-muted" style={{ fontSize: '0.7rem' }}>Folios: {inv.open_folios_count}</span>
+                              ) : inv.amfi_code ? (
+                                <span className="text-muted" style={{ fontSize: '0.7rem' }}>{inv.amfi_code}</span>
+                              ) : null}
+                            </div>
+                          </td>
+                        );
+                      }
+
+                      if (col.key === 'asOfDate') {
+                        return (
+                          <td key={`${inv.id}-asOfDate`} className="px-3 text-center holdings-col-asOfDate text-nowrap">
+                            {inv.day_change_uses_fallback && inv.day_change_as_of_date
+                              ? formatAsOfDate(inv.day_change_as_of_date)
+                              : '-'}
+                          </td>
+                        );
+                      }
+
+                      if (col.key === 'price') {
                         const acquiredUnits = Number(inv.acquired_units) || 0;
                         const avgCostText = acquiredUnits > 0.0001
                           ? (String(inv.currency || 'INR').toUpperCase() === 'INR'
@@ -1220,7 +1265,7 @@ export default function Dashboard() {
                             : `${inv.avg_cost_per_unit_native == null ? `${getCurrencySymbol(inv.currency)}N/A` : formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)} | ₹${formatNumber(inv.invested_amount / inv.acquired_units, 2)}`)
                           : '';
                         return (
-                          <>
+                          <td key={`${inv.id}-price`} className="px-3 text-end holdings-col-price">
                             {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type) ? (
                               <div className="fw-medium">
                                 {Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-'}
@@ -1229,127 +1274,201 @@ export default function Dashboard() {
                               <div className="fw-medium">{formatWithSymbol(inv.price_per_unit, inv.currency, 2)}</div>
                             )}
                             <div className="text-muted" style={{ fontSize: '0.7rem' }}>{avgCostText}</div>
-                          </>
+                          </td>
                         );
-                      })()}
-                    </td>
-                    <td className="px-3 text-end">
-                      {isIntervalSwitching ? (
-                        <>
-                          <div className="fw-medium text-muted">...</div>
-                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
-                        </>
-                      ) : (
-                        <>
-                          <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>
-                          <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>
-                            {formatPct(inv.day_change_pct)}{dayChangePctSuffix}
-                          </div>
-                        </>
-                      )}
-                    </td>
-                    <td className="px-3 text-end">
-                      <div className="fw-medium">{formatNumber((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
-                      <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {formatNumber(inv.invested_amount, 0)}
-                      </div>
-                    </td>
-                    <td className="px-3 text-end">
-                      <div className="fw-medium">{formatNumber(inv.current_value, 0)}</div>
-                      <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
-                      </div>
-                    </td>
-                    <td className="px-3 text-end">
-                      <div className="fw-medium">{(inv.portfolio_pct || 0).toFixed(2)}%</div>
-                      <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {info.totalValue > 0 ? (((inv.current_value || 0) / info.totalValue) * 100).toFixed(2) : '0.00'}%
-                      </div>
-                    </td>
-                    <td className="px-3 text-end">
-                      <div className={`fw-semibold ${profitColor(inv.profit_loss)}`}>
-                        {inv.profit_loss >= 0 ? '+' : ''}{formatNumber(inv.profit_loss, 0)}
-                      </div>
-                      <div className={profitColor(inv.profit_loss_pct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
-                        {formatPct(inv.profit_loss_pct)} | {inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}
-                      </div>
-                    </td>
+                      }
+
+                      if (col.key === 'dayChange') {
+                        return (
+                          <td key={`${inv.id}-dayChange`} className="px-3 text-end holdings-col-dayChange">
+                            {isIntervalSwitching ? (
+                              <>
+                                <div className="fw-medium text-muted">...</div>
+                                <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
+                              </>
+                            ) : (
+                              <>
+                                <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>
+                                <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>
+                                  {formatPct(inv.day_change_pct)}{dayChangePctSuffix}
+                                </div>
+                              </>
+                            )}
+                          </td>
+                        );
+                      }
+
+                      if (col.key === 'totalCost') {
+                        return (
+                          <td key={`${inv.id}-totalCost`} className="px-3 text-end holdings-col-totalCost">
+                            <div className="fw-medium">{formatNumber((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
+                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                              {formatNumber(inv.invested_amount, 0)}
+                            </div>
+                          </td>
+                        );
+                      }
+
+                      if (col.key === 'currentValue') {
+                        return (
+                          <td key={`${inv.id}-currentValue`} className="px-3 text-end holdings-col-currentValue">
+                            <div className="fw-medium">{formatNumber(inv.current_value, 0)}</div>
+                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                              {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
+                            </div>
+                          </td>
+                        );
+                      }
+
+                      if (col.key === 'portfolioPct') {
+                        return (
+                          <td key={`${inv.id}-portfolioPct`} className="px-3 text-end holdings-col-portfolioPct">
+                            <div className="fw-medium">{(inv.portfolio_pct || 0).toFixed(2)}%</div>
+                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                              {info.totalValue > 0 ? (((inv.current_value || 0) / info.totalValue) * 100).toFixed(2) : '0.00'}%
+                            </div>
+                          </td>
+                        );
+                      }
+
+                      if (col.key === 'totalReturn') {
+                        return (
+                          <td key={`${inv.id}-totalReturn`} className="px-3 text-end holdings-col-totalReturn">
+                            <div className={`fw-semibold ${profitColor(inv.profit_loss)}`}>
+                              {inv.profit_loss >= 0 ? '+' : ''}{formatNumber(inv.profit_loss, 0)}
+                            </div>
+                            <div className={profitColor(inv.profit_loss_pct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
+                              {isMobile
+                                ? `${formatPct(inv.profit_loss_pct)}|${inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}`
+                                : `${formatPct(inv.profit_loss_pct)} | ${inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}`}
+                            </div>
+                          </td>
+                        );
+                      }
+
+                      return null;
+                    })}
                   </tr>
                 ))}
                 {/* Total Row */}
                 <tr className="table-light fw-semibold">
-                  <td className="px-3">Total</td>
-                  {showAsOfDateColumn ? (
-                    <td className="px-3 text-center">
-                      {info.dayChangeFallbackCount > 0
-                        ? (info.dayChangeAsOfMixed
-                          ? 'Mixed'
-                          : (info.dayChangeAsOfDate ? formatDate(info.dayChangeAsOfDate) : '-'))
-                        : '-'}
-                    </td>
-                  ) : null}
-                  <td className="px-3 text-end">
-                    {INTEREST_RATE_ASSET_TYPES.has(type) ? (
-                      <>
-                        <div className="fw-medium">-</div>
-                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>{latestTypeDate ? formatDate(latestTypeDate) : ''}</div>
-                      </>
-                    ) : (
-                      <>
-                        <div className="fw-medium">
-                          {weightedLivePrice == null
-                            ? '-'
-                            : formatWithSymbol(weightedLivePrice, weightedPriceCurrency, 2)}
-                        </div>
-                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                          {weightedAvgCostPerUnit == null
-                            ? ''
-                            : formatWithSymbol(weightedAvgCostPerUnit, weightedPriceCurrency, 2)}
-                        </div>
-                      </>
-                    )}
-                  </td>
-                  <td className="px-3 text-end">
-                    {isIntervalSwitching ? (
-                      <>
-                        <div className="fw-medium text-muted">...</div>
-                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
-                      </>
-                    ) : (
-                      <>
-                        <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
-                        <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>
-                          {formatPct(totalDayChangePct)}{dayChangePctSuffix}
-                        </div>
-                      </>
-                    )}
-                  </td>
-                  <td className="px-3 text-end">
-                    <div className="fw-medium">{formatNumber(totalCurrentInvested, 0)}</div>
-                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                      {formatNumber(info.totalInvested, 0)}
-                    </div>
-                  </td>
-                  <td className="px-3 text-end">
-                    <div className="fw-medium">{formatNumber(info.totalValue, 0)}</div>
-                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                      {totalUnits > 0.0001 ? `${formatNumber(totalUnits, 4)} Units` : ''}
-                    </div>
-                  </td>
-                  <td className="px-3 text-end">
-                    <div className="fw-medium">
-                      {portfolio.total_value > 0 ? ((info.totalValue / portfolio.total_value) * 100).toFixed(2) : '0.00'}%
-                    </div>
-                    <div className="text-muted" style={{ fontSize: '0.7rem' }}>100.00%</div>
-                  </td>
-                  <td className={`px-3 text-end ${profitColor(info.totalProfitLoss)}`}>
-                    <div className="fw-semibold">
-                      {info.totalProfitLoss >= 0 ? '+' : ''}{formatNumber(info.totalProfitLoss, 0)}
-                    </div>
-                    <div className={profitColor(totalAbsPct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
-                      {formatPct(totalAbsPct)} | {info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}
-                    </div>
-                  </td>
+                  {tableColumns.map((col) => {
+                    if (col.key === 'name') {
+                      return <td key={`${type}-total-name`} className="px-3 holdings-col-name">Total</td>;
+                    }
+
+                    if (col.key === 'asOfDate') {
+                      return (
+                        <td key={`${type}-total-asOfDate`} className="px-3 text-center holdings-col-asOfDate text-nowrap">
+                          {info.dayChangeFallbackCount > 0
+                            ? (info.dayChangeAsOfMixed
+                              ? 'Mixed'
+                              : (info.dayChangeAsOfDate ? formatAsOfDate(info.dayChangeAsOfDate) : '-'))
+                            : '-'}
+                        </td>
+                      );
+                    }
+
+                    if (col.key === 'price') {
+                      return (
+                        <td key={`${type}-total-price`} className="px-3 text-end holdings-col-price">
+                          {INTEREST_RATE_ASSET_TYPES.has(type) ? (
+                            <>
+                              <div className="fw-medium">-</div>
+                              {!isMobile && (
+                                <div className="text-muted" style={{ fontSize: '0.7rem' }}>{latestTypeDate ? formatDate(latestTypeDate) : ''}</div>
+                              )}
+                            </>
+                          ) : (
+                            <>
+                              <div className="fw-medium">
+                                {weightedLivePrice == null
+                                  ? '-'
+                                  : formatWithSymbol(weightedLivePrice, weightedPriceCurrency, 2)}
+                              </div>
+                              {!isMobile && (
+                                <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                                  {weightedAvgCostPerUnit == null
+                                    ? ''
+                                    : formatWithSymbol(weightedAvgCostPerUnit, weightedPriceCurrency, 2)}
+                                </div>
+                              )}
+                            </>
+                          )}
+                        </td>
+                      );
+                    }
+
+                    if (col.key === 'dayChange') {
+                      return (
+                        <td key={`${type}-total-dayChange`} className="px-3 text-end holdings-col-dayChange">
+                          {isIntervalSwitching ? (
+                            <>
+                              <div className="fw-medium text-muted">...</div>
+                              <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
+                            </>
+                          ) : (
+                            <>
+                              <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
+                              <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>
+                                {formatPct(totalDayChangePct)}{dayChangePctSuffix}
+                              </div>
+                            </>
+                          )}
+                        </td>
+                      );
+                    }
+
+                    if (col.key === 'totalCost') {
+                      return (
+                        <td key={`${type}-total-totalCost`} className="px-3 text-end holdings-col-totalCost">
+                          <div className="fw-medium">{formatNumber(totalCurrentInvested, 0)}</div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                            {formatNumber(info.totalInvested, 0)}
+                          </div>
+                        </td>
+                      );
+                    }
+
+                    if (col.key === 'currentValue') {
+                      return (
+                        <td key={`${type}-total-currentValue`} className="px-3 text-end holdings-col-currentValue">
+                          <div className="fw-medium">{formatNumber(info.totalValue, 0)}</div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                            {totalUnits > 0.0001 ? `${formatNumber(totalUnits, 4)} Units` : ''}
+                          </div>
+                        </td>
+                      );
+                    }
+
+                    if (col.key === 'portfolioPct') {
+                      return (
+                        <td key={`${type}-total-portfolioPct`} className="px-3 text-end holdings-col-portfolioPct">
+                          <div className="fw-medium">
+                            {portfolio.total_value > 0 ? ((info.totalValue / portfolio.total_value) * 100).toFixed(2) : '0.00'}%
+                          </div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>100.00%</div>
+                        </td>
+                      );
+                    }
+
+                    if (col.key === 'totalReturn') {
+                      return (
+                        <td key={`${type}-total-totalReturn`} className={`px-3 text-end holdings-col-totalReturn ${profitColor(info.totalProfitLoss)}`}>
+                          <div className="fw-semibold">
+                            {info.totalProfitLoss >= 0 ? '+' : ''}{formatNumber(info.totalProfitLoss, 0)}
+                          </div>
+                          <div className={profitColor(totalAbsPct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
+                            {isMobile
+                              ? `${formatPct(totalAbsPct)}|${info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}`
+                              : `${formatPct(totalAbsPct)} | ${info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}`}
+                          </div>
+                        </td>
+                      );
+                    }
+
+                    return null;
+                  })}
                 </tr>
               </tbody>
             </Table>
