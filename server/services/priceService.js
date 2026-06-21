@@ -349,7 +349,8 @@ async function getYahooFinance() {
 async function fetchStockPrice(symbol) {
   // Try direct Yahoo Finance API first (more reliable, no crumb needed)
   try {
-    return await fetchStockPriceDirect(symbol);
+    const direct = await fetchStockPriceDirect(symbol, { mode: 'default' });
+    return { ...direct, fetchMode: 'default' };
   } catch (directErr) {
     // Fall back to yahoo-finance2 library
     try {
@@ -383,6 +384,7 @@ async function fetchStockPrice(symbol) {
             && nowSec >= regularEnd && nowSec <= postEnd;
           return (inAH && sessionDateIst) ? nextUsWeekday(sessionDateIst) : sessionDateIst;
         })(),
+        fetchMode: 'default',
       };
     } catch (libErr) {
       throw new Error(`Failed to fetch price for ${symbol}: ${directErr.message}`);
@@ -390,15 +392,37 @@ async function fetchStockPrice(symbol) {
   }
 }
 
+async function fetchStockPriceForUpdater(symbol) {
+  try {
+    const direct = await fetchStockPriceDirect(symbol, { mode: 'updater' });
+    return { ...direct, fetchMode: 'updater' };
+  } catch (directErr) {
+    const fallback = await fetchStockPrice(symbol);
+    return { ...fallback, fetchMode: 'updater' };
+  }
+}
+
+async function fetchStockPriceForBackfill(symbol) {
+  try {
+    const direct = await fetchStockPriceDirect(symbol, { mode: 'backfill' });
+    return { ...direct, fetchMode: 'backfill' };
+  } catch (directErr) {
+    const fallback = await fetchStockPrice(symbol);
+    return { ...fallback, fetchMode: 'backfill' };
+  }
+}
+
 /**
  * Fetch stock price via Yahoo Finance v8 chart API (no crumb/auth needed).
  */
-function fetchStockPriceDirect(symbol) {
+function fetchStockPriceDirect(symbol, options = {}) {
   return new Promise((resolve, reject) => {
     const instrumentType = inferStockInstrumentType(symbol);
     const foreignIntradayQuery = 'range=1d&interval=5m&includePrePost=true';
     const defaultDailyQuery = 'range=1d&interval=1d';
-    const query = instrumentType === 'FOREIGN_STOCK' ? foreignIntradayQuery : defaultDailyQuery;
+    const mode = String(options.mode || 'default').toLowerCase();
+    const useForeignIntraday = instrumentType === 'FOREIGN_STOCK' && mode === 'updater';
+    const query = useForeignIntraday ? foreignIntradayQuery : defaultDailyQuery;
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?${query}`;
     https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
       let data = '';
@@ -429,6 +453,7 @@ function fetchStockPriceDirect(symbol) {
               date:           sessionInfo.date,
               sessionDateIst: sessionInfo.sessionDateIst,
               sessionPhase:   sessionInfo.sessionPhase,
+              fetchMode:      mode,
             });
           } else {
             reject(new Error(`No price data for ${symbol}`));
@@ -1797,6 +1822,8 @@ module.exports = {
   searchMutualFunds,
   fetchMutualFundHistory,
   fetchStockPrice,
+  fetchStockPriceForUpdater,
+  fetchStockPriceForBackfill,
   fetchStockHistory,
   fetchHistoricalStockPrice,
   fetchHistoricalOHLC,

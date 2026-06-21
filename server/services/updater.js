@@ -6,6 +6,7 @@
 const {
   fetchMutualFundNAV,
   fetchStockPrice,
+  fetchStockPriceForUpdater,
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
   toNSETicker,
@@ -746,7 +747,7 @@ async function updateAllPrices(db, options = {}) {
             continue;
           }
           await delay(500);
-          const foreignData = await fetchStockPrice(inv.ticker_symbol);
+          const foreignData = await fetchStockPriceForUpdater(inv.ticker_symbol);
           const sourceDecision = resolvePriceSourceFromProviderDate({
             providerDate: foreignData.date,
             runDate: today,
@@ -777,7 +778,7 @@ async function updateAllPrices(db, options = {}) {
             if (foreignData.sessionPhase === 'pre') priceSource = 'PRE';
             else if (foreignData.sessionPhase === 'post') priceSource = 'POST';
           }
-          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK price fetch returned price=${foreignData.price}, providerDate=${sourceDecision.providerDate}, sessionPhase=${foreignData.sessionPhase || 'regular'}, priceSource=${priceSource}`);
+          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK price fetch returned price=${foreignData.price}, providerDate=${sourceDecision.providerDate}, sessionPhase=${foreignData.sessionPhase || 'regular'}, fetchMode=${foreignData.fetchMode || 'updater'}, priceSource=${priceSource}`);
           break;
         }
         case 'BOND': {

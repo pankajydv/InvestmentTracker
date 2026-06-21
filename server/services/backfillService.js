@@ -6,6 +6,7 @@ const {
   fetchMutualFundHistory,
   fetchMutualFundNAV,
   fetchStockPrice,
+  fetchStockPriceForBackfill,
   fetchNPSNAV,
 } = require('./priceService');
 const { fetchNPSHistory } = require('./priceService');
@@ -1034,9 +1035,17 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     const isSessionDate = isMarketSessionDate(date, db, cache, inv.asset_type);
     if (canUseProviderForRunDate(cache, date) && isSessionDate) {
       try {
-        const quote = await fetchStockPrice(inv.ticker_symbol || inv.symbol || '');
+        const quote = await fetchStockPriceForBackfill(inv.ticker_symbol || inv.symbol || '');
         const live = Number(quote?.price || 0);
         const providerDate = toIsoDate(quote?.date);
+        logBackfillInfo('[Backfill][Stock] Provider quote fetched', {
+          investmentId: inv.id,
+          portfolioId,
+          date,
+          providerDate,
+          sessionPhase: quote?.sessionPhase || 'regular',
+          fetchMode: quote?.fetchMode || 'backfill',
+        });
         if (Number.isFinite(live) && live > 0 && providerDate === date) {
           return { price: live, source: 'LIVE' };
         }
