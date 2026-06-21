@@ -677,7 +677,7 @@ export default function Dashboard() {
 
   const formatAsOfDate = (dateValue) => {
     const formatted = formatDate(dateValue);
-    if (!isMobile || !formatted) return formatted;
+    if (!formatted) return formatted;
     return formatted.replace(/-\d{4}$/, '');
   };
 

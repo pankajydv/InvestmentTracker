@@ -984,8 +984,8 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     if (hist && hist.has(date)) {
       return { price: Number(hist.get(date)), source: 'LIVE' };
     }
-    // fallback: try latest NSE quote for today
-    if (date === todayIso()) {
+    // fallback: try latest NSE quote for today only on market-session days
+    if (date === todayIso() && isMarketSessionDate(date, db, cache, 'SGB')) {
       if (isPhase3ProviderBlocked(cache, date)) {
         warnPhase3ProviderViolation(
           cache,
@@ -1031,12 +1031,26 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
       return { price: Number(exact), source: 'LIVE' };
     }
 
-    if (canUseProviderForRunDate(cache, date)) {
+    const isSessionDate = isMarketSessionDate(date, db, cache, inv.asset_type);
+    if (canUseProviderForRunDate(cache, date) && isSessionDate) {
       try {
         const quote = await fetchStockPrice(inv.ticker_symbol || inv.symbol || '');
         const live = Number(quote?.price || 0);
-        if (Number.isFinite(live) && live > 0) {
+        const providerDate = toIsoDate(quote?.date);
+        if (Number.isFinite(live) && live > 0 && providerDate === date) {
           return { price: live, source: 'LIVE' };
+        }
+
+        if (providerDate && providerDate < date) {
+          const providerDateClose = series.get(providerDate);
+          if (providerDateClose != null) {
+            return { price: Number(providerDateClose), source: 'LOCF' };
+          }
+
+          const officialClose = Number(quote?.officialClose || 0);
+          if (Number.isFinite(officialClose) && officialClose > 0) {
+            return { price: officialClose, source: 'LOCF' };
+          }
         }
       } catch (e) {
         logBackfillError(`[Backfill][Stock] Live quote fetch failed for investment ${inv.id} on ${date}: ${e?.message || e}`);
