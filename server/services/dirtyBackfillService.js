@@ -519,7 +519,11 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {})
   });
 
   try {
-    const result = await runBackfillInTwoSteps(db, { runDate: effectiveRunDate, scopes });
+    const result = await runBackfillInTwoSteps(db, {
+      runDate: effectiveRunDate,
+      scopes,
+      runTag: options?.runTag || null,
+    });
 
     const markDone = db.prepare(`
       UPDATE dirty_backfill_scope

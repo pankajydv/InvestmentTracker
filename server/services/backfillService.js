@@ -870,6 +870,12 @@ function getStoredPriceOnOrBefore(db, investmentId, portfolioId, date) {
 }
 
 async function getPriceForDate(db, inv, date, cache, portfolioId) {
+  const cacheRunDate = toIsoDate(cache?.runDate);
+  const isMidnightLocfSeed = cache?.runTag === 'midnight_rollover'
+    && cacheRunDate
+    && date === cacheRunDate
+    && (inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'SGB');
+
   if (inv.asset_type === 'BOND') {
     return { price: Number(inv.face_value || 1000), source: 'COMPUTED' };
   }
@@ -982,11 +988,11 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
       }
     }
     const hist = cache.sgb.get(symbol);
-    if (hist && hist.has(date)) {
+    if (hist && hist.has(date) && !isMidnightLocfSeed) {
       return { price: Number(hist.get(date)), source: 'LIVE' };
     }
     // fallback: try latest NSE quote for today only on market-session days
-    if (date === todayIso() && isMarketSessionDate(date, db, cache, 'SGB')) {
+    if (!isMidnightLocfSeed && date === todayIso() && isMarketSessionDate(date, db, cache, 'SGB')) {
       if (isPhase3ProviderBlocked(cache, date)) {
         warnPhase3ProviderViolation(
           cache,
@@ -1028,12 +1034,12 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     }
     const series = cache.stockByInvestment.get(inv.id) || new Map();
     const exact = series.get(date);
-    if (exact != null) {
+    if (exact != null && !isMidnightLocfSeed) {
       return { price: Number(exact), source: 'LIVE' };
     }
 
     const isSessionDate = isMarketSessionDate(date, db, cache, inv.asset_type);
-    if (canUseProviderForRunDate(cache, date) && isSessionDate) {
+    if (!isMidnightLocfSeed && canUseProviderForRunDate(cache, date) && isSessionDate) {
       try {
         const quote = await fetchStockPriceForBackfill(inv.ticker_symbol || inv.symbol || '');
         const live = Number(quote?.price || 0);
@@ -4514,6 +4520,7 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
     allowNetworkFallback: false,
     phase: 'phase2_cache_build',
     runDate,
+    runTag: String(options.runTag || '').trim() || null,
     rangeStart: Array.from(fetchStartByInvestment.values()).reduce((m, s) => (m == null || s < m ? s : m), null)
       || step1ScopeList.reduce((m, s) => (m == null || s.dirty_from_date < m ? s.dirty_from_date : m), null)
       || scopeList.reduce((m, s) => (m == null || s.dirty_from_date < m ? s.dirty_from_date : m), null)
@@ -4582,7 +4589,10 @@ async function runBackfillInTwoSteps(db, options = {}) {
   const scopes = options.scopes || [];
   logBackfillInfo(`[Backfill] Starting four-step backfill for ${runDate} with ${scopes.length} scope(s)...`);
 
-  const result = await backfillDirtyScopes(db, scopes, { runDate });
+  const result = await backfillDirtyScopes(db, scopes, {
+    runDate,
+    runTag: options.runTag || null,
+  });
   logBackfillInfo('[Backfill] Four-step backfill completed.');
   return result;
 }

@@ -457,6 +457,17 @@ async function updateAllPrices(db, options = {}) {
     LIMIT 1
   `);
 
+  const getLastPriceBeforeDate = db.prepare(`
+    SELECT price_per_unit
+    FROM daily_values
+    WHERE investment_id = ?
+      AND date < ?
+    ORDER BY date DESC
+    LIMIT 1
+  `);
+
+  const isMidnightLocfSeedRun = runTag === 'midnight_rollover';
+
   async function getFxRateForDate(date) {
     if (fxRateByDate.has(date)) return fxRateByDate.get(date);
     try {
@@ -648,9 +659,7 @@ async function updateAllPrices(db, options = {}) {
       let apiChange = null;
       let apiChangePct = null;
       let providerDateForWriteback = null;
-      // FOREIGN_STOCK after-hours: also write the regular session close for the session date.
-      let foreignSessionDateForWriteback = null;
-      let foreignSessionOfficialClose = 0;
+      // Foreign stocks should not mutate historical dates from updater intraday payloads.
       
       console.log(`  [DEBUG] Processing ${inv.name} (id=${inv.id}, type=${inv.asset_type})`);
 
@@ -738,6 +747,16 @@ async function updateAllPrices(db, options = {}) {
           apiChange = stockData.change;
           apiChangePct = stockData.changePercent;
           priceSource = sourceDecision.priceSource;
+          if (isMidnightLocfSeedRun) {
+            const hasLiveToday = Number(getLivePriceForDate.get(inv.id, today)?.price_per_unit || 0) > 0;
+            if (!hasLiveToday) {
+              const prior = Number(getLastPriceBeforeDate.get(inv.id, today)?.price_per_unit || 0);
+              if (Number.isFinite(prior) && prior > 0) {
+                pricePerUnit = prior;
+              }
+              priceSource = 'LOCF';
+            }
+          }
           console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, effectivePrice=${pricePerUnit}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
           break;
         }
@@ -760,16 +779,6 @@ async function updateAllPrices(db, options = {}) {
           apiChangePct = foreignData.changePercent;
           priceSource = sourceDecision.priceSource;
           providerDateForWriteback = sourceDecision.providerDate;
-          // After-hours: remember session date + official close so we can write a LIVE
-          // snapshot for the session date (the row the regular close belongs to).
-          if (foreignData.sessionPhase === 'post'
-            && foreignData.sessionDateIst
-            && foreignData.sessionDateIst < today
-            && Number(foreignData.officialClose) > 0
-          ) {
-            foreignSessionDateForWriteback = foreignData.sessionDateIst;
-            foreignSessionOfficialClose = Number(foreignData.officialClose);
-          }
           // Refine LIVE to PRE or POST so the source label reflects data quality.
           // PRE = pre-market price; will be overwritten to LIVE when regular session closes.
           // POST = after-hours price attributed to next session; overwritten when that session closes.
@@ -812,6 +821,18 @@ async function updateAllPrices(db, options = {}) {
             if (lastKnown) pricePerUnit = lastKnown.price_per_unit;
             if (lastKnown) priceSource = 'LOCF';
           }
+
+          if (isMidnightLocfSeedRun) {
+            const hasLiveToday = Number(getLivePriceForDate.get(inv.id, today)?.price_per_unit || 0) > 0;
+            if (!hasLiveToday) {
+              const prior = Number(getLastPriceBeforeDate.get(inv.id, today)?.price_per_unit || 0);
+              if (Number.isFinite(prior) && prior > 0) {
+                pricePerUnit = prior;
+              }
+              priceSource = 'LOCF';
+            }
+          }
+
           if (!pricePerUnit) {
             pricePerUnit = inv.face_value || 5000;
           }
@@ -909,28 +930,8 @@ async function updateAllPrices(db, options = {}) {
       }
 
       let providerDateRowsWritten = 0;
-      // FOREIGN_STOCK after-hours: write the official regular-session close for the session date.
-      if (inv.asset_type === 'FOREIGN_STOCK'
-        && foreignSessionDateForWriteback
-        && foreignSessionOfficialClose > 0
-        && foreignSessionDateForWriteback < today
-        && /^\d{4}-\d{2}-\d{2}$/.test(foreignSessionDateForWriteback)
-      ) {
-        const sessionFx = await getFxRateForDate(foreignSessionDateForWriteback);
-        const sessionRows = writeInvestmentSnapshotForDate(inv, foreignSessionDateForWriteback, foreignSessionOfficialClose, 'LIVE', sessionFx);
-        if (sessionRows > 0) {
-          touchedDates.add(foreignSessionDateForWriteback);
-          logAppInfo('[UpdatePrices] FOREIGN_STOCK after-hours: session-date snapshot written with official close', {
-            investmentId: inv.id,
-            investmentName: inv.name,
-            sessionDate: foreignSessionDateForWriteback,
-            officialClose: foreignSessionOfficialClose,
-            runDate: today,
-          });
-        }
-      }
       if (
-        (inv.asset_type === 'FOREIGN_STOCK' || inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'MUTUAL_FUND' || inv.asset_type === 'NPS')
+        (inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'MUTUAL_FUND' || inv.asset_type === 'NPS')
         && providerDateForWriteback
         && providerDateForWriteback < today
         && /^\d{4}-\d{2}-\d{2}$/.test(providerDateForWriteback)

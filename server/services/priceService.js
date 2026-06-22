@@ -115,11 +115,11 @@ function detectForeignStockSession(meta, timestamps, closes) {
   if (!sessionDateProvider) return null;
 
   let sessionPhase = 'regular';
-  if (latest && Number.isFinite(postStart) && Number.isFinite(postEnd) && latest.ts >= postStart && latest.ts <= postEnd) {
+  if (latest && Number.isFinite(postStart) && Number.isFinite(postEnd) && latest.ts >= postStart && latest.ts < postEnd) {
     sessionPhase = 'post';
   } else if (latest && Number.isFinite(preStart) && Number.isFinite(preEnd) && latest.ts >= preStart && latest.ts < preEnd) {
     sessionPhase = 'pre';
-  } else if (latest && Number.isFinite(regularStart) && Number.isFinite(regularEnd) && latest.ts >= regularStart && latest.ts <= regularEnd) {
+  } else if (latest && Number.isFinite(regularStart) && Number.isFinite(regularEnd) && latest.ts >= regularStart && latest.ts < regularEnd) {
     sessionPhase = 'regular';
   }
 
@@ -152,16 +152,19 @@ function detectForeignStockSession(meta, timestamps, closes) {
   const change    = price - prevClose;
   const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
 
-  // officialClose: the regular-session candle close for the session date.
-  // Used as the LIVE writeback price for the session date row when in after-hours.
-  let officialClose = null;
-  if (rows.length > 0 && Number.isFinite(regularStart) && Number.isFinite(regularEnd)) {
+  // officialClose must remain aligned to provider daily-close semantics.
+  // Prefer regularMarketPrice and only fall back to intraday regular candles.
+  let officialClose = Number.isFinite(Number(meta.regularMarketPrice))
+    ? Number(meta.regularMarketPrice)
+    : null;
+  if ((!Number.isFinite(officialClose) || officialClose <= 0)
+    && rows.length > 0
+    && Number.isFinite(regularStart)
+    && Number.isFinite(regularEnd)
+  ) {
     for (const row of rows) {
-      if (row.ts < regularStart || row.ts > regularEnd) continue;
+      if (row.ts < regularStart || row.ts >= regularEnd) continue;
       officialClose = row.close;
-    }
-    if ((!Number.isFinite(officialClose) || officialClose <= 0) && Number.isFinite(meta.regularMarketPrice)) {
-      officialClose = Number(meta.regularMarketPrice);
     }
   }
 
@@ -174,6 +177,52 @@ function detectForeignStockSession(meta, timestamps, closes) {
     date:            providerDate,   // intended daily_values date
     sessionDateIst: sessionDateProvider, // provider session date (naming retained for compatibility)
     sessionPhase,                    // 'pre' | 'regular' | 'post'
+  };
+}
+
+function detectIndianStockSession(meta, timestamps, closes) {
+  if (!meta || !meta.regularMarketPrice) return null;
+
+  const gmtoffset = Number(meta.gmtoffset);
+  const rows = [];
+  const points = Math.min(
+    Array.isArray(timestamps) ? timestamps.length : 0,
+    Array.isArray(closes) ? closes.length : 0,
+  );
+  for (let i = 0; i < points; i += 1) {
+    const ts = Number(timestamps[i]);
+    const close = Number(closes[i]);
+    if (!Number.isFinite(ts) || !Number.isFinite(close) || close <= 0) continue;
+    rows.push({ ts, close });
+  }
+
+  const latest = rows.length > 0 ? rows[rows.length - 1] : null;
+  const fallbackTs = Number(meta.regularMarketTime);
+  const providerTs = latest?.ts || (Number.isFinite(fallbackTs) ? fallbackTs : null);
+  const providerDate = exchangeDateFromUnixSeconds(providerTs, gmtoffset);
+  if (!providerDate) return null;
+
+  const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
+  const latestClose = latest?.close;
+  const price = (Number.isFinite(latestClose) && latestClose > 0)
+    ? latestClose
+    : Number(meta.regularMarketPrice);
+
+  const change = price - prevClose;
+  const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
+  const officialClose = Number.isFinite(Number(meta.regularMarketPrice))
+    ? Number(meta.regularMarketPrice)
+    : (Number.isFinite(latestClose) ? latestClose : null);
+
+  return {
+    price,
+    change: Math.round(change * 100) / 100,
+    changePercent: Math.round(changePct * 100) / 100,
+    previousClose: prevClose,
+    officialClose,
+    date: providerDate,
+    sessionDateIst: providerDate,
+    sessionPhase: 'regular',
   };
 }
 
@@ -437,7 +486,9 @@ function fetchStockPriceDirect(symbol, options = {}) {
             const closes = Array.isArray(result?.indicators?.quote?.[0]?.close)
               ? result.indicators.quote[0].close
               : [];
-            const sessionInfo = detectForeignStockSession(meta, timestamps, closes);
+            const sessionInfo = instrumentType === 'FOREIGN_STOCK'
+              ? detectForeignStockSession(meta, timestamps, closes)
+              : detectIndianStockSession(meta, timestamps, closes);
             if (!sessionInfo) {
               reject(new Error(`No price data for ${symbol}`));
               return;
