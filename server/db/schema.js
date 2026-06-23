@@ -274,6 +274,24 @@ function initializeDb(db) {
       completed_at TEXT
     );
 
+    -- XIRR Cache: Pre-calculated XIRR values for dashboard performance
+    -- Pre-calculated after scheduler price updates to avoid expensive computations
+    CREATE TABLE IF NOT EXISTS xirr_cache (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cache_key TEXT UNIQUE NOT NULL,
+      portfolio_id INTEGER,
+      interval TEXT NOT NULL,
+      xirr_value REAL,
+      interval_change REAL,
+      interval_change_pct REAL,
+      opening_value REAL,
+      closing_value REAL,
+      computed_at TEXT NOT NULL,
+      valid_until TEXT NOT NULL,
+      source TEXT DEFAULT 'scheduler',
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
     -- Applied schema migrations (audit + idempotency)
     CREATE TABLE IF NOT EXISTS schema_migrations (
       id TEXT PRIMARY KEY,
@@ -294,6 +312,7 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_asset_type_daily_portfolio_date ON asset_type_daily(portfolio_id, date);
     CREATE INDEX IF NOT EXISTS idx_asset_type_daily_type_date ON asset_type_daily(asset_type, date);
     CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id);
+    CREATE INDEX IF NOT EXISTS idx_transactions_portfolio_investment ON transactions(portfolio_id, investment_id);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_status_date ON dirty_backfill_scope(status, dirty_from_date);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_investment_portfolio ON dirty_backfill_scope(investment_id, portfolio_id, status);
     CREATE INDEX IF NOT EXISTS idx_symbol_history_investment_dates ON investment_symbol_history(investment_id, valid_from, valid_to);
@@ -302,6 +321,9 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_hist_price_repair_lookup ON historical_price_repair_scope(instrument_type, symbol, from_date, to_date, status);
     CREATE INDEX IF NOT EXISTS idx_market_holidays_year ON market_holidays(year);
     CREATE INDEX IF NOT EXISTS idx_daily_data_gaps_entity ON daily_data_gaps(table_name, entity_id);
+    CREATE INDEX IF NOT EXISTS idx_xirr_cache_key ON xirr_cache(cache_key);
+    CREATE INDEX IF NOT EXISTS idx_xirr_cache_portfolio ON xirr_cache(portfolio_id, interval);
+    CREATE INDEX IF NOT EXISTS idx_xirr_cache_valid ON xirr_cache(valid_until);
 
     -- Portfolio-level expenses (AMC, platform fees, CDSL charges, etc.)
     CREATE TABLE IF NOT EXISTS portfolio_expenses (

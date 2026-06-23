@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
-import { getDashboardSummary, getDailyValuesHealthStatus } from '../services/api';
+import { getDashboardSummary, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
@@ -471,20 +471,44 @@ export default function Dashboard() {
     const runId = loadRunRef.current;
     const timeoutId = setTimeout(() => {
       if (runId === loadRunRef.current) {
-        loadDailyHealth();
+        // Parallel load: health + compliance together
+        Promise.all([
+          (async () => {
+            try {
+              if (selectedIds.length > 1) {
+                const healthResults = await Promise.all(selectedIds.map((id) => getDailyValuesHealthStatus(id).catch(() => null)));
+                if (runId !== loadRunRef.current) return;
+                setDailyHealth(combineHealthStatuses(healthResults.filter(Boolean)));
+              } else {
+                const health = await getDailyValuesHealthStatus(selectedId).catch(() => null);
+                if (runId !== loadRunRef.current) return;
+                setDailyHealth(health);
+              }
+            } catch {
+              if (runId !== loadRunRef.current) return;
+              setDailyHealth(null);
+            }
+          })(),
+          (async () => {
+            try {
+              setComplianceLoading(true);
+              const [gapsResult, statusResult] = await Promise.all([
+                getOpenGaps().catch(() => ({ gaps: [] })),
+                getComplianceStatus().catch(() => null),
+              ]);
+              if (runId !== loadRunRef.current) return;
+              setComplianceGaps(gapsResult?.gaps || []);
+              setComplianceStatus(statusResult);
+            } catch (e) {
+              console.error('Compliance check failed:', e);
+            } finally {
+              if (runId !== loadRunRef.current) return;
+              setComplianceLoading(false);
+            }
+          })(),
+        ]);
       }
     }, 100);
-    return () => clearTimeout(timeoutId);
-  }, [selectedId, selectedIdsKey, settingsLoading]);
-
-  useEffect(() => {
-    if (settingsLoading) return undefined;
-    const runId = loadRunRef.current;
-    const timeoutId = setTimeout(() => {
-      if (runId === loadRunRef.current) {
-        loadComplianceStatus();
-      }
-    }, 150);
     return () => clearTimeout(timeoutId);
   }, [selectedId, selectedIdsKey, settingsLoading]);
 

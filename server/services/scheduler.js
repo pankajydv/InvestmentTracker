@@ -22,6 +22,7 @@ const { todayIso, addDaysIso, eachDateIso, istDateFromUnixSeconds } = require('.
 const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
 const { scanAndRepairComplianceGaps, refreshComplianceScanFloor } = require('./compliance/complianceScanService');
 const { DIRTY_SCOPE_LOOKBACK_SESSIONS } = require('./freshnessPolicy');
+const { preCalculateXirrCache } = require('./xirrCacheService');
 
 function parsePositiveIntEnv(name, fallback) {
   const parsed = Number(process.env[name]);
@@ -948,6 +949,18 @@ async function runSchedulerCycle(db, label, options = {}) {
     complianceScanFloor: refreshedScanFloor,
   });
 
+  // ── Step 5.5/6: XIRR pre-calculation (new) ──────────────────────────────
+  logAppInfo(`[Scheduler] ${label}: Step 5.5/6 pre-calculating XIRR cache`, {});
+  let xirrCacheResult = null;
+  try {
+    xirrCacheResult = await preCalculateXirrCache(db, label);
+  } catch (xirrErr) {
+    logAppError(`[Scheduler] ${label}: Step 5.5/6 XIRR pre-calculation failed (non-fatal)`, {
+      error: xirrErr.message,
+    });
+  }
+  logAppInfo(`[Scheduler] ${label}: Step 5.5/6 completed`, xirrCacheResult || {});
+
   // ── Step 6/6: Compliance scan ─────────────────────────────────────────────
   let complianceResult = null;
   const complianceScanMode = options.complianceScanMode || null;
@@ -963,7 +976,7 @@ async function runSchedulerCycle(db, label, options = {}) {
     logAppInfo(`[Scheduler] ${label}: Step 6/6 compliance scan skipped (no mode specified)`);
   }
 
-  return { rollingFreshness, catchUp, locfReconcile, preflight, result, complianceResult };
+  return { rollingFreshness, catchUp, locfReconcile, preflight, result, xirrCacheResult, complianceResult };
   } finally {
     isSchedulerCycleRunning = false;
   }

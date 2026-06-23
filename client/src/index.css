@@ -118,15 +118,20 @@ tr:hover .row-actions {
 .asset-metric-value,
 .asset-metric-rate {
   font-variant-numeric: tabular-nums;
-  flex-shrink: 0;
 }
 
 .asset-metric-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 600;
   font-size: 0.76rem;
 }
 
 .asset-metric-rate {
+  flex-shrink: 0;
   margin-left: auto;
   font-weight: 600;
   font-size: 0.75rem;
@@ -136,6 +141,20 @@ tr:hover .row-actions {
   color: #b8c1cc;
   flex-shrink: 0;
   margin: 0 0.12rem;
+}
+
+@media (max-width: 480px) {
+  .asset-metric-value {
+    font-size: 0.72rem;
+  }
+
+  .asset-metric-rate {
+    font-size: 0.71rem;
+  }
+
+  .asset-metric-separator {
+    margin: 0 0.08rem;
+  }
 }
 
 /* Type badge colors */

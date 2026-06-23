@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { fetchHistoricalUSDToINR, fetchUSDToINR } = require('../services/priceService');
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
+const { invalidatePortfolioXirrCache } = require('../services/xirrCacheService');
 const { logAppInfo, logAppError } = require('../services/appLogger');
 
 /**
@@ -191,6 +192,8 @@ module.exports = function (db) {
         'transaction-created',
         `txn:${result.lastInsertRowid}`
       );
+      // Invalidate XIRR cache since transaction flows changed
+      invalidatePortfolioXirrCache(db, portfolio_id);
       logAppInfo('[Transaction] Created', {
         transaction_id: Number(result.lastInsertRowid),
         investment_id: Number(investment_id),
@@ -382,6 +385,8 @@ module.exports = function (db) {
         'transaction-updated',
         `txn:${existing.id}`
       );
+      // Invalidate XIRR cache since transaction flows changed
+      invalidatePortfolioXirrCache(db, existing.portfolio_id);
 
       const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(req.params.id);
       logAppInfo('[Transaction] Updated', {
@@ -412,6 +417,8 @@ module.exports = function (db) {
         'transaction-deleted',
         `txn:${existing.id}`
       );
+      // Invalidate XIRR cache since transaction flows changed
+      invalidatePortfolioXirrCache(db, existing.portfolio_id);
 
       logAppInfo('[Transaction] Deleted', {
         transaction_id: Number(existing.id),

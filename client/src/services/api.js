@@ -32,6 +32,20 @@ export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInR
   if (customToDate) params.set('custom_to_date', String(customToDate));
   return fetchJSON(`/dashboard/summary?${params}`);
 };
+// Batch endpoint: fetch summary, health, and allocation in single request (optimized)
+export const getDashboardBatch = (portfolioId, { requests = 'summary,health,allocation', hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate, runDate } = {}) => {
+  const params = new URLSearchParams();
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  params.set('requests', requests);
+  if (hideSold) params.set('hide_sold', 'true');
+  if (includeFullySoldInReturns) params.set('include_sold_in_returns', 'true');
+  if (xirrMode) params.set('xirr_mode', String(xirrMode));
+  if (interval) params.set('interval', String(interval));
+  if (customFromDate) params.set('custom_from_date', String(customFromDate));
+  if (customToDate) params.set('custom_to_date', String(customToDate));
+  if (runDate) params.set('run_date', runDate);
+  return fetchJSON(`/dashboard/batch?${params}`);
+};
 export const getPerformance = (period, from, to, portfolioId) => {
   const params = new URLSearchParams();
   if (period) params.set('period', period);

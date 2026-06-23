@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { getMarketSessionDates } = require('../services/marketPriceCache');
 const { calculateIntervalXIRR } = require('../services/xirrCalculator');
+const { getCachedXirr, generateCacheKey } = require('../services/xirrCacheService');
 const { logAppWarn } = require('../services/appLogger');
 const { DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS } = require('../services/freshnessPolicy');
 const {
@@ -303,9 +304,12 @@ module.exports = function (db) {
     today.setHours(0, 0, 0, 0);
     const todayStr = today.toISOString().split('T')[0];
     
-    const latestAggregateDate = db.prepare(`
+    // Consolidate MAX(date) queries: fetch once and reuse
+    const latestDateResult = db.prepare(`
       SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id IS NOT NULL
-    `).get()?.max_date;
+    `).get();
+    const latestAggregateDate = latestDateResult?.max_date;
+    const latestDateInDb = latestAggregateDate;
 
     let stalePricesWarning = null;
     if (!latestAggregateDate || latestAggregateDate < todayStr) {
@@ -324,9 +328,7 @@ module.exports = function (db) {
     let intervalToDate = null;
 
     // Find latest available date in database instead of using "today"
-    const latestDateInDb = db.prepare(`
-      SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id IS NOT NULL
-    `).get()?.max_date;
+    // (reuse latestDateInDb from above - already fetched)
 
     if (req.query.custom_from_date && req.query.custom_to_date) {
       // Custom date range
@@ -409,38 +411,64 @@ module.exports = function (db) {
 
     // Calculate XIRR for the interval
     let intervalXIRR = null;
-    try {
-      const xirrResult = calculateIntervalXIRR(
-        db,
-        portfolio_id ? Number(portfolio_id) : null,
-        intervalFromDate,
-        intervalToDate
-      );
-      intervalXIRR = {
-        xirr_pct: xirrResult.xirr_pct,
-        interval_change: xirrResult.interval_change,
-        interval_change_pct: xirrResult.interval_change_pct,
-        opening_value: xirrResult.opening_value,
-        closing_value: xirrResult.closing_value,
-        confidence: xirrResult.confidence,
-        error: xirrResult.error,
-        requested_from_date: xirrResult.requested_from_date || intervalFromDate,
-        requested_to_date: xirrResult.requested_to_date || intervalToDate,
-        from_date: xirrResult.from_date || intervalFromDate,
-        to_date: xirrResult.to_date || intervalToDate,
-      };
-    } catch (err) {
-      intervalXIRR = {
-        xirr_pct: null,
-        interval_change: 0,
-        interval_change_pct: 0,
-        opening_value: 0,
-        closing_value: 0,
-        confidence: 'error',
-        error: err.message,
-        from_date: intervalFromDate,
-        to_date: intervalToDate,
-      };
+    
+    // Try to use cached XIRR for preset intervals (1D, YD, 1W)
+    if (!req.query.custom_from_date && !req.query.custom_to_date) {
+      const cacheKey = generateCacheKey(portfolio_id ? Number(portfolio_id) : null, intervalParam);
+      const cachedXirr = getCachedXirr(db, cacheKey);
+      if (cachedXirr) {
+        intervalXIRR = {
+          xirr_pct: cachedXirr.xirr_pct,
+          interval_change: cachedXirr.interval_change,
+          interval_change_pct: cachedXirr.interval_change_pct,
+          opening_value: cachedXirr.opening_value,
+          closing_value: cachedXirr.closing_value,
+          confidence: cachedXirr.confidence,
+          error: null,
+          requested_from_date: intervalFromDate,
+          requested_to_date: intervalToDate,
+          from_date: intervalFromDate,
+          to_date: intervalToDate,
+          cached_at: cachedXirr.cached_at,
+        };
+      }
+    }
+    
+    // If no cache hit, calculate fresh XIRR
+    if (!intervalXIRR) {
+      try {
+        const xirrResult = calculateIntervalXIRR(
+          db,
+          portfolio_id ? Number(portfolio_id) : null,
+          intervalFromDate,
+          intervalToDate
+        );
+        intervalXIRR = {
+          xirr_pct: xirrResult.xirr_pct,
+          interval_change: xirrResult.interval_change,
+          interval_change_pct: xirrResult.interval_change_pct,
+          opening_value: xirrResult.opening_value,
+          closing_value: xirrResult.closing_value,
+          confidence: xirrResult.confidence,
+          error: xirrResult.error,
+          requested_from_date: xirrResult.requested_from_date || intervalFromDate,
+          requested_to_date: xirrResult.requested_to_date || intervalToDate,
+          from_date: xirrResult.from_date || intervalFromDate,
+          to_date: xirrResult.to_date || intervalToDate,
+        };
+      } catch (err) {
+        intervalXIRR = {
+          xirr_pct: null,
+          interval_change: 0,
+          interval_change_pct: 0,
+          opening_value: 0,
+          closing_value: 0,
+          confidence: 'error',
+          error: err.message,
+          from_date: intervalFromDate,
+          to_date: intervalToDate,
+        };
+      }
     }
 
     // For preset 1D/YD, align the card to strict day_change (not value-delta interval math).
@@ -1226,6 +1254,14 @@ module.exports = function (db) {
       info.intervalChangePct = null;
       info.intervalFromDate = null;
       info.intervalToDate = null;
+    }
+
+    // 1D/Yesterday: compute intervalChangePct directly from accumulated dayChange vs totalValue.
+    if (isPresetOneDay || isPresetYesterday) {
+      for (const info of Object.values(byType)) {
+        const prevValue = (Number(info.totalValue) || 0) - (Number(info.dayChange) || 0);
+        info.intervalChangePct = prevValue > 0 ? ((Number(info.dayChange) || 0) / prevValue) * 100 : 0;
+      }
     }
 
     // Non-1D: compute asset-type interval change from asset_type_daily using strict in-range bounds.
@@ -2017,6 +2053,151 @@ module.exports = function (db) {
         `).all(...pfParams);
 
     res.json(allocation);
+  });
+
+  // ─── Batch Endpoint: Combines summary + health + allocation in single request ────
+  router.get('/batch', (req, res) => {
+    try {
+      const batchRequests = String(req.query.requests || 'summary,health').toLowerCase().split(',').map(r => r.trim());
+      const result = {};
+
+      // Include summary if requested
+      if (batchRequests.includes('summary')) {
+        // Reuse summary logic
+        const summaryReq = { query: req.query };
+        let summaryData = null;
+        let summaryErr = null;
+
+        try {
+          // Consolidate MAX(date) query once
+          const latestDateResult = db.prepare(`
+            SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id IS NOT NULL
+          `).get();
+          const latestDateInDb = latestDateResult?.max_date;
+
+          // Get summary data (simplified version)
+          const portfolio_id = req.query.portfolio_id;
+          const hideSold = req.query.hide_sold === 'true';
+          const includeFullySoldInReturns = req.query.include_sold_in_returns === 'true';
+
+          if (portfolio_id) {
+            summaryData = db.prepare(
+              'SELECT * FROM portfolio_daily WHERE portfolio_id = ? ORDER BY date DESC LIMIT 1'
+            ).get(portfolio_id);
+          } else {
+            if (latestDateInDb) {
+              summaryData = db.prepare(`
+                SELECT
+                  ? AS date,
+                  SUM(total_value) as total_value,
+                  SUM(total_invested) as total_invested,
+                  SUM(total_profit_loss) as total_profit_loss,
+                  SUM(day_change) as day_change
+                FROM portfolio_daily
+                WHERE portfolio_id IS NOT NULL AND date = ?
+              `).get(latestDateInDb, latestDateInDb);
+            }
+          }
+          result.summary = { status: 'ok', data: summaryData, latest_date: latestDateInDb };
+        } catch (e) {
+          summaryErr = e.message;
+          result.summary = { status: 'error', error: summaryErr };
+        }
+      }
+
+      // Include health if requested
+      if (batchRequests.includes('health')) {
+        try {
+          const portfolio_id = req.query.portfolio_id;
+          const runDate = req.query.run_date || new Date().toISOString().split('T')[0];
+
+          // Get daily_values health
+          const allHealthData = portfolio_id
+            ? db.prepare(`
+                SELECT
+                  COUNT(*) AS total_scopes,
+                  COUNT(CASE WHEN datediff('day', MAX(dv.date), ?) > 14 THEN 1 END) AS stale_scopes,
+                  COUNT(CASE WHEN dv.units = 0 AND dv.current_value > 1 THEN 1 END) AS zero_units_nonzero_value
+                FROM (
+                  SELECT investment_id, MAX(date) AS date, units, current_value
+                  FROM daily_values
+                  WHERE portfolio_id = ?
+                  GROUP BY investment_id
+                ) dv
+              `).get(runDate, portfolio_id)
+            : db.prepare(`
+                SELECT
+                  COUNT(*) AS total_scopes,
+                  COUNT(CASE WHEN datediff('day', MAX(dv.date), ?) > 14 THEN 1 END) AS stale_scopes,
+                  COUNT(CASE WHEN dv.units = 0 AND dv.current_value > 1 THEN 1 END) AS zero_units_nonzero_value
+                FROM (
+                  SELECT investment_id, portfolio_id, MAX(date) AS date, units, current_value
+                  FROM daily_values
+                  GROUP BY investment_id, portfolio_id
+                ) dv
+              `).get(runDate);
+
+          result.health = {
+            status: 'ok',
+            run_date: runDate,
+            total_scopes: allHealthData?.total_scopes || 0,
+            stale_scopes: allHealthData?.stale_scopes || 0,
+            zero_units_issues: allHealthData?.zero_units_nonzero_value || 0,
+          };
+        } catch (e) {
+          result.health = { status: 'error', error: e.message };
+        }
+      }
+
+      // Include allocation if requested
+      if (batchRequests.includes('allocation')) {
+        try {
+          const portfolio_id = req.query.portfolio_id;
+          const allocation = portfolio_id
+            ? db.prepare(`
+                SELECT
+                  i.asset_type,
+                  COUNT(*) as count,
+                  COALESCE(SUM(dv.current_value), 0) as total_value,
+                  COALESCE(SUM(dv.invested_amount), 0) as total_invested,
+                  COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
+                FROM investments i
+                LEFT JOIN daily_values dv ON i.id = dv.investment_id
+                  AND dv.portfolio_id = ?
+                  AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+                GROUP BY i.asset_type
+              `).all(portfolio_id, portfolio_id)
+            : db.prepare(`
+                WITH latest_by_scope AS (
+                  SELECT investment_id, portfolio_id, MAX(date) AS max_date
+                  FROM daily_values
+                  GROUP BY investment_id, portfolio_id
+                )
+                SELECT
+                  i.asset_type,
+                  COUNT(*) as count,
+                  COALESCE(SUM(dv.current_value), 0) as total_value,
+                  COALESCE(SUM(dv.invested_amount), 0) as total_invested,
+                  COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
+                FROM investments i
+                LEFT JOIN daily_values dv ON i.id = dv.investment_id
+                  AND dv.date IN (
+                    SELECT max_date FROM latest_by_scope
+                    WHERE investment_id = dv.investment_id
+                  )
+                GROUP BY i.asset_type
+              `).all();
+
+          result.allocation = { status: 'ok', data: allocation };
+        } catch (e) {
+          result.allocation = { status: 'error', error: e.message };
+        }
+      }
+
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   return router;
