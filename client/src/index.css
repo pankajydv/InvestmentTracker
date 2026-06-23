@@ -46,47 +46,6 @@ body {
   .holdings-table td.holdings-col-optional {
     display: none;
   }
-
-  .holdings-table th,
-  .holdings-table td {
-    padding-left: 0.3rem !important;
-    padding-right: 0.3rem !important;
-    font-size: 0.72rem;
-    line-height: 1.15;
-  }
-
-  .holdings-table th {
-    font-size: 0.66rem;
-    line-height: 1.1;
-  }
-
-  .holdings-table td .fw-medium,
-  .holdings-table td .fw-semibold {
-    font-size: 0.78rem;
-    line-height: 1.12;
-  }
-
-  .holdings-table td .text-muted {
-    font-size: 0.6rem !important;
-    line-height: 1.05;
-  }
-
-  .holdings-table .holdings-col-price .fw-medium,
-  .holdings-table .holdings-col-dayChange .fw-medium,
-  .holdings-table .holdings-col-totalReturn .fw-semibold,
-  .holdings-table .holdings-col-totalReturn > div:last-child {
-    white-space: nowrap;
-  }
-
-  .holdings-table .holdings-col-totalReturn > div:last-child,
-  .holdings-table .holdings-col-dayChange > div:last-child {
-    font-size: 0.58rem !important;
-    letter-spacing: -0.01em;
-  }
-
-  .holdings-table .holdings-col-asOfDate {
-    white-space: nowrap;
-  }
 }
 
 /* Row actions: hidden by default, visible on hover */
@@ -123,6 +82,11 @@ tr:hover .row-actions {
   min-height: 0;
 }
 
+/* Add scroll runway so bottom dashboard sections can align near top on anchor jumps. */
+.dashboard-page {
+  padding-bottom: clamp(220px, 35vh, 520px);
+}
+
 .asset-allocation-card .fw-semibold.text-nowrap {
   font-size: 1.2rem !important;
   line-height: 1.2;
@@ -132,19 +96,23 @@ tr:hover .row-actions {
 .asset-metric-line {
   display: flex;
   align-items: baseline;
-  gap: 0.05rem;
+  gap: 0;
   white-space: nowrap;
   font-size: 0.72rem;
-  line-height: 1.3;
+  line-height: 1.28;
   letter-spacing: 0;
   overflow: hidden;
 }
 
 .asset-metric-label {
-  width: 2.2rem;
+  width: auto;
   flex-shrink: 0;
-  color: #6b7280;
-  font-weight: 500;
+  color: #5f6b7a;
+  font-weight: 600;
+  font-size: 0.68rem;
+  letter-spacing: 0.015em;
+  margin-right: 0.14rem;
+  opacity: 0.9;
 }
 
 .asset-metric-value,
@@ -153,13 +121,21 @@ tr:hover .row-actions {
   flex-shrink: 0;
 }
 
+.asset-metric-value {
+  font-weight: 600;
+  font-size: 0.76rem;
+}
+
 .asset-metric-rate {
   margin-left: auto;
+  font-weight: 600;
+  font-size: 0.75rem;
 }
 
 .asset-metric-separator {
-  color: #9ca3af;
+  color: #b8c1cc;
   flex-shrink: 0;
+  margin: 0 0.12rem;
 }
 
 /* Type badge colors */

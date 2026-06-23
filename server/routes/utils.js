@@ -697,6 +697,10 @@ module.exports = function (db) {
           return String(a.first_missing_date || '').localeCompare(String(b.first_missing_date || ''));
         });
 
+      const pendingDirtyCount = db.prepare(
+        "SELECT COUNT(*) AS c FROM dirty_backfill_scope WHERE status IN ('pending', 'running')"
+      ).get()?.c || 0;
+
       const counts = {
         scopes_checked: details.length,
         issue_scopes: issues.length,
@@ -706,11 +710,12 @@ module.exports = function (db) {
         pending_locf: details.reduce((sum, row) => sum + Number(row.pending_locf_count || 0), 0),
         overdue_locf: details.reduce((sum, row) => sum + Number(row.overdue_locf_count || 0), 0),
         stale_scopes: details.filter((row) => row.stale).length,
+        pending_dirty_scopes: Number(pendingDirtyCount || 0),
       };
 
       const status = counts.missing_rows > 0 || counts.compliance_errors > 0
         ? 'error'
-        : (counts.unexpected_locf > 0 || counts.stale_scopes > 0 ? 'warning' : 'ok');
+        : (counts.unexpected_locf > 0 || counts.stale_scopes > 0 || counts.pending_dirty_scopes > 0 ? 'warning' : 'ok');
 
       const compliance = getComplianceScanState(runDate, db);
 
@@ -1220,7 +1225,6 @@ module.exports = function (db) {
     try {
       const body = req.body || {};
       const dryRun = body.dry_run === true;
-      const executeNow = body.execute_now === true;
       const runDate = parseDateOnly(body.run_date) || todayIso();
 
       const selector = body.selector || {};
@@ -1230,7 +1234,7 @@ module.exports = function (db) {
 
       logAppInfo('[UI] Mark dirty scopes requested', {
         dry_run: dryRun,
-        execute_now: executeNow,
+        execute_now: false,
         run_date: runDate,
         selector,
         date_strategy: dateStrategy,
@@ -1286,6 +1290,33 @@ module.exports = function (db) {
         const { buildSelectorMatches, computeScopeDatesFromStrategy } = require('../services/dirtyBackfillService');
         const matches = buildSelectorMatches(db, selector);
         const scopesWithDates = computeScopeDatesFromStrategy(db, matches, dateStrategy);
+        const previewScopes = scopesWithDates.slice(0, 100);
+
+        const portfolioIds = [...new Set(
+          previewScopes
+            .map((scope) => Number(scope.portfolio_id))
+            .filter((id) => Number.isInteger(id) && id > 0)
+        )];
+        const portfolioNameById = new Map();
+        if (portfolioIds.length) {
+          const placeholders = portfolioIds.map(() => '?').join(',');
+          const portfolioRows = db.prepare(`
+            SELECT id, name
+            FROM portfolios
+            WHERE id IN (${placeholders})
+          `).all(...portfolioIds);
+          for (const row of portfolioRows) {
+            portfolioNameById.set(Number(row.id), row.name || null);
+          }
+        }
+
+        const scopesWithPortfolioNames = previewScopes.map((scope) => {
+          const portfolioId = Number(scope.portfolio_id);
+          return {
+            ...scope,
+            portfolio_name: portfolioNameById.get(portfolioId) || null,
+          };
+        });
 
         logAppInfo('[UI] Mark dirty scopes dry-run', {
           matched_count: matches.length,
@@ -1298,7 +1329,7 @@ module.exports = function (db) {
           run_date: runDate,
           matched_count: matches.length,
           scopes_count: scopesWithDates.length,
-          scopes: scopesWithDates.slice(0, 100),
+          scopes: scopesWithPortfolioNames,
           message: scopesWithDates.length > 100 ? `Showing first 100 of ${scopesWithDates.length} scopes` : undefined,
         });
       }
@@ -1317,20 +1348,6 @@ module.exports = function (db) {
         errors_count: result.errors.length,
       });
 
-      // Execute preflight if requested
-      if (executeNow && result.enqueued_count > 0) {
-        const preflight = await runDirtyBackfillPreflight(db, runDate);
-        logAppInfo('[UI] Mark dirty scopes executed preflight', { ...preflight });
-        return res.json({
-          success: true,
-          matched_count: result.matched_count,
-          enqueued_count: result.enqueued_count,
-          errors: result.errors,
-          executed_now: true,
-          preflight_result: preflight,
-        });
-      }
-
       res.json({
         success: true,
         matched_count: result.matched_count,
@@ -1341,6 +1358,388 @@ module.exports = function (db) {
     } catch (e) {
       logAppError('[UI] Mark dirty scopes failed', { error: e.message });
       return res.status(500).json({ error: e.message || 'Failed to mark dirty scopes' });
+    }
+  });
+
+  // ─── Purge market price cache ─────────────────────────────────────────
+  router.post('/market-price-cache/purge', (req, res) => {
+    try {
+      const { selector = {}, date_range = {}, date_strategy = {}, dry_run = false } = req.body || {};
+      const dryRun = dry_run === true || String(dry_run).toLowerCase() === 'true';
+      const requestedMode = String(req.body?.purge_mode || '').toLowerCase();
+      const legacyPurgeFx = parseBooleanLike(req.body?.purge_fx_rate_cache, false);
+      const purgeMode = ['market', 'fx', 'both'].includes(requestedMode)
+        ? requestedMode
+        : (legacyPurgeFx ? 'both' : 'market');
+      const purgeMarketPriceCache = purgeMode === 'market' || purgeMode === 'both';
+      const purgeFxRateCache = purgeMode === 'fx' || purgeMode === 'both';
+
+      // Validate date strategy + optional end date
+      const strategyType = String(date_strategy.type || 'scope_first_transaction').toLowerCase();
+      if (!['scope_first_transaction', 'max_of_fixed_and_scope_first'].includes(strategyType)) {
+        return res.status(400).json({ error: `Invalid date_strategy.type: ${date_strategy.type}` });
+      }
+
+      const fixedFromDate = parseDateOnly(date_strategy.from_date);
+      if (strategyType === 'max_of_fixed_and_scope_first' && !fixedFromDate) {
+        return res.status(400).json({ error: 'date_strategy.type=max_of_fixed_and_scope_first requires from_date (YYYY-MM-DD)' });
+      }
+
+      const parsedFrom = parseDateOnly(date_range.from_date);
+      const parsedTo = parseDateOnly(date_range.to_date);
+      if (parsedFrom && parsedTo && parsedTo < parsedFrom) {
+        return res.status(400).json({ error: 'date_range.to_date must be >= date_range.from_date' });
+      }
+
+      // FX-only mode is investment-independent: use explicit from/to dates for fx_rate_cache.
+      if (purgeMode === 'fx') {
+        const earliestFxDate = db.prepare(`
+          SELECT MIN(date) AS d
+          FROM fx_rate_cache
+        `).get()?.d || null;
+        const fxFromDate = parsedFrom || earliestFxDate;
+
+        if (!fxFromDate) {
+          return res.json({
+            dry_run: dryRun,
+            matched_investments: 0,
+            rows_affected: 0,
+            date_strategy: {
+              type: strategyType,
+              from_date: fixedFromDate || null,
+            },
+            to_date: parsedTo || null,
+            fx_rate_cache: {
+              enabled: true,
+              from_date: null,
+              to_date: parsedTo || null,
+              rows_affected: 0,
+            },
+            purge_mode: purgeMode,
+            preview: [],
+            message: 'No fx_rate_cache rows available to purge',
+          });
+        }
+
+        if (dryRun) {
+          const fxCountWithEnd = db.prepare(`
+            SELECT COUNT(*) AS c
+            FROM fx_rate_cache
+            WHERE date >= ?
+              AND date <= ?
+          `);
+          const fxCountNoEnd = db.prepare(`
+            SELECT COUNT(*) AS c
+            FROM fx_rate_cache
+            WHERE date >= ?
+          `);
+          const fxRows = Number(
+            (parsedTo
+              ? fxCountWithEnd.get(fxFromDate, parsedTo)?.c
+              : fxCountNoEnd.get(fxFromDate)?.c) || 0
+          );
+
+          return res.json({
+            dry_run: true,
+            matched_investments: 0,
+            rows_affected: 0,
+            date_strategy: {
+              type: strategyType,
+              from_date: fixedFromDate || null,
+            },
+            to_date: parsedTo || null,
+            fx_rate_cache: {
+              enabled: true,
+              from_date: fxFromDate,
+              to_date: parsedTo || null,
+              rows_affected: fxRows,
+            },
+            purge_mode: purgeMode,
+            preview: [],
+          });
+        }
+
+        const fxDeleteWithEnd = db.prepare(`
+          DELETE FROM fx_rate_cache
+          WHERE date >= ?
+            AND date <= ?
+        `);
+        const fxDeleteNoEnd = db.prepare(`
+          DELETE FROM fx_rate_cache
+          WHERE date >= ?
+        `);
+        const fxInfo = parsedTo
+          ? fxDeleteWithEnd.run(fxFromDate, parsedTo)
+          : fxDeleteNoEnd.run(fxFromDate);
+        const fxRowsDeleted = Number(fxInfo?.changes || 0);
+
+        logAppInfo('[UI] Purge fx rate cache executed', {
+          from_date: fxFromDate,
+          to_date: parsedTo || null,
+          rows_deleted: fxRowsDeleted,
+        });
+
+        return res.json({
+          dry_run: false,
+          matched_investments: 0,
+          rows_affected: 0,
+          date_strategy: {
+            type: strategyType,
+            from_date: fixedFromDate || null,
+          },
+          to_date: parsedTo || null,
+          fx_rate_cache: {
+            enabled: true,
+            from_date: fxFromDate,
+            to_date: parsedTo || null,
+            rows_affected: fxRowsDeleted,
+          },
+          purge_mode: purgeMode,
+          preview: [],
+        });
+      }
+
+      const { buildSelectorMatches } = require('../services/dirtyBackfillService');
+
+      // Resolve investment IDs from selector (no portfolio_ids for cache — cache is investment-level)
+      const scopeSelector = { ...selector };
+      delete scopeSelector.portfolio_ids;
+
+      const matches = buildSelectorMatches(db, scopeSelector);
+      const investmentIds = [...new Set(matches.map((m) => Number(m.investment_id)))].filter(Boolean);
+
+      if (!investmentIds.length) {
+        return res.json({
+          dry_run: dryRun,
+          matched_investments: 0,
+          rows_affected: 0,
+          date_strategy: {
+            type: strategyType,
+            from_date: fixedFromDate || null,
+          },
+          to_date: parsedTo || null,
+          fx_rate_cache: {
+            enabled: purgeFxRateCache,
+            from_date: null,
+            to_date: parsedTo || null,
+            rows_affected: 0,
+          },
+          purge_mode: purgeMode,
+          message: 'No matching investments found',
+        });
+      }
+
+      const placeholders = investmentIds.map(() => '?').join(',');
+
+      const firstTxnRows = db.prepare(`
+        SELECT investment_id, MIN(date(transaction_date)) AS first_txn_date
+        FROM transactions
+        WHERE investment_id IN (${placeholders})
+        GROUP BY investment_id
+      `).all(...investmentIds);
+      const firstTxnByInvestment = new Map(firstTxnRows.map((row) => [Number(row.investment_id), row.first_txn_date || null]));
+
+      const invRows = db.prepare(
+        `SELECT id, name, asset_type FROM investments WHERE id IN (${placeholders})`
+      ).all(...investmentIds);
+      const invById = new Map(invRows.map((r) => [Number(r.id), r]));
+
+      const windows = investmentIds.map((investmentId) => {
+        const firstTxnDate = firstTxnByInvestment.get(Number(investmentId)) || null;
+        const fromDate = strategyType === 'scope_first_transaction'
+          ? firstTxnDate
+          : (firstTxnDate ? (firstTxnDate > fixedFromDate ? firstTxnDate : fixedFromDate) : fixedFromDate);
+        return {
+          investment_id: Number(investmentId),
+          from_date: fromDate || null,
+          to_date: parsedTo || null,
+        };
+      }).filter((row) => !!row.from_date);
+
+      const fxFromDate = windows.map((w) => w.from_date).sort().at(0) || null;
+
+      if (!windows.length) {
+        return res.json({
+          dry_run: dryRun,
+          matched_investments: investmentIds.length,
+          rows_affected: 0,
+          date_strategy: {
+            type: strategyType,
+            from_date: fixedFromDate || null,
+          },
+          to_date: parsedTo || null,
+          fx_rate_cache: {
+            enabled: purgeFxRateCache,
+            from_date: null,
+            to_date: parsedTo || null,
+            rows_affected: 0,
+          },
+          purge_mode: purgeMode,
+          preview: [],
+          message: 'No investments had a valid from date for purge',
+        });
+      }
+
+      if (dryRun) {
+        const countStmtWithEnd = db.prepare(`
+          SELECT COUNT(*) AS row_count, MIN(date) AS min_date, MAX(date) AS max_date
+          FROM market_price_cache
+          WHERE investment_id = ?
+            AND date >= ?
+            AND date <= ?
+        `);
+        const countStmtNoEnd = db.prepare(`
+          SELECT COUNT(*) AS row_count, MIN(date) AS min_date, MAX(date) AS max_date
+          FROM market_price_cache
+          WHERE investment_id = ?
+            AND date >= ?
+        `);
+
+        const preview = windows.map((window) => {
+          const counted = window.to_date
+            ? countStmtWithEnd.get(window.investment_id, window.from_date, window.to_date)
+            : countStmtNoEnd.get(window.investment_id, window.from_date);
+          const inv = invById.get(Number(window.investment_id));
+          return {
+            investment_id: window.investment_id,
+            investment_name: inv?.name || null,
+            asset_type: inv?.asset_type || null,
+            from_date: window.from_date,
+            to_date: window.to_date,
+            row_count: purgeMarketPriceCache ? Number(counted?.row_count || 0) : 0,
+            min_date: counted?.min_date || null,
+            max_date: counted?.max_date || null,
+          };
+        });
+        const totalRows = preview.reduce((sum, row) => sum + Number(row.row_count || 0), 0);
+        let fxRows = 0;
+        if (purgeFxRateCache && fxFromDate) {
+          const fxCountWithEnd = db.prepare(`
+            SELECT COUNT(*) AS c
+            FROM fx_rate_cache
+            WHERE date >= ?
+              AND date <= ?
+          `);
+          const fxCountNoEnd = db.prepare(`
+            SELECT COUNT(*) AS c
+            FROM fx_rate_cache
+            WHERE date >= ?
+          `);
+          fxRows = Number(
+            (parsedTo
+              ? fxCountWithEnd.get(fxFromDate, parsedTo)?.c
+              : fxCountNoEnd.get(fxFromDate)?.c) || 0
+          );
+        }
+
+        logAppInfo('[UI] Purge market price cache dry-run', {
+          matched_investments: windows.length,
+          preview_investments: preview.length,
+          total_rows: totalRows,
+          date_strategy: strategyType,
+          fixed_from_date: fixedFromDate || null,
+          to_date: parsedTo || null,
+          purge_fx_rate_cache: purgeFxRateCache,
+          purge_market_price_cache: purgeMarketPriceCache,
+          purge_mode: purgeMode,
+          fx_rows: fxRows,
+        });
+
+        return res.json({
+          dry_run: true,
+          matched_investments: windows.length,
+          rows_affected: totalRows,
+          date_strategy: {
+            type: strategyType,
+            from_date: fixedFromDate || null,
+          },
+          to_date: parsedTo || null,
+          fx_rate_cache: {
+            enabled: purgeFxRateCache,
+            from_date: purgeFxRateCache ? fxFromDate : null,
+            to_date: parsedTo || null,
+            rows_affected: fxRows,
+          },
+          purge_mode: purgeMode,
+          preview,
+        });
+      }
+
+      // Execute purge
+      const deleteStmtWithEnd = db.prepare(`
+        DELETE FROM market_price_cache
+        WHERE investment_id = ?
+          AND date >= ?
+          AND date <= ?
+      `);
+      const deleteStmtNoEnd = db.prepare(`
+        DELETE FROM market_price_cache
+        WHERE investment_id = ?
+          AND date >= ?
+      `);
+
+      let rowsDeleted = 0;
+      let fxRowsDeleted = 0;
+      const purgeTxn = db.transaction((purgeWindows) => {
+        if (purgeMarketPriceCache) {
+          for (const window of purgeWindows) {
+            const info = window.to_date
+              ? deleteStmtWithEnd.run(window.investment_id, window.from_date, window.to_date)
+              : deleteStmtNoEnd.run(window.investment_id, window.from_date);
+            rowsDeleted += Number(info?.changes || 0);
+          }
+        }
+
+        if (purgeFxRateCache && fxFromDate) {
+          const fxDeleteWithEnd = db.prepare(`
+            DELETE FROM fx_rate_cache
+            WHERE date >= ?
+              AND date <= ?
+          `);
+          const fxDeleteNoEnd = db.prepare(`
+            DELETE FROM fx_rate_cache
+            WHERE date >= ?
+          `);
+          const fxInfo = parsedTo
+            ? fxDeleteWithEnd.run(fxFromDate, parsedTo)
+            : fxDeleteNoEnd.run(fxFromDate);
+          fxRowsDeleted = Number(fxInfo?.changes || 0);
+        }
+      });
+      purgeTxn(windows);
+
+      logAppInfo('[UI] Purge market price cache executed', {
+        matched_investments: windows.length,
+        rows_deleted: rowsDeleted,
+        date_strategy: strategyType,
+        fixed_from_date: fixedFromDate || null,
+        to_date: parsedTo || null,
+        purge_fx_rate_cache: purgeFxRateCache,
+        purge_market_price_cache: purgeMarketPriceCache,
+        purge_mode: purgeMode,
+        fx_rows_deleted: fxRowsDeleted,
+      });
+
+      res.json({
+        dry_run: false,
+        matched_investments: windows.length,
+        rows_affected: rowsDeleted,
+        date_strategy: {
+          type: strategyType,
+          from_date: fixedFromDate || null,
+        },
+        to_date: parsedTo || null,
+        fx_rate_cache: {
+          enabled: purgeFxRateCache,
+          from_date: purgeFxRateCache ? fxFromDate : null,
+          to_date: parsedTo || null,
+          rows_affected: fxRowsDeleted,
+        },
+        purge_mode: purgeMode,
+      });
+    } catch (e) {
+      logAppError('[UI] Purge market price cache failed', { error: e.message });
+      res.status(500).json({ error: e.message || 'Failed to purge market price cache' });
     }
   });
 

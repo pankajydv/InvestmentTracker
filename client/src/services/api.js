@@ -249,6 +249,11 @@ export const markDirtyScopesFromSelector = (payload) =>
     method: 'POST',
     body: JSON.stringify(payload),
   });
+export const purgeMarketPriceCache = (payload) =>
+  fetchJSON('/utils/market-price-cache/purge', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
 export const getInterestRates = () => fetchJSON('/utils/interest-rates');
 export const createInterestRate = (data) =>
   fetchJSON('/utils/interest-rates', { method: 'POST', body: JSON.stringify(data) });

@@ -343,6 +343,15 @@ module.exports = function (db) {
           d.setDate(d.getDate() - 1);
           intervalFromDate = d.toISOString().split('T')[0];
           break;
+        case 'YD': {
+          const yTo = new Date(latestDateInDb);
+          yTo.setDate(yTo.getDate() - 1);
+          intervalToDate = yTo.toISOString().split('T')[0];
+          const yFrom = new Date(intervalToDate);
+          yFrom.setDate(yFrom.getDate() - 1);
+          intervalFromDate = yFrom.toISOString().split('T')[0];
+          break;
+        }
         case '2D':
           d.setDate(d.getDate() - 2);
           intervalFromDate = d.toISOString().split('T')[0];
@@ -434,19 +443,20 @@ module.exports = function (db) {
       };
     }
 
-    // For preset 1D, align the card to strict day_change (not value-delta interval math).
+    // For preset 1D/YD, align the card to strict day_change (not value-delta interval math).
     const isPresetOneDay = !req.query.custom_from_date && !req.query.custom_to_date && intervalParam === '1D';
+    const isPresetYesterday = !req.query.custom_from_date && !req.query.custom_to_date && intervalParam === 'YD';
     const marketState = getDashboardMarketState(new Date());
     let oneDayCardSource = 'not_applicable';
     let oneDayCardSourceReason = 'interval_not_1d';
 
     if (isPresetOneDay) {
-      const anyTrackedMarketOpen = marketState.india.isOpen || marketState.us.isOpen;
-      oneDayCardSource = anyTrackedMarketOpen ? 'top_card' : 'table_derived';
-      oneDayCardSourceReason = anyTrackedMarketOpen ? 'market_open' : 'all_markets_closed';
+      // Keep 1D card semantics strict: always use rollup day_change for latest snapshot.
+      oneDayCardSource = 'top_card';
+      oneDayCardSourceReason = 'strict_rollup';
     }
 
-    if (isPresetOneDay && intervalToDate) {
+    if ((isPresetOneDay || isPresetYesterday) && intervalToDate) {
       if (portfolio_id) {
         const latestOneDay = db.prepare(`
           SELECT total_value, day_change
@@ -987,7 +997,7 @@ module.exports = function (db) {
     }
 
     // Non-1D intervals: replace per-investment 1-day values with interval-scoped sums.
-    if (!isPresetOneDay && intervalFromDate && intervalToDate) {
+    if (!isPresetOneDay && !isPresetYesterday && intervalFromDate && intervalToDate) {
       const findBoundsForInvestment = portfolio_id
         ? db.prepare(`
             SELECT
@@ -1079,22 +1089,7 @@ module.exports = function (db) {
       }
     }
 
-    if (isPresetOneDay && oneDayCardSource === 'table_derived') {
-      const tableClosingValue = investments.reduce((sum, inv) => sum + (Number(inv.current_value) || 0), 0);
-      const tableIntervalChange = investments.reduce((sum, inv) => sum + (Number(inv.day_change) || 0), 0);
-      const tableOpeningValue = tableClosingValue - tableIntervalChange;
-      const tableAsOfDate = latestSnapshotDate || intervalToDate || null;
-
-      intervalXIRR = {
-        ...intervalXIRR,
-        interval_change: tableIntervalChange,
-        interval_change_pct: tableOpeningValue > 0 ? (tableIntervalChange / tableOpeningValue) * 100 : 0,
-        opening_value: tableOpeningValue,
-        closing_value: tableClosingValue,
-        from_date: tableAsOfDate,
-        to_date: tableAsOfDate,
-      };
-    }
+    // Intentionally no table-derived overwrite for preset 1D.
 
     const totalsSoldFilter = hideSold && !includeSoldInReturns
       ? soldFilter
@@ -1234,7 +1229,7 @@ module.exports = function (db) {
     }
 
     // Non-1D: compute asset-type interval change from asset_type_daily using strict in-range bounds.
-    if (!isPresetOneDay && intervalFromDate && intervalToDate) {
+    if (!isPresetOneDay && !isPresetYesterday && intervalFromDate && intervalToDate) {
       const findBoundsForType = portfolio_id
         ? db.prepare(`
             SELECT

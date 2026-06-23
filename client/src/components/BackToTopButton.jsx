@@ -20,6 +20,10 @@ export default function BackToTopButton() {
   }, []);
 
   const handleClick = () => {
+    if (window.location.hash && window.location.hash.startsWith('#section-')) {
+      const cleanUrl = `${window.location.pathname}${window.location.search}`;
+      window.history.replaceState(null, '', cleanUrl);
+    }
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 

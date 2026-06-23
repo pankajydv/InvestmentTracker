@@ -1,18 +1,21 @@
 import React, { useState } from 'react';
-import { Modal, Button, Form, Alert, Tabs, Tab, Badge, Spinner } from 'react-bootstrap';
-import { AlertCircle, Eye } from 'lucide-react';
+import { Modal, Button, Form, Alert, Badge, Spinner } from 'react-bootstrap';
+import { Eye } from 'lucide-react';
 import { markDirtyScopesFromSelector } from '../services/api';
+import { ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS } from '../utils/formatters';
 
-const ASSET_TYPES = ['EQUITY', 'MUTUAL_FUND', 'ETF', 'NPS', 'FIXED_INCOME', 'COMMODITY', 'CRYPTO', 'RSU', 'ESPP'];
+const ASSET_TYPES = Object.keys(ASSET_TYPE_LABELS);
 
 const DATE_STRATEGIES = [
   { value: 'scope_first_transaction', label: 'From First Transaction (default)', desc: 'Earliest transaction date for each scope' },
-  { value: 'fixed_date', label: 'Fixed Date', desc: 'Specific date you choose' },
   { value: 'max_of_fixed_and_scope_first', label: 'Fixed OR First (max)', desc: 'Later of fixed date or first transaction' },
 ];
 
+function normalizeDateStrategy(strategy) {
+  return strategy === 'fixed_date' ? 'max_of_fixed_and_scope_first' : strategy;
+}
+
 export default function ManualDirtyScopeModal({ show, onHide }) {
-  const [tab, setTab] = useState('quick');
   const [loading, setLoading] = useState(false);
   const [previewing, setPreviewing] = useState(false);
   const [executing, setExecuting] = useState(false);
@@ -24,13 +27,7 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
   // Quick selector
   const [quickMode, setQuickMode] = useState('all_active');
   const [quickAsset, setQuickAsset] = useState('');
-
-  // Custom selector
-  const [portfolioIds, setPortfolioIds] = useState('');
-  const [assetTypes, setAssetTypes] = useState('');
-  const [investmentIds, setInvestmentIds] = useState('');
-  const [includeInactive, setIncludeInactive] = useState(false);
-  const [includeExcluded, setIncludeExcluded] = useState(false);
+  const [quickInvestmentId, setQuickInvestmentId] = useState('');
 
   // Date strategy
   const [dateStrategy, setDateStrategy] = useState('scope_first_transaction');
@@ -38,23 +35,14 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
 
   // Metadata
   const [reason, setReason] = useState('manual-mark');
-  const [dryRun, setDryRun] = useState(true);
-  const [executeNow, setExecuteNow] = useState(false);
 
   const reset = () => {
-    setTab('quick');
     setQuickMode('all_active');
     setQuickAsset('');
-    setPortfolioIds('');
-    setAssetTypes('');
-    setInvestmentIds('');
-    setIncludeInactive(false);
-    setIncludeExcluded(false);
+    setQuickInvestmentId('');
     setDateStrategy('scope_first_transaction');
     setFixedDate(new Date().toISOString().split('T')[0]);
     setReason('manual-mark');
-    setDryRun(true);
-    setExecuteNow(false);
     setError('');
     setSuccessMsg('');
     setResult(null);
@@ -69,32 +57,21 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
   const buildSelector = () => {
     const selector = {};
 
-    if (tab === 'quick') {
-      if (quickMode === 'all_active') {
-        // No selector filters = all active
-        selector.include_inactive = false;
-        selector.include_excluded = false;
-      } else if (quickMode === 'specific_asset' && quickAsset) {
-        selector.asset_types = [quickAsset];
-        selector.include_inactive = false;
-        selector.include_excluded = false;
-      } else if (quickMode === 'all_including_inactive') {
-        selector.include_inactive = true;
-        selector.include_excluded = false;
-      }
-    } else {
-      // Custom
-      if (portfolioIds.trim()) {
-        selector.portfolio_ids = portfolioIds.split(',').map(p => Number(p.trim())).filter(p => !isNaN(p));
-      }
-      if (assetTypes.trim()) {
-        selector.asset_types = assetTypes.split(',').map(a => a.trim().toUpperCase()).filter(a => a);
-      }
-      if (investmentIds.trim()) {
-        selector.investment_ids = investmentIds.split(',').map(i => Number(i.trim())).filter(i => !isNaN(i));
-      }
-      selector.include_inactive = includeInactive;
-      selector.include_excluded = includeExcluded;
+    if (quickMode === 'all_active') {
+      // No selector filters = all active
+      selector.include_inactive = false;
+      selector.include_excluded = false;
+    } else if (quickMode === 'specific_asset' && quickAsset) {
+      selector.asset_types = [quickAsset];
+      selector.include_inactive = false;
+      selector.include_excluded = false;
+    } else if (quickMode === 'specific_investment' && quickInvestmentId.trim()) {
+      selector.investment_ids = [Number(quickInvestmentId.trim())];
+      selector.include_inactive = true;
+      selector.include_excluded = true;
+    } else if (quickMode === 'all_including_inactive') {
+      selector.include_inactive = true;
+      selector.include_excluded = false;
     }
 
     return selector;
@@ -107,11 +84,12 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
       setPreviewing(true);
 
       const selector = buildSelector();
+      const normalizedDateStrategy = normalizeDateStrategy(dateStrategy);
       const payload = {
         selector,
         date_strategy: {
-          type: dateStrategy,
-          ...(dateStrategy !== 'scope_first_transaction' && { from_date: fixedDate }),
+          type: normalizedDateStrategy,
+          ...(normalizedDateStrategy !== 'scope_first_transaction' && { from_date: fixedDate }),
         },
         reason,
         dry_run: true,
@@ -133,18 +111,19 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
       setExecuting(true);
 
       const selector = buildSelector();
+      const normalizedDateStrategy = normalizeDateStrategy(dateStrategy);
       const payload = {
         selector,
         date_strategy: {
-          type: dateStrategy,
-          ...(dateStrategy !== 'scope_first_transaction' && { from_date: fixedDate }),
+          type: normalizedDateStrategy,
+          ...(normalizedDateStrategy !== 'scope_first_transaction' && { from_date: fixedDate }),
         },
         reason,
         dry_run: false,
-        execute_now: executeNow,
       };
 
       const data = await markDirtyScopesFromSelector(payload);
+      setPreviewData(null);
       setResult(data);
       setSuccessMsg(`✓ Enqueued ${data.enqueued_count} scopes for backfill`);
     } catch (e) {
@@ -180,7 +159,7 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
         {previewData && !executing && (
           <Alert variant="warning" className="mb-3">
             <div className="fw-semibold mb-2 d-flex align-items-center gap-2">
-              <Eye size={16} /> Preview (Dry-Run)
+              <Eye size={16} /> Preview
             </div>
             <small>
               <div>Will match: <Badge bg="secondary">{previewData.matched_count}</Badge> scopes</div>
@@ -190,7 +169,7 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
                   <div style={{ fontSize: '0.75rem', maxHeight: '150px', overflowY: 'auto' }}>
                     {previewData.scopes.slice(0, 5).map((s, i) => (
                       <div key={i} className="text-muted">
-                        Investment {s.investment_id} → {s.portfolio_id} from {s.dirty_from_date}
+                        Investment {s.investment_id} ({s.portfolio_name || `Portfolio ${s.portfolio_id}`}) from {s.dirty_from_date}
                       </div>
                     ))}
                     {previewData.scopes.length > 5 && (
@@ -203,110 +182,68 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
           </Alert>
         )}
 
-        <Tabs activeKey={tab} onSelect={(k) => setTab(k)} className="mb-3">
-          {/* Quick Selector Tab */}
-          <Tab eventKey="quick" title="Quick Selector">
-            <div className="mt-3">
-              <Form.Group className="mb-3">
-                <Form.Label className="fw-semibold">Select Scope</Form.Label>
-                <Form.Check
-                  type="radio"
-                  label="All Active Investments (default)"
-                  name="quickMode"
-                  value="all_active"
-                  checked={quickMode === 'all_active'}
-                  onChange={(e) => setQuickMode(e.target.value)}
-                />
-                <Form.Check
-                  type="radio"
-                  label="All Including Inactive"
-                  name="quickMode"
-                  value="all_including_inactive"
-                  checked={quickMode === 'all_including_inactive'}
-                  onChange={(e) => setQuickMode(e.target.value)}
-                />
-                <Form.Check
-                  type="radio"
-                  label="Specific Asset Type"
-                  name="quickMode"
-                  value="specific_asset"
-                  checked={quickMode === 'specific_asset'}
-                  onChange={(e) => setQuickMode(e.target.value)}
-                />
-                {quickMode === 'specific_asset' && (
-                  <Form.Select
-                    value={quickAsset}
-                    onChange={(e) => setQuickAsset(e.target.value)}
-                    className="mt-2"
-                    size="sm"
-                  >
-                    <option value="">Choose asset type...</option>
-                    {ASSET_TYPES.map((t) => (
-                      <option key={t} value={t}>
-                        {t}
-                      </option>
-                    ))}
-                  </Form.Select>
-                )}
-              </Form.Group>
-            </div>
-          </Tab>
-
-          {/* Custom Selector Tab */}
-          <Tab eventKey="custom" title="Custom Filters">
-            <div className="mt-3 small text-muted mb-3">
-              Leave blank to include all. Comma-separated IDs for specific selections.
-            </div>
-
-            <Form.Group className="mb-2">
-              <Form.Label className="small">Portfolio IDs</Form.Label>
-              <Form.Control
-                type="text"
-                placeholder="e.g. 1,2,3"
-                value={portfolioIds}
-                onChange={(e) => setPortfolioIds(e.target.value)}
-                size="sm"
-              />
-            </Form.Group>
-
-            <Form.Group className="mb-2">
-              <Form.Label className="small">Asset Types</Form.Label>
-              <Form.Control
-                type="text"
-                placeholder="e.g. MUTUAL_FUND,NPS"
-                value={assetTypes}
-                onChange={(e) => setAssetTypes(e.target.value)}
-                size="sm"
-              />
-            </Form.Group>
-
-            <Form.Group className="mb-3">
-              <Form.Label className="small">Investment IDs</Form.Label>
-              <Form.Control
-                type="text"
-                placeholder="e.g. 212,45,67"
-                value={investmentIds}
-                onChange={(e) => setInvestmentIds(e.target.value)}
-                size="sm"
-              />
-            </Form.Group>
-
-            <Form.Check
-              type="checkbox"
-              label="Include Inactive Investments"
-              checked={includeInactive}
-              onChange={(e) => setIncludeInactive(e.target.checked)}
-              className="mb-2 small"
+        <Form.Group className="mb-3">
+          <Form.Label className="fw-semibold">Select Scope</Form.Label>
+          <Form.Check
+            type="radio"
+            label="All Active Investments (default)"
+            name="quickMode"
+            value="all_active"
+            checked={quickMode === 'all_active'}
+            onChange={(e) => setQuickMode(e.target.value)}
+          />
+          <Form.Check
+            type="radio"
+            label="All Including Inactive"
+            name="quickMode"
+            value="all_including_inactive"
+            checked={quickMode === 'all_including_inactive'}
+            onChange={(e) => setQuickMode(e.target.value)}
+          />
+          <Form.Check
+            type="radio"
+            label="Specific Asset Type"
+            name="quickMode"
+            value="specific_asset"
+            checked={quickMode === 'specific_asset'}
+            onChange={(e) => setQuickMode(e.target.value)}
+          />
+          <Form.Check
+            type="radio"
+            label="Specific Investment"
+            name="quickMode"
+            value="specific_investment"
+            checked={quickMode === 'specific_investment'}
+            onChange={(e) => setQuickMode(e.target.value)}
+          />
+          {quickMode === 'specific_asset' && (
+            <Form.Select
+              value={quickAsset}
+              onChange={(e) => setQuickAsset(e.target.value)}
+              className="mt-2"
+              size="sm"
+            >
+              <option value="">Choose asset type...</option>
+              {ASSET_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {ASSET_TYPE_FULL_NAMES[t] ? `${ASSET_TYPE_FULL_NAMES[t]} (${t})` : t}
+                </option>
+              ))}
+            </Form.Select>
+          )}
+          {quickMode === 'specific_investment' && (
+            <Form.Control
+              type="number"
+              min="1"
+              step="1"
+              value={quickInvestmentId}
+              onChange={(e) => setQuickInvestmentId(e.target.value)}
+              className="mt-2"
+              size="sm"
+              placeholder="Enter investment ID (e.g. 212)"
             />
-            <Form.Check
-              type="checkbox"
-              label="Include Excluded from Tracking"
-              checked={includeExcluded}
-              onChange={(e) => setIncludeExcluded(e.target.checked)}
-              className="mb-2 small"
-            />
-          </Tab>
-        </Tabs>
+          )}
+        </Form.Group>
 
         {/* Date Strategy */}
         <Form.Group className="mb-3">
@@ -354,28 +291,10 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
           <Form.Text className="small text-muted">For audit trail</Form.Text>
         </Form.Group>
 
-        {/* Checkboxes */}
         <Form.Group className="mb-3 p-3 bg-light rounded">
-          <Form.Check
-            type="checkbox"
-            label={<span>Dry-run first <Badge bg="info">recommended</Badge></span>}
-            checked={dryRun}
-            onChange={(e) => setDryRun(e.target.checked)}
-            className="mb-2"
-          />
-          <Form.Text className="d-block small text-muted mb-2">
-            Shows what will be marked without writing to database.
+          <Form.Text className="d-block small text-muted mb-0">
+            Preview first to verify matches, then mark dirty scopes.
           </Form.Text>
-
-          {!dryRun && (
-            <Form.Check
-              type="checkbox"
-              label="Execute immediately after marking"
-              checked={executeNow}
-              onChange={(e) => setExecuteNow(e.target.checked)}
-              className="text-danger small"
-            />
-          )}
         </Form.Group>
       </Modal.Body>
 
@@ -384,7 +303,7 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
           Close
         </Button>
 
-        {dryRun && !previewData && (
+        {!previewData && (
           <Button
             variant="primary"
             onClick={handlePreview}
@@ -394,26 +313,23 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
           </Button>
         )}
 
-        {previewData && dryRun && (
+        {previewData && (
           <>
             <Button
-              variant="outline-primary"
-              onClick={() => { setDryRun(false); setPreviewData(null); }}
-              disabled={executing}
+              variant="outline-secondary"
+              onClick={handlePreview}
+              disabled={previewing || executing || loading}
             >
-              Continue to Execute
+              {previewing ? <><Spinner size="sm" className="me-2" />Previewing...</> : 'Refresh Preview'}
+            </Button>
+            <Button
+              variant="success"
+              onClick={handleExecute}
+              disabled={executing || loading || previewing}
+            >
+              {executing ? <><Spinner size="sm" className="me-2" />Marking...</> : 'Mark Dirty Scopes'}
             </Button>
           </>
-        )}
-
-        {!dryRun && (
-          <Button
-            variant="success"
-            onClick={handleExecute}
-            disabled={executing || loading}
-          >
-            {executing ? <><Spinner size="sm" className="me-2" />Executing...</> : 'Execute'}
-          </Button>
         )}
       </Modal.Footer>
     </Modal>

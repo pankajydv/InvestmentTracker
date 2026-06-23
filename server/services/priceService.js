@@ -56,13 +56,6 @@ function nextUsWeekday(dateIso) {
   return cursor;
 }
 
-function exchangeDateFromUnixSeconds(unixSeconds, gmtoffsetSeconds) {
-  if (!Number.isFinite(Number(unixSeconds))) return null;
-  const ts = Number(unixSeconds);
-  const offset = Number.isFinite(Number(gmtoffsetSeconds)) ? Number(gmtoffsetSeconds) : 0;
-  return new Date((ts + offset) * 1000).toISOString().slice(0, 10);
-}
-
 /**
  * Determine the canonical US trading date and best available price from a Yahoo Finance
  * chart API response, correctly handling pre-market, regular, and after-hours sessions.
@@ -85,86 +78,61 @@ function detectForeignStockSession(meta, timestamps, closes) {
   if (!meta || !meta.regularMarketPrice) return null;
 
   const tp = meta.currentTradingPeriod;
-  const regularStart = Number(tp?.regular?.start);
-  const regularEnd = Number(tp?.regular?.end);
-  const postStart = Number(tp?.post?.start);
-  const postEnd = Number(tp?.post?.end);
-  const preStart = Number(tp?.pre?.start);
-  const preEnd = Number(tp?.pre?.end);
-  const gmtoffset = Number(meta.gmtoffset);
+  const regularStart = tp?.regular?.start;
+  const regularEnd   = tp?.regular?.end;
+  const postEnd      = tp?.post?.end;
+  const preStart     = tp?.pre?.start;
+  const preEnd       = tp?.pre?.end;
 
-  const rows = [];
-  const points = Math.min(
-    Array.isArray(timestamps) ? timestamps.length : 0,
-    Array.isArray(closes) ? closes.length : 0,
-  );
-  for (let i = 0; i < points; i += 1) {
-    const ts = Number(timestamps[i]);
-    const close = Number(closes[i]);
-    if (!Number.isFinite(ts) || !Number.isFinite(close) || close <= 0) continue;
-    rows.push({ ts, close });
-  }
+  // Session phase: compare current UTC time against Yahoo's trading period boundaries.
+  const nowSec = Math.floor(Date.now() / 1000);
+  const inAfterHours = Number.isFinite(regularEnd) && Number.isFinite(postEnd)
+    && nowSec >= regularEnd && nowSec <= postEnd;
+  const inPreMarket = !inAfterHours
+    && Number.isFinite(preStart) && Number.isFinite(preEnd)
+    && nowSec >= preStart && nowSec < preEnd;
 
-  const latest = rows.length > 0 ? rows[rows.length - 1] : null;
-
-  // Provider session date is anchored to the exchange regular-session start.
-  // No IST conversion: this preserves provider trading-calendar dates exactly as-is.
-  const sessionDateProvider = Number.isFinite(regularStart)
-    ? exchangeDateFromUnixSeconds(regularStart, gmtoffset)
-    : null;
-  if (!sessionDateProvider) return null;
-
-  let sessionPhase = 'regular';
-  if (latest && Number.isFinite(postStart) && Number.isFinite(postEnd) && latest.ts >= postStart && latest.ts < postEnd) {
-    sessionPhase = 'post';
-  } else if (latest && Number.isFinite(preStart) && Number.isFinite(preEnd) && latest.ts >= preStart && latest.ts < preEnd) {
-    sessionPhase = 'pre';
-  } else if (latest && Number.isFinite(regularStart) && Number.isFinite(regularEnd) && latest.ts >= regularStart && latest.ts < regularEnd) {
-    sessionPhase = 'regular';
-  }
+  // US session date anchor: regular.start is 9:30 AM EST = 7:00 PM IST on the same calendar
+  // date as the US trading session.  IST conversion is safe here (no midnight crossing).
+  const sessionDateIst = regularStart ? istDateFromUnixSeconds(regularStart) : null;
+  if (!sessionDateIst) return null;
 
   // After-hours data belongs to the NEXT trading session's daily_values row.
-  const providerDate = sessionPhase === 'post'
-    ? nextUsWeekday(sessionDateProvider)
-    : sessionDateProvider;
+  const providerDate = inAfterHours ? nextUsWeekday(sessionDateIst) : sessionDateIst;
 
   // Best available price for the current session phase.
   const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
   const postPrice = Number(meta.postMarketPrice);
   const prePrice  = Number(meta.preMarketPrice);
-  const latestClose = latest?.close;
+  const preTime   = Number(meta.preMarketTime);
+  const regTime   = Number(meta.regularMarketTime);
 
-  let price;
-  if (sessionPhase === 'post') {
-    if (Number.isFinite(latestClose) && latestClose > 0) price = latestClose;
-    else if (Number.isFinite(postPrice) && postPrice > 0) price = postPrice;
-    else price = meta.regularMarketPrice;
-  } else if (sessionPhase === 'pre') {
-    if (Number.isFinite(latestClose) && latestClose > 0) price = latestClose;
-    else if (Number.isFinite(prePrice) && prePrice > 0) price = prePrice;
-    else price = meta.regularMarketPrice;
+  let price, sessionPhase;
+  if (inAfterHours && Number.isFinite(postPrice) && postPrice > 0) {
+    price = postPrice;
+    sessionPhase = 'post';
+  } else if (inPreMarket && Number.isFinite(prePrice) && prePrice > 0 && preTime > regTime) {
+    price = prePrice;
+    sessionPhase = 'pre';
   } else {
-    price = (Number.isFinite(latestClose) && latestClose > 0)
-      ? latestClose
-      : meta.regularMarketPrice;
+    price = meta.regularMarketPrice;
+    sessionPhase = 'regular';
   }
 
   const change    = price - prevClose;
   const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
 
-  // officialClose must remain aligned to provider daily-close semantics.
-  // Prefer regularMarketPrice and only fall back to intraday regular candles.
-  let officialClose = Number.isFinite(Number(meta.regularMarketPrice))
-    ? Number(meta.regularMarketPrice)
-    : null;
-  if ((!Number.isFinite(officialClose) || officialClose <= 0)
-    && rows.length > 0
-    && Number.isFinite(regularStart)
-    && Number.isFinite(regularEnd)
-  ) {
-    for (const row of rows) {
-      if (row.ts < regularStart || row.ts >= regularEnd) continue;
-      officialClose = row.close;
+  // officialClose: the regular-session candle close for the session date.
+  // Used as the LIVE writeback price for the session date row when in after-hours.
+  let officialClose = null;
+  if (Array.isArray(timestamps) && Array.isArray(closes)) {
+    const points = Math.min(timestamps.length, closes.length);
+    for (let i = 0; i < points; i += 1) {
+      const pointDate = istDateFromUnixSeconds(timestamps[i]);
+      if (pointDate !== sessionDateIst) continue;
+      const c = Number(closes[i]);
+      if (!Number.isFinite(c) || c <= 0) continue;
+      officialClose = c;
     }
   }
 
@@ -175,54 +143,8 @@ function detectForeignStockSession(meta, timestamps, closes) {
     previousClose:   prevClose,
     officialClose,
     date:            providerDate,   // intended daily_values date
-    sessionDateIst: sessionDateProvider, // provider session date (naming retained for compatibility)
+    sessionDateIst,                  // actual US session date (for after-hours writeback)
     sessionPhase,                    // 'pre' | 'regular' | 'post'
-  };
-}
-
-function detectIndianStockSession(meta, timestamps, closes) {
-  if (!meta || !meta.regularMarketPrice) return null;
-
-  const gmtoffset = Number(meta.gmtoffset);
-  const rows = [];
-  const points = Math.min(
-    Array.isArray(timestamps) ? timestamps.length : 0,
-    Array.isArray(closes) ? closes.length : 0,
-  );
-  for (let i = 0; i < points; i += 1) {
-    const ts = Number(timestamps[i]);
-    const close = Number(closes[i]);
-    if (!Number.isFinite(ts) || !Number.isFinite(close) || close <= 0) continue;
-    rows.push({ ts, close });
-  }
-
-  const latest = rows.length > 0 ? rows[rows.length - 1] : null;
-  const fallbackTs = Number(meta.regularMarketTime);
-  const providerTs = latest?.ts || (Number.isFinite(fallbackTs) ? fallbackTs : null);
-  const providerDate = exchangeDateFromUnixSeconds(providerTs, gmtoffset);
-  if (!providerDate) return null;
-
-  const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
-  const latestClose = latest?.close;
-  const price = (Number.isFinite(latestClose) && latestClose > 0)
-    ? latestClose
-    : Number(meta.regularMarketPrice);
-
-  const change = price - prevClose;
-  const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
-  const officialClose = Number.isFinite(Number(meta.regularMarketPrice))
-    ? Number(meta.regularMarketPrice)
-    : (Number.isFinite(latestClose) ? latestClose : null);
-
-  return {
-    price,
-    change: Math.round(change * 100) / 100,
-    changePercent: Math.round(changePct * 100) / 100,
-    previousClose: prevClose,
-    officialClose,
-    date: providerDate,
-    sessionDateIst: providerDate,
-    sessionPhase: 'regular',
   };
 }
 
@@ -398,8 +320,7 @@ async function getYahooFinance() {
 async function fetchStockPrice(symbol) {
   // Try direct Yahoo Finance API first (more reliable, no crumb needed)
   try {
-    const direct = await fetchStockPriceDirect(symbol, { mode: 'default' });
-    return { ...direct, fetchMode: 'default' };
+    return await fetchStockPriceDirect(symbol);
   } catch (directErr) {
     // Fall back to yahoo-finance2 library
     try {
@@ -433,7 +354,6 @@ async function fetchStockPrice(symbol) {
             && nowSec >= regularEnd && nowSec <= postEnd;
           return (inAH && sessionDateIst) ? nextUsWeekday(sessionDateIst) : sessionDateIst;
         })(),
-        fetchMode: 'default',
       };
     } catch (libErr) {
       throw new Error(`Failed to fetch price for ${symbol}: ${directErr.message}`);
@@ -441,38 +361,12 @@ async function fetchStockPrice(symbol) {
   }
 }
 
-async function fetchStockPriceForUpdater(symbol) {
-  try {
-    const direct = await fetchStockPriceDirect(symbol, { mode: 'updater' });
-    return { ...direct, fetchMode: 'updater' };
-  } catch (directErr) {
-    const fallback = await fetchStockPrice(symbol);
-    return { ...fallback, fetchMode: 'updater' };
-  }
-}
-
-async function fetchStockPriceForBackfill(symbol) {
-  try {
-    const direct = await fetchStockPriceDirect(symbol, { mode: 'backfill' });
-    return { ...direct, fetchMode: 'backfill' };
-  } catch (directErr) {
-    const fallback = await fetchStockPrice(symbol);
-    return { ...fallback, fetchMode: 'backfill' };
-  }
-}
-
 /**
  * Fetch stock price via Yahoo Finance v8 chart API (no crumb/auth needed).
  */
-function fetchStockPriceDirect(symbol, options = {}) {
+function fetchStockPriceDirect(symbol) {
   return new Promise((resolve, reject) => {
-    const instrumentType = inferStockInstrumentType(symbol);
-    const foreignIntradayQuery = 'range=1d&interval=5m&includePrePost=true';
-    const defaultDailyQuery = 'range=1d&interval=1d';
-    const mode = String(options.mode || 'default').toLowerCase();
-    const useForeignIntraday = instrumentType === 'FOREIGN_STOCK' && mode === 'updater';
-    const query = useForeignIntraday ? foreignIntradayQuery : defaultDailyQuery;
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?${query}`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=1d`;
     https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
@@ -486,9 +380,7 @@ function fetchStockPriceDirect(symbol, options = {}) {
             const closes = Array.isArray(result?.indicators?.quote?.[0]?.close)
               ? result.indicators.quote[0].close
               : [];
-            const sessionInfo = instrumentType === 'FOREIGN_STOCK'
-              ? detectForeignStockSession(meta, timestamps, closes)
-              : detectIndianStockSession(meta, timestamps, closes);
+            const sessionInfo = detectForeignStockSession(meta, timestamps, closes);
             if (!sessionInfo) {
               reject(new Error(`No price data for ${symbol}`));
               return;
@@ -504,7 +396,6 @@ function fetchStockPriceDirect(symbol, options = {}) {
               date:           sessionInfo.date,
               sessionDateIst: sessionInfo.sessionDateIst,
               sessionPhase:   sessionInfo.sessionPhase,
-              fetchMode:      mode,
             });
           } else {
             reject(new Error(`No price data for ${symbol}`));
@@ -1873,8 +1764,6 @@ module.exports = {
   searchMutualFunds,
   fetchMutualFundHistory,
   fetchStockPrice,
-  fetchStockPriceForUpdater,
-  fetchStockPriceForBackfill,
   fetchStockHistory,
   fetchHistoricalStockPrice,
   fetchHistoricalOHLC,

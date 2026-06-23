@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button, Dropdown, Modal, Form, Alert } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, ArrowLeftRight, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing, Zap } from 'lucide-react';
+import { BarChart3, PlusCircle, TrendingUp, List, ArrowLeftRight, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing, DatabaseZap, Trash2 } from 'lucide-react';
 import { HolidaysListModal, HolidaysSyncModal } from './HolidaysMenuItems';
-import { PWAInstallButton } from './PWAInstallButton';
 import ManualDirtyScopeModal from './ManualDirtyScopeModal';
+import PurgeMarketPriceCacheModal from './PurgeMarketPriceCacheModal';
+import { PWAInstallButton } from './PWAInstallButton';
 import { triggerPriceUpdate, cancelPriceUpdate, exportData, getCorporateActionSuggestionCount } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 import { useAppSettings } from '../context/AppSettingsContext';
@@ -27,7 +28,8 @@ export default function Navbar({ user, onLogout }) {
   const [showHolidays, setShowHolidays] = useState(false);
   const [showSync, setShowSync] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showDirtyScopeModal, setShowDirtyScopeModal] = useState(false);
+  const [showDirtyScopes, setShowDirtyScopes] = useState(false);
+  const [showPurgeCache, setShowPurgeCache] = useState(false);
   const [draftSettings, setDraftSettings] = useState(null);
   const [settingsMessage, setSettingsMessage] = useState('');
   const [pendingCASuggestions, setPendingCASuggestions] = useState(0);
@@ -230,7 +232,7 @@ export default function Navbar({ user, onLogout }) {
                 </Dropdown.Item>
               ) : (
                 <>
-                  <Dropdown.Header className="small text-muted">Manual operations</Dropdown.Header>
+                  <Dropdown.Header className="small text-muted">Data management</Dropdown.Header>
                   <Dropdown.Item
                     onClick={() => handleUpdate()}
                     className="d-flex align-items-center gap-2"
@@ -239,13 +241,11 @@ export default function Navbar({ user, onLogout }) {
                     <RefreshCw size={14} />
                     Update Prices
                   </Dropdown.Item>
-                  <Dropdown.Item
-                    onClick={() => setShowDirtyScopeModal(true)}
-                    className="d-flex align-items-center gap-2"
-                    title="Mark dirt scopes for backfill"
-                  >
-                    <Zap size={14} />
-                    Mark Dirt Scopes
+                  <Dropdown.Item onClick={() => setShowDirtyScopes(true)} className="d-flex align-items-center gap-2">
+                    <DatabaseZap size={14} /> Mark Dirty Scopes
+                  </Dropdown.Item>
+                  <Dropdown.Item onClick={() => setShowPurgeCache(true)} className="d-flex align-items-center gap-2">
+                    <Trash2 size={14} /> Purge Price Cache
                   </Dropdown.Item>
                 </>
               )}
@@ -348,7 +348,8 @@ export default function Navbar({ user, onLogout }) {
       </Modal>
       <HolidaysListModal show={showHolidays} onHide={() => setShowHolidays(false)} year={currentYear} />
       <HolidaysSyncModal show={showSync} onHide={() => setShowSync(false)} year={currentYear} />
-      <ManualDirtyScopeModal show={showDirtyScopeModal} onHide={() => setShowDirtyScopeModal(false)} />
+      <ManualDirtyScopeModal show={showDirtyScopes} onHide={() => setShowDirtyScopes(false)} />
+      <PurgeMarketPriceCacheModal show={showPurgeCache} onHide={() => setShowPurgeCache(false)} />
     </>
   );
 }

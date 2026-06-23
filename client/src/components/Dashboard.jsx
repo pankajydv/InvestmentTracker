@@ -714,13 +714,15 @@ export default function Dashboard() {
     });
   };
 
+  const isDayChangeMode = selectedInterval === '1D' || selectedInterval === 'YD';
+
   const baseSortColumns = [
     { key: 'name', label: 'Name', subLabel: 'Folios / Identifier' },
     { key: 'price', label: 'Last Price', subLabel: 'Avg Cost / Unit', end: true },
     {
       key: 'dayChange',
       label: `${selectedInterval === 'CUSTOM' ? 'Custom' : selectedInterval} Change`,
-      subLabel: selectedInterval === '1D' ? '% Change' : '% Change p.a.',
+      subLabel: isDayChangeMode ? '% Change' : '% Change p.a.',
       end: true,
     },
     { key: 'totalCost', label: 'Net Invested', subLabel: 'Total Cost', end: true },
@@ -773,8 +775,7 @@ export default function Dashboard() {
   );
 
   return (
-    <div>
-      {/* Portfolio Header */}
+    <div className="dashboard-page">
       <div className="d-flex justify-content-between align-items-center mb-4">
         {selectedPortfolio ? (
           <div className="d-flex align-items-center gap-2">
@@ -929,6 +930,8 @@ export default function Dashboard() {
                       ? `${customFromDate} to ${customToDate}`
                       : selectedInterval === '1D'
                       ? '1 Day Change'
+                      : selectedInterval === 'YD'
+                      ? 'Yesterday Change'
                       : `${selectedInterval} Change`}
                   </span>
                 </div>
@@ -950,6 +953,7 @@ export default function Dashboard() {
                     style={{ maxWidth: '100px', fontSize: '0.85rem' }}
                   >
                     <option value="1D">1D</option>
+                    <option value="YD">YD</option>
                     <option value="2D">2D</option>
                     <option value="1W">1W</option>
                     <option value="1M">1M</option>
@@ -1010,7 +1014,7 @@ export default function Dashboard() {
                   <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
                     Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
                   </div>
-                  {data?.intervalXIRR?.xirr_pct != null && (
+                  {!isDayChangeMode && data?.intervalXIRR?.xirr_pct != null && (
                     <div className={`small ${profitColor(data.intervalXIRR.xirr_pct)}`}>
                       Annualized (XIRR): {formatPct(data.intervalXIRR.xirr_pct)}
                     </div>
@@ -1052,13 +1056,8 @@ export default function Dashboard() {
             {sortedAssetEntries.map(([type, info]) => (
               <Col xs={6} md={4} lg={3} xl={2} key={type}>
                 {(() => {
-                  const intervalChangeBase = Number(info.totalValue || 0) - Number(info.dayChange || 0);
-                  const intervalChangePct = selectedInterval === '1D'
-                    ? (intervalChangeBase > 0
-                      ? (Number(info.dayChange || 0) / intervalChangeBase) * 100
-                      : 0)
-                    : Number(info.intervalChangePct ?? 0);
-                  const intervalPctSuffix = selectedInterval === '1D' ? '' : ' p.a.';
+                  const intervalChangePct = Number(info.displayChangePct ?? 0);
+                  const intervalPctSuffix = isDayChangeMode ? '' : ' p.a.';
                   const lifetimeClass = profitColor(info.totalProfitLoss);
                   const intervalClass = profitColor(info.dayChange);
 
@@ -1150,13 +1149,8 @@ export default function Dashboard() {
           if (!inv.date) return maxDate;
           return !maxDate || inv.date > maxDate ? inv.date : maxDate;
         }, null);
-        const dayChangeDenominator = Number(info.totalValue || 0) - Number(info.dayChange || 0);
-        const totalDayChangePct = selectedInterval === '1D'
-          ? (dayChangeDenominator > 0
-            ? (Number(info.dayChange || 0) / dayChangeDenominator) * 100
-            : 0)
-          : Number(info.intervalChangePct ?? 0);
-        const dayChangePctSuffix = selectedInterval === '1D' ? '' : ' p.a.';
+        const totalDayChangePct = Number(info.displayChangePct ?? 0);
+        const dayChangePctSuffix = isDayChangeMode ? '' : ' p.a.';
         const totalAbsPct = Number(info.totalInvested || 0) > 0
           ? (Number(info.totalProfitLoss || 0) / Number(info.totalInvested || 0)) * 100
           : 0;
