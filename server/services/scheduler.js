@@ -898,9 +898,7 @@ async function runSchedulerCycle(db, label, options = {}) {
   });
   const catchUp = ensureSchedulerCatchUpScopes(db, preflightRunDate, label);
   const locfReconcile = ensureMarketLinkedLocfReconcileScopes(db, preflightRunDate, label);
-  const preflight = await runDirtyBackfillPreflight(db, preflightRunDate, {
-    runTag: options.runTag || null,
-  });
+  const preflight = await runDirtyBackfillPreflight(db, preflightRunDate);
   logAppInfo(`[Scheduler] ${label}: Step 4/6 completed (catch-up + backfill preflight)`, {
     catchUp,
     locfReconcile,
