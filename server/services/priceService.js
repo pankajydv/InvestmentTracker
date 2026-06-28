@@ -62,7 +62,7 @@ function nextUsWeekday(dateIso) {
  *
  * Date attribution rules:
  *  - Pre-market (4 AM–9:30 AM EST) and regular session (9:30 AM–4 PM EST)
- *      → daily_values row for the US session date (regular.start → IST)
+ *      → daily_values row for the US session date (exchange date)
  *  - After-hours (4 PM–8 PM EST)
  *      → daily_values row for the NEXT US weekday (after-hours previews the next open)
  *
@@ -92,9 +92,9 @@ function detectForeignStockSession(meta, timestamps, closes) {
     && Number.isFinite(preStart) && Number.isFinite(preEnd)
     && nowSec >= preStart && nowSec < preEnd;
 
-  // US session date anchor: regular.start is 9:30 AM EST = 7:00 PM IST on the same calendar
-  // date as the US trading session.  IST conversion is safe here (no midnight crossing).
-  const sessionDateIst = regularStart ? istDateFromUnixSeconds(regularStart) : null;
+  // Use exchange session date semantics from provider timestamps.
+  // We intentionally avoid IST date conversion for storage date attribution.
+  const sessionDateIst = regularStart ? utcDateFromUnixSeconds(regularStart) : null;
   if (!sessionDateIst) return null;
 
   // After-hours data belongs to the NEXT trading session's daily_values row.
@@ -128,7 +128,7 @@ function detectForeignStockSession(meta, timestamps, closes) {
   if (Array.isArray(timestamps) && Array.isArray(closes)) {
     const points = Math.min(timestamps.length, closes.length);
     for (let i = 0; i < points; i += 1) {
-      const pointDate = istDateFromUnixSeconds(timestamps[i]);
+      const pointDate = utcDateFromUnixSeconds(timestamps[i]);
       if (pointDate !== sessionDateIst) continue;
       const c = Number(closes[i]);
       if (!Number.isFinite(c) || c <= 0) continue;
@@ -315,12 +315,14 @@ async function getYahooFinance() {
  * Fetch current stock price using Yahoo Finance v8 API (direct HTTP, no crumb needed).
  * Falls back to yahoo-finance2 library if direct approach fails.
  * @param {string} symbol - Ticker symbol (e.g., 'RELIANCE.NS' for NSE, 'AAPL' for US)
+ * @param {Object} [options]
+ * @param {'1d'|'1m'} [options.interval='1d'] - Interval for chart lane. 1d for close lane, 1m for phase lane.
  * @returns {Promise<{price: number, currency: string, name: string, change: number, changePercent: number, officialClose?: number|null}>}
  */
-async function fetchStockPrice(symbol) {
+async function fetchStockPrice(symbol, options = {}) {
   // Try direct Yahoo Finance API first (more reliable, no crumb needed)
   try {
-    return await fetchStockPriceDirect(symbol);
+    return await fetchStockPriceDirect(symbol, options);
   } catch (directErr) {
     // Fall back to yahoo-finance2 library
     try {
@@ -339,7 +341,7 @@ async function fetchStockPrice(symbol) {
           // Use session start for correct US date; fall back to UTC of close (safe for US markets)
           const tp = quote.currentTradingPeriod;
           const s = tp?.regular?.start;
-          return s ? istDateFromUnixSeconds(s) : utcDateFromUnixSeconds(quote.regularMarketTime);
+          return s ? utcDateFromUnixSeconds(s) : utcDateFromUnixSeconds(quote.regularMarketTime);
         })(),
         date: (() => {
           const tp = quote.currentTradingPeriod;
@@ -348,7 +350,7 @@ async function fetchStockPrice(symbol) {
           const nowSec = Math.floor(Date.now() / 1000);
           const sessionStart = tp?.regular?.start;
           const sessionDateIst = sessionStart
-            ? istDateFromUnixSeconds(sessionStart)
+            ? utcDateFromUnixSeconds(sessionStart)
             : utcDateFromUnixSeconds(quote.regularMarketTime);
           const inAH = Number.isFinite(regularEnd) && Number.isFinite(postEnd)
             && nowSec >= regularEnd && nowSec <= postEnd;
@@ -364,9 +366,10 @@ async function fetchStockPrice(symbol) {
 /**
  * Fetch stock price via Yahoo Finance v8 chart API (no crumb/auth needed).
  */
-function fetchStockPriceDirect(symbol) {
+function fetchStockPriceDirect(symbol, options = {}) {
   return new Promise((resolve, reject) => {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=1d`;
+    const interval = options.interval === '1m' ? '1m' : '1d';
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=${interval}`;
     https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);

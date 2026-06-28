@@ -143,6 +143,8 @@ function resolvePriceSourceFromProviderDate({
   providerDate,
   runDate,
   assetType,
+  sessionPhase = null,
+  authoritativeClose = false,
   investmentId,
   investmentName,
 }) {
@@ -155,6 +157,22 @@ function resolvePriceSourceFromProviderDate({
       runDate,
     });
     return { priceSource: 'LOCF', providerDate: null };
+  }
+
+  const normalizedAssetType = String(assetType || '').toUpperCase();
+
+  if (normalizedAssetType === 'FOREIGN_STOCK') {
+    if (authoritativeClose && normalizedProviderDate <= runDate) {
+      return { priceSource: 'LIVE', providerDate: normalizedProviderDate };
+    }
+
+    if (normalizedProviderDate === runDate) {
+      if (sessionPhase === 'pre') return { priceSource: 'PRE', providerDate: normalizedProviderDate };
+      if (sessionPhase === 'post') return { priceSource: 'POST', providerDate: normalizedProviderDate };
+      return { priceSource: 'LIVE', providerDate: normalizedProviderDate };
+    }
+
+    return { priceSource: 'LOCF', providerDate: normalizedProviderDate };
   }
 
   return {
@@ -646,10 +664,6 @@ async function updateAllPrices(db, options = {}) {
       let priceSource = 'COMPUTED';
       let apiChange = null;
       let apiChangePct = null;
-      let providerDateForWriteback = null;
-      // FOREIGN_STOCK after-hours: also write the regular session close for the session date.
-      let foreignSessionDateForWriteback = null;
-      let foreignSessionOfficialClose = 0;
       
       console.log(`  [DEBUG] Processing ${inv.name} (id=${inv.id}, type=${inv.asset_type})`);
 
@@ -682,7 +696,6 @@ async function updateAllPrices(db, options = {}) {
             apiChange = navData.change;
             apiChangePct = navData.changePercent;
             priceSource = sourceDecision.priceSource;
-            providerDateForWriteback = sourceDecision.providerDate;
           } else {
             console.warn(`  ${inv.name}: No AMFI code, computing from transactions only`);
           }
@@ -703,7 +716,6 @@ async function updateAllPrices(db, options = {}) {
             investmentId: inv.id,
             investmentName: inv.name,
           });
-          providerDateForWriteback = sourceDecision.providerDate;
           const staleProviderDate = sourceDecision.providerDate && sourceDecision.providerDate < today;
           if (staleProviderDate) {
             const officialClose = Number(stockData.officialClose);
@@ -746,38 +758,7 @@ async function updateAllPrices(db, options = {}) {
             continue;
           }
           await delay(500);
-          const foreignData = await fetchStockPrice(inv.ticker_symbol);
-          const sourceDecision = resolvePriceSourceFromProviderDate({
-            providerDate: foreignData.date,
-            runDate: today,
-            assetType: inv.asset_type,
-            investmentId: inv.id,
-            investmentName: inv.name,
-          });
-          pricePerUnit = foreignData.price;
-          apiChange = foreignData.change;
-          apiChangePct = foreignData.changePercent;
-          priceSource = sourceDecision.priceSource;
-          providerDateForWriteback = sourceDecision.providerDate;
-          // After-hours: remember session date + official close so we can write a LIVE
-          // snapshot for the session date (the row the regular close belongs to).
-          if (foreignData.sessionPhase === 'post'
-            && foreignData.sessionDateIst
-            && foreignData.sessionDateIst < today
-            && Number(foreignData.officialClose) > 0
-          ) {
-            foreignSessionDateForWriteback = foreignData.sessionDateIst;
-            foreignSessionOfficialClose = Number(foreignData.officialClose);
-          }
-          // Refine LIVE to PRE or POST so the source label reflects data quality.
-          // PRE = pre-market price; will be overwritten to LIVE when regular session closes.
-          // POST = after-hours price attributed to next session; overwritten when that session closes.
-          // LOCF source is preserved as-is (no data was fetched).
-          if (priceSource === 'LIVE') {
-            if (foreignData.sessionPhase === 'pre') priceSource = 'PRE';
-            else if (foreignData.sessionPhase === 'post') priceSource = 'POST';
-          }
-          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK price fetch returned price=${foreignData.price}, providerDate=${sourceDecision.providerDate}, sessionPhase=${foreignData.sessionPhase || 'regular'}, priceSource=${priceSource}`);
+          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK using close lane (1d) + phase lane (1m)`);
           break;
         }
         case 'BOND': {
@@ -866,7 +847,6 @@ async function updateAllPrices(db, options = {}) {
             apiChange = npsData.change;
             apiChangePct = npsData.changePercent;
             priceSource = sourceDecision.priceSource;
-            providerDateForWriteback = sourceDecision.providerDate;
           } catch (e) {
             console.warn(`  ${inv.name}: NPS NAV fetch failed (${e.message}), falling back to last known price`);
             // Fallback 1: use last valid stored daily value (exclude placeholder 99.99)
@@ -907,52 +887,52 @@ async function updateAllPrices(db, options = {}) {
         }
       }
 
-      let providerDateRowsWritten = 0;
-      // FOREIGN_STOCK after-hours: write the official regular-session close for the session date.
-      if (inv.asset_type === 'FOREIGN_STOCK'
-        && foreignSessionDateForWriteback
-        && foreignSessionOfficialClose > 0
-        && foreignSessionDateForWriteback < today
-        && /^\d{4}-\d{2}-\d{2}$/.test(foreignSessionDateForWriteback)
-      ) {
-        const sessionFx = await getFxRateForDate(foreignSessionDateForWriteback);
-        const sessionRows = writeInvestmentSnapshotForDate(inv, foreignSessionDateForWriteback, foreignSessionOfficialClose, 'LIVE', sessionFx);
-        if (sessionRows > 0) {
-          touchedDates.add(foreignSessionDateForWriteback);
-          logAppInfo('[UpdatePrices] FOREIGN_STOCK after-hours: session-date snapshot written with official close', {
-            investmentId: inv.id,
-            investmentName: inv.name,
-            sessionDate: foreignSessionDateForWriteback,
-            officialClose: foreignSessionOfficialClose,
-            runDate: today,
-          });
+      let skipDefaultTodayWrite = false;
+      if (inv.asset_type === 'FOREIGN_STOCK') {
+        const closeLaneData = await fetchStockPrice(inv.ticker_symbol, { interval: '1d' });
+        const phaseLaneData = await fetchStockPrice(inv.ticker_symbol, { interval: '1m' });
+
+        const closeSessionDate = normalizeProviderDate(closeLaneData.sessionDateIst || closeLaneData.date);
+        const closePrice = Number(closeLaneData.officialClose) > 0
+          ? Number(closeLaneData.officialClose)
+          : Number(closeLaneData.price);
+
+        if (closeSessionDate && closePrice > 0 && /^\d{4}-\d{2}-\d{2}$/.test(closeSessionDate) && closeSessionDate <= today) {
+          const closeFx = await getFxRateForDate(closeSessionDate);
+          const closeRows = writeInvestmentSnapshotForDate(inv, closeSessionDate, closePrice, 'LIVE', closeFx);
+          if (closeRows > 0) {
+            touchedDates.add(closeSessionDate);
+          }
         }
-      }
-      if (
-        (inv.asset_type === 'FOREIGN_STOCK' || inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'MUTUAL_FUND' || inv.asset_type === 'NPS')
-        && providerDateForWriteback
-        && providerDateForWriteback < today
-        && /^\d{4}-\d{2}-\d{2}$/.test(providerDateForWriteback)
-      ) {
-        const providerFx = inv.asset_type === 'FOREIGN_STOCK'
-          ? await getFxRateForDate(providerDateForWriteback)
-          : usdToInr;
-        providerDateRowsWritten = writeInvestmentSnapshotForDate(inv, providerDateForWriteback, pricePerUnit, 'LIVE', providerFx);
-        if (providerDateRowsWritten > 0) {
-          touchedDates.add(providerDateForWriteback);
-          logAppInfo('[UpdatePrices] Provider-date snapshot refreshed', {
-            investmentId: inv.id,
-            investmentName: inv.name,
-            assetType: inv.asset_type,
-            providerDate: providerDateForWriteback,
-            runDate: today,
-            rowsWritten: providerDateRowsWritten,
-            pricePerUnit,
-          });
+
+        let runDatePrice = Number(phaseLaneData.price || 0);
+        let runDateSource = 'LOCF';
+        const phaseDecision = resolvePriceSourceFromProviderDate({
+          providerDate: phaseLaneData.date,
+          runDate: today,
+          assetType: inv.asset_type,
+          sessionPhase: phaseLaneData.sessionPhase || null,
+          investmentId: inv.id,
+          investmentName: inv.name,
+        });
+
+        if (phaseDecision.providerDate === today && runDatePrice > 0) {
+          runDateSource = phaseDecision.priceSource;
+        } else if (closePrice > 0) {
+          runDatePrice = closePrice;
+          runDateSource = 'LOCF';
         }
+
+        if (runDatePrice > 0) {
+          writeInvestmentSnapshotForDate(inv, today, runDatePrice, runDateSource, usdToInr);
+          touchedDates.add(today);
+        }
+        skipDefaultTodayWrite = true;
       }
 
-      writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, usdToInr);
+      if (!skipDefaultTodayWrite) {
+        writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, usdToInr);
+      }
       const combinedSnapshot = db.prepare(`
         SELECT
           COALESCE(SUM(current_value), 0) AS total_value,

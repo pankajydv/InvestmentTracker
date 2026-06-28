@@ -1029,14 +1029,14 @@ function startScheduler(db) {
   // Captures Indian session and US pre-market data (US pre-market runs 1:30 PM–7 PM IST).
   // MF/NPS reuse existing LIVE rows so provider calls are skipped when already fresh.
   const intradayTimes = [
-    '25 9 * * *',    // 9:25 AM
-    '25 10 * * *',   // 10:25 AM
-    '25 11 * * *',   // 11:25 AM
-    '25 12 * * *',   // 12:25 PM
-    '25 13 * * *',   // 1:25 PM
-    '25 14 * * *',   // 2:25 PM
-    '25 15 * * *',   // 3:25 PM
-    '25 16 * * *',   // 4:25 PM
+    '25 9 * * 1-5',    // 9:25 AM
+    '25 10 * * 1-5',   // 10:25 AM
+    '25 11 * * 1-5',   // 11:25 AM
+    '25 12 * * 1-5',   // 12:25 PM
+    '25 13 * * 1-5',   // 1:25 PM
+    '25 14 * * 1-5',   // 2:25 PM
+    '25 15 * * 1-5',   // 3:25 PM
+    '25 16 * * 1-5',   // 4:25 PM
   ];
 
   intradayTimes.forEach((cronTime, index) => {
@@ -1063,10 +1063,10 @@ function startScheduler(db) {
   // Covers US regular session hours (9:30 AM–4 PM EDT = 7 PM–1:30 AM IST).
   // Running on weekends keeps preflight/dirty-scope active even when US is closed.
   const usMarketTimes = [
-    '25 19 * * *',  // 7:25 PM
-    '25 20 * * *',  // 8:25 PM
-    '25 21 * * *',  // 9:25 PM
-    '25 23 * * *',  // 11:25 PM
+    '25 19 * * 1-5',  // 7:25 PM
+    '25 20 * * 1-5',  // 8:25 PM
+    '25 21 * * 1-5',  // 9:25 PM
+    '25 23 * * 1-5',  // 11:25 PM
   ];
 
   usMarketTimes.forEach((cronTime, index) => {
@@ -1108,18 +1108,35 @@ function startScheduler(db) {
     timezone: 'Asia/Kolkata',
   });
 
-  // Early-morning seed run at 4:25 AM IST (all days) - all asset types.
-  // Market-linked assets are processed only on market-session days.
+  // Early-morning baseline run at 4:25 AM IST (all days) - all asset types.
   cron.schedule('25 4 * * *', async () => {
-    console.log('[Scheduler] Running 4:25 AM seed update (all asset types, session-aware)...');
+    console.log('[Scheduler] Running 4:25 AM baseline update (all asset types, all days)...');
     try {
       await runSchedulerCycle(db, 'Early morning seed run (all types)', {
-        sessionOnlyForMarketLinked: true,
+        assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
+        reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
         runTag: 'early_morning_seed',
       });
     } catch (e) {
       console.error('[Scheduler] 4:25 AM seed update failed:', e.message);
       logAppError('[Scheduler] Early morning seed run failed', { error: e.message });
+    }
+  }, {
+    timezone: 'Asia/Kolkata',
+  });
+
+  // Evening baseline run at 5:25 PM IST (all days) - all asset types.
+  cron.schedule('25 17 * * *', async () => {
+    console.log('[Scheduler] Running 5:25 PM evening baseline update (all asset types, all days)...');
+    try {
+      await runSchedulerCycle(db, 'Evening baseline run (all types)', {
+        assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
+        reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
+        runTag: 'evening_baseline',
+      });
+    } catch (e) {
+      console.error('[Scheduler] 5:25 PM evening baseline update failed:', e.message);
+      logAppError('[Scheduler] Evening baseline run failed', { error: e.message });
     }
   }, {
     timezone: 'Asia/Kolkata',
@@ -1148,13 +1165,15 @@ function startScheduler(db) {
   });
 
   console.log('[Scheduler] Daily price updates scheduled:');
-  console.log('  - 4:25 AM IST (all asset types; market-linked only on session days, daily)');
+  console.log('  - 4:25 AM IST (all asset types, all days)');
+  console.log('  - 5:25 PM IST (all asset types, all days)');
   console.log('  - 9:25 AM–4:25 PM IST (hourly, Indian stocks + SGB + MF/NPS retries, weekdays)');
   console.log('  - 7:25 PM, 8:25 PM, 9:25 PM, 11:25 PM IST (foreign stocks + conditional MF/NPS, weekdays)');
-  console.log('  - 10:25 PM IST (all asset types, weekdays)');
+  console.log('  - 10:25 PM IST (all asset types, all days)');
   logAppInfo('[Scheduler] Scheduled jobs initialized', {
     timezone: 'Asia/Kolkata',
     earlyMorningAccrualRun: '04:25',
+    eveningBaselineRun: '17:25',
     intradayRuns: 8,
     usMarketRuns: ['19:25', '20:25', '21:25', '23:25'],
     nightlyRun: '22:25',
