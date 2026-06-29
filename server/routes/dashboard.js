@@ -972,8 +972,9 @@ module.exports = function (db) {
       const dayChangeResolved = resolveDisplayDayChangeFromRows(rowsDesc, inv.asset_type);
 
       inv.day_change = Number(dayChangeResolved.dayChange || 0);
-      inv.day_change_pct = latestRow.current_value > 0
-        ? (inv.day_change / latestRow.current_value) * 100
+      const prevValue = Number(latestRow.current_value || 0) - Number(inv.day_change || 0);
+      inv.day_change_pct = prevValue > 0
+        ? (inv.day_change / prevValue) * 100
         : 0;
       inv.day_change_as_of_date = dayChangeResolved.asOfDate || null;
       inv.day_change_uses_fallback = !!dayChangeResolved.usedFallback;
@@ -1370,6 +1371,38 @@ module.exports = function (db) {
               AND DATE(t.transaction_date) <= ?
           `);
 
+      const intervalTransactionsForType = portfolio_id
+        ? db.prepare(`
+            SELECT
+              DATE(t.transaction_date) AS txn_date,
+              t.transaction_type,
+              COALESCE(t.amount, 0) AS amount,
+              COALESCE(t.fees, 0) AS fees,
+              t.notes
+            FROM transactions t
+            JOIN investments i ON i.id = t.investment_id
+            WHERE t.portfolio_id = ?
+              AND i.asset_type = ?
+              AND DATE(t.transaction_date) >= ?
+              AND DATE(t.transaction_date) <= ?
+            ORDER BY DATE(t.transaction_date)
+          `)
+        : db.prepare(`
+            SELECT
+              DATE(t.transaction_date) AS txn_date,
+              t.transaction_type,
+              COALESCE(t.amount, 0) AS amount,
+              COALESCE(t.fees, 0) AS fees,
+              t.notes
+            FROM transactions t
+            JOIN investments i ON i.id = t.investment_id
+            WHERE t.portfolio_id IS NOT NULL
+              AND i.asset_type = ?
+              AND DATE(t.transaction_date) >= ?
+              AND DATE(t.transaction_date) <= ?
+            ORDER BY DATE(t.transaction_date)
+          `);
+
       for (const [assetTypeKey, info] of Object.entries(byType)) {
         const bounds = portfolio_id
           ? findBoundsForType.get(portfolio_id, assetTypeKey, intervalFromDate, intervalToDate)
@@ -1401,8 +1434,54 @@ module.exports = function (db) {
           ? Number(netFlowForType.get(portfolio_id, assetTypeKey, chosenFrom, chosenTo)?.net_flow || 0)
           : Number(netFlowForType.get(assetTypeKey, chosenFrom, chosenTo)?.net_flow || 0);
 
+        const intervalTransactions = portfolio_id
+          ? intervalTransactionsForType.all(portfolio_id, assetTypeKey, chosenFrom, chosenTo)
+          : intervalTransactionsForType.all(assetTypeKey, chosenFrom, chosenTo);
+
+        const intervalCashflows = [];
+        if (openingValue !== 0) {
+          intervalCashflows.push({
+            amount: -openingValue,
+            date: new Date(`${chosenFrom}T00:00:00.000Z`),
+          });
+        }
+
+        for (const txn of intervalTransactions) {
+          const amount = Number(txn.amount) || 0;
+          const fees = Number(txn.fees) || 0;
+          let cashflow = 0;
+          const treatAsInternal = isInternalXirrCashflow(assetTypeKey, txn.transaction_type);
+          const treatAsAccrualOnly = isAccrualOnlyXirrCashflow(txn.transaction_type, txn.notes);
+
+          if (treatAsAccrualOnly) {
+            cashflow = 0;
+          } else if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+            cashflow = -(amount + fees);
+          } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
+            cashflow = amount - fees;
+          }
+
+          if (Math.abs(cashflow) > 1e-9) {
+            intervalCashflows.push({
+              amount: cashflow,
+              date: new Date(`${txn.txn_date}T00:00:00.000Z`),
+            });
+          }
+        }
+
+        if (closingValue !== 0) {
+          intervalCashflows.push({
+            amount: closingValue,
+            date: new Date(`${chosenTo}T00:00:00.000Z`),
+          });
+        }
+
+        const intervalXirrRate = calculateXirr(intervalCashflows);
+
         info.dayChange = intervalDayChange;
-        info.intervalChangePct = openingValue > 0 ? (intervalDayChange / openingValue) * 100 : 0;
+        info.intervalChangePct = intervalXirrRate == null
+          ? (openingValue > 0 ? (intervalDayChange / openingValue) * 100 : 0)
+          : intervalXirrRate * 100;
         info.intervalFromDate = chosenFrom;
         info.intervalToDate = chosenTo;
 

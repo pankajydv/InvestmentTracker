@@ -746,7 +746,7 @@ export default function Dashboard() {
     {
       key: 'dayChange',
       label: `${selectedInterval === 'CUSTOM' ? 'Custom' : selectedInterval} Change`,
-      subLabel: isDayChangeMode ? '% Change' : '% Change p.a.',
+      subLabel: '% Change',
       end: true,
     },
     { key: 'totalCost', label: 'Net Invested', subLabel: 'Total Cost', end: true },
@@ -1080,7 +1080,7 @@ export default function Dashboard() {
             {sortedAssetEntries.map(([type, info]) => (
               <Col xs={6} md={4} lg={3} xl={2} key={type}>
                 {(() => {
-                  const intervalChangePct = Number(info.displayChangePct ?? 0);
+                  const intervalChangePct = Number(info.intervalChangePct ?? 0);
                   const intervalPctSuffix = isDayChangeMode ? '' : ' p.a.';
                   const lifetimeClass = profitColor(info.totalProfitLoss);
                   const intervalClass = profitColor(info.dayChange);
@@ -1173,8 +1173,8 @@ export default function Dashboard() {
           if (!inv.date) return maxDate;
           return !maxDate || inv.date > maxDate ? inv.date : maxDate;
         }, null);
-        const totalDayChangePct = Number(info.displayChangePct ?? 0);
-        const dayChangePctSuffix = isDayChangeMode ? '' : ' p.a.';
+        const totalDayChangePct = Number(info.intervalChangePct ?? 0);
+        const dayChangePctSuffix = '';
         const totalAbsPct = Number(info.totalInvested || 0) > 0
           ? (Number(info.totalProfitLoss || 0) / Number(info.totalInvested || 0)) * 100
           : 0;
