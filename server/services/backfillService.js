@@ -68,8 +68,8 @@ function addDays(dateIso, days) {
 
 function getMarketCacheEvaluationEndDate(runDate) {
   const normalizedRunDate = toIsoDate(runDate) || todayIso();
-  const todayMinusOne = addDays(todayIso(), -1);
-  return normalizedRunDate < todayMinusOne ? normalizedRunDate : todayMinusOne;
+  const today = todayIso();
+  return normalizedRunDate < today ? normalizedRunDate : today;
 }
 
 function getMarketClosedSetForYear(year, db, cache) {

@@ -25,6 +25,7 @@ const {
 const {
   quantizeForStorage,
 } = require('./numberPrecision');
+const { upsertInvestmentPriceSeries } = require('./marketPriceCache');
 const { markScopeDirty, runDailyBootstrapDirtyScopeEnqueue } = require('./dirtyBackfillService');
 const { todayIso, normalizeProviderDate } = require('./dateUtils');
 const { LOCF_STREAK_WARN_SESSIONS, FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS } = require('./freshnessPolicy');
@@ -492,7 +493,7 @@ async function updateAllPrices(db, options = {}) {
     }
   }
 
-  function writeInvestmentSnapshotForDate(inv, asOfDate, resolvedPricePerUnit, resolvedPriceSource, fxRateForDate = usdToInr) {
+  function writeInvestmentSnapshotForDate(inv, asOfDate, resolvedPricePerUnit, resolvedPriceSource, fxRateForDate = usdToInr, sourceProviderDate = null) {
     const portfolioIds = getDistinctPortfolios.all(inv.id, asOfDate).map((r) => r.portfolio_id);
     let wroteRows = 0;
 
@@ -620,12 +621,16 @@ async function updateAllPrices(db, options = {}) {
         }
 
         if (LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType)) {
+          const normalizedProviderDate = normalizeProviderDate(sourceProviderDate);
+          const reconcileFromDate = normalizedProviderDate && normalizedProviderDate < today
+            ? normalizedProviderDate
+            : today;
           markScopeDirty(db, {
             investmentId: inv.id,
             portfolioId: pid,
-            dirtyFromDate: today,
+            dirtyFromDate: reconcileFromDate,
             reason: 'locf-lag-signal',
-            sourceEventId: `update-prices-locf:${today}`,
+            sourceEventId: `update-prices-locf:${today}:${reconcileFromDate}`,
           });
         }
       }
@@ -662,6 +667,7 @@ async function updateAllPrices(db, options = {}) {
 
       let pricePerUnit = 0;
       let priceSource = 'COMPUTED';
+      let providerDateForSource = null;
       let apiChange = null;
       let apiChangePct = null;
       
@@ -693,9 +699,17 @@ async function updateAllPrices(db, options = {}) {
             });
             console.log(`  ${inv.name} (id=${inv.id}): MF NAV fetch returned nav=${navData.nav}, providerDate=${sourceDecision.providerDate}, priceSource=${sourceDecision.priceSource}`);
             pricePerUnit = navData.nav;
+            providerDateForSource = sourceDecision.providerDate;
             apiChange = navData.change;
             apiChangePct = navData.changePercent;
             priceSource = sourceDecision.priceSource;
+            if (sourceDecision.providerDate && Number.isFinite(Number(navData.nav)) && Number(navData.nav) > 0) {
+              upsertInvestmentPriceSeries(inv.id, 'MUTUAL_FUND', String(inv.amfi_code || '').trim(), [{
+                date: sourceDecision.providerDate,
+                close: Number(navData.nav),
+                source: 'AMFI',
+              }], null);
+            }
           } else {
             console.warn(`  ${inv.name}: No AMFI code, computing from transactions only`);
           }
@@ -749,6 +763,7 @@ async function updateAllPrices(db, options = {}) {
           apiChange = stockData.change;
           apiChangePct = stockData.changePercent;
           priceSource = sourceDecision.priceSource;
+          providerDateForSource = sourceDecision.providerDate;
           console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, effectivePrice=${pricePerUnit}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
           break;
         }
@@ -780,6 +795,7 @@ async function updateAllPrices(db, options = {}) {
               apiChange = sgbData.change;
               apiChangePct = sgbData.changePercent;
               priceSource = sourceDecision.priceSource;
+              providerDateForSource = sourceDecision.providerDate;
               console.log(`  ${inv.name} (id=${inv.id}): SGB price fetch returned price=${sgbData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
             } catch (e) {
               console.warn(`  ${inv.name}: NSE price fetch failed (${e.message}), falling back to last known price`);
@@ -844,9 +860,17 @@ async function updateAllPrices(db, options = {}) {
             });
             console.log(`  ${inv.name} (id=${inv.id}): NPS NAV fetch returned nav=${npsData.nav}, providerDate=${sourceDecision.providerDate}, previousPrice=${lastKnownPrice}, change=${npsData.change}, priceSource=${sourceDecision.priceSource}`);
             pricePerUnit = npsData.nav;
+            providerDateForSource = sourceDecision.providerDate;
             apiChange = npsData.change;
             apiChangePct = npsData.changePercent;
             priceSource = sourceDecision.priceSource;
+            if (sourceDecision.providerDate && Number.isFinite(Number(npsData.nav)) && Number(npsData.nav) > 0) {
+              upsertInvestmentPriceSeries(inv.id, 'NPS', String(inv.nps_fund_code || '').trim(), [{
+                date: sourceDecision.providerDate,
+                close: Number(npsData.nav),
+                source: 'NPS',
+              }], null);
+            }
           } catch (e) {
             console.warn(`  ${inv.name}: NPS NAV fetch failed (${e.message}), falling back to last known price`);
             // Fallback 1: use last valid stored daily value (exclude placeholder 99.99)
@@ -899,7 +923,7 @@ async function updateAllPrices(db, options = {}) {
 
         if (closeSessionDate && closePrice > 0 && /^\d{4}-\d{2}-\d{2}$/.test(closeSessionDate) && closeSessionDate <= today) {
           const closeFx = await getFxRateForDate(closeSessionDate);
-          const closeRows = writeInvestmentSnapshotForDate(inv, closeSessionDate, closePrice, 'LIVE', closeFx);
+          const closeRows = writeInvestmentSnapshotForDate(inv, closeSessionDate, closePrice, 'LIVE', closeFx, closeSessionDate);
           if (closeRows > 0) {
             touchedDates.add(closeSessionDate);
           }
@@ -924,14 +948,14 @@ async function updateAllPrices(db, options = {}) {
         }
 
         if (runDatePrice > 0) {
-          writeInvestmentSnapshotForDate(inv, today, runDatePrice, runDateSource, usdToInr);
+          writeInvestmentSnapshotForDate(inv, today, runDatePrice, runDateSource, usdToInr, phaseDecision.providerDate);
           touchedDates.add(today);
         }
         skipDefaultTodayWrite = true;
       }
 
       if (!skipDefaultTodayWrite) {
-        writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, usdToInr);
+        writeInvestmentSnapshotForDate(inv, today, pricePerUnit, priceSource, usdToInr, providerDateForSource);
       }
       const combinedSnapshot = db.prepare(`
         SELECT

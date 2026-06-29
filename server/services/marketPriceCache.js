@@ -1717,6 +1717,7 @@ async function hydrateHistoricalPriceSeries({
   const end = normalizeDate(toDate);
   if (!start || !end) return [];
   const normalizedFreshnessSkipFromDate = normalizeDate(freshnessSkipFromDate);
+  const allowProviderCalendarOverflow = instrumentType === 'MUTUAL_FUND' || instrumentType === 'NPS';
 
   const marketSessionDates = getMarketSessionDates(start, end, instrumentType);
   const contextInvestmentId = Number.isFinite(Number(contextMeta?.investmentId))
@@ -1773,7 +1774,12 @@ async function hydrateHistoricalPriceSeries({
         const fetched = await fetchRange(window.from, window.to);
         const normalizedFetched = mapFetchedRows(fetched)
           .map(normalizeCachePoint)
-          .filter((point) => point && point.date >= window.from && point.date <= window.to && point.close != null);
+          .filter((point) => {
+            if (!point || point.close == null) return false;
+            if (point.date < window.from) return false;
+            const windowUpperBound = allowProviderCalendarOverflow ? end : window.to;
+            return point.date <= windowUpperBound;
+          });
 
         totalFetchedPoints += normalizedFetched.length;
         if (suppressRecentMissing && normalizedFetched.length === 0) {
