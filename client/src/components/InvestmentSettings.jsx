@@ -957,7 +957,7 @@ export default function InvestmentSettings() {
                 }}
                 aria-expanded={fxRateCacheExpanded}
               >
-                {fxRateCacheExpanded ? 'Hide FX Rates' : 'Show FX Rates'}
+                {fxRateCacheExpanded ? 'Collapse FX Rates' : 'Expand FX Rates'}
               </Button>
             </div>
 
