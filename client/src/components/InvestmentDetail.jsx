@@ -124,6 +124,7 @@ export default function InvestmentDetail() {
   const investmentsSearch = location.state?.investmentsSearch || '';
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [transactionsExpanded, setTransactionsExpanded] = useState(false);
   const [dailyValuesExpanded, setDailyValuesExpanded] = useState(false);
   const [dailyValuesLoading, setDailyValuesLoading] = useState(false);
   const [dailyValuesError, setDailyValuesError] = useState('');
@@ -1083,8 +1084,22 @@ export default function InvestmentDetail() {
       <Card className="shadow-sm transactions-card">
         <Card.Header className="bg-white px-3 py-2">
           <div className="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2">
-            <h2 className="h6 fw-semibold mb-0">Transactions</h2>
+            <div>
+              <h2 className="h6 fw-semibold mb-1">Transactions</h2>
+              <div className="small text-muted">All transaction rows for this investment.</div>
+            </div>
             <div className="d-flex flex-wrap justify-content-md-end align-items-center gap-2 ms-md-auto">
+              <Button
+                size="sm"
+                variant="outline-secondary"
+                onClick={() => setTransactionsExpanded((prev) => !prev)}
+                aria-expanded={transactionsExpanded}
+              >
+                {transactionsExpanded ? 'Collapse Transactions' : 'Expand Transactions'}
+              </Button>
+
+              {!transactionsExpanded ? null : (
+                <>
               {isForeignUSD && (
                 <Dropdown autoClose="outside">
                   <Dropdown.Toggle variant="outline-secondary" size="sm">
@@ -1184,167 +1199,173 @@ export default function InvestmentDetail() {
                   className="small"
                 />
               )}
+                </>
+              )}
             </div>
           </div>
         </Card.Header>
-        {visibleTransactions.length === 0 ? (
-          <Card.Body className="text-center text-muted py-4">
-            No transactions recorded yet. Add your first transaction above.
-          </Card.Body>
-        ) : (
-          <div className="responsive-table">
-            {hiddenPlaceholderCount > 0 && (
-              <div className="px-3 py-2 small text-muted border-bottom">
-                Hidden {hiddenPlaceholderCount} placeholder RSU rows with no amount/price/withholding data.
+        <Collapse in={transactionsExpanded}>
+          <div>
+            {visibleTransactions.length === 0 ? (
+              <Card.Body className="text-center text-muted py-4">
+                No transactions recorded yet. Add your first transaction above.
+              </Card.Body>
+            ) : (
+              <div className="responsive-table">
+                {hiddenPlaceholderCount > 0 && (
+                  <div className="px-3 py-2 small text-muted border-bottom">
+                    Hidden {hiddenPlaceholderCount} placeholder RSU rows with no amount/price/withholding data.
+                  </div>
+                )}
+                <Table hover size="sm" className="mb-0 small transactions-table">
+                  <thead className="table-light">
+                    <tr>
+                      <th className="px-3 text-nowrap">Date</th>
+                      <th className="px-3">Type</th>
+                      {!isPPF && <th className="px-3 text-end">Units</th>}
+                      {isForeignUSD && <th className="px-3 text-end">Withheld</th>}
+                      {isForeignUSD && <th className="px-3 text-end">FX</th>}
+                      {!isPPF && <th className="px-3 text-end">Price</th>}
+                      <th className="px-3 text-end">Amt</th>
+                      {!isPPF && <th className="px-3 text-end">Fees</th>}
+                      {isPPF && <th className="px-3 text-end">Balance</th>}
+                      {!isPPF && <th className="px-3 text-end">Hold</th>}
+                      {hasFolioColumn && <th className="px-3">Folio</th>}
+                      {isForeignUSD && <th className="px-3">Grant</th>}
+                      <th className="px-3">Notes</th>
+                      <th className="px-3 text-center" style={{ width: 64 }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(() => {
+                      // Compute running holding from oldest to newest
+                      // Corporate actions come before regular trades on the same date
+                      const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
+                      const txnSortKey = (t) => CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1;
+                      const sorted = [...visibleTransactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || txnSortKey(a) - txnSortKey(b) || a.id - b.id);
+                      const holdingMap = {};
+                      const balanceMap = {};
+                      const creditTypes = isEpsInvestment
+                        ? ['EPS_CONTRIBUTION', 'INTEREST', 'TRANSFER_IN']
+                        : ['DEPOSIT', 'INTEREST', 'RECONCILE', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'TRANSFER_IN'];
+                      let unitBal = 0;
+                      let amtBal = data.opening_balance || 0;
+                      for (const txn of sorted) {
+                        if (UNIT_ADD_TYPES.includes(txn.transaction_type)) unitBal += txn.units || 0;
+                        else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) unitBal -= txn.units || 0;
+                        if (Math.abs(unitBal) < 1e-6) unitBal = 0;
+                        holdingMap[txn.id] = unitBal;
+                        // EPS-only ledgers should accumulate EPS rows; EPF-ledgers should exclude EPS rows.
+                        if (creditTypes.includes(txn.transaction_type)) {
+                          amtBal += txn.amount || 0;
+                        } else if (['WITHDRAWAL', 'TRANSFER_OUT'].includes(txn.transaction_type)) {
+                          amtBal -= txn.amount || 0;
+                        }
+                        balanceMap[txn.id] = amtBal;
+                      }
+                      const hasFolio = visibleTransactions.some(t => t.folio_number);
+                      const filteredByFolio = selectedFolio === 'ALL'
+                        ? [...sorted]
+                        : [...sorted].filter((t) => t.folio_number === selectedFolio);
+                      const filteredByGrant = isForeignUSD && selectedGrants.length > 0
+                        ? filteredByFolio.filter((t) => selectedGrants.includes(parseGrantMeta(t).grantLabel))
+                        : filteredByFolio;
+                      const filteredByType = selectedTypes.length > 0
+                        ? filteredByGrant.filter((t) => selectedTypes.includes(t.transaction_type))
+                        : filteredByGrant;
+                      const filteredByDate = filteredByType.filter((t) => {
+                        if (dateFrom && String(t.transaction_date || '') < dateFrom) return false;
+                        if (dateTo && String(t.transaction_date || '') > dateTo) return false;
+                        return true;
+                      });
+                      const filteredSorted = filteredByDate.reverse();
+                      return filteredSorted.map((txn) => {
+                        const grantMeta = parseGrantMeta(txn);
+                        const totalToVest = grantMeta.awardNumber ? awardTotalToVest[grantMeta.awardNumber] : null;
+                        const cumulativeVested = cumulativeAwardGrossByTxnId[txn.id];
+                        const grantProgress = cumulativeVested != null && totalToVest != null
+                          ? `${formatGrantUnits(cumulativeVested)}/${formatGrantUnits(totalToVest)}`
+                          : null;
+                        return (
+                      <tr
+                        key={txn.id}
+                        style={(() => {
+                          if (txn.transaction_type === 'SELL') return { opacity: 0.68, backgroundColor: '#f8f9fa' };
+                          if (isFullySoldLot(txn)) return { opacity: 0.62, backgroundColor: '#f3f4f6' };
+                          return undefined;
+                        })()}
+                      >
+                        <td className="px-3 text-nowrap">{formatDate(txn.transaction_date)}</td>
+                        <td className="px-3">
+                          <span className={`badge rounded-pill badge-${txn.transaction_type.toLowerCase()}`}>
+                            {getTxnTypeLabel(txn.transaction_type)}
+                          </span>
+                        </td>
+                        {!isPPF && (
+                          <td className="px-3 text-end">
+                            {txn.units ? formatNumber(txn.units, 4) : '-'}
+                            {isForeignUSD && txn.gross_units != null && txn.tax_withheld_units != null && Math.abs(Number(txn.gross_units || 0) - Number(txn.units || 0)) > 0.000001 ? (
+                              <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                                Gross {formatNumber(txn.gross_units, 4)}
+                              </div>
+                            ) : null}
+                          </td>
+                        )}
+                        {isForeignUSD && <td className="px-3 text-end">{txn.tax_withheld_units != null ? formatNumber(txn.tax_withheld_units, 4) : '-'}</td>}
+                        {isForeignUSD && <td className="px-3 text-end">{txn.exchange_rate_used != null ? `₹${formatNumber(txn.exchange_rate_used, 4)}/$` : '-'}</td>}
+                        {!isPPF && (
+                          <td className="px-3 text-end">
+                            {txn.price_per_unit ? `${isForeignUSD ? '$' : '₹'}${formatNumber(txn.price_per_unit, 2)}` : '-'}
+                            {isForeignUSD && txn.fmv_per_unit != null ? (
+                              <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                                FMV ${formatNumber(txn.fmv_per_unit, 2)}
+                              </div>
+                            ) : null}
+                          </td>
+                        )}
+                        <td className="px-3 text-end fw-medium">
+                          ₹{formatNumber(txn.amount, 2)}
+                          {isForeignUSD && txn.usd_amount ? (
+                            <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
+                              ${formatNumber(txn.usd_amount, 2)}
+                            </div>
+                          ) : null}
+                        </td>
+                        {!isPPF && <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
+                        {isPPF && <td className="px-3 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>}
+                        {!isPPF && <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
+                        {!isPPF && hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
+                        {isForeignUSD && (
+                          <td className="px-3">
+                            <div className="fw-medium text-body" style={{ whiteSpace: 'nowrap' }}>
+                              {grantMeta.grantLabel || '-'}
+                            </div>
+                            {grantProgress ? <div className="text-muted" style={{ fontSize: '0.75rem', lineHeight: 1.1 }}>{grantProgress}</div> : null}
+                          </td>
+                        )}
+                        <td className="px-3 text-muted" style={{ maxWidth: 150, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
+                        <td className="px-3">
+                          {EDITABLE_TYPES.includes(txn.transaction_type) && (
+                            <div className="d-flex gap-1 row-actions">
+                              <button onClick={() => handleEditTxn(txn)} className="btn btn-link btn-sm p-0 text-primary" title="Edit">
+                                <Pencil size={14} />
+                              </button>
+                              <button onClick={() => { setDeleteConfirm(txn); setDeleteText(''); }} className="btn btn-link btn-sm p-0 text-danger" title="Delete">
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                        );
+                      });
+                    })()}
+                  </tbody>
+                </Table>
               </div>
             )}
-            <Table hover size="sm" className="mb-0 small transactions-table">
-              <thead className="table-light">
-                <tr>
-                  <th className="px-3 text-nowrap">Date</th>
-                  <th className="px-3">Type</th>
-                  {!isPPF && <th className="px-3 text-end">Units</th>}
-                  {isForeignUSD && <th className="px-3 text-end">Withheld</th>}
-                  {isForeignUSD && <th className="px-3 text-end">FX</th>}
-                  {!isPPF && <th className="px-3 text-end">Price</th>}
-                  <th className="px-3 text-end">Amt</th>
-                  {!isPPF && <th className="px-3 text-end">Fees</th>}
-                  {isPPF && <th className="px-3 text-end">Balance</th>}
-                  {!isPPF && <th className="px-3 text-end">Hold</th>}
-                  {hasFolioColumn && <th className="px-3">Folio</th>}
-                  {isForeignUSD && <th className="px-3">Grant</th>}
-                  <th className="px-3">Notes</th>
-                  <th className="px-3 text-center" style={{ width: 64 }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(() => {
-                  // Compute running holding from oldest to newest
-                  // Corporate actions come before regular trades on the same date
-                  const CORPORATE_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
-                  const txnSortKey = (t) => CORPORATE_TYPES.has(t.transaction_type) ? 0 : 1;
-                  const sorted = [...visibleTransactions].sort((a, b) => a.transaction_date.localeCompare(b.transaction_date) || txnSortKey(a) - txnSortKey(b) || a.id - b.id);
-                  const holdingMap = {};
-                  const balanceMap = {};
-                  const creditTypes = isEpsInvestment
-                    ? ['EPS_CONTRIBUTION', 'INTEREST', 'TRANSFER_IN']
-                    : ['DEPOSIT', 'INTEREST', 'RECONCILE', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'TRANSFER_IN'];
-                  let unitBal = 0;
-                  let amtBal = data.opening_balance || 0;
-                  for (const txn of sorted) {
-                    if (UNIT_ADD_TYPES.includes(txn.transaction_type)) unitBal += txn.units || 0;
-                    else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) unitBal -= txn.units || 0;
-                    if (Math.abs(unitBal) < 1e-6) unitBal = 0;
-                    holdingMap[txn.id] = unitBal;
-                    // EPS-only ledgers should accumulate EPS rows; EPF-ledgers should exclude EPS rows.
-                    if (creditTypes.includes(txn.transaction_type)) {
-                      amtBal += txn.amount || 0;
-                    } else if (['WITHDRAWAL', 'TRANSFER_OUT'].includes(txn.transaction_type)) {
-                      amtBal -= txn.amount || 0;
-                    }
-                    balanceMap[txn.id] = amtBal;
-                  }
-                  const hasFolio = visibleTransactions.some(t => t.folio_number);
-                  const filteredByFolio = selectedFolio === 'ALL'
-                    ? [...sorted]
-                    : [...sorted].filter((t) => t.folio_number === selectedFolio);
-                  const filteredByGrant = isForeignUSD && selectedGrants.length > 0
-                    ? filteredByFolio.filter((t) => selectedGrants.includes(parseGrantMeta(t).grantLabel))
-                    : filteredByFolio;
-                  const filteredByType = selectedTypes.length > 0
-                    ? filteredByGrant.filter((t) => selectedTypes.includes(t.transaction_type))
-                    : filteredByGrant;
-                  const filteredByDate = filteredByType.filter((t) => {
-                    if (dateFrom && String(t.transaction_date || '') < dateFrom) return false;
-                    if (dateTo && String(t.transaction_date || '') > dateTo) return false;
-                    return true;
-                  });
-                  const filteredSorted = filteredByDate.reverse();
-                  return filteredSorted.map((txn) => {
-                    const grantMeta = parseGrantMeta(txn);
-                    const totalToVest = grantMeta.awardNumber ? awardTotalToVest[grantMeta.awardNumber] : null;
-                    const cumulativeVested = cumulativeAwardGrossByTxnId[txn.id];
-                    const grantProgress = cumulativeVested != null && totalToVest != null
-                      ? `${formatGrantUnits(cumulativeVested)}/${formatGrantUnits(totalToVest)}`
-                      : null;
-                    return (
-                  <tr
-                    key={txn.id}
-                    style={(() => {
-                      if (txn.transaction_type === 'SELL') return { opacity: 0.68, backgroundColor: '#f8f9fa' };
-                      if (isFullySoldLot(txn)) return { opacity: 0.62, backgroundColor: '#f3f4f6' };
-                      return undefined;
-                    })()}
-                  >
-                    <td className="px-3 text-nowrap">{formatDate(txn.transaction_date)}</td>
-                    <td className="px-3">
-                      <span className={`badge rounded-pill badge-${txn.transaction_type.toLowerCase()}`}>
-                        {getTxnTypeLabel(txn.transaction_type)}
-                      </span>
-                    </td>
-                    {!isPPF && (
-                      <td className="px-3 text-end">
-                        {txn.units ? formatNumber(txn.units, 4) : '-'}
-                        {isForeignUSD && txn.gross_units != null && txn.tax_withheld_units != null && Math.abs(Number(txn.gross_units || 0) - Number(txn.units || 0)) > 0.000001 ? (
-                          <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
-                            Gross {formatNumber(txn.gross_units, 4)}
-                          </div>
-                        ) : null}
-                      </td>
-                    )}
-                    {isForeignUSD && <td className="px-3 text-end">{txn.tax_withheld_units != null ? formatNumber(txn.tax_withheld_units, 4) : '-'}</td>}
-                    {isForeignUSD && <td className="px-3 text-end">{txn.exchange_rate_used != null ? `₹${formatNumber(txn.exchange_rate_used, 4)}/$` : '-'}</td>}
-                    {!isPPF && (
-                      <td className="px-3 text-end">
-                        {txn.price_per_unit ? `${isForeignUSD ? '$' : '₹'}${formatNumber(txn.price_per_unit, 2)}` : '-'}
-                        {isForeignUSD && txn.fmv_per_unit != null ? (
-                          <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
-                            FMV ${formatNumber(txn.fmv_per_unit, 2)}
-                          </div>
-                        ) : null}
-                      </td>
-                    )}
-                    <td className="px-3 text-end fw-medium">
-                      ₹{formatNumber(txn.amount, 2)}
-                      {isForeignUSD && txn.usd_amount ? (
-                        <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
-                          ${formatNumber(txn.usd_amount, 2)}
-                        </div>
-                      ) : null}
-                    </td>
-                    {!isPPF && <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
-                    {isPPF && <td className="px-3 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>}
-                    {!isPPF && <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
-                    {!isPPF && hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
-                    {isForeignUSD && (
-                      <td className="px-3">
-                        <div className="fw-medium text-body" style={{ whiteSpace: 'nowrap' }}>
-                          {grantMeta.grantLabel || '-'}
-                        </div>
-                        {grantProgress ? <div className="text-muted" style={{ fontSize: '0.75rem', lineHeight: 1.1 }}>{grantProgress}</div> : null}
-                      </td>
-                    )}
-                    <td className="px-3 text-muted" style={{ maxWidth: 150, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={txn.notes || ''}>{txn.notes || '-'}</td>
-                    <td className="px-3">
-                      {EDITABLE_TYPES.includes(txn.transaction_type) && (
-                        <div className="d-flex gap-1 row-actions">
-                          <button onClick={() => handleEditTxn(txn)} className="btn btn-link btn-sm p-0 text-primary" title="Edit">
-                            <Pencil size={14} />
-                          </button>
-                          <button onClick={() => { setDeleteConfirm(txn); setDeleteText(''); }} className="btn btn-link btn-sm p-0 text-danger" title="Delete">
-                            <Trash2 size={14} />
-                          </button>
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                    );
-                  });
-                })()}
-              </tbody>
-            </Table>
           </div>
-        )}
+        </Collapse>
       </Card>
 
       <Card className="shadow-sm mt-4">
@@ -1366,7 +1387,7 @@ export default function InvestmentDetail() {
               }}
               aria-expanded={dailyValuesExpanded}
             >
-              {dailyValuesExpanded ? 'Hide Daily Values' : 'Show Daily Values'}
+              {dailyValuesExpanded ? 'Collapse Daily Values' : 'Expand Daily Values'}
             </Button>
           </div>
 

@@ -742,7 +742,7 @@ export default function InvestmentSettings() {
                 }}
                 aria-expanded={priceHistoryExpanded}
               >
-                {priceHistoryExpanded ? 'Hide Historical Prices' : 'Show Historical Prices'}
+                {priceHistoryExpanded ? 'Collapse Historical Prices' : 'Expand Historical Prices'}
               </Button>
             </div>
 
