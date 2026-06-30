@@ -574,6 +574,7 @@ async function warmRecentMarketCache(db, runDate, refreshDays, label) {
         symbol,
         fromDate,
         toDate: runDate,
+        freshnessSkipFromDate: runDate,
         sourceLabel: 'YAHOO',
         fetchRange: async (missingFrom, missingTo) => fetchStockSeriesFromSource(symbol, missingFrom, missingTo),
         mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),

@@ -959,6 +959,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
               symbol,
               fromDate: from,
               toDate: to,
+              freshnessSkipFromDate: runDate,
               sourceLabel: 'NSE_HISTORICAL_TRADE',
               fetchRange: async (missingFrom, missingTo) => fetchSGBNseHistoricalRaw(symbol, missingFrom, missingTo, (level, msg, meta) => {
                 if (level === 'error') logBackfillError(`[SGB] ${msg}`, meta);
@@ -2999,6 +3000,7 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
       symbol: window.symbol,
       fromDate: window.startDate,
       toDate: window.endDate,
+      freshnessSkipFromDate: runDate,
       sourceLabel: 'YAHOO',
       fetchRange: async (missingFrom, missingTo) => fetchStockSeriesFromSource(window.symbol, missingFrom, missingTo),
       mapFetchedRows: (fetched) => (Array.isArray(fetched) ? fetched : []),
@@ -3557,6 +3559,7 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
       symbol: window.code,
       fromDate: window.startDate,
       toDate: window.endDate,
+      freshnessSkipFromDate: runDate,
       sourceLabel: 'AMFI',
       fetchRange: async () => fetchMutualFundHistory(window.code).catch((err) => {
         logBackfillError(`[Backfill][Funds] Provider fetch failed for ${window.code}: ${err?.message || err}`);
@@ -3762,6 +3765,7 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
       symbol: 'USDINR=X',
       fromDate: fxStart,
       toDate: fxEnd,
+      freshnessSkipFromDate: runDate,
       sourceLabel: 'YAHOO',
       fetchRange: async (missingFrom, missingTo) => fetchStockSeriesFromSource('USDINR=X', missingFrom, missingTo),
       mapFetchedRows: (rows) => {
