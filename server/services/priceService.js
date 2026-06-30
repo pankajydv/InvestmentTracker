@@ -149,6 +149,66 @@ function detectForeignStockSession(meta, timestamps, closes) {
 }
 
 /**
+ * Determine provider date attribution for Indian stocks from observed quote/candle
+ * timestamps instead of foreign session metadata.
+ *
+ * This avoids advancing to the next IST day before a true new-day quote exists.
+ *
+ * @param {object} meta - result.meta from Yahoo chart API
+ * @param {number[]} timestamps - result.timestamp candle start Unix seconds
+ * @returns {{ date, price, change, changePercent, officialClose, previousClose, sessionPhase, sessionDateIst } | null}
+ */
+function detectIndianStockSession(meta, timestamps) {
+  if (!meta || !meta.regularMarketPrice) return null;
+
+  let providerDate = null;
+  const regularMarketTime = Number(meta.regularMarketTime);
+  if (Number.isFinite(regularMarketTime) && regularMarketTime > 0) {
+    providerDate = istDateFromUnixSeconds(regularMarketTime);
+  }
+
+  if (!providerDate && Array.isArray(timestamps) && timestamps.length > 0) {
+    for (let i = timestamps.length - 1; i >= 0; i -= 1) {
+      const ts = Number(timestamps[i]);
+      if (!Number.isFinite(ts) || ts <= 0) continue;
+      providerDate = istDateFromUnixSeconds(ts);
+      if (providerDate) break;
+    }
+  }
+
+  if (!providerDate) return null;
+
+  const price = Number(meta.regularMarketPrice);
+  if (!Number.isFinite(price) || price <= 0) return null;
+
+  const prevCloseRaw = Number(meta.chartPreviousClose ?? meta.previousClose);
+  const previousClose = Number.isFinite(prevCloseRaw) && prevCloseRaw > 0
+    ? prevCloseRaw
+    : price;
+
+  const changeRaw = Number(meta.regularMarketChange);
+  const change = Number.isFinite(changeRaw)
+    ? changeRaw
+    : (price - previousClose);
+
+  const changePercentRaw = Number(meta.regularMarketChangePercent);
+  const changePercent = Number.isFinite(changePercentRaw)
+    ? changePercentRaw
+    : (previousClose > 0 ? (change / previousClose) * 100 : 0);
+
+  return {
+    price,
+    change: Math.round(change * 100) / 100,
+    changePercent: Math.round(changePercent * 100) / 100,
+    previousClose,
+    officialClose: null,
+    date: providerDate,
+    sessionDateIst: providerDate,
+    sessionPhase: 'regular',
+  };
+}
+
+/**
  * Check if a date (YYYY-MM-DD) is a weekday (Mon-Fri), used for NSE trading day.
  * @param {string} dateIso - ISO date string (YYYY-MM-DD)
  * @returns {boolean}
@@ -383,7 +443,10 @@ function fetchStockPriceDirect(symbol, options = {}) {
             const closes = Array.isArray(result?.indicators?.quote?.[0]?.close)
               ? result.indicators.quote[0].close
               : [];
-            const sessionInfo = detectForeignStockSession(meta, timestamps, closes);
+            const instrumentType = inferStockInstrumentType(symbol);
+            const sessionInfo = instrumentType === 'INDIAN_STOCK'
+              ? detectIndianStockSession(meta, timestamps)
+              : detectForeignStockSession(meta, timestamps, closes);
             if (!sessionInfo) {
               reject(new Error(`No price data for ${symbol}`));
               return;
