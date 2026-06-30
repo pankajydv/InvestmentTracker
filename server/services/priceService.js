@@ -1724,6 +1724,113 @@ async function fetchSGBPrice(symbol) {
   };
 }
 
+function parseNseDateTimeToIso(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return null;
+  const m = value.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})(?:\s+\d{2}:\d{2}:\d{2})?$/);
+  if (!m) return null;
+  const months = {
+    jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+    jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+  };
+  const mm = months[String(m[2] || '').toLowerCase()];
+  if (!mm) return null;
+  return `${m[3]}-${mm}-${String(m[1]).padStart(2, '0')}`;
+}
+
+/**
+ * Fetch SGB live quote from NSE symbol data endpoint used during intraday runs.
+ * @param {string} symbol - NSE symbol e.g. 'SGBSEP28VI' or 'SGBJAN29IX'
+ * @returns {Promise<{price: number, change: number, changePercent: number, previousClose: number, date: string}>}
+ */
+async function fetchSGBLivePrice(symbol) {
+  const cleanSymbol = String(symbol || '').trim();
+  if (!cleanSymbol) throw new Error('SGB symbol is required');
+
+  const url = (
+    'https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi' +
+    `?functionName=getSymbolData&marketType=N&series=GB&symbol=${encodeURIComponent(cleanSymbol)}`
+  );
+
+  const payload = await new Promise((resolve, reject) => {
+    https.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124',
+        Accept: 'application/json',
+        Referer: `https://www.nseindia.com/get-quotes/bonds?symbol=${encodeURIComponent(cleanSymbol)}`,
+      },
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`NSE getSymbolData failed (${res.statusCode}) for ${cleanSymbol}`));
+        return;
+      }
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Failed to parse NSE getSymbolData for ${cleanSymbol}: ${e.message}`));
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+
+  const rows = Array.isArray(payload?.equityResponse)
+    ? payload.equityResponse
+    : (payload?.equityResponse ? [payload.equityResponse] : []);
+  const row = rows[0] || null;
+  if (!row || typeof row !== 'object') {
+    throw new Error(`No equityResponse row for ${cleanSymbol}`);
+  }
+
+  const tradeInfo = row.tradeInfo || {};
+  const orderBook = row.orderBook || {};
+  const metaData = row.metaData || {};
+
+  const priceCandidates = [tradeInfo.lastPrice, orderBook.lastPrice, metaData.closePrice, metaData.averagePrice];
+  const price = priceCandidates
+    .map((v) => Number(v))
+    .find((v) => Number.isFinite(v) && v > 0);
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error(`No valid live price in NSE getSymbolData for ${cleanSymbol}`);
+  }
+
+  const previousCloseCandidates = [metaData.previousClose, tradeInfo.basePrice, metaData.basePrice];
+  const previousClose = previousCloseCandidates
+    .map((v) => Number(v))
+    .find((v) => Number.isFinite(v) && v > 0) || price;
+
+  const changeRaw = Number(metaData.change);
+  const change = Number.isFinite(changeRaw) ? changeRaw : (price - previousClose);
+
+  const changePctRaw = Number(metaData.pChange);
+  const changePercent = Number.isFinite(changePctRaw)
+    ? changePctRaw
+    : (previousClose > 0 ? (change / previousClose) * 100 : 0);
+
+  const providerDate = (
+    parseNseDateTimeToIso(tradeInfo.secwisedelposdate)
+    || parseNseDateTimeToIso(row.lastUpdateTime)
+    || parseNseDateTimeToIso(metaData.lastUpdateTime)
+    || null
+  );
+
+  if (!providerDate) {
+    throw new Error(`No provider date in NSE getSymbolData for ${cleanSymbol}`);
+  }
+
+  return {
+    price,
+    change: Math.round(change * 100) / 100,
+    changePercent: Math.round(changePercent * 100) / 100,
+    previousClose,
+    date: providerDate,
+  };
+}
+
 // ─── NPS NAV Fetching ─────────────────────────────────────────────────────────
 
 function parseNpsDateToIso(dateStr) {
@@ -1845,6 +1952,7 @@ module.exports = {
   searchStocks,
   resolveAmfiCodeByISIN,
   fetchSGBPrice,
+  fetchSGBLivePrice,
   fetchNPSNAV,
   fetchNPSHistory,
   getMarketDataSourceForNSE,

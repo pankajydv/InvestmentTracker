@@ -8,13 +8,15 @@ const path = require('path');
 const { getDb, initializeDb, ensureNPSFundCodeMigration, ensureRemoveCombinedAggregatesMigration } = require('./db/schema');
 const { startScheduler } = require('./services/scheduler');
 const { requireAuth } = require('./middleware/auth');
-const { logAppInfo, logAppError, getUnifiedLogPathForDate } = require('./services/appLogger');
+const { logAppInfo, logAppError, getUnifiedLogPathForDate, installConsoleCapture } = require('./services/appLogger');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 const appMode = String(process.env.APP_MODE || 'production').toLowerCase();
 const isProduction = appMode !== 'dev' && appMode !== 'development' && appMode !== 'test';
 const schedulerEnabled = process.env.ENABLE_SCHEDULER === 'true';
+
+installConsoleCapture();
 
 // Initialize database
 const db = getDb();

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const util = require('util');
 const { applyEnvDefaults } = require('../config/envDefaults');
 
 applyEnvDefaults();
@@ -14,6 +15,19 @@ const LOG_FILE_PREFIX = 'invest-tracker';
 const LOG_TO_CONSOLE = String(
   process.env.APP_LOG_TO_CONSOLE || (IS_PRODUCTION_MODE ? 'false' : 'true')
 ).toLowerCase() === 'true';
+const CAPTURE_CONSOLE_TO_FILE = String(
+  process.env.APP_CAPTURE_CONSOLE_TO_FILE || 'true'
+).toLowerCase() === 'true';
+
+const BASE_CONSOLE = {
+  log: console.log.bind(console),
+  info: (console.info || console.log).bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+  debug: (console.debug || console.log).bind(console),
+};
+
+let consoleCaptureInstalled = false;
 
 function toIstDate(date = new Date()) {
   return new Date(date.getTime() + (IST_OFFSET_MINUTES * 60 * 1000));
@@ -71,8 +85,12 @@ function pruneOldLogs() {
   }
 }
 
-function writeLog(_prefix, level, message, meta = null) {
+function writeLog(_prefix, level, message, meta = null, options = null) {
   try {
+    const opts = options || {};
+    const emitToConsole = opts.emitToConsole !== false;
+    const skipPrune = opts.skipPrune === true;
+
     ensureLogDir();
     const filePath = path.join(LOG_DIR, `${LOG_FILE_PREFIX}-${currentDateStamp()}.log`);
     const ts = currentTimestampIst();
@@ -80,21 +98,62 @@ function writeLog(_prefix, level, message, meta = null) {
     const line = `[${ts}] [${level}] ${message}${metaPart}\n`;
     fs.appendFileSync(filePath, line, 'utf8');
 
-    if (LOG_TO_CONSOLE) {
+    if (emitToConsole && LOG_TO_CONSOLE) {
       const text = line.trimEnd();
       if (level === 'ERROR') {
-        console.error(text);
+        BASE_CONSOLE.error(text);
       } else if (level === 'WARN') {
-        console.warn(text);
+        BASE_CONSOLE.warn(text);
+      } else if (level === 'DEBUG') {
+        BASE_CONSOLE.debug(text);
       } else {
-        console.log(text);
+        BASE_CONSOLE.log(text);
       }
     }
 
-    pruneOldLogs();
+    if (!skipPrune) {
+      pruneOldLogs();
+    }
   } catch (_) {
-    console.error('[ERROR] [Logger] Failed to write application log entry');
+    BASE_CONSOLE.error('[ERROR] [Logger] Failed to write application log entry');
   }
+}
+
+function formatConsoleArg(arg) {
+  if (typeof arg === 'string') return arg;
+  if (arg instanceof Error) {
+    return arg.stack || arg.message || String(arg);
+  }
+  return util.inspect(arg, { depth: 5, colors: false, breakLength: 120, compact: true });
+}
+
+function installConsoleCapture() {
+  if (consoleCaptureInstalled) return false;
+  if (!CAPTURE_CONSOLE_TO_FILE) return false;
+
+  const map = [
+    ['log', 'INFO'],
+    ['info', 'INFO'],
+    ['warn', 'WARN'],
+    ['error', 'ERROR'],
+    ['debug', 'DEBUG'],
+  ];
+
+  for (const [method, level] of map) {
+    const original = BASE_CONSOLE[method] || BASE_CONSOLE.log;
+    console[method] = (...args) => {
+      try {
+        const message = args.map(formatConsoleArg).join(' ');
+        writeLog('console', level, message, null, { emitToConsole: false, skipPrune: true });
+      } catch (_) {
+        // Always preserve original console behavior even if log persistence fails.
+      }
+      original(...args);
+    };
+  }
+
+  consoleCaptureInstalled = true;
+  return true;
 }
 
 function logAppInfo(message, meta = null) {
@@ -148,4 +207,5 @@ module.exports = {
   getAppLogPathForDate,
   getBackfillLogPathForDate,
   getLogDir,
+  installConsoleCapture,
 };

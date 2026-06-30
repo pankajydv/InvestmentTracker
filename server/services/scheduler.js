@@ -1047,6 +1047,7 @@ function startScheduler(db) {
         await runSchedulerCycle(db, `Intraday run ${hour}:25`, {
           assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
           reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
+          useLiveSgbIntraday: true,
           runTag: `intraday_${hour}_25`,
           complianceScanMode: ENABLE_INTRADAY_COMPLIANCE ? 'incremental' : null,
         });

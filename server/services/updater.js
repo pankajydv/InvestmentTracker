@@ -11,6 +11,7 @@ const {
   toNSETicker,
   resolveAmfiCodeByISIN,
   fetchSGBPrice,
+  fetchSGBLivePrice,
   fetchNPSNAV,
 } = require('./priceService');
 const { calculatePfInterestPreview, calculatePfValueAsOfDate, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
@@ -782,8 +783,31 @@ async function updateAllPrices(db, options = {}) {
         }
         case 'SGB': {
           if (inv.ticker_symbol) {
+            const shouldUseLiveSgb = options.useLiveSgbIntraday === true && /^intraday_\d+_25$/.test(String(runTag || ''));
             try {
-              const sgbData = await fetchSGBPrice(inv.ticker_symbol);
+              let sgbData = null;
+              let fetchMode = 'historical';
+
+              if (shouldUseLiveSgb) {
+                try {
+                  sgbData = await fetchSGBLivePrice(inv.ticker_symbol);
+                  fetchMode = 'live';
+                } catch (liveError) {
+                  logAppWarn('[UpdatePrices] SGB live fetch failed; falling back to historical', {
+                    investmentId: inv.id,
+                    investmentName: inv.name,
+                    symbol: inv.ticker_symbol,
+                    runTag,
+                    error: liveError.message,
+                  });
+                }
+              }
+
+              if (!sgbData) {
+                sgbData = await fetchSGBPrice(inv.ticker_symbol);
+                fetchMode = fetchMode === 'live' ? 'live_fallback_historical' : 'historical';
+              }
+
               const sourceDecision = resolvePriceSourceFromProviderDate({
                 providerDate: sgbData.date,
                 runDate: today,
@@ -796,7 +820,17 @@ async function updateAllPrices(db, options = {}) {
               apiChangePct = sgbData.changePercent;
               priceSource = sourceDecision.priceSource;
               providerDateForSource = sourceDecision.providerDate;
-              console.log(`  ${inv.name} (id=${inv.id}): SGB price fetch returned price=${sgbData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
+              console.log(`  ${inv.name} (id=${inv.id}): SGB ${fetchMode} fetch returned price=${sgbData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
+              logAppInfo('[UpdatePrices] SGB provider decision', {
+                investmentId: inv.id,
+                investmentName: inv.name,
+                symbol: inv.ticker_symbol,
+                runTag,
+                usedLiveIntraday: shouldUseLiveSgb,
+                fetchMode,
+                providerDate: sourceDecision.providerDate,
+                priceSource,
+              });
             } catch (e) {
               console.warn(`  ${inv.name}: NSE price fetch failed (${e.message}), falling back to last known price`);
             }
