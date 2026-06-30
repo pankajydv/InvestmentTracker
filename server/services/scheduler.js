@@ -1097,7 +1097,6 @@ function startScheduler(db) {
     console.log('[Scheduler] Running 00:01 AM day-rollover sweep (all types)...');
     try {
       await runSchedulerCycle(db, 'Midnight day-rollover sweep', {
-        assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
         reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
         runTag: 'midnight_rollover',
       });
@@ -1114,7 +1113,6 @@ function startScheduler(db) {
     console.log('[Scheduler] Running 4:25 AM baseline update (all asset types, all days)...');
     try {
       await runSchedulerCycle(db, 'Early morning seed run (all types)', {
-        assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
         reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
         runTag: 'early_morning_seed',
       });
@@ -1131,7 +1129,6 @@ function startScheduler(db) {
     console.log('[Scheduler] Running 5:25 PM evening baseline update (all asset types, all days)...');
     try {
       await runSchedulerCycle(db, 'Evening baseline run (all types)', {
-        assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
         reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
         runTag: 'evening_baseline',
       });
