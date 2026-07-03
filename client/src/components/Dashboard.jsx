@@ -1035,20 +1035,20 @@ export default function Dashboard() {
                   <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
                     {formatINR(data?.intervalXIRR?.interval_change || 0)}
                   </div>
-                  <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
-                    Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
-                  </div>
-                  {!isDayChangeMode && data?.intervalXIRR?.xirr_pct != null && (
+                  {isDayChangeMode ? (
+                    <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
+                      Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
+                    </div>
+                  ) : data?.intervalXIRR?.xirr_pct != null ? (
                     <div className={`small ${profitColor(data.intervalXIRR.xirr_pct)}`}>
-                      Annualized (XIRR): {formatPct(data.intervalXIRR.xirr_pct)}
+                      Change: {formatPct(data.intervalXIRR.xirr_pct)} p.a.
+                    </div>
+                  ) : (
+                    <div className="small text-warning" title={data?.intervalXIRR?.error || 'XIRR could not be calculated for this interval'}>
+                      ⚠ XIRR unavailable
                     </div>
                   )}
                 </>
-              )}
-              {data?.intervalXIRR?.confidence === 'error' && (
-                <div className="small text-warning" title={data.intervalXIRR.error}>
-                  ⚠ Error calculating XIRR
-                </div>
               )}
             </Card.Body>
           </Card>

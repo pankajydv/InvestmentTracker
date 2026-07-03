@@ -29,7 +29,8 @@ const {
 } = require('./marketPriceCache');
 const { updateAggregateDailyRange } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
-const { toIsoDate, todayIso } = require('./dateUtils');
+const { generateVestSuggestions } = require('./rsuVestActualizationService');
+const { toIsoDate, todayIso, exchangeDateFromUnixSeconds } = require('./dateUtils');
 const { logBackfillInfo, logBackfillWarn, logBackfillError } = require('./appLogger');
 const { LOCF_STREAK_WARN_SESSIONS } = require('./freshnessPolicy');
 const { getMarketHolidays, getWeekends } = require('./holidays/marketHolidayService');
@@ -715,6 +716,17 @@ function fetchStockSeriesFromSource(symbol, startDate, endDate) {
             return;
           }
           const timestamps = result.timestamp || [];
+          const meta = result.meta || {};
+          const exchangeTz = String(meta.exchangeTimezoneName || '').trim();
+          const nowSec = Math.floor(Date.now() / 1000);
+          const regularEnd = Number(meta.currentTradingPeriod?.regular?.end);
+          const currentSessionStart = Number(meta.currentTradingPeriod?.regular?.start);
+          const currentSessionDate = Number.isFinite(currentSessionStart)
+            ? exchangeDateFromUnixSeconds(currentSessionStart, exchangeTz)
+            : null;
+          // The current session's candle is still forming until its regular close passes.
+          // Never persist an unsettled candle as a settled close.
+          const currentSessionUnsettled = Number.isFinite(regularEnd) && nowSec < regularEnd;
           const quote = result.indicators?.quote?.[0] || {};
           const opens = quote.open || [];
           const highs = quote.high || [];
@@ -725,7 +737,12 @@ function fetchStockSeriesFromSource(symbol, startDate, endDate) {
           for (let i = 0; i < timestamps.length; i += 1) {
             const close = closes[i];
             if (close == null) continue;
-            const d = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+            // Attribute dates in the exchange's local timezone (never IST/UTC).
+            const d = exchangeDateFromUnixSeconds(timestamps[i], exchangeTz);
+            if (!d) continue;
+            // Skip the current, not-yet-settled session so partial intraday values
+            // are never written into the cache.
+            if (currentSessionUnsettled && currentSessionDate && d >= currentSessionDate) continue;
             const closeNum = Number(close);
             if (!Number.isFinite(closeNum) || closeNum <= 0) continue;
 
@@ -4094,6 +4111,35 @@ async function processAutoBackfillCAEntries(db, options = {}) {
     );
   }
 
+  // RSU vest actualization runs as a sub-step of the CA sync (suggest mode only),
+  // mirroring the corporate-action suggestion flow: it scans settled placeholder
+  // VEST rows globally and queues accept/reject cards. FX is read strictly from the
+  // prewarmed cache (no network); dirty-marking still happens later on manual accept.
+  let rsuVestSummary = null;
+  if (!applyChanges) {
+    try {
+      const resolveFxRate = async (date) => {
+        const v = cache?.fx?.get(date);
+        return Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null;
+      };
+      rsuVestSummary = await generateVestSuggestions(db, {
+        portfolioId: null,
+        asOfDate: runDate,
+        settleDays: 2,
+        resolveFxRate,
+      });
+      if (rsuVestSummary.scanned > 0 || rsuVestSummary.queued > 0 || rsuVestSummary.refreshed > 0) {
+        logBackfillInfo(
+          `[Backfill][RSU-Vest] scanned=${rsuVestSummary.scanned}, queued=${rsuVestSummary.queued}, refreshed=${rsuVestSummary.refreshed}, suppressed=${rsuVestSummary.suppressed}, skipped=${rsuVestSummary.skipped}`
+        );
+      }
+    } catch (rsuErr) {
+      logBackfillWarn('[Backfill][RSU-Vest] Vest suggestion scan failed; continuing', {
+        error: rsuErr?.message || String(rsuErr),
+      });
+    }
+  }
+
   logBackfillInfo(`[Backfill][CA] Completed AutoBackfill CA. inserted=${inserted}, updated=${updated}, modified=${inserted + updated}, mode=${applyChanges ? 'apply' : 'suggest'}`);
   if (allCaChanges.length) {
     for (const change of allCaChanges) {
@@ -4108,6 +4154,7 @@ async function processAutoBackfillCAEntries(db, options = {}) {
     earliestChangedDate,
     caChanges: allCaChanges,
     suggestionSummary,
+    rsuVestSummary,
     mode: applyChanges ? 'apply' : 'suggest',
   };
 }
@@ -4525,6 +4572,9 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
     caSuggested: step1Result?.modified || 0,
     caInserted: step1Result?.inserted || 0,
     caUpdated: step1Result?.updated || 0,
+    rsuVestQueued: step1Result?.rsuVestSummary?.queued || 0,
+    rsuVestRefreshed: step1Result?.rsuVestSummary?.refreshed || 0,
+    rsuVestSuppressed: step1Result?.rsuVestSummary?.suppressed || 0,
   });
 
   if (options.step1Only === true) {

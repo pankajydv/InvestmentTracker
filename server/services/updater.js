@@ -143,20 +143,23 @@ function cancelUpdate() {
 
 function resolvePriceSourceFromProviderDate({
   providerDate,
+  rowDate,
   runDate,
   assetType,
   sessionPhase = null,
   authoritativeClose = false,
+  allowRollingPost = false,
   investmentId,
   investmentName,
 }) {
+  const normalizedRowDate = normalizeProviderDate(rowDate || runDate);
   const normalizedProviderDate = normalizeProviderDate(providerDate);
   if (!normalizedProviderDate) {
     logAppWarn('[UpdatePrices][ProviderDateMissing] Provider response missing date; forcing LOCF', {
       investmentId,
       investmentName,
       assetType,
-      runDate,
+      rowDate: normalizedRowDate,
     });
     return { priceSource: 'LOCF', providerDate: null };
   }
@@ -164,21 +167,26 @@ function resolvePriceSourceFromProviderDate({
   const normalizedAssetType = String(assetType || '').toUpperCase();
 
   if (normalizedAssetType === 'FOREIGN_STOCK') {
-    if (authoritativeClose && normalizedProviderDate <= runDate) {
+    if (authoritativeClose && normalizedProviderDate <= normalizedRowDate) {
       return { priceSource: 'LIVE', providerDate: normalizedProviderDate };
     }
 
-    if (normalizedProviderDate === runDate) {
+    if (normalizedProviderDate === normalizedRowDate) {
       if (sessionPhase === 'pre') return { priceSource: 'PRE', providerDate: normalizedProviderDate };
       if (sessionPhase === 'post') return { priceSource: 'POST', providerDate: normalizedProviderDate };
       return { priceSource: 'LIVE', providerDate: normalizedProviderDate };
+    }
+
+    // Rolling POST: if provider session has not advanced yet, keep POST on newer row dates.
+    if (allowRollingPost && sessionPhase === 'post' && normalizedProviderDate < normalizedRowDate) {
+      return { priceSource: 'POST', providerDate: normalizedProviderDate };
     }
 
     return { priceSource: 'LOCF', providerDate: normalizedProviderDate };
   }
 
   return {
-    priceSource: normalizedProviderDate === runDate ? 'LIVE' : 'LOCF',
+    priceSource: normalizedProviderDate === normalizedRowDate ? 'LIVE' : 'LOCF',
     providerDate: normalizedProviderDate,
   };
 }
@@ -476,6 +484,37 @@ async function updateAllPrices(db, options = {}) {
     LIMIT 1
   `);
 
+  const getMostRecentPostRowBeforeDate = db.prepare(`
+    SELECT date
+    FROM daily_values
+    WHERE investment_id = ?
+      AND date < ?
+      AND price_source = 'POST'
+    ORDER BY date DESC
+    LIMIT 1
+  `);
+
+  const getMostRecentLiveRowOnOrBeforeDate = db.prepare(`
+    SELECT date, price_per_unit
+    FROM daily_values
+    WHERE investment_id = ?
+      AND date <= ?
+      AND price_source = 'LIVE'
+      AND price_per_unit > 0
+    ORDER BY date DESC
+    LIMIT 1
+  `);
+
+  const getMostRecentPriceOnOrBeforeDate = db.prepare(`
+    SELECT date, price_per_unit
+    FROM daily_values
+    WHERE investment_id = ?
+      AND date <= ?
+      AND price_per_unit > 0
+    ORDER BY date DESC
+    LIMIT 1
+  `);
+
   async function getFxRateForDate(date) {
     if (fxRateByDate.has(date)) return fxRateByDate.get(date);
     try {
@@ -642,6 +681,49 @@ async function updateAllPrices(db, options = {}) {
     return wroteRows;
   }
 
+  async function reclassifyPreviousPostRowAsLocf(inv, newPostDate) {
+    const prevPost = getMostRecentPostRowBeforeDate.get(inv.id, newPostDate);
+    if (!prevPost?.date) return;
+
+    const previousPostDate = String(prevPost.date);
+    const liveBaseline = getMostRecentLiveRowOnOrBeforeDate.get(inv.id, previousPostDate);
+    const fallbackBaseline = getMostRecentPriceOnOrBeforeDate.get(inv.id, previousPostDate);
+    const baselinePrice = Number(liveBaseline?.price_per_unit || fallbackBaseline?.price_per_unit || 0);
+
+    if (!(baselinePrice > 0)) {
+      logAppWarn('[UpdatePrices][FOREIGN_STOCK] Rolling POST reclassification skipped (missing baseline price)', {
+        investmentId: inv.id,
+        investmentName: inv.name,
+        previousPostDate,
+        newPostDate,
+      });
+      return;
+    }
+
+    const previousDateFx = await getFxRateForDate(previousPostDate);
+    const baselineProviderDate = liveBaseline?.date || fallbackBaseline?.date || previousPostDate;
+    const rows = writeInvestmentSnapshotForDate(
+      inv,
+      previousPostDate,
+      baselinePrice,
+      'LOCF',
+      previousDateFx,
+      baselineProviderDate
+    );
+
+    if (rows > 0) {
+      touchedDates.add(previousPostDate);
+      logAppInfo('[UpdatePrices][FOREIGN_STOCK] Rolled previous POST row to LOCF', {
+        investmentId: inv.id,
+        investmentName: inv.name,
+        previousPostDate,
+        newPostDate,
+        baselinePrice,
+        baselineProviderDate,
+      });
+    }
+  }
+
 
   for (const inv of investments) {
     if (_cancelled) {
@@ -774,7 +856,7 @@ async function updateAllPrices(db, options = {}) {
             continue;
           }
           await delay(500);
-          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK using close lane (1d) + phase lane (1m)`);
+          console.log(`  ${inv.name} (id=${inv.id}): FOREIGN_STOCK using phase lane (15m)`);
           break;
         }
         case 'BOND': {
@@ -947,43 +1029,54 @@ async function updateAllPrices(db, options = {}) {
 
       let skipDefaultTodayWrite = false;
       if (inv.asset_type === 'FOREIGN_STOCK') {
-        const closeLaneData = await fetchStockPrice(inv.ticker_symbol, { interval: '1d' });
-        const phaseLaneData = await fetchStockPrice(inv.ticker_symbol, { interval: '1m' });
-
-        const closeSessionDate = normalizeProviderDate(closeLaneData.sessionDateIst || closeLaneData.date);
-        const closePrice = Number(closeLaneData.officialClose) > 0
-          ? Number(closeLaneData.officialClose)
-          : Number(closeLaneData.price);
-
-        if (closeSessionDate && closePrice > 0 && /^\d{4}-\d{2}-\d{2}$/.test(closeSessionDate) && closeSessionDate <= today) {
-          const closeFx = await getFxRateForDate(closeSessionDate);
-          const closeRows = writeInvestmentSnapshotForDate(inv, closeSessionDate, closePrice, 'LIVE', closeFx, closeSessionDate);
-          if (closeRows > 0) {
-            touchedDates.add(closeSessionDate);
-          }
+        const phaseLaneData = await fetchStockPrice(inv.ticker_symbol, { interval: '15m' });
+        const phaseSessionDate = normalizeProviderDate(phaseLaneData.sessionDateIst);
+        const phaseSessionClose = Number(phaseLaneData.officialClose || phaseLaneData.previousClose || phaseLaneData.price || 0);
+        if (phaseSessionDate && phaseSessionDate < today && phaseSessionClose > 0) {
+          const phaseSessionFx = await getFxRateForDate(phaseSessionDate);
+          const phaseSessionRows = writeInvestmentSnapshotForDate(inv, phaseSessionDate, phaseSessionClose, 'LIVE', phaseSessionFx, phaseSessionDate);
+          if (phaseSessionRows > 0) touchedDates.add(phaseSessionDate);
         }
 
         let runDatePrice = Number(phaseLaneData.price || 0);
-        let runDateSource = 'LOCF';
         const phaseDecision = resolvePriceSourceFromProviderDate({
           providerDate: phaseLaneData.date,
-          runDate: today,
+          rowDate: today,
           assetType: inv.asset_type,
           sessionPhase: phaseLaneData.sessionPhase || null,
+          allowRollingPost: true,
           investmentId: inv.id,
           investmentName: inv.name,
         });
+        let runDateSource = phaseDecision.priceSource;
 
-        if (phaseDecision.providerDate === today && runDatePrice > 0) {
-          runDateSource = phaseDecision.priceSource;
-        } else if (closePrice > 0) {
-          runDatePrice = closePrice;
+        if (!(runDatePrice > 0)) {
+          const fallback = getMostRecentPriceOnOrBeforeDate.get(inv.id, today);
+          if (Number(fallback?.price_per_unit) > 0) {
+            runDatePrice = Number(fallback.price_per_unit);
+          }
           runDateSource = 'LOCF';
         }
 
         if (runDatePrice > 0) {
           writeInvestmentSnapshotForDate(inv, today, runDatePrice, runDateSource, usdToInr, phaseDecision.providerDate);
           touchedDates.add(today);
+
+          logAppInfo('[UpdatePrices][FOREIGN_STOCK] Run-date source decision', {
+            investmentId: inv.id,
+            investmentName: inv.name,
+            runDate: today,
+            providerDate: phaseDecision.providerDate,
+            sessionDate: phaseSessionDate,
+            sessionPhase: phaseLaneData.sessionPhase || null,
+            runDateSource,
+            runDatePrice,
+            rolledPost: runDateSource === 'POST' && Boolean(phaseDecision.providerDate && phaseDecision.providerDate < today),
+          });
+
+          if (runDateSource === 'POST') {
+            await reclassifyPreviousPostRowAsLocf(inv, today);
+          }
         }
         skipDefaultTodayWrite = true;
       }

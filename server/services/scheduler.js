@@ -18,7 +18,7 @@ const {
 } = require('./priceService');
 const { getSGBNseHistoricalPrices } = require('./sgbNseHistorical');
 const { hydrateStockSeriesForPhase2 } = require('./marketPriceCache');
-const { todayIso, addDaysIso, eachDateIso, istDateFromUnixSeconds } = require('./dateUtils');
+const { todayIso, addDaysIso, eachDateIso, istDateFromUnixSeconds, exchangeDateFromUnixSeconds } = require('./dateUtils');
 const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
 const { scanAndRepairComplianceGaps, refreshComplianceScanFloor } = require('./compliance/complianceScanService');
 const { DIRTY_SCOPE_LOOKBACK_SESSIONS } = require('./freshnessPolicy');
@@ -454,6 +454,17 @@ function fetchStockSeriesFromSource(symbol, startDate, endDate) {
             return;
           }
           const timestamps = result.timestamp || [];
+          const meta = result.meta || {};
+          const exchangeTz = String(meta.exchangeTimezoneName || '').trim();
+          const nowSec = Math.floor(Date.now() / 1000);
+          const regularEnd = Number(meta.currentTradingPeriod?.regular?.end);
+          const currentSessionStart = Number(meta.currentTradingPeriod?.regular?.start);
+          const currentSessionDate = Number.isFinite(currentSessionStart)
+            ? exchangeDateFromUnixSeconds(currentSessionStart, exchangeTz)
+            : null;
+          // The current session's candle is still forming until its regular close passes.
+          // Never persist an unsettled candle as a settled close.
+          const currentSessionUnsettled = Number.isFinite(regularEnd) && nowSec < regularEnd;
           const quote = result.indicators?.quote?.[0] || {};
           const opens = quote.open || [];
           const highs = quote.high || [];
@@ -464,8 +475,12 @@ function fetchStockSeriesFromSource(symbol, startDate, endDate) {
           for (let i = 0; i < timestamps.length; i += 1) {
             const close = closes[i];
             if (close == null) continue;
-            const d = istDateFromUnixSeconds(timestamps[i]);
+            // Attribute dates in the exchange's local timezone (never IST/UTC).
+            const d = exchangeDateFromUnixSeconds(timestamps[i], exchangeTz);
             if (!d) continue;
+            // Skip the current, not-yet-settled session so partial intraday values
+            // are never written into the cache.
+            if (currentSessionUnsettled && currentSessionDate && d >= currentSessionDate) continue;
             const closeNum = Number(close);
             if (!Number.isFinite(closeNum) || closeNum <= 0) continue;
 

@@ -1403,6 +1403,7 @@ module.exports = function (db) {
             ORDER BY DATE(t.transaction_date)
           `);
 
+      const portfolioIntervalCashflows = [];
       for (const [assetTypeKey, info] of Object.entries(byType)) {
         const bounds = portfolio_id
           ? findBoundsForType.get(portfolio_id, assetTypeKey, intervalFromDate, intervalToDate)
@@ -1476,6 +1477,8 @@ module.exports = function (db) {
           });
         }
 
+        portfolioIntervalCashflows.push(...intervalCashflows);
+
         const intervalXirrRate = calculateXirr(intervalCashflows);
 
         info.dayChange = intervalDayChange;
@@ -1506,6 +1509,24 @@ module.exports = function (db) {
           });
         }
       }
+
+      // Top-level interval XIRR: same engine (calculateXirr) and same cashflows as the
+      // per-type cards, unioned across all asset types (portfolio total = sum of its parts).
+      // Never silently fall back to raw period return; a null solve is an explicit error.
+      const portfolioIntervalRate = calculateXirr(portfolioIntervalCashflows);
+      const portfolioIntervalDayChange = Object.values(byType)
+        .reduce((sum, info) => sum + (Number(info.dayChange) || 0), 0);
+      intervalXIRR = {
+        ...intervalXIRR,
+        interval_change: portfolioIntervalDayChange,
+        xirr_pct: portfolioIntervalRate == null ? null : portfolioIntervalRate * 100,
+        confidence: portfolioIntervalRate == null ? 'error' : 'full',
+        error: portfolioIntervalRate == null
+          ? 'Interval XIRR could not be solved for the combined cashflows'
+          : null,
+        from_date: intervalFromDate,
+        to_date: intervalToDate,
+      };
     }
 
     const totalInvestedByScope = byTypeTotals.reduce((sum, row) => sum + (Number(row.totalInvested) || 0), 0);

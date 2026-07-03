@@ -6,7 +6,7 @@ import { HolidaysListModal, HolidaysSyncModal } from './HolidaysMenuItems';
 import ManualDirtyScopeModal from './ManualDirtyScopeModal';
 import PurgeMarketPriceCacheModal from './PurgeMarketPriceCacheModal';
 import { PWAInstallButton } from './PWAInstallButton';
-import { triggerPriceUpdate, cancelPriceUpdate, exportData, getCorporateActionSuggestionCount } from '../services/api';
+import { triggerPriceUpdate, cancelPriceUpdate, exportData, getCorporateActionSuggestionCount, getRsuVestSuggestionCount } from '../services/api';
 import PortfolioSelector from './PortfolioSelector';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -33,16 +33,26 @@ export default function Navbar({ user, onLogout }) {
   const [draftSettings, setDraftSettings] = useState(null);
   const [settingsMessage, setSettingsMessage] = useState('');
   const [pendingCASuggestions, setPendingCASuggestions] = useState(0);
+  const [pendingRsuVests, setPendingRsuVests] = useState(0);
   const currentYear = new Date().getFullYear();
 
   useEffect(() => {
     let cancelled = false;
     const loadPending = async () => {
       try {
-        const data = await getCorporateActionSuggestionCount(selectedId || null);
-        if (!cancelled) setPendingCASuggestions(Number(data?.count || 0));
+        const [ca, rsu] = await Promise.all([
+          getCorporateActionSuggestionCount(selectedId || null),
+          getRsuVestSuggestionCount(selectedId || null),
+        ]);
+        if (!cancelled) {
+          setPendingCASuggestions(Number(ca?.count || 0));
+          setPendingRsuVests(Number(rsu?.count || 0));
+        }
       } catch (_e) {
-        if (!cancelled) setPendingCASuggestions(0);
+        if (!cancelled) {
+          setPendingCASuggestions(0);
+          setPendingRsuVests(0);
+        }
       }
     };
     loadPending();
@@ -147,8 +157,8 @@ export default function Navbar({ user, onLogout }) {
             >
               <BellRing size={16} />
               <span className="d-none d-lg-inline">Pending</span>
-              {pendingCASuggestions > 0 && (
-                <span className="badge rounded-pill bg-danger">{pendingCASuggestions}</span>
+              {(pendingCASuggestions + pendingRsuVests) > 0 && (
+                <span className="badge rounded-pill bg-danger">{pendingCASuggestions + pendingRsuVests}</span>
               )}
             </Nav.Link>
           </Nav>

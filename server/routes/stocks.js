@@ -11,6 +11,11 @@ const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisit
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 const { logAppInfo, logAppWarn, logAppError } = require('../services/appLogger');
 const { quantizeForStorage, quantizeNullableForStorage } = require('../services/numberPrecision');
+const {
+  deriveVestActualization,
+  computeVestValues,
+  generateVestSuggestions,
+} = require('../services/rsuVestActualizationService');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -2262,12 +2267,14 @@ module.exports = function (db) {
             SELECT COUNT(*) AS count
             FROM corporate_action_suggestions
             WHERE status = 'pending'
+              AND source <> 'RSU_VEST'
               AND (portfolio_id = ? OR portfolio_id IS NULL)
           `).get(portfolioId)
         : db.prepare(`
             SELECT COUNT(*) AS count
             FROM corporate_action_suggestions
             WHERE status = 'pending'
+              AND source <> 'RSU_VEST'
           `).get();
       res.json({ count: Number(row?.count || 0) });
     } catch (e) {
@@ -2309,6 +2316,7 @@ module.exports = function (db) {
             FROM corporate_action_suggestions s
             LEFT JOIN investments i ON i.id = s.investment_id
             WHERE s.status = ?
+              AND s.source <> 'RSU_VEST'
               AND (s.portfolio_id = ? OR s.portfolio_id IS NULL)
             ORDER BY s.created_at DESC, s.id DESC
             LIMIT ?
@@ -2332,6 +2340,7 @@ module.exports = function (db) {
             FROM corporate_action_suggestions s
             LEFT JOIN investments i ON i.id = s.investment_id
             WHERE s.status = ?
+              AND s.source <> 'RSU_VEST'
             ORDER BY s.created_at DESC, s.id DESC
             LIMIT ?
           `).all(status, limit);
@@ -2550,6 +2559,301 @@ module.exports = function (db) {
     } catch (e) {
       logAppError('[Stocks] Corporate action suggestion resolve failed', { error: e.message });
       return res.status(500).json({ error: 'Failed to resolve suggestions: ' + e.message });
+    }
+  });
+
+  // ─── RSU Vest Actualization Suggestions ───────────────────────────────
+  // Turn placeholder VEST rows (award schedule only) into fully valued
+  // transactions, surfaced for accept / accept-with-edits / reject like the
+  // corporate-action suggestion flow. Reuses corporate_action_suggestions with
+  // source = 'RSU_VEST'.
+
+  // Generate/refresh pending RSU vest suggestions by scanning placeholder vests.
+  // Shares generateVestSuggestions with the auto-backfill CA sub-step; here FX
+  // is resolved via a network fetch (priceService), off the review card.
+  router.post('/rsu-vests/generate', express.json(), async (req, res) => {
+    try {
+      const portfolioId = req.body?.portfolio_id ? Number(req.body.portfolio_id) : null;
+      const asOfDate = req.body?.as_of_date ? String(req.body.as_of_date) : new Date().toISOString().slice(0, 10);
+      const settleDays = req.body?.settle_days != null ? Number(req.body.settle_days) : 2;
+
+      const resolveFxRate = async (date) => {
+        const v = await fetchHistoricalUSDToINR(date);
+        return Number.isFinite(Number(v)) ? Number(v) : null;
+      };
+
+      const summary = await generateVestSuggestions(db, {
+        portfolioId,
+        asOfDate,
+        settleDays,
+        resolveFxRate,
+      });
+
+      return res.json(summary);
+    } catch (e) {
+      logAppError('[Stocks] RSU vest generate failed', { error: e.message });
+      return res.status(500).json({ error: 'Failed to generate RSU vest suggestions: ' + e.message });
+    }
+  });
+
+  router.get('/rsu-vests/suggestions/count', (req, res) => {
+    try {
+      const portfolioId = Number(req.query?.portfolio_id || 0);
+      const hasPortfolio = Number.isInteger(portfolioId) && portfolioId > 0;
+      const row = hasPortfolio
+        ? db.prepare(`
+            SELECT COUNT(*) AS count FROM corporate_action_suggestions
+            WHERE status = 'pending' AND source = 'RSU_VEST'
+              AND (portfolio_id = ? OR portfolio_id IS NULL)
+          `).get(portfolioId)
+        : db.prepare(`
+            SELECT COUNT(*) AS count FROM corporate_action_suggestions
+            WHERE status = 'pending' AND source = 'RSU_VEST'
+          `).get();
+      res.json({ count: Number(row?.count || 0) });
+    } catch (e) {
+      logAppError('[Stocks] RSU vest suggestion count failed', { error: e.message });
+      res.status(500).json({ error: 'Failed to fetch RSU vest suggestion count: ' + e.message });
+    }
+  });
+
+  router.get('/rsu-vests/suggestions', (req, res) => {
+    try {
+      const status = String(req.query?.status || 'pending').toLowerCase();
+      const allowedStatus = new Set(['pending', 'applied', 'rejected']);
+      if (!allowedStatus.has(status)) {
+        return res.status(400).json({ error: 'Invalid status' });
+      }
+      const portfolioId = Number(req.query?.portfolio_id || 0);
+      const hasPortfolio = Number.isInteger(portfolioId) && portfolioId > 0;
+      const limitRaw = Number(req.query?.limit || 200);
+      const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 200;
+
+      const rows = hasPortfolio
+        ? db.prepare(`
+            SELECT s.id, s.status, s.investment_id, s.portfolio_id, s.transaction_date,
+                   s.notes, s.payload_json, s.created_at, s.updated_at, s.resolved_at,
+                   i.name AS investment_name
+            FROM corporate_action_suggestions s
+            LEFT JOIN investments i ON i.id = s.investment_id
+            WHERE s.status = ? AND s.source = 'RSU_VEST'
+              AND (s.portfolio_id = ? OR s.portfolio_id IS NULL)
+            ORDER BY s.transaction_date DESC, s.id DESC
+            LIMIT ?
+          `).all(status, portfolioId, limit)
+        : db.prepare(`
+            SELECT s.id, s.status, s.investment_id, s.portfolio_id, s.transaction_date,
+                   s.notes, s.payload_json, s.created_at, s.updated_at, s.resolved_at,
+                   i.name AS investment_name
+            FROM corporate_action_suggestions s
+            LEFT JOIN investments i ON i.id = s.investment_id
+            WHERE s.status = ? AND s.source = 'RSU_VEST'
+            ORDER BY s.transaction_date DESC, s.id DESC
+            LIMIT ?
+          `).all(status, limit);
+
+      const data = rows.map((row) => {
+        let payload = null;
+        try { payload = JSON.parse(String(row.payload_json || '{}')); } catch (_e) { payload = null; }
+        return {
+          id: Number(row.id),
+          status: row.status,
+          investment_id: Number(row.investment_id),
+          investment_name: row.investment_name || null,
+          portfolio_id: row.portfolio_id == null ? null : Number(row.portfolio_id),
+          transaction_date: row.transaction_date,
+          notes: row.notes || null,
+          payload,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          resolved_at: row.resolved_at || null,
+        };
+      });
+
+      return res.json({ suggestions: data, status });
+    } catch (e) {
+      logAppError('[Stocks] RSU vest suggestion list failed', { error: e.message });
+      return res.status(500).json({ error: 'Failed to fetch RSU vest suggestions: ' + e.message });
+    }
+  });
+
+  // Resolve RSU vest suggestions. Body:
+  //   { decision: 'accept' | 'reject', items: [{ id, overrides? }] }
+  // On accept, `overrides` (grossUnits, fmv, withholdingRate, withheldUnits,
+  // netUnits, fxRate) let the user edit before applying; relationships are
+  // re-derived server-side for consistency.
+  router.post('/rsu-vests/suggestions/resolve', express.json(), (req, res) => {
+    try {
+      const decision = String(req.body?.decision || '').toLowerCase();
+      if (decision !== 'accept' && decision !== 'reject') {
+        return res.status(400).json({ error: "decision must be 'accept' or 'reject'" });
+      }
+      const items = Array.isArray(req.body?.items) ? req.body.items : [];
+      if (!items.length) return res.status(400).json({ error: 'items are required' });
+
+      const overridesById = new Map();
+      const ids = [];
+      for (const item of items) {
+        const id = Number(item?.id);
+        if (!Number.isInteger(id) || id <= 0) continue;
+        ids.push(id);
+        overridesById.set(id, item?.overrides && typeof item.overrides === 'object' ? item.overrides : {});
+      }
+      if (!ids.length) return res.status(400).json({ error: 'valid ids are required' });
+
+      const placeholders = ids.map(() => '?').join(',');
+      const suggestionRows = db.prepare(`
+        SELECT id, status, payload_json
+        FROM corporate_action_suggestions
+        WHERE id IN (${placeholders}) AND source = 'RSU_VEST'
+        ORDER BY id ASC
+      `).all(...ids);
+
+      const updateVest = db.prepare(`
+        UPDATE transactions
+        SET transaction_date = ?, gross_units = ?, tax_withheld_units = ?, units = ?,
+            price_per_unit = ?, fmv_per_unit = ?, amount = ?, usd_amount = ?,
+            exchange_rate_used = ?
+        WHERE id = ? AND transaction_type = 'VEST'
+      `);
+      const markResolved = db.prepare(`
+        UPDATE corporate_action_suggestions
+        SET status = ?, resolved_at = datetime('now'), updated_at = datetime('now')
+        WHERE id = ?
+      `);
+
+      const dirtyCandidates = [];
+      let accepted = 0;
+      let rejected = 0;
+      let skipped = 0;
+
+      const runAll = db.transaction(() => {
+        for (const row of suggestionRows) {
+          if (row.status !== 'pending') { skipped += 1; continue; }
+
+          if (decision === 'reject') {
+            markResolved.run('rejected', row.id);
+            rejected += 1;
+            continue;
+          }
+
+          let payload = null;
+          try { payload = JSON.parse(String(row.payload_json || '{}')); } catch (_e) { payload = null; }
+          const base = payload?.base || {};
+          const transactionId = Number(payload?.transactionId || 0);
+          const vestDate = String(payload?.transactionDate || '');
+          if (!Number.isInteger(transactionId) || transactionId <= 0 || !vestDate) { skipped += 1; continue; }
+
+          const target = db.prepare(`
+            SELECT id, investment_id, portfolio_id, locked
+            FROM transactions WHERE id = ? AND transaction_type = 'VEST'
+          `).get(transactionId);
+          if (!target || Number(target.locked || 0) === 1) { skipped += 1; continue; }
+
+          const overrides = overridesById.get(row.id) || {};
+
+          // Vest date may be edited within +/- 7 days (weekend/holiday shifts).
+          // The client re-derives FMV/FX for the edited date and passes them as
+          // overrides, so we only need to validate + persist the new date here.
+          let effectiveVestDate = vestDate;
+          if (overrides.vestDate) {
+            const editedIso = String(overrides.vestDate).slice(0, 10);
+            const editedMs = new Date(`${editedIso}T00:00:00.000Z`).getTime();
+            const baseMs = new Date(`${vestDate}T00:00:00.000Z`).getTime();
+            if (!Number.isFinite(editedMs) || Math.abs(editedMs - baseMs) > 7 * 86400000) {
+              skipped += 1;
+              continue;
+            }
+            effectiveVestDate = editedIso;
+          }
+
+          const values = computeVestValues({
+            txn: { gross_units: base.grossUnits, transaction_date: effectiveVestDate },
+            fmv: base.fmv,
+            fmvSourceDate: base.fmvSourceDate,
+            withholdingRate: base.withholdingRate,
+            fxRate: base.fxRate,
+            overrides,
+          });
+
+          if (!(values.grossUnits > 0) || !(values.fmv > 0) || !(values.netUnits > 0)) { skipped += 1; continue; }
+
+          updateVest.run(
+            effectiveVestDate,
+            quantizeNullableForStorage(values.grossUnits),
+            quantizeNullableForStorage(values.withheldUnits),
+            quantizeNullableForStorage(values.netUnits),
+            quantizeNullableForStorage(values.fmv),
+            quantizeNullableForStorage(values.fmv),
+            quantizeForStorage(values.amount || 0),
+            quantizeNullableForStorage(values.usdAmount),
+            quantizeNullableForStorage(values.fxRate),
+            transactionId
+          );
+          dirtyCandidates.push({
+            investment_id: target.investment_id,
+            portfolio_id: target.portfolio_id,
+            transaction_date: effectiveVestDate < vestDate ? effectiveVestDate : vestDate,
+          });
+          markResolved.run('applied', row.id);
+          accepted += 1;
+        }
+      });
+
+      runAll();
+      if (dirtyCandidates.length) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'rsu-vest-actualization-accept');
+      }
+
+      return res.json({ accepted, rejected, skipped });
+    } catch (e) {
+      logAppError('[Stocks] RSU vest suggestion resolve failed', { error: e.message });
+      return res.status(500).json({ error: 'Failed to resolve RSU vest suggestions: ' + e.message });
+    }
+  });
+
+  // Live re-derivation helper for the review card: given an investment + date
+  // (and optional gross units), return the derived FMV (prior-trading-day
+  // close), FX (current flow), carried-forward withholding rate, and computed
+  // net/withheld/amounts. Called when the user edits the vest date / gross.
+  router.get('/rsu-vests/derive', async (req, res) => {
+    try {
+      const investmentId = Number(req.query?.investment_id || 0);
+      const date = String(req.query?.date || '').slice(0, 10);
+      const grossUnitsRaw = req.query?.gross_units;
+      if (!Number.isInteger(investmentId) || investmentId <= 0 || !date) {
+        return res.status(400).json({ error: 'investment_id and date are required' });
+      }
+
+      const txnRow = {
+        id: 0,
+        investment_id: investmentId,
+        portfolio_id: null,
+        transaction_date: date,
+        gross_units: grossUnitsRaw != null && grossUnitsRaw !== ''
+          ? Number(grossUnitsRaw)
+          : Number(db.prepare(`
+              SELECT gross_units FROM transactions
+              WHERE investment_id = ? AND transaction_type = 'VEST'
+                AND gross_units > 0
+              ORDER BY DATE(transaction_date) DESC LIMIT 1
+            `).get(investmentId)?.gross_units || 0),
+        notes: null,
+      };
+
+      let fx = null;
+      try {
+        const v = await fetchHistoricalUSDToINR(date);
+        fx = Number.isFinite(Number(v)) ? Number(v) : null;
+      } catch (_e) {
+        fx = null;
+      }
+
+      const derived = deriveVestActualization(db, txnRow, { fxRate: fx });
+      return res.json(derived);
+    } catch (e) {
+      logAppError('[Stocks] RSU vest derive failed', { error: e.message });
+      return res.status(500).json({ error: 'Failed to derive RSU vest values: ' + e.message });
     }
   });
 

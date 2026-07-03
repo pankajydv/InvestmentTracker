@@ -528,6 +528,40 @@ export const resolveCorporateActionSuggestions = ({ ids, decision }) =>
     body: JSON.stringify({ ids, decision }),
   });
 
+// ─── RSU Vest Actualization ──────────────────────────────────────────────
+export const generateRsuVestSuggestions = ({ portfolioId, asOfDate } = {}) =>
+  fetchJSON('/stocks/rsu-vests/generate', {
+    method: 'POST',
+    body: JSON.stringify({
+      portfolio_id: portfolioId || null,
+      as_of_date: asOfDate || null,
+    }),
+  });
+export const getRsuVestSuggestionCount = (portfolioId) => {
+  const params = new URLSearchParams();
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/stocks/rsu-vests/suggestions/count${params.toString() ? `?${params}` : ''}`);
+};
+export const getRsuVestSuggestions = ({ status = 'pending', portfolioId, limit } = {}) => {
+  const params = new URLSearchParams();
+  if (status) params.set('status', String(status));
+  if (portfolioId) params.set('portfolio_id', String(portfolioId));
+  if (Number.isFinite(Number(limit)) && Number(limit) > 0) params.set('limit', String(Math.floor(Number(limit))));
+  return fetchJSON(`/stocks/rsu-vests/suggestions${params.toString() ? `?${params}` : ''}`);
+};
+export const resolveRsuVestSuggestions = ({ items, decision }) =>
+  fetchJSON('/stocks/rsu-vests/suggestions/resolve', {
+    method: 'POST',
+    body: JSON.stringify({ items, decision }),
+  });
+export const deriveRsuVestValues = ({ investmentId, date, grossUnits } = {}) => {
+  const params = new URLSearchParams();
+  params.set('investment_id', String(investmentId));
+  params.set('date', String(date));
+  if (grossUnits != null && grossUnits !== '') params.set('gross_units', String(grossUnits));
+  return fetchJSON(`/stocks/rsu-vests/derive?${params}`);
+};
+
 // Interest Rate Sync
 export const previewInterestRateSync = (assetType, portfolioId) => {
   const params = new URLSearchParams({ asset_type: assetType });

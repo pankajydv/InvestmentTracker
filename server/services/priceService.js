@@ -20,6 +20,7 @@ const {
   normalizeProviderDate,
   istDateFromUnixSeconds,
   utcDateFromUnixSeconds,
+  exchangeDateFromUnixSeconds,
   formatIstDate,
   addDaysIso: addDaysIsoDate,
 } = require('./dateUtils');
@@ -40,34 +41,19 @@ function inferStockInstrumentType(symbol) {
 // ─── Market Hours & Staleness Helpers ─────────────────────────────────────────
 
 /**
- * Advance dateIso by one calendar day at a time until we land on a US weekday.
- * Used to map after-hours trading to the NEXT trading session date.
- * @param {string} dateIso - YYYY-MM-DD
- * @returns {string}
- */
-function nextUsWeekday(dateIso) {
-  let cursor = addDaysIsoDate(dateIso, 1);
-  // Infinite-loop-safe: worst case is skipping a 2-day weekend.
-  for (let i = 0; i < 7; i += 1) {
-    const day = new Date(`${cursor}T00:00:00.000Z`).getUTCDay();
-    if (day !== 0 && day !== 6) return cursor;
-    cursor = addDaysIsoDate(cursor, 1);
-  }
-  return cursor;
-}
-
-/**
  * Determine the canonical US trading date and best available price from a Yahoo Finance
  * chart API response, correctly handling pre-market, regular, and after-hours sessions.
  *
  * Date attribution rules:
- *  - Pre-market (4 AM–9:30 AM EST) and regular session (9:30 AM–4 PM EST)
- *      → daily_values row for the US session date (exchange date)
- *  - After-hours (4 PM–8 PM EST)
- *      → daily_values row for the NEXT US weekday (after-hours previews the next open)
+ *  - Pre-market / regular / after-hours
+ *      -> providerDate remains the current exchange session date
+ *
+ * Rolling POST attribution to newer row dates is handled in updater logic using
+ * rowDate + providerDate + allowRollingPost.
  *
  * Session phase is detected by comparing current server time (UTC seconds) against
- * the currentTradingPeriod boundaries returned by Yahoo — no timezone conversions needed.
+ * provider boundaries. POST is intentionally treated as open-ended after regular end
+ * until newer session metadata/candles supersede it.
  *
  * @param {object} meta - result.meta from Yahoo chart API
  * @param {number[]} timestamps - result.timestamp candle start Unix seconds
@@ -80,61 +66,74 @@ function detectForeignStockSession(meta, timestamps, closes) {
   const tp = meta.currentTradingPeriod;
   const regularStart = tp?.regular?.start;
   const regularEnd   = tp?.regular?.end;
-  const postEnd      = tp?.post?.end;
   const preStart     = tp?.pre?.start;
-  const preEnd       = tp?.pre?.end;
 
-  // Session phase: compare current UTC time against Yahoo's trading period boundaries.
+  // Session phase: compare current UTC time against provider boundaries.
+  // POST intentionally stays active after regular end until a newer session appears.
   const nowSec = Math.floor(Date.now() / 1000);
-  const inAfterHours = Number.isFinite(regularEnd) && Number.isFinite(postEnd)
-    && nowSec >= regularEnd && nowSec <= postEnd;
+  const inAfterHours = Number.isFinite(regularEnd) && nowSec >= regularEnd;
   const inPreMarket = !inAfterHours
-    && Number.isFinite(preStart) && Number.isFinite(preEnd)
-    && nowSec >= preStart && nowSec < preEnd;
+    && Number.isFinite(preStart) && Number.isFinite(regularStart)
+    && nowSec >= preStart && nowSec < regularStart;
 
   // Use exchange session date semantics from provider timestamps.
-  // We intentionally avoid IST date conversion for storage date attribution.
-  const sessionDateIst = regularStart ? utcDateFromUnixSeconds(regularStart) : null;
+  // Dates are attributed in the exchange's local timezone (never IST/UTC).
+  const exchangeTimezoneName = String(meta.exchangeTimezoneName || '').trim();
+  const sessionDateIst = regularStart ? exchangeDateFromUnixSeconds(regularStart, exchangeTimezoneName) : null;
   if (!sessionDateIst) return null;
 
-  // After-hours data belongs to the NEXT trading session's daily_values row.
-  const providerDate = inAfterHours ? nextUsWeekday(sessionDateIst) : sessionDateIst;
+  // Keep providerDate anchored to the actual provider session date.
+  const providerDate = sessionDateIst;
 
-  // Best available price for the current session phase.
-  const prevClose = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
-  const postPrice = Number(meta.postMarketPrice);
-  const prePrice  = Number(meta.preMarketPrice);
-  const preTime   = Number(meta.preMarketTime);
-  const regTime   = Number(meta.regularMarketTime);
+  // Previous-close baseline depends on phase:
+  // - pre/post (or stale market-closed windows): compare against regularMarketPrice
+  // - regular session: compare against chartPreviousClose when available
+  const regularMarketPrice = Number(meta.regularMarketPrice);
+  const chartPreviousClose = Number(meta.chartPreviousClose);
+  const previousCloseMeta = Number(meta.previousClose);
+
+  let prevClose;
+  if (inAfterHours || inPreMarket) {
+    prevClose = regularMarketPrice;
+  } else if (Number.isFinite(chartPreviousClose) && chartPreviousClose > 0) {
+    prevClose = chartPreviousClose;
+  } else if (Number.isFinite(previousCloseMeta) && previousCloseMeta > 0) {
+    prevClose = previousCloseMeta;
+  } else {
+    prevClose = regularMarketPrice;
+  }
+
+  let latestClose = null;
+  if (Array.isArray(closes) && closes.length > 0) {
+    for (let i = closes.length - 1; i >= 0; i -= 1) {
+      const c = Number(closes[i]);
+      if (!Number.isFinite(c) || c <= 0) continue;
+      latestClose = c;
+      break;
+    }
+  }
 
   let price, sessionPhase;
-  if (inAfterHours && Number.isFinite(postPrice) && postPrice > 0) {
-    price = postPrice;
+  if (inAfterHours) {
+    price = latestClose || regularMarketPrice;
     sessionPhase = 'post';
-  } else if (inPreMarket && Number.isFinite(prePrice) && prePrice > 0 && preTime > regTime) {
-    price = prePrice;
+  } else if (inPreMarket) {
+    price = latestClose || regularMarketPrice;
     sessionPhase = 'pre';
   } else {
-    price = meta.regularMarketPrice;
+    price = latestClose || regularMarketPrice;
     sessionPhase = 'regular';
   }
+
+  if (!Number.isFinite(price) || price <= 0) return null;
 
   const change    = price - prevClose;
   const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
 
-  // officialClose: the regular-session candle close for the session date.
-  // Used as the LIVE writeback price for the session date row when in after-hours.
-  let officialClose = null;
-  if (Array.isArray(timestamps) && Array.isArray(closes)) {
-    const points = Math.min(timestamps.length, closes.length);
-    for (let i = 0; i < points; i += 1) {
-      const pointDate = utcDateFromUnixSeconds(timestamps[i]);
-      if (pointDate !== sessionDateIst) continue;
-      const c = Number(closes[i]);
-      if (!Number.isFinite(c) || c <= 0) continue;
-      officialClose = c;
-    }
-  }
+  const officialCloseCandidate = Number(meta.regularMarketPrice);
+  const officialClose = Number.isFinite(officialCloseCandidate) && officialCloseCandidate > 0
+    ? officialCloseCandidate
+    : null;
 
   return {
     price,
@@ -363,6 +362,269 @@ async function fetchMutualFundHistory(amfiCode) {
 
 let yahooFinance = null;
 
+const QUOTE_PROVIDER_COOLDOWN_MS = 5 * 60 * 1000;
+const QUOTE_PROVIDER_MAX_CONSECUTIVE_FAILURES = 3;
+const QUOTE_AUTH_TTL_MS = 30 * 60 * 1000;
+
+const YAHOO_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+const quoteProviderHealth = {
+  consecutiveFailures: 0,
+  cooldownUntilMs: 0,
+  lastFailureCode: null,
+};
+
+const quoteAuthState = {
+  cookieHeader: null,
+  crumb: null,
+  expiresAtMs: 0,
+};
+
+function extractCookieHeader(setCookieHeader) {
+  if (!Array.isArray(setCookieHeader) || setCookieHeader.length === 0) return null;
+  const pairs = setCookieHeader
+    .map((c) => String(c || '').split(';')[0].trim())
+    .filter(Boolean);
+  return pairs.length > 0 ? pairs.join('; ') : null;
+}
+
+function extractCrumbFromHtml(html) {
+  const text = String(html || '');
+  const match = text.match(/"CrumbStore"\s*:\s*\{"crumb":"([^"\\]*(?:\\.[^"\\]*)*)"\}/);
+  if (!match || !match[1]) return null;
+  const raw = match[1]
+    .replace(/\\u002F/g, '/')
+    .replace(/\\u0026/g, '&')
+    .replace(/\\\\/g, '\\')
+    .replace(/\\"/g, '"');
+  return raw || null;
+}
+
+function httpGetRaw(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        resolve({
+          statusCode: Number(res.statusCode || 0),
+          headers: res.headers || {},
+          body: data,
+        });
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
+async function ensureYahooQuoteAuth(forceRefresh = false) {
+  if (!forceRefresh
+      && quoteAuthState.cookieHeader
+      && quoteAuthState.crumb
+      && Date.now() < Number(quoteAuthState.expiresAtMs || 0)) {
+    return { cookieHeader: quoteAuthState.cookieHeader, crumb: quoteAuthState.crumb };
+  }
+
+  const pageResp = await httpGetRaw('https://finance.yahoo.com/quote/MSFT?p=MSFT', {
+    'User-Agent': YAHOO_USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+  });
+
+  if (pageResp.statusCode < 200 || pageResp.statusCode >= 400) {
+    throw new Error(`AUTH_BOOTSTRAP_HTTP_${pageResp.statusCode || 'UNKNOWN'}`);
+  }
+
+  const cookieHeader = extractCookieHeader(pageResp.headers['set-cookie']);
+  let crumb = extractCrumbFromHtml(pageResp.body);
+
+  if (!crumb) {
+    const crumbResp = await httpGetRaw('https://query1.finance.yahoo.com/v1/test/getcrumb', {
+      'User-Agent': YAHOO_USER_AGENT,
+      'Accept': 'text/plain,*/*;q=0.8',
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      Referer: 'https://finance.yahoo.com/',
+    });
+
+    if (crumbResp.statusCode >= 200 && crumbResp.statusCode < 300) {
+      const body = String(crumbResp.body || '').trim();
+      if (body && !body.includes('{') && !body.includes('<')) {
+        crumb = body;
+      }
+    }
+  }
+
+  if (!crumb) {
+    throw new Error('AUTH_CRUMB_MISSING');
+  }
+
+  quoteAuthState.cookieHeader = cookieHeader;
+  quoteAuthState.crumb = crumb;
+  quoteAuthState.expiresAtMs = Date.now() + QUOTE_AUTH_TTL_MS;
+
+  return { cookieHeader: quoteAuthState.cookieHeader, crumb: quoteAuthState.crumb };
+}
+
+function shouldUseQuoteProvider() {
+  return Date.now() >= Number(quoteProviderHealth.cooldownUntilMs || 0);
+}
+
+function markQuoteProviderSuccess() {
+  quoteProviderHealth.consecutiveFailures = 0;
+  quoteProviderHealth.cooldownUntilMs = 0;
+  quoteProviderHealth.lastFailureCode = null;
+}
+
+function markQuoteProviderFailure(code) {
+  const normalizedCode = String(code || 'UNKNOWN').toUpperCase();
+  const hardFailure = normalizedCode === 'HTTP_401'
+    || normalizedCode === 'HTTP_403'
+    || normalizedCode === 'HTTP_429';
+  quoteProviderHealth.lastFailureCode = normalizedCode;
+  quoteProviderHealth.consecutiveFailures += 1;
+  if (hardFailure || quoteProviderHealth.consecutiveFailures >= QUOTE_PROVIDER_MAX_CONSECUTIVE_FAILURES) {
+    quoteProviderHealth.cooldownUntilMs = Date.now() + QUOTE_PROVIDER_COOLDOWN_MS;
+  }
+}
+
+function parseForeignQuoteSession(symbol, quote) {
+  if (!quote) return null;
+
+  const regularMarketPrice = Number(quote.regularMarketPrice);
+  const regularMarketTime = Number(quote.regularMarketTime);
+  if (!Number.isFinite(regularMarketPrice) || regularMarketPrice <= 0 || !Number.isFinite(regularMarketTime) || regularMarketTime <= 0) {
+    return null;
+  }
+
+  const marketState = String(quote.marketState || '').toUpperCase();
+  const exchangeTimezoneName = String(quote.exchangeTimezoneName || '').trim();
+  const preMarketPrice = Number(quote.preMarketPrice);
+  const preMarketTime = Number(quote.preMarketTime);
+  const postMarketPrice = Number(quote.postMarketPrice);
+  const postMarketTime = Number(quote.postMarketTime);
+
+  const hasValidPost = Number.isFinite(postMarketPrice)
+    && postMarketPrice > 0
+    && Number.isFinite(postMarketTime)
+    && postMarketTime > 0;
+  const hasValidPre = Number.isFinite(preMarketPrice)
+    && preMarketPrice > 0
+    && Number.isFinite(preMarketTime)
+    && preMarketTime > 0;
+
+  let sessionPhase = 'regular';
+  let price = regularMarketPrice;
+  let providerTimestamp = regularMarketTime;
+
+  if (hasValidPre && marketState.startsWith('PRE')) {
+    sessionPhase = 'pre';
+    price = preMarketPrice;
+    providerTimestamp = preMarketTime;
+  } else if (hasValidPost && (marketState.startsWith('POST') || marketState === 'CLOSED')) {
+    sessionPhase = 'post';
+    price = postMarketPrice;
+    providerTimestamp = postMarketTime;
+  }
+
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(providerTimestamp) || providerTimestamp <= 0) {
+    return null;
+  }
+
+  // Attribute the provider date using the exchange's local timezone (never IST/UTC),
+  // so a session that closes 16:00 ET on 02-July stays 02-July.
+  const providerDate = exchangeDateFromUnixSeconds(providerTimestamp, exchangeTimezoneName);
+  // The canonical settled session date (used for market_price_cache) comes from the
+  // regular market timestamp in exchange-local terms.
+  const sessionDate = exchangeDateFromUnixSeconds(regularMarketTime, exchangeTimezoneName);
+  if (!providerDate) return null;
+
+  const previousCloseCandidate = Number(quote.regularMarketPreviousClose);
+  const previousClose = Number.isFinite(previousCloseCandidate) && previousCloseCandidate > 0
+    ? previousCloseCandidate
+    : regularMarketPrice;
+
+  const officialClose = regularMarketPrice;
+  const change = Number.isFinite(Number(quote.regularMarketChange))
+    ? Number(quote.regularMarketChange)
+    : (price - previousClose);
+  const changePercent = Number.isFinite(Number(quote.regularMarketChangePercent))
+    ? Number(quote.regularMarketChangePercent)
+    : (previousClose > 0 ? (change / previousClose) * 100 : 0);
+
+  return {
+    price,
+    currency: quote.currency || 'USD',
+    name: symbol || quote.shortName || quote.longName,
+    change,
+    changePercent,
+    previousClose,
+    officialClose,
+    date: providerDate,
+    sessionDateIst: sessionDate || providerDate,
+    sessionPhase,
+    exchangeTimezoneName: exchangeTimezoneName || null,
+  };
+}
+
+async function fetchForeignStockPriceFromQuoteApi(symbol) {
+  const fields = [
+    'currency',
+    'marketState',
+    'regularMarketPrice',
+    'regularMarketTime',
+    'regularMarketPreviousClose',
+    'regularMarketChange',
+    'regularMarketChangePercent',
+    'preMarketPrice',
+    'preMarketTime',
+    'postMarketPrice',
+    'postMarketTime',
+    'hasPrePostMarketData',
+    'exchangeTimezoneName',
+    'shortName',
+    'longName',
+  ].join(',');
+
+  const doRequest = async (forceAuthRefresh = false) => {
+    const auth = await ensureYahooQuoteAuth(forceAuthRefresh);
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}&fields=${encodeURIComponent(fields)}&crumb=${encodeURIComponent(auth.crumb)}&formatted=false&region=US&lang=en-US`;
+    const resp = await httpGetRaw(url, {
+      'User-Agent': YAHOO_USER_AGENT,
+      'Accept': 'application/json,text/plain,*/*',
+      ...(auth.cookieHeader ? { Cookie: auth.cookieHeader } : {}),
+      Referer: `https://finance.yahoo.com/quote/${encodeURIComponent(symbol)}`,
+      Origin: 'https://finance.yahoo.com',
+    });
+
+    if (resp.statusCode !== 200) {
+      throw new Error(`HTTP_${resp.statusCode || 'UNKNOWN'}`);
+    }
+
+    let json;
+    try {
+      json = JSON.parse(resp.body);
+    } catch (_) {
+      throw new Error('QUOTE_PARSE_FAILED');
+    }
+
+    const quote = json?.quoteResponse?.result?.[0];
+    const parsed = parseForeignQuoteSession(symbol, quote);
+    if (!parsed) {
+      throw new Error('QUOTE_SHAPE_INVALID');
+    }
+    return parsed;
+  };
+
+  try {
+    return await doRequest(false);
+  } catch (err) {
+    const code = String(err.message || '').toUpperCase();
+    const shouldRetryWithFreshAuth = code === 'HTTP_401' || code === 'HTTP_403' || code === 'HTTP_429';
+    if (!shouldRetryWithFreshAuth) throw err;
+    return doRequest(true);
+  }
+}
+
 async function getYahooFinance() {
   if (!yahooFinance) {
     const YahooFinance = await import('yahoo-finance2').then(m => m.default);
@@ -376,11 +638,25 @@ async function getYahooFinance() {
  * Falls back to yahoo-finance2 library if direct approach fails.
  * @param {string} symbol - Ticker symbol (e.g., 'RELIANCE.NS' for NSE, 'AAPL' for US)
  * @param {Object} [options]
- * @param {'1d'|'1m'} [options.interval='1d'] - Interval for chart lane. 1d for close lane, 1m for phase lane.
+ * @param {'1d'|'15m'} [options.interval='1d'] - Interval for chart lane. 1d for end-of-day lane, 15m for phase lane.
  * @returns {Promise<{price: number, currency: string, name: string, change: number, changePercent: number, officialClose?: number|null}>}
  */
 async function fetchStockPrice(symbol, options = {}) {
-  // Try direct Yahoo Finance API first (more reliable, no crumb needed)
+  const instrumentType = inferStockInstrumentType(symbol);
+  const requestedInterval = String(options.interval || '1d').toLowerCase();
+  const shouldTryQuoteFirst = instrumentType === 'FOREIGN_STOCK' && requestedInterval === '15m';
+
+  if (shouldTryQuoteFirst && shouldUseQuoteProvider()) {
+    try {
+      const quoteData = await fetchForeignStockPriceFromQuoteApi(symbol);
+      markQuoteProviderSuccess();
+      return quoteData;
+    } catch (quoteErr) {
+      markQuoteProviderFailure(quoteErr.message);
+    }
+  }
+
+  // Try direct Yahoo Finance chart API first (no crumb needed)
   try {
     return await fetchStockPriceDirect(symbol, options);
   } catch (directErr) {
@@ -403,19 +679,7 @@ async function fetchStockPrice(symbol, options = {}) {
           const s = tp?.regular?.start;
           return s ? utcDateFromUnixSeconds(s) : utcDateFromUnixSeconds(quote.regularMarketTime);
         })(),
-        date: (() => {
-          const tp = quote.currentTradingPeriod;
-          const regularEnd = tp?.regular?.end;
-          const postEnd = tp?.post?.end;
-          const nowSec = Math.floor(Date.now() / 1000);
-          const sessionStart = tp?.regular?.start;
-          const sessionDateIst = sessionStart
-            ? utcDateFromUnixSeconds(sessionStart)
-            : utcDateFromUnixSeconds(quote.regularMarketTime);
-          const inAH = Number.isFinite(regularEnd) && Number.isFinite(postEnd)
-            && nowSec >= regularEnd && nowSec <= postEnd;
-          return (inAH && sessionDateIst) ? nextUsWeekday(sessionDateIst) : sessionDateIst;
-        })(),
+        date: utcDateFromUnixSeconds(quote.regularMarketTime),
       };
     } catch (libErr) {
       throw new Error(`Failed to fetch price for ${symbol}: ${directErr.message}`);
@@ -428,7 +692,8 @@ async function fetchStockPrice(symbol, options = {}) {
  */
 function fetchStockPriceDirect(symbol, options = {}) {
   return new Promise((resolve, reject) => {
-    const interval = options.interval === '1m' ? '1m' : '1d';
+    const requestedInterval = String(options.interval || '1d').toLowerCase();
+    const interval = requestedInterval === '15m' ? '15m' : '1d';
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=${interval}`;
     https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
       let data = '';

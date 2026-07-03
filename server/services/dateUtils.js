@@ -55,6 +55,36 @@ function utcDateFromUnixSeconds(seconds) {
   return new Date(n * 1000).toISOString().slice(0, 10);
 }
 
+/**
+ * Convert a Unix epoch (seconds) to a calendar date (YYYY-MM-DD) in the given
+ * exchange timezone (e.g. 'America/New_York', 'Asia/Kolkata').
+ *
+ * This is the canonical date attribution for market data: a session that closes
+ * at 16:00 ET on 02-July stays 02-July even though the equivalent UTC/IST instant
+ * may already be 03-July. Falls back to UTC date when the timezone is missing/invalid.
+ *
+ * @param {number} seconds - Unix epoch seconds
+ * @param {string} timeZone - IANA timezone name from provider (exchangeTimezoneName)
+ * @returns {string|null} YYYY-MM-DD in the exchange timezone
+ */
+function exchangeDateFromUnixSeconds(seconds, timeZone) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n)) return null;
+  const tz = String(timeZone || '').trim();
+  if (!tz) return utcDateFromUnixSeconds(n);
+  try {
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    return formatter.format(new Date(n * 1000));
+  } catch (_) {
+    return utcDateFromUnixSeconds(n);
+  }
+}
+
 function addDaysIso(isoDate, days) {
   const normalized = toIsoDate(isoDate);
   if (!normalized) return null;
@@ -84,6 +114,7 @@ module.exports = {
   normalizeProviderDate,
   istDateFromUnixSeconds,
   utcDateFromUnixSeconds,
+  exchangeDateFromUnixSeconds,
   addDaysIso,
   eachDateIso,
   todayIso,

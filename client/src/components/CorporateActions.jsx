@@ -12,6 +12,7 @@ import {
 } from '../services/api';
 import { formatNumber, formatDate } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
+import RsuVestReview from './RsuVestReview';
 
 const TYPE_BADGE = {
   DIVIDEND: 'badge-dividend',
@@ -231,6 +232,8 @@ export default function CorporateActions() {
       </div>
 
       {error && <Alert variant="danger" className="small py-2">{error}</Alert>}
+
+      <RsuVestReview />
 
       <Card className="shadow-sm">
         <Card.Header className="bg-white d-flex align-items-center justify-content-between py-2">
