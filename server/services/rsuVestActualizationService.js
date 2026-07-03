@@ -337,7 +337,7 @@ async function generateVestSuggestions(db, {
     INSERT INTO corporate_action_suggestions (
       source, action, investment_id, portfolio_id, transaction_type,
       transaction_date, fingerprint, payload_json, notes, status, created_at, updated_at
-    ) VALUES ('RSU_VEST', 'actualize', ?, ?, 'VEST', ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))
+    ) VALUES ('RSU_VEST', 'updated', ?, ?, 'VEST', ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))
   `);
   const refreshSuggestion = db.prepare(`
     UPDATE corporate_action_suggestions

@@ -16,6 +16,12 @@ const round3 = (x) => {
   return Math.round(n * 1000) / 1000;
 };
 
+const round2 = (x) => {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 100) / 100;
+};
+
 function rowFromSuggestion(item) {
   const payload = item.payload || {};
   const base = payload.base || {};
@@ -33,7 +39,7 @@ function rowFromSuggestion(item) {
     grossUnits,
     taxRatePct: withholdingRate ? Number((withholdingRate * 100).toFixed(3)) : 0,
     withheldUnits,
-    fmv: Number(values.fmv ?? base.fmv ?? 0),
+    fmv: round2(values.fmv ?? base.fmv ?? 0),
     // hidden (Option C): FX is auto-derived, not shown, sent silently on accept
     fxRate: base.fxRate != null ? Number(base.fxRate) : null,
     fmvSourceDate: values.fmvSourceDate || base.fmvSourceDate || null,
@@ -125,7 +131,7 @@ export default function RsuVestReview() {
       });
       if (derived && derived.derivable) {
         patchRow(id, {
-          fmv: Number(derived.values?.fmv ?? row.fmv),
+          fmv: round2(derived.values?.fmv ?? row.fmv),
           fmvSourceDate: derived.values?.fmvSourceDate || null,
           fxRate: derived.values?.fxRate != null ? Number(derived.values.fxRate) : row.fxRate,
           warnings: derived.warnings || row.warnings,
