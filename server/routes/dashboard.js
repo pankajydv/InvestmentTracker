@@ -3,7 +3,6 @@ const router = express.Router();
 const { getMarketSessionDates } = require('../services/marketPriceCache');
 const { calculateIntervalXIRR } = require('../services/xirrCalculator');
 const { getCachedXirr, generateCacheKey } = require('../services/xirrCacheService');
-const { logAppWarn } = require('../services/appLogger');
 const { DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS } = require('../services/freshnessPolicy');
 const {
   ACQUIRED_UNITS_INFLOW_TYPES_SQL,
@@ -1289,24 +1288,6 @@ module.exports = function (db) {
               AND date <= ?
           `);
 
-      const sumIntervalDayChangeForType = portfolio_id
-        ? db.prepare(`
-            SELECT COALESCE(SUM(day_change), 0) AS interval_day_change
-            FROM asset_type_daily
-            WHERE portfolio_id = ?
-              AND asset_type = ?
-              AND date >= ?
-              AND date <= ?
-          `)
-        : db.prepare(`
-            SELECT COALESCE(SUM(day_change), 0) AS interval_day_change
-            FROM asset_type_daily
-            WHERE portfolio_id IS NOT NULL
-              AND asset_type = ?
-              AND date >= ?
-              AND date <= ?
-          `);
-
       const openingValueForType = portfolio_id
         ? db.prepare(`
             SELECT COALESCE(total_value, 0) AS total_value
@@ -1339,36 +1320,6 @@ module.exports = function (db) {
             WHERE portfolio_id IS NOT NULL
               AND asset_type = ?
               AND date = ?
-          `);
-
-      const netFlowForType = portfolio_id
-        ? db.prepare(`
-            SELECT COALESCE(SUM(CASE
-              WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(t.amount, 0)
-              WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(t.amount, 0)
-              WHEN t.transaction_type = 'TDS' THEN -ABS(COALESCE(t.amount, 0))
-              ELSE 0
-            END), 0) AS net_flow
-            FROM transactions t
-            JOIN investments i ON i.id = t.investment_id
-            WHERE t.portfolio_id = ?
-              AND i.asset_type = ?
-              AND DATE(t.transaction_date) >= ?
-              AND DATE(t.transaction_date) <= ?
-          `)
-        : db.prepare(`
-            SELECT COALESCE(SUM(CASE
-              WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(t.amount, 0)
-              WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(t.amount, 0)
-              WHEN t.transaction_type = 'TDS' THEN -ABS(COALESCE(t.amount, 0))
-              ELSE 0
-            END), 0) AS net_flow
-            FROM transactions t
-            JOIN investments i ON i.id = t.investment_id
-            WHERE t.portfolio_id IS NOT NULL
-              AND i.asset_type = ?
-              AND DATE(t.transaction_date) >= ?
-              AND DATE(t.transaction_date) <= ?
           `);
 
       const intervalTransactionsForType = portfolio_id
@@ -1419,10 +1370,6 @@ module.exports = function (db) {
           continue;
         }
 
-        const intervalDayChange = portfolio_id
-          ? Number(sumIntervalDayChangeForType.get(portfolio_id, assetTypeKey, chosenFrom, chosenTo)?.interval_day_change || 0)
-          : Number(sumIntervalDayChangeForType.get(assetTypeKey, chosenFrom, chosenTo)?.interval_day_change || 0);
-
         const openingValue = portfolio_id
           ? Number(openingValueForType.get(portfolio_id, assetTypeKey, chosenFrom)?.total_value || 0)
           : Number(openingValueForType.get(assetTypeKey, chosenFrom)?.total_value || 0);
@@ -1430,10 +1377,6 @@ module.exports = function (db) {
         const closingValue = portfolio_id
           ? Number(closingValueForType.get(portfolio_id, assetTypeKey, chosenTo)?.total_value || 0)
           : Number(closingValueForType.get(assetTypeKey, chosenTo)?.total_value || 0);
-
-        const netFlow = portfolio_id
-          ? Number(netFlowForType.get(portfolio_id, assetTypeKey, chosenFrom, chosenTo)?.net_flow || 0)
-          : Number(netFlowForType.get(assetTypeKey, chosenFrom, chosenTo)?.net_flow || 0);
 
         const intervalTransactions = portfolio_id
           ? intervalTransactionsForType.all(portfolio_id, assetTypeKey, chosenFrom, chosenTo)
@@ -1481,33 +1424,18 @@ module.exports = function (db) {
 
         const intervalXirrRate = calculateXirr(intervalCashflows);
 
-        info.dayChange = intervalDayChange;
+        // Consistent basis (option A): the ₹ figure is the net money gained/lost over the
+        // interval — the sum of the very same cashflows the XIRR is solved from
+        // (= closing - opening + proceeds/income - contributions). Because both the amount
+        // and the % derive from one flow set, their signs always agree.
+        const intervalNetProfit = intervalCashflows.reduce((sum, flow) => sum + flow.amount, 0);
+
+        info.dayChange = intervalNetProfit;
         info.intervalChangePct = intervalXirrRate == null
-          ? (openingValue > 0 ? (intervalDayChange / openingValue) * 100 : 0)
+          ? (openingValue > 0 ? (intervalNetProfit / openingValue) * 100 : 0)
           : intervalXirrRate * 100;
         info.intervalFromDate = chosenFrom;
         info.intervalToDate = chosenTo;
-
-        const snapshotDerivedIntervalChange = closingValue - openingValue - netFlow;
-        const deviationAbs = Math.abs(intervalDayChange - snapshotDerivedIntervalChange);
-        const deviationThreshold = Math.max(1, Math.abs(intervalDayChange) * 0.0025);
-        if (deviationAbs > deviationThreshold) {
-          logAppWarn('[Interval][AssetType] day_change and snapshot-flow interval deviation', {
-            portfolio_id: portfolio_id ? Number(portfolio_id) : null,
-            asset_type: assetTypeKey,
-            requested_from_date: intervalFromDate,
-            requested_to_date: intervalToDate,
-            chosen_from_date: chosenFrom,
-            chosen_to_date: chosenTo,
-            opening_value: openingValue,
-            closing_value: closingValue,
-            net_external_cashflows: netFlow,
-            interval_change_from_day_change: intervalDayChange,
-            interval_change_from_snapshot_flow: snapshotDerivedIntervalChange,
-            deviation_abs: deviationAbs,
-            deviation_threshold: deviationThreshold,
-          });
-        }
       }
 
       // Top-level interval XIRR: same engine (calculateXirr) and same cashflows as the
