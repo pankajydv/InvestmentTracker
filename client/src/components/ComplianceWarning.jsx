@@ -1,16 +1,29 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Alert, Button, Modal, Table, Spinner } from 'react-bootstrap';
 import { AlertTriangle } from 'lucide-react';
 
 export function ComplianceWarning({ gaps, loading }) {
   const [showDetails, setShowDetails] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+
+  // Re-show the banner whenever the set of gaps changes.
+  const gapsSignature = (gaps || []).length;
+  useEffect(() => {
+    setDismissed(false);
+  }, [gapsSignature]);
 
   if (loading) return null;
   if (!gaps || gaps.length === 0) return null;
+  if (dismissed) return null;
 
   return (
     <>
-      <Alert variant="warning" className="d-flex align-items-center justify-content-between gap-2">
+      <Alert
+        variant="warning"
+        dismissible
+        onClose={() => setDismissed(true)}
+        className="d-flex align-items-center justify-content-between gap-2"
+      >
         <div className="d-flex align-items-center gap-2">
           <AlertTriangle size={20} className="text-warning" />
           <span>

@@ -289,6 +289,7 @@ function combineHealthStatuses(results) {
       pending_locf: 0,
       overdue_locf: 0,
       stale_scopes: 0,
+      pending_dirty_scopes: 0,
     },
     compliance: {
       runDate: null,
@@ -317,6 +318,7 @@ function combineHealthStatuses(results) {
     merged.counts.pending_locf += Number(counts.pending_locf || 0);
     merged.counts.overdue_locf += Number(counts.overdue_locf || 0);
     merged.counts.stale_scopes += Number(counts.stale_scopes || 0);
+    merged.counts.pending_dirty_scopes += Number(counts.pending_dirty_scopes || 0);
 
     const compliance = result.compliance || {};
     merged.compliance.runDate = [merged.compliance.runDate, compliance.runDate]
@@ -353,7 +355,7 @@ function combineHealthStatuses(results) {
   }
 
   if (merged.counts.missing_rows > 0 || merged.counts.compliance_errors > 0) merged.status = 'error';
-  else if (merged.counts.unexpected_locf > 0 || merged.counts.stale_scopes > 0) merged.status = 'warning';
+  else if (merged.counts.unexpected_locf > 0 || merged.counts.stale_scopes > 0 || merged.counts.pending_dirty_scopes > 0) merged.status = 'warning';
 
   merged.issues.sort((a, b) => {
     if ((b.missing_count || 0) !== (a.missing_count || 0)) {
@@ -428,6 +430,7 @@ export default function Dashboard() {
   const [sortConfigs, setSortConfigs] = useState({});
   const [dailyHealth, setDailyHealth] = useState(null);
   const [showHealthDetails, setShowHealthDetails] = useState(false);
+  const [dismissedBanners, setDismissedBanners] = useState({});
   const [complianceGaps, setComplianceGaps] = useState([]);
   const [complianceStatus, setComplianceStatus] = useState(null);
   const [complianceLoading, setComplianceLoading] = useState(false);
@@ -790,6 +793,17 @@ export default function Dashboard() {
   };
 
   const complianceSnapshot = dailyHealth?.compliance || complianceStatus?.compliance || null;
+  const isBannerDismissed = (id, signature) => dismissedBanners[id] === signature;
+  const dismissBanner = (id, signature) => setDismissedBanners((prev) => ({ ...prev, [id]: signature }));
+  const rollupBannerSig = rollupWarning
+    ? `rollup:${rollupWarning.maxDate || '-'}:${rollupWarning.portfoliosCovered || 0}/${rollupWarning.portfoliosTotal || 0}`
+    : null;
+  const healthBannerSig = dailyHealth
+    ? `health:${dailyHealth.status}:${JSON.stringify(dailyHealth.counts || {})}`
+    : null;
+  const staleBannerSig = stalePricesWarning
+    ? `stale:${stalePricesWarning.latestDate || '-'}`
+    : null;
   const sortedAssetEntries = sortAssetTypeEntries(byType);
   const selectedIntervalLabel = selectedInterval === 'CUSTOM' ? 'Cust' : selectedInterval;
   const hasRecordedComplianceScan = !!(
@@ -827,8 +841,13 @@ export default function Dashboard() {
 
       <ComplianceWarning gaps={complianceGaps} loading={complianceLoading} />
 
-      {rollupWarning && (
-        <Alert variant="warning" className="py-2 mb-4">
+      {rollupWarning && !isBannerDismissed('rollup', rollupBannerSig) && (
+        <Alert
+          variant="warning"
+          className="py-2 mb-4"
+          dismissible
+          onClose={() => dismissBanner('rollup', rollupBannerSig)}
+        >
           <div className="d-flex align-items-center gap-2">
             <AlertTriangle size={16} />
             <span className="fw-semibold">Rollup date alignment warning</span>
@@ -839,8 +858,13 @@ export default function Dashboard() {
         </Alert>
       )}
 
-      {dailyHealth && dailyHealth.status !== 'ok' && (
-        <Alert variant={dailyHealth.status === 'error' ? 'danger' : 'warning'} className="py-2 mb-4">
+      {dailyHealth && dailyHealth.status !== 'ok' && !isBannerDismissed('health', healthBannerSig) && (
+        <Alert
+          variant={dailyHealth.status === 'error' ? 'danger' : 'warning'}
+          className="py-2 mb-4"
+          dismissible
+          onClose={() => dismissBanner('health', healthBannerSig)}
+        >
           <div className="d-flex justify-content-between align-items-center flex-wrap gap-2">
             <div className="d-flex align-items-center gap-2">
               <AlertTriangle size={16} />
@@ -913,8 +937,13 @@ export default function Dashboard() {
         </Alert>
       )}
 
-      {stalePricesWarning && (
-        <Alert variant="warning" className="py-2 mb-4">
+      {stalePricesWarning && !isBannerDismissed('stale', staleBannerSig) && (
+        <Alert
+          variant="warning"
+          className="py-2 mb-4"
+          dismissible
+          onClose={() => dismissBanner('stale', staleBannerSig)}
+        >
           <div className="d-flex align-items-center gap-2">
             <AlertTriangle size={16} />
             <span className="fw-semibold">Data is outdated</span>

@@ -2216,10 +2216,10 @@ module.exports = function (db) {
             ? db.prepare(`
                 SELECT
                   COUNT(*) AS total_scopes,
-                  COUNT(CASE WHEN datediff('day', MAX(dv.date), ?) > 14 THEN 1 END) AS stale_scopes,
-                  COUNT(CASE WHEN dv.units = 0 AND dv.current_value > 1 THEN 1 END) AS zero_units_nonzero_value
+                  COUNT(CASE WHEN julianday(?) - julianday(MAX(dv.date)) > 14 THEN 1 END) AS stale_scopes,
+                  COUNT(CASE WHEN dv.total_units = 0 AND dv.current_value > 1 THEN 1 END) AS zero_units_nonzero_value
                 FROM (
-                  SELECT investment_id, MAX(date) AS date, units, current_value
+                  SELECT investment_id, MAX(date) AS date, total_units, current_value
                   FROM daily_values
                   WHERE portfolio_id = ?
                   GROUP BY investment_id
@@ -2228,10 +2228,10 @@ module.exports = function (db) {
             : db.prepare(`
                 SELECT
                   COUNT(*) AS total_scopes,
-                  COUNT(CASE WHEN datediff('day', MAX(dv.date), ?) > 14 THEN 1 END) AS stale_scopes,
-                  COUNT(CASE WHEN dv.units = 0 AND dv.current_value > 1 THEN 1 END) AS zero_units_nonzero_value
+                  COUNT(CASE WHEN julianday(?) - julianday(MAX(dv.date)) > 14 THEN 1 END) AS stale_scopes,
+                  COUNT(CASE WHEN dv.total_units = 0 AND dv.current_value > 1 THEN 1 END) AS zero_units_nonzero_value
                 FROM (
-                  SELECT investment_id, portfolio_id, MAX(date) AS date, units, current_value
+                  SELECT investment_id, portfolio_id, MAX(date) AS date, total_units, current_value
                   FROM daily_values
                   GROUP BY investment_id, portfolio_id
                 ) dv

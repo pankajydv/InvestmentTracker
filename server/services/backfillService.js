@@ -1046,7 +1046,21 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     const series = cache.stockByInvestment.get(inv.id) || new Map();
     const exact = series.get(date);
     if (exact != null) {
-      return { price: Number(exact), source: 'LIVE' };
+      // Determine the real cached source for this date. A cache row that is a
+      // LOCF carry-forward must NOT be stamped LIVE (that produces stale prices
+      // marked LIVE with day_change 0). Only genuine provider closes stay LIVE.
+      if (!cache.stockSourceByInvestment) cache.stockSourceByInvestment = new Map();
+      if (!cache.stockSourceByInvestment.has(inv.id)) {
+        const srcMap = new Map();
+        const srcRows = getInvestmentSeries(inv.id, cache.rangeStart || '1900-01-01', cache.rangeEnd || date);
+        for (const r of srcRows) {
+          if (r?.date) srcMap.set(r.date, String(r.source || '').toUpperCase());
+        }
+        cache.stockSourceByInvestment.set(inv.id, srcMap);
+      }
+      const cachedSource = cache.stockSourceByInvestment.get(inv.id)?.get(date);
+      const resolvedSource = cachedSource === 'LOCF' ? 'LOCF' : 'LIVE';
+      return { price: Number(exact), source: resolvedSource };
     }
 
     if (canUseProviderForRunDate(cache, date)) {
