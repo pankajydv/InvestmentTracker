@@ -8,6 +8,28 @@ import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE
 import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
+import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
+
+function AllocationChartTooltip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const datum = payload[0]?.payload;
+  if (!datum) return null;
+  return (
+    <div
+      style={{
+        background: '#fff',
+        border: '1px solid #dee2e6',
+        borderRadius: 6,
+        padding: '6px 10px',
+        fontSize: '0.75rem',
+        boxShadow: '0 2px 8px rgba(0,0,0,0.12)',
+      }}
+    >
+      <div style={{ fontWeight: 600 }}>{datum.fullName}</div>
+      <div>{formatINR(datum.value)} · {Number(datum.pct || 0).toFixed(1)}%</div>
+    </div>
+  );
+}
 
 const ASSET_TYPE_DISPLAY_ORDER = {
   INDIAN_STOCK: 1,
@@ -805,6 +827,18 @@ export default function Dashboard() {
     ? `stale:${stalePricesWarning.latestDate || '-'}`
     : null;
   const sortedAssetEntries = sortAssetTypeEntries(byType);
+  const allocationChartData = sortedAssetEntries
+    .map(([type, info]) => ({
+      type,
+      name: ASSET_TYPE_LABELS[type] || type,
+      fullName: ASSET_TYPE_FULL_NAMES[type] || ASSET_TYPE_LABELS[type] || type,
+      value: Number(info.totalValue) || 0,
+    }))
+    .filter((datum) => datum.value > 0);
+  const allocationChartTotal = allocationChartData.reduce((sum, datum) => sum + datum.value, 0);
+  allocationChartData.forEach((datum) => {
+    datum.pct = allocationChartTotal > 0 ? (datum.value / allocationChartTotal) * 100 : 0;
+  });
   const selectedIntervalLabel = selectedInterval === 'CUSTOM' ? 'Cust' : selectedInterval;
   const hasRecordedComplianceScan = !!(
     complianceSnapshot?.lastScan?.mode
@@ -1105,20 +1139,29 @@ export default function Dashboard() {
       <Card className="shadow-sm mb-4">
         <Card.Body>
           <h2 className="h6 fw-semibold mb-3">Asset Allocation</h2>
-          <Row className="g-2">
+          <div className="asset-allocation-grid">
             {sortedAssetEntries.map(([type, info]) => (
-              <Col xs={6} md={4} lg={3} xl={2} key={type}>
+              <div className="asset-allocation-grid-item" key={type}>
                 {(() => {
                   const intervalChangePct = Number(info.intervalChangePct ?? 0);
                   const intervalPctSuffix = isDayChangeMode ? '' : ' p.a.';
                   const lifetimeClass = profitColor(info.totalProfitLoss);
                   const intervalClass = profitColor(info.dayChange);
+                  const allocationPct = portfolio.total_value > 0
+                    ? (info.totalValue / portfolio.total_value) * 100
+                    : 0;
 
                   return (
                 <div
                   className="rounded p-2 border asset-allocation-card"
                   style={{ borderLeftColor: ASSET_TYPE_COLORS[type], borderLeftWidth: '4px', borderLeftStyle: 'solid' }}
                 >
+                  <span
+                    className="asset-allocation-pct"
+                    title={`${ASSET_TYPE_FULL_NAMES[type] || ASSET_TYPE_LABELS[type]} is ${allocationPct.toFixed(1)}% of total current value`}
+                  >
+                    {allocationPct.toFixed(1)}%
+                  </span>
                   <a
                     href={`#section-${type}`}
                     className="text-decoration-underline fw-semibold"
@@ -1162,9 +1205,48 @@ export default function Dashboard() {
                 </div>
                   );
                 })()}
-              </Col>
+              </div>
             ))}
-          </Row>
+            {allocationChartData.length > 0 && (
+              <div className="asset-allocation-donut-cell">
+                <div className="asset-allocation-donut" aria-label="Asset allocation weightage pie chart">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={allocationChartData}
+                        dataKey="value"
+                        nameKey="name"
+                        innerRadius="60%"
+                        outerRadius="100%"
+                        paddingAngle={0}
+                        stroke="#fff"
+                        strokeWidth={1}
+                        isAnimationActive={false}
+                      >
+                        {allocationChartData.map((datum) => (
+                          <Cell key={datum.type} fill={ASSET_TYPE_COLORS[datum.type] || '#6c757d'} />
+                        ))}
+                      </Pie>
+                      <RechartsTooltip content={<AllocationChartTooltip />} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="asset-allocation-donut-caption">Weight by value</div>
+                <div className="asset-allocation-legend">
+                  {allocationChartData.map((datum) => (
+                    <span className="asset-allocation-legend-item" key={datum.type}>
+                      <span
+                        className="asset-allocation-legend-dot"
+                        style={{ backgroundColor: ASSET_TYPE_COLORS[datum.type] || '#6c757d' }}
+                      />
+                      <span className="asset-allocation-legend-label">{datum.name}</span>
+                      <span className="asset-allocation-legend-pct">{Number(datum.pct || 0).toFixed(1)}%</span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
         </Card.Body>
       </Card>
 
