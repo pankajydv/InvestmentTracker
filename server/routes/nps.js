@@ -8,6 +8,8 @@ const express = require('express');
 const multer = require('multer');
 const { parseNPSStatements } = require('../services/npsStatementParser');
 const { logAppInfo, logAppError } = require('../services/appLogger');
+const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
+const { parseNpsPayslips, payslipMonthForCreditDate } = require('../services/npsPayslipParser');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -48,13 +50,50 @@ module.exports = function (db) {
   }
 
   /**
+   * Populate `charges` on contribution transactions from salary-slip data.
+   *
+   * The monthly "NPS charges deduction" from the payslip is the total charge for
+   * that month; it is split across the schemes that received a contribution on the
+   * same credit date, proportionally to each scheme's contribution amount. A credit
+   * in month M maps to the payslip for month M-1 (contributions are deducted from a
+   * month's salary and credited to NPS early the following month).
+   *
+   * Returns the number of transactions that were priced.
+   */
+  function applyPayslipCharges(transactions, chargeByMonth) {
+    if (!chargeByMonth || chargeByMonth.size === 0) return 0;
+
+    // Total contribution amount per credit date (across all schemes).
+    const dateTotals = {};
+    for (const t of transactions) {
+      if (t.type !== 'EMPLOYER_CONTRIBUTION' && t.type !== 'VOLUNTARY_CONTRIBUTION') continue;
+      dateTotals[t.date] = (dateTotals[t.date] || 0) + Math.abs(t.amount || 0);
+    }
+
+    let priced = 0;
+    for (const t of transactions) {
+      if (t.type !== 'EMPLOYER_CONTRIBUTION' && t.type !== 'VOLUNTARY_CONTRIBUTION') continue;
+      const payslipMonth = payslipMonthForCreditDate(t.date);
+      const monthly = payslipMonth ? chargeByMonth.get(payslipMonth) : null;
+      if (!monthly || !(monthly.charge > 0)) continue;
+      const total = dateTotals[t.date] || Math.abs(t.amount || 0);
+      if (!(total > 0)) continue;
+      t.charges = Math.round((monthly.charge * Math.abs(t.amount || 0) / total) * 100) / 100;
+      priced++;
+    }
+    return priced;
+  }
+
+  /**
    * POST /api/nps/preview
    * Upload NPS CSV files and get a preview of transactions per scheme.
    * Body (multipart): files[] (CSV), portfolio_id
    */
-  router.post('/preview', upload.array('files', 20), async (req, res) => {
+  router.post('/preview', upload.fields([{ name: 'files', maxCount: 20 }, { name: 'payslips', maxCount: 20 }]), async (req, res) => {
     try {
-      if (!req.files || req.files.length === 0) {
+      const npsFiles = req.files?.files || [];
+      const payslipFiles = req.files?.payslips || [];
+      if (npsFiles.length === 0) {
         return res.status(400).json({ error: 'No files uploaded' });
       }
       if (!req.body.portfolio_id) {
@@ -65,11 +104,15 @@ module.exports = function (db) {
       const portfolio = db.prepare('SELECT * FROM portfolios WHERE id = ?').get(portfolioId);
       if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
 
-      const parsed = await parseNPSStatements(req.files, req.body.password || '');
+      const parsed = await parseNPSStatements(npsFiles, req.body.password || '');
 
       if (!parsed.schemes.length && !parsed.transactions.length) {
         return res.status(400).json({ error: 'No NPS transactions found in the uploaded files.' });
       }
+
+      // Populate contribution fees from uploaded salary slips (if any).
+      const payslipChargeMap = await parseNpsPayslips(payslipFiles);
+      const pricedCount = applyPayslipCharges(parsed.transactions, payslipChargeMap);
 
       // Validate subscriber name matches the selected portfolio
       if (parsed.subscriberName) {
@@ -139,12 +182,17 @@ module.exports = function (db) {
           newTransactions: newTxns,
           existingTransactions: totalTxns - newTxns,
         },
+        payslips: {
+          filesUploaded: payslipFiles.length,
+          monthsFound: Array.from(payslipChargeMap.keys()).sort(),
+          transactionsPriced: pricedCount,
+        },
       });
     } catch (e) {
       console.error('NPS preview error:', e);
       logAppError('[NPS] Preview failed', {
         portfolio_id: Number(req.body?.portfolio_id || 0) || null,
-        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        file_count: Array.isArray(req.files?.files) ? req.files.files.length : 0,
         error: e.message,
       });
       res.status(500).json({ error: 'Failed to parse NPS statements: ' + e.message });

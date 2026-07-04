@@ -149,9 +149,28 @@ module.exports = function (db) {
         exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units,
       } = req.body;
 
-      if (!investment_id || !portfolio_id || !transaction_type || !transaction_date || !amount) {
+      const amountMissing = amount === undefined || amount === null || amount === '' || Number.isNaN(Number(amount));
+      if (!investment_id || !portfolio_id || !transaction_type || !transaction_date || amountMissing) {
         return res.status(400).json({ error: 'investment_id, portfolio_id, transaction_type, transaction_date, and amount are required' });
       }
+
+      const normalizedAmount = Number(amount);
+      const normalizedFees = Number.isFinite(Number(fees)) ? Number(fees) : 0;
+      const normalizedPricePerUnit = price_per_unit === undefined || price_per_unit === null || price_per_unit === ''
+        ? null
+        : Number(price_per_unit);
+      const normalizedUsdAmount = usd_amount === undefined || usd_amount === null || usd_amount === ''
+        ? null
+        : Number(usd_amount);
+      const normalizedFmvPerUnit = fmv_per_unit === undefined || fmv_per_unit === null || fmv_per_unit === ''
+        ? null
+        : Number(fmv_per_unit);
+      const normalizedGrossUnits = gross_units === undefined || gross_units === null || gross_units === ''
+        ? null
+        : Number(gross_units);
+      const normalizedTaxWithheldUnits = tax_withheld_units === undefined || tax_withheld_units === null || tax_withheld_units === ''
+        ? null
+        : Number(tax_withheld_units);
 
       const inv = db.prepare('SELECT * FROM investments WHERE id = ?').get(investment_id);
       if (!inv) return res.status(404).json({ error: 'Investment not found' });
@@ -182,8 +201,8 @@ module.exports = function (db) {
         INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(investment_id, portfolio_id, transaction_type, normalizedTransactionDate,
-        normalizedUnits || null, price_per_unit || null, amount, fees || 0, broker || null, notes || null,
-        resolvedRate, usd_amount || null, fmv_per_unit || null, gross_units || null, tax_withheld_units || null);
+        normalizedUnits || null, normalizedPricePerUnit, normalizedAmount, normalizedFees, broker || null, notes || null,
+        resolvedRate, normalizedUsdAmount, normalizedFmvPerUnit, normalizedGrossUnits, normalizedTaxWithheldUnits);
 
       const txn = db.prepare('SELECT * FROM transactions WHERE id = ?').get(result.lastInsertRowid);
       markDirtyFromTransactions(
@@ -200,7 +219,7 @@ module.exports = function (db) {
         portfolio_id: Number(portfolio_id),
         transaction_type,
         transaction_date: normalizedTransactionDate,
-        amount: Number(amount || 0),
+        amount: normalizedAmount,
       });
       res.status(201).json(txn);
     } catch (e) {

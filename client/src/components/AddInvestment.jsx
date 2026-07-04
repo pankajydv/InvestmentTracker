@@ -107,7 +107,9 @@ export default function AddInvestment() {
 
   // NPS state
   const npsFileRef = useRef(null);
+  const npsPayslipRef = useRef(null);
   const [npsFiles, setNpsFiles] = useState([]);
+  const [npsPayslipFiles, setNpsPayslipFiles] = useState([]);
   const [npsUploading, setNpsUploading] = useState(false);
   const [npsImporting, setNpsImporting] = useState(false);
   const [npsError, setNpsError] = useState('');
@@ -576,7 +578,7 @@ export default function AddInvestment() {
     if (!npsFiles.length) return setNpsError('Please select NPS statement files');
     setNpsUploading(true);
     try {
-      const data = await previewNPSStatements(npsFiles, portfolioId, npsPassword);
+      const data = await previewNPSStatements(npsFiles, portfolioId, npsPassword, npsPayslipFiles);
       setNpsPreview(data);
       setNpsSelectedSchemes(new Set(
         data.schemes.map((s, i) => s.newTransactionCount > 0 ? i : null).filter(i => i !== null)
@@ -618,11 +620,13 @@ export default function AddInvestment() {
     setNpsPreview(null);
     setNpsResult(null);
     setNpsFiles([]);
+    setNpsPayslipFiles([]);
     setNpsError('');
     setNpsSelectedSchemes(new Set());
     setNpsExpandedScheme(null);
     setNpsPassword('');
     if (npsFileRef.current) npsFileRef.current.value = '';
+    if (npsPayslipRef.current) npsPayslipRef.current.value = '';
   };
 
   const NPS_TXN_TYPES = [
@@ -1790,6 +1794,24 @@ export default function AddInvestment() {
                           />
                         </Col>
                       </Row>
+                      <Row className="g-3 align-items-end mt-0">
+                        <Col md={12}>
+                          <Form.Label className="small">
+                            Salary Slips <span className="text-muted">(PDF, optional — populates NPS charge fees)</span>
+                          </Form.Label>
+                          <Form.Control
+                            ref={npsPayslipRef}
+                            size="sm"
+                            type="file"
+                            accept=".pdf"
+                            multiple
+                            onChange={(e) => setNpsPayslipFiles(Array.from(e.target.files))}
+                          />
+                          <Form.Text className="text-muted" style={{ fontSize: '0.7rem' }}>
+                            Reads the monthly “NPS charges deduction” and splits it across schemes as fees.
+                          </Form.Text>
+                        </Col>
+                      </Row>
                       {npsFiles.some(f => f.name.toLowerCase().endsWith('.pdf')) && (
                         <Row className="g-3 mt-0">
                           <Col md={6}>
@@ -1807,6 +1829,7 @@ export default function AddInvestment() {
                       {npsFiles.length > 0 && (
                         <div className="mt-2 small text-muted">
                           {npsFiles.length} file{npsFiles.length > 1 ? 's' : ''} selected
+                          {npsPayslipFiles.length > 0 && <> · {npsPayslipFiles.length} salary slip{npsPayslipFiles.length > 1 ? 's' : ''}</>}
                         </div>
                       )}
                       <div className="mt-3">
@@ -1849,6 +1872,22 @@ export default function AddInvestment() {
                           label={<span className="small text-muted">Select all schemes with new transactions</span>}
                         />
                       </div>
+
+                      {npsPreview.payslips?.filesUploaded > 0 && (
+                        <div className="small mb-2 d-flex align-items-center gap-1 flex-wrap">
+                          <span className="badge bg-light text-dark border">
+                            {npsPreview.payslips.filesUploaded} salary slip{npsPreview.payslips.filesUploaded > 1 ? 's' : ''}
+                          </span>
+                          {npsPreview.payslips.monthsFound?.length > 0 ? (
+                            <span className="text-muted">
+                              Charges found for {npsPreview.payslips.monthsFound.join(', ')} ·{' '}
+                              <span className="text-success">{npsPreview.payslips.transactionsPriced} contribution{npsPreview.payslips.transactionsPriced !== 1 ? 's' : ''} priced</span>
+                            </span>
+                          ) : (
+                            <span className="text-warning">No “NPS charges deduction” line found in the uploaded slips.</span>
+                          )}
+                        </div>
+                      )}
 
                       {/* Scheme List */}
                       {npsPreview.schemes.map((scheme, idx) => {
@@ -1915,6 +1954,7 @@ export default function AddInvestment() {
                                         <th className="px-2 py-1">Date</th>
                                         <th className="px-2 py-1">Type</th>
                                         <th className="px-2 py-1 text-end">Amount</th>
+                                        <th className="px-2 py-1 text-end">Fees</th>
                                         <th className="px-2 py-1 text-end">NAV</th>
                                         <th className="px-2 py-1 text-end">Units</th>
                                         <th className="px-2 py-1">Description</th>
@@ -1937,6 +1977,7 @@ export default function AddInvestment() {
                                             </span>
                                           </td>
                                           <td className="px-2 py-1 text-end">{formatCurrency(t.amount)}</td>
+                                          <td className="px-2 py-1 text-end text-muted">{t.charges ? formatCurrency(t.charges) : '-'}</td>
                                           <td className="px-2 py-1 text-end">{t.nav ? t.nav.toFixed(4) : '-'}</td>
                                           <td className="px-2 py-1 text-end">{t.units ? t.units.toFixed(4) : '-'}</td>
                                           <td className="px-2 py-1 text-muted text-truncate" style={{ maxWidth: 180 }}>{t.particulars}</td>

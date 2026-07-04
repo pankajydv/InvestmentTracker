@@ -11,6 +11,7 @@ const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisit
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 const { logAppInfo, logAppWarn, logAppError } = require('../services/appLogger');
 const { quantizeForStorage, quantizeNullableForStorage } = require('../services/numberPrecision');
+const { getNearestOnOrBefore } = require('../services/marketPriceCache');
 const {
   deriveVestActualization,
   computeVestValues,
@@ -2767,13 +2768,33 @@ module.exports = function (db) {
             effectiveVestDate = editedIso;
           }
 
+          // FX (Option C): resolve silently at accept time instead of trusting the value
+          // frozen into the suggestion at generation time (which can be 0 if FX was not
+          // available when the suggestion was generated). Precedence:
+          //   explicit override (card / date-edit) > FX cache for the vest date > payload.
+          let resolvedFxRate = Number(overrides.fxRate);
+          if (!(resolvedFxRate > 0)) {
+            let cacheFx = 0;
+            try {
+              const fxRow = getNearestOnOrBefore('FX', 'USDINR=X', effectiveVestDate);
+              cacheFx = Number(fxRow?.close);
+            } catch (_fxErr) {
+              cacheFx = 0;
+            }
+            resolvedFxRate = cacheFx > 0 ? cacheFx : Number(base.fxRate);
+          }
+          const acceptOverrides = {
+            ...overrides,
+            fxRate: Number.isFinite(resolvedFxRate) && resolvedFxRate > 0 ? resolvedFxRate : null,
+          };
+
           const values = computeVestValues({
             txn: { gross_units: base.grossUnits, transaction_date: effectiveVestDate },
             fmv: base.fmv,
             fmvSourceDate: base.fmvSourceDate,
             withholdingRate: base.withholdingRate,
             fxRate: base.fxRate,
-            overrides,
+            overrides: acceptOverrides,
           });
 
           if (!(values.grossUnits > 0) || !(values.fmv > 0) || !(values.netUnits > 0)) { skipped += 1; continue; }

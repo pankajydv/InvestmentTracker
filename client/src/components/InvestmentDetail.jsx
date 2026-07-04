@@ -148,10 +148,15 @@ export default function InvestmentDetail() {
     price_per_unit: '',
     amount: '',
     fees: '0',
+    broker: '',
     notes: '',
     exchange_rate_used: '',
     usd_amount: '',
     fmv_per_unit: '',
+    offering_period: '',
+    grant_date: '',
+    share_source: 'SP',
+    holding_period: 'Short',
   });
   const [rateLoading, setRateLoading] = useState(false);
 
@@ -236,16 +241,52 @@ export default function InvestmentDetail() {
   const handleAddTransaction = async (e) => {
     e.preventDefault();
     try {
-      let amount = parseFloat(txnForm.amount);
+      const isEsppPurchase = txnForm.transaction_type === 'ESPP_PURCHASE';
+      const hasAmountInput = String(txnForm.amount ?? '').trim() !== '';
+      let amount = hasAmountInput ? parseFloat(txnForm.amount) : null;
       // For USD investments: auto-compute INR amount from USD × rate if not set
       const rate = txnForm.exchange_rate_used ? parseFloat(txnForm.exchange_rate_used) : null;
       const usdUnits = txnForm.units ? parseFloat(txnForm.units) : null;
       const priceUSD = txnForm.price_per_unit ? parseFloat(txnForm.price_per_unit) : null;
-      if (!amount && usdUnits && priceUSD && rate) {
+      if ((amount == null || Number.isNaN(amount)) && isEsppPurchase) {
+        amount = 0;
+      } else if ((amount == null || Number.isNaN(amount)) && usdUnits && priceUSD && rate) {
         amount = usdUnits * priceUSD * rate;
-      } else if (!amount && usdUnits && priceUSD) {
+      } else if ((amount == null || Number.isNaN(amount)) && usdUnits && priceUSD) {
         amount = usdUnits * priceUSD;
       }
+
+      const hasUsdAmountInput = String(txnForm.usd_amount ?? '').trim() !== '';
+      const usdAmount = hasUsdAmountInput
+        ? parseFloat(txnForm.usd_amount)
+        : (usdUnits && priceUSD ? usdUnits * priceUSD : null);
+
+      const normalizedShareSource = String(txnForm.share_source || '').trim().toUpperCase();
+      const normalizedHoldingPeriod = String(txnForm.holding_period || '').trim();
+      const offering = String(txnForm.offering_period || '').trim();
+      const sourceSuffix = offering
+        ? offering.replace(/\s+/g, '')
+        : 'Manual';
+      const esppKey = `ESPP_MANUAL|${txnForm.transaction_date}|${sourceSuffix}`;
+      const autoEsppNotes = [
+        'ESPP Purchase | ESPP',
+        offering ? `Offering ${offering}` : null,
+        txnForm.grant_date ? `Grant Date ${txnForm.grant_date}` : null,
+        normalizedShareSource ? `Share Source ${normalizedShareSource}` : null,
+        normalizedHoldingPeriod ? `Holding ${normalizedHoldingPeriod}` : null,
+        Number.isFinite(parseFloat(txnForm.fmv_per_unit)) ? `FMV Purchase $${parseFloat(txnForm.fmv_per_unit).toFixed(2)}` : null,
+        'Source Manual Add Transaction',
+        `Key ${esppKey}`,
+        txnForm.notes ? `User Note ${txnForm.notes.trim()}` : null,
+      ].filter(Boolean).join(' | ');
+
+      const payloadNotes = isEsppPurchase
+        ? autoEsppNotes
+        : (txnForm.notes || null);
+
+      const payloadBroker = txnForm.broker
+        ? txnForm.broker.trim()
+        : (isEsppPurchase && isForeignUSD ? 'Fidelity' : null);
 
       await addTransaction({
         investment_id: parseInt(id),
@@ -256,16 +297,18 @@ export default function InvestmentDetail() {
         price_per_unit: priceUSD,
         amount,
         fees: parseFloat(txnForm.fees) || 0,
-        notes: txnForm.notes || null,
+        broker: payloadBroker,
+        notes: payloadNotes,
         exchange_rate_used: rate,
-        usd_amount: txnForm.usd_amount ? parseFloat(txnForm.usd_amount) : (usdUnits && priceUSD ? usdUnits * priceUSD : null),
+        usd_amount: Number.isFinite(usdAmount) ? usdAmount : null,
         fmv_per_unit: txnForm.fmv_per_unit ? parseFloat(txnForm.fmv_per_unit) : null,
       });
       setShowAddTxn(false);
       setTxnForm({
         transaction_type: txnTypes[0], transaction_date: new Date().toISOString().split('T')[0],
-        units: '', price_per_unit: '', amount: '', fees: '0', notes: '',
+        units: '', price_per_unit: '', amount: '', fees: '0', broker: '', notes: '',
         exchange_rate_used: '', usd_amount: '', fmv_per_unit: '',
+        offering_period: '', grant_date: '', share_source: 'SP', holding_period: 'Short',
       });
       loadData();
     } catch (e) {
@@ -486,6 +529,15 @@ export default function InvestmentDetail() {
 
   const updateTxnField = (field, value) => {
     const updated = { ...txnForm, [field]: value };
+    const isEsppPurchase = updated.transaction_type === 'ESPP_PURCHASE';
+
+    if (field === 'transaction_type' && value === 'ESPP_PURCHASE') {
+      if (!String(updated.amount || '').trim()) updated.amount = '0';
+      if (!String(updated.broker || '').trim()) updated.broker = 'Fidelity';
+      if (!String(updated.share_source || '').trim()) updated.share_source = 'SP';
+      if (!String(updated.holding_period || '').trim()) updated.holding_period = 'Short';
+    }
+
     // Date change: auto-fetch RBI rate for USD investments
     if (field === 'transaction_date' && isForeignUSD && value) {
       fetchRBIRate(value);
@@ -495,11 +547,17 @@ export default function InvestmentDetail() {
       const u = parseFloat(updated.units) || 0;
       const p = parseFloat(updated.price_per_unit) || 0;
       const r = parseFloat(updated.exchange_rate_used) || 0;
-      if (u > 0 && p > 0 && r > 0 && (field === 'units' || field === 'price_per_unit' || field === 'exchange_rate_used')) {
-        updated.usd_amount = String(Math.round(u * p * 100) / 100);
-        updated.amount = String(Math.round(u * p * r * 100) / 100);
+      if (u > 0 && p > 0 && (field === 'units' || field === 'price_per_unit')) {
+        if (!String(updated.usd_amount || '').trim()) {
+          updated.usd_amount = String(Math.round(u * p * 100) / 100);
+        }
       }
-    } else if ((field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
+      if (!isEsppPurchase && u > 0 && p > 0 && r > 0 && (field === 'units' || field === 'price_per_unit' || field === 'exchange_rate_used')) {
+        if (!String(updated.amount || '').trim()) {
+          updated.amount = String(Math.round(u * p * r * 100) / 100);
+        }
+      }
+    } else if (!isEsppPurchase && (field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
       updated.amount = (parseFloat(updated.units) * parseFloat(updated.price_per_unit)).toFixed(2);
     }
     setTxnForm(updated);
@@ -1057,15 +1115,65 @@ export default function InvestmentDetail() {
                   </>
                 )}
                 <Col md={4}>
-                  <Form.Label className="small">Amount (₹){isForeignUSD && txnForm.usd_amount ? ` — USD ${txnForm.usd_amount}` : ''}</Form.Label>
+                  <Form.Label className="small">
+                    Amount (₹)
+                    {isForeignUSD && txnForm.usd_amount ? ` — USD ${txnForm.usd_amount}` : ''}
+                    {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' ? ' (usually 0 for ESPP acquisitions)' : ''}
+                  </Form.Label>
                   <Form.Control size="sm" type="number" step="0.01" value={txnForm.amount}
-                    onChange={(e) => updateTxnField('amount', e.target.value)} placeholder="Total amount in ₹" required />
+                    onChange={(e) => updateTxnField('amount', e.target.value)} placeholder="Total amount in ₹" required={txnForm.transaction_type !== 'ESPP_PURCHASE'} />
                 </Col>
+                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                  <Col md={4}>
+                    <Form.Label className="small">Cost Basis (USD)</Form.Label>
+                    <Form.Control size="sm" type="number" step="0.01" value={txnForm.usd_amount}
+                      onChange={(e) => updateTxnField('usd_amount', e.target.value)} placeholder="e.g. 2615.93" />
+                  </Col>
+                )}
+                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                  <Col md={4}>
+                    <Form.Label className="small">Broker</Form.Label>
+                    <Form.Control size="sm" type="text" value={txnForm.broker}
+                      onChange={(e) => updateTxnField('broker', e.target.value)} placeholder="Fidelity" />
+                  </Col>
+                )}
                 <Col md={4}>
                   <Form.Label className="small">Charges (₹)</Form.Label>
                   <Form.Control size="sm" type="number" step="0.01" value={txnForm.fees}
                     onChange={(e) => updateTxnField('fees', e.target.value)} />
                 </Col>
+                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                  <Col md={4}>
+                    <Form.Label className="small">Offering Period</Form.Label>
+                    <Form.Control size="sm" type="text" value={txnForm.offering_period}
+                      onChange={(e) => updateTxnField('offering_period', e.target.value)} placeholder="APR/01/2026 - JUN/30/2026" />
+                  </Col>
+                )}
+                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                  <Col md={4}>
+                    <Form.Label className="small">Grant Date</Form.Label>
+                    <Form.Control size="sm" type="date" value={txnForm.grant_date}
+                      onChange={(e) => updateTxnField('grant_date', e.target.value)} />
+                  </Col>
+                )}
+                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                  <Col md={4}>
+                    <Form.Label className="small">Share Source</Form.Label>
+                    <Form.Control size="sm" type="text" value={txnForm.share_source}
+                      onChange={(e) => updateTxnField('share_source', e.target.value)} placeholder="SP" />
+                  </Col>
+                )}
+                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                  <Col md={4}>
+                    <Form.Label className="small">Holding Period</Form.Label>
+                    <Form.Select size="sm" value={txnForm.holding_period}
+                      onChange={(e) => updateTxnField('holding_period', e.target.value)}>
+                      <option value="Short">Short</option>
+                      <option value="Long">Long</option>
+                      <option value="">Not Specified</option>
+                    </Form.Select>
+                  </Col>
+                )}
                 <Col md={4}>
                   <Form.Label className="small">Notes</Form.Label>
                   <Form.Control size="sm" type="text" value={txnForm.notes}

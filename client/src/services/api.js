@@ -437,9 +437,10 @@ export const addAmcCharge = (data) =>
   fetchJSON('/expenses', { method: 'POST', body: JSON.stringify(data) });
 
 // NPS Statement Upload
-export const previewNPSStatements = async (files, portfolioId, password) => {
+export const previewNPSStatements = async (files, portfolioId, password, payslipFiles = []) => {
   const formData = new FormData();
   files.forEach(f => formData.append('files', f));
+  (payslipFiles || []).forEach(f => formData.append('payslips', f));
   formData.append('portfolio_id', portfolioId);
   if (password) formData.append('password', password);
   const res = await fetch(`${API_BASE}/nps/preview`, { method: 'POST', body: formData, credentials: 'include' });
