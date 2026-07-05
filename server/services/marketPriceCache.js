@@ -1,6 +1,7 @@
 const { getDb } = require('../db/schema');
 const { getMarketHolidays, getWeekends } = require('./holidays/marketHolidayService');
 const https = require('https');
+const { logAppInfo } = require('./appLogger');
 
 let db = null;
 let schemaEnsured = false;
@@ -12,6 +13,12 @@ const LOCF_WINDOW_SESSIONS = 20;
 const CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS = 3;
 const INVESTMENT_CACHE_MIGRATION_KEY = 'market_price_cache_unified_v3_symbol_is_provider_migrated';
 const MARKET_CACHE_ISO_DATE_MIGRATION_KEY = 'market_price_cache_iso_date_migrated_v1';
+const ENABLE_CACHE_WRITE_AUDIT = String(process.env.APP_CACHE_WRITE_AUDIT_LOG || 'true').toLowerCase() === 'true';
+
+function emitCacheWriteAudit(event, meta) {
+  if (!ENABLE_CACHE_WRITE_AUDIT) return;
+  logAppInfo(`[Audit] ${event}`, meta);
+}
 
 function addDays(date, days) {
   const iso = normalizeDate(date);
@@ -1864,6 +1871,9 @@ function upsertPricePoint(point) {
   if (isFxInstrumentType(point.instrumentType)) {
     const rate = Number(point.close);
     if (!Number.isFinite(rate) || rate <= 0) return;
+    const existingFx = ENABLE_CACHE_WRITE_AUDIT
+      ? conn.prepare('SELECT rate, source FROM fx_rate_cache WHERE date = ? LIMIT 1').get(normalizedDate)
+      : null;
     conn.prepare(`
       INSERT INTO fx_rate_cache (date, rate, source, fetched_at, updated_at)
       VALUES (?, ?, ?, datetime('now'), datetime('now'))
@@ -1876,6 +1886,15 @@ function upsertPricePoint(point) {
       rate,
       point.source ?? null
     );
+    emitCacheWriteAudit('fxc.write', {
+      action: existingFx ? 'update' : 'insert',
+      date: normalizedDate,
+      rate,
+      source: point.source ?? null,
+      previousSource: existingFx?.source || null,
+      previousRate: existingFx?.rate == null ? null : Number(existingFx.rate),
+      phase: 'market_cache',
+    });
     return;
   }
   const resolvedAdjClose = isStockInstrumentType(point.instrumentType)
@@ -1884,6 +1903,12 @@ function upsertPricePoint(point) {
   const splitHistoryValue = isSplitSupportedInstrumentType(point.instrumentType)
     ? null
     : (point.splitHistoryJson ?? null);
+
+  const existingMarket = ENABLE_CACHE_WRITE_AUDIT
+    ? conn.prepare(
+      'SELECT investment_id, close, source FROM market_price_cache WHERE instrument_type = ? AND symbol = ? AND date = ? LIMIT 1'
+    ).get(point.instrumentType, point.symbol, normalizedDate)
+    : null;
 
   conn.prepare(`
     INSERT INTO market_price_cache (
@@ -1914,6 +1939,20 @@ function upsertPricePoint(point) {
     point.volume ?? null,
     point.source ?? null
   );
+
+  emitCacheWriteAudit('mpc.write', {
+    action: existingMarket ? 'update' : 'insert',
+    investmentId: existingMarket?.investment_id ?? null,
+    instrumentType: point.instrumentType,
+    symbol: point.symbol,
+    date: normalizedDate,
+    close: point.close ?? null,
+    volume: point.volume ?? null,
+    source: point.source ?? null,
+    previousSource: existingMarket?.source || null,
+    previousClose: existingMarket?.close == null ? null : Number(existingMarket.close),
+    phase: 'market_cache',
+  });
 }
 
 function upsertPriceSeries(instrumentType, symbol, points, source = null, investmentId = null) {
@@ -1930,11 +1969,24 @@ function upsertPriceSeries(instrumentType, symbol, points, source = null, invest
         updated_at = datetime('now')
     `);
     const txFx = conn.transaction((rows) => {
+      const selectFx = ENABLE_CACHE_WRITE_AUDIT
+        ? conn.prepare('SELECT rate, source FROM fx_rate_cache WHERE date = ? LIMIT 1')
+        : null;
       for (const p of rows) {
         const d = normalizeDate(p.date);
         const rate = Number(p.close);
         if (!d || !Number.isFinite(rate) || rate <= 0) continue;
+        const existingFx = selectFx ? selectFx.get(d) : null;
         stmtFx.run(d, rate, p.source ?? source ?? null);
+        emitCacheWriteAudit('fxc.write', {
+          action: existingFx ? 'update' : 'insert',
+          date: d,
+          rate,
+          source: p.source ?? source ?? null,
+          previousSource: existingFx?.source || null,
+          previousRate: existingFx?.rate == null ? null : Number(existingFx.rate),
+          phase: 'market_cache',
+        });
       }
     });
 
@@ -1963,9 +2015,15 @@ function upsertPriceSeries(instrumentType, symbol, points, source = null, invest
   `);
 
   const tx = conn.transaction((rows) => {
+    const selectMarket = ENABLE_CACHE_WRITE_AUDIT
+      ? conn.prepare(
+        'SELECT investment_id, close, source FROM market_price_cache WHERE instrument_type = ? AND symbol = ? AND date = ? LIMIT 1'
+      )
+      : null;
     for (const p of rows) {
       const d = normalizeDate(p.date);
       if (!d) continue;
+      const existingMarket = selectMarket ? selectMarket.get(instrumentType, symbol, d) : null;
       stmt.run(
         invId,
         instrumentType,
@@ -1981,6 +2039,19 @@ function upsertPriceSeries(instrumentType, symbol, points, source = null, invest
         p.volume ?? null,
         p.source ?? source ?? null
       );
+      emitCacheWriteAudit('mpc.write', {
+        action: existingMarket ? 'update' : 'insert',
+        investmentId: invId ?? existingMarket?.investment_id ?? null,
+        instrumentType,
+        symbol,
+        date: d,
+        close: p.close ?? null,
+        volume: p.volume ?? null,
+        source: p.source ?? source ?? null,
+        previousSource: existingMarket?.source || null,
+        previousClose: existingMarket?.close == null ? null : Number(existingMarket.close),
+        phase: 'market_cache',
+      });
     }
   });
 
@@ -2060,9 +2131,15 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
   `);
 
   const tx = conn.transaction((rows) => {
+    const selectMarket = ENABLE_CACHE_WRITE_AUDIT
+      ? conn.prepare(
+        'SELECT investment_id, close, source FROM market_price_cache WHERE instrument_type = ? AND symbol = ? AND date = ? LIMIT 1'
+      )
+      : null;
     for (const p of rows) {
       const d = normalizeDate(p.date);
       if (!d) continue;
+      const existingMarket = selectMarket ? selectMarket.get(String(instrumentType || '').toUpperCase(), investmentSymbol, d) : null;
       stmt.run(
         Number(investmentId),
         String(instrumentType || '').toUpperCase(),
@@ -2076,6 +2153,19 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
         p.volume ?? null,
         p.source ?? source ?? null
       );
+      emitCacheWriteAudit('mpc.write', {
+        action: existingMarket ? 'update' : 'insert',
+        investmentId: Number(investmentId),
+        instrumentType: String(instrumentType || '').toUpperCase(),
+        symbol: investmentSymbol,
+        date: d,
+        close: p.close ?? null,
+        volume: p.volume ?? null,
+        source: p.source ?? source ?? null,
+        previousSource: existingMarket?.source || null,
+        previousClose: existingMarket?.close == null ? null : Number(existingMarket.close),
+        phase: 'market_cache',
+      });
     }
   });
 

@@ -451,6 +451,7 @@ function buildMissingNpsWindows(inv, missingSegments) {
 
 const AGGREGATE_RESUME_KEY = 'backfill_aggregate_resume_v1';
 const CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS = 3;
+const ENABLE_ROW_WRITE_AUDIT = String(process.env.APP_ROW_WRITE_AUDIT_LOG || 'true').toLowerCase() === 'true';
 
 function readAggregateResumeState(db) {
   const row = db.prepare('SELECT value FROM config WHERE key = ? LIMIT 1').get(AGGREGATE_RESUME_KEY);
@@ -887,12 +888,12 @@ function getStoredPriceOnOrBefore(db, investmentId, portfolioId, date) {
 
 async function getPriceForDate(db, inv, date, cache, portfolioId) {
   if (inv.asset_type === 'BOND') {
-    return { price: Number(inv.face_value || 1000), source: 'COMPUTED' };
+    return { price: Number(inv.face_value || 1000), source: 'COMPUTED', origin: 'local_compute_face_value' };
   }
 
   if (inv.asset_type === 'MUTUAL_FUND') {
     const currentCode = normalizeMutualFundCode(inv.amfi_code);
-    if (!currentCode) return { price: 0, source: 'COMPUTED' };
+    if (!currentCode) return { price: 0, source: 'COMPUTED', origin: 'local_compute_missing_code' };
     if (!cache.mfByInvestment) cache.mfByInvestment = new Map();
     if (!cache.mfByInvestment.has(inv.id)) {
       const map = loadInvestmentSeriesMapFromLocalCache(
@@ -913,7 +914,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     }
     const map = cache.mfByInvestment.get(inv.id) || new Map();
     const exact = map.get(date);
-    if (exact != null) return { price: Number(exact), source: 'LIVE' };
+    if (exact != null) return { price: Number(exact), source: 'LIVE', origin: 'market_cache_exact' };
 
     if (canUseProviderForRunDate(cache, date)) {
       try {
@@ -922,7 +923,11 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
         const nav = Number(navData?.nav || 0);
         if (Number.isFinite(nav) && nav > 0) {
           const navDate = normalizeMfDate(navData?.date);
-          return { price: nav, source: navDate === date ? 'LIVE' : 'LOCF' };
+          return {
+            price: nav,
+            source: navDate === date ? 'LIVE' : 'LOCF',
+            origin: navDate === date ? 'provider' : 'provider_lag',
+          };
         }
       } catch (e) {
         logBackfillError(`[Backfill][MF] Live NAV fetch failed for ${currentCode} on ${date}: ${e?.message || e}`);
@@ -930,16 +935,16 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     }
 
     const nearest = nearestOnOrBefore(map, date);
-    if (nearest != null) return { price: Number(nearest), source: 'LOCF' };
+    if (nearest != null) return { price: Number(nearest), source: 'LOCF', origin: 'market_cache_nearest' };
     const stored = getStoredPriceOnOrBefore(db, inv.id, portfolioId, date);
-    if (stored && stored.price > 0) return stored;
-    return { price: 0, source: 'COMPUTED' };
+    if (stored && stored.price > 0) return { ...stored, origin: 'prior_daily_value' };
+    return { price: 0, source: 'COMPUTED', origin: 'local_compute_fallback' };
   }
 
   if (inv.asset_type === 'SGB') {
     // SGB: Use NSE historical trade API for historical, fallback to NSE quote for today
     const symbol = inv.ticker_symbol;
-    if (!symbol) return { price: 0, source: 'COMPUTED' };
+    if (!symbol) return { price: 0, source: 'COMPUTED', origin: 'local_compute_missing_symbol' };
     if (!cache.sgb) cache.sgb = new Map();
     if (!cache.sgb.has(symbol)) {
       try {
@@ -1000,7 +1005,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     }
     const hist = cache.sgb.get(symbol);
     if (hist && hist.has(date)) {
-      return { price: Number(hist.get(date)), source: 'LIVE' };
+      return { price: Number(hist.get(date)), source: 'LIVE', origin: 'market_cache_exact' };
     }
     // fallback: try latest NSE quote for today
     if (date === todayIso()) {
@@ -1015,7 +1020,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
         try {
           const { fetchSGBPrice } = require('./priceService');
           const live = await fetchSGBPrice(symbol);
-          if (live && live.price > 0) return { price: Number(live.price), source: 'LIVE' };
+          if (live && live.price > 0) return { price: Number(live.price), source: 'LIVE', origin: 'provider_live' };
         } catch (e) {
           logBackfillError(`[Backfill][SGB] Live quote fetch failed for ${symbol} on ${date}: ${e?.message || e}`);
         }
@@ -1025,12 +1030,12 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     if (hist && hist.size > 0) {
       // find nearest on or before
       const keys = Array.from(hist.keys()).filter(k => k <= date).sort();
-      if (keys.length > 0) return { price: Number(hist.get(keys[keys.length-1])), source: 'LOCF' };
+      if (keys.length > 0) return { price: Number(hist.get(keys[keys.length-1])), source: 'LOCF', origin: 'market_cache_nearest' };
     }
     // fallback: stored
     const stored = getStoredPriceOnOrBefore(db, inv.id, portfolioId, date);
-    if (stored && stored.price > 0) return stored;
-    return { price: 0, source: 'COMPUTED' };
+    if (stored && stored.price > 0) return { ...stored, origin: 'prior_daily_value' };
+    return { price: 0, source: 'COMPUTED', origin: 'local_compute_fallback' };
   }
   if (inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'FOREIGN_STOCK') {
     if (!cache.stockByInvestment) cache.stockByInvestment = new Map();
@@ -1060,7 +1065,11 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
       }
       const cachedSource = cache.stockSourceByInvestment.get(inv.id)?.get(date);
       const resolvedSource = cachedSource === 'LOCF' ? 'LOCF' : 'LIVE';
-      return { price: Number(exact), source: resolvedSource };
+      return {
+        price: Number(exact),
+        source: resolvedSource,
+        origin: resolvedSource === 'LOCF' ? 'market_cache_exact_locf' : 'market_cache_exact',
+      };
     }
 
     if (canUseProviderForRunDate(cache, date)) {
@@ -1068,7 +1077,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
         const quote = await fetchStockPrice(inv.ticker_symbol || inv.symbol || '');
         const live = Number(quote?.price || 0);
         if (Number.isFinite(live) && live > 0) {
-          return { price: live, source: 'LIVE' };
+          return { price: live, source: 'LIVE', origin: 'provider' };
         }
       } catch (e) {
         logBackfillError(`[Backfill][Stock] Live quote fetch failed for investment ${inv.id} on ${date}: ${e?.message || e}`);
@@ -1077,19 +1086,19 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
 
     const nearest = nearestOnOrBefore(series, date);
     if (nearest != null) {
-      return { price: Number(nearest), source: 'LOCF' };
+      return { price: Number(nearest), source: 'LOCF', origin: 'market_cache_nearest' };
     }
 
     // Fallback 1: nearest investment-level cache entry when in-memory range is sparse.
     const investmentNearest = getInvestmentNearestOnOrBefore(inv.id, date);
     if (investmentNearest?.close != null) {
-      return { price: Number(investmentNearest.close), source: 'LOCF' };
+      return { price: Number(investmentNearest.close), source: 'LOCF', origin: 'investment_cache_nearest' };
     }
 
     // Fallback 2: last stored daily snapshot for this scope (LOCF carry-forward).
     const stored = getStoredPriceOnOrBefore(db, inv.id, portfolioId, date);
     if (stored && stored.price > 0) {
-      return { price: Number(stored.price), source: 'LOCF' };
+      return { price: Number(stored.price), source: 'LOCF', origin: 'prior_daily_value' };
     }
 
     warnBackfillOnce(
@@ -1103,7 +1112,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
         reason: 'missing-investment-market-cache-entry',
       }
     );
-    return { price: 0, source: 'COMPUTED' };
+    return { price: 0, source: 'COMPUTED', origin: 'local_compute_fallback' };
   }
 
   if (inv.asset_type === 'NPS') {
@@ -1139,7 +1148,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
 
       const map = cache.nps.get(inv.nps_fund_code);
       const exact = map.get(date);
-      if (isValidNpsNav(exact)) return { price: Number(exact), source: 'LIVE' };
+      if (isValidNpsNav(exact)) return { price: Number(exact), source: 'LIVE', origin: 'market_cache_exact' };
 
       if (canUseProviderForRunDate(cache, date)) {
         try {
@@ -1147,7 +1156,11 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
           const nav = Number(live?.nav || 0);
           if (isValidNpsNav(nav)) {
             const navDate = normalizeMfDate(live?.date);
-            return { price: nav, source: navDate === date ? 'LIVE' : 'LOCF' };
+            return {
+              price: nav,
+              source: navDate === date ? 'LIVE' : 'LOCF',
+              origin: navDate === date ? 'provider' : 'provider_lag',
+            };
           }
         } catch (e) {
           logBackfillError(`[Backfill][NPS] Live NAV fetch failed for ${inv.nps_fund_code} on ${date}: ${e?.message || e}`);
@@ -1155,7 +1168,7 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
       }
 
       const nearest = nearestOnOrBefore(map, date);
-      if (isValidNpsNav(nearest)) return { price: Number(nearest), source: 'LOCF' };
+      if (isValidNpsNav(nearest)) return { price: Number(nearest), source: 'LOCF', origin: 'market_cache_nearest' };
     }
 
     const row = db.prepare(`
@@ -1167,13 +1180,13 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
       ORDER BY transaction_date DESC, id DESC
       LIMIT 1
     `).get(inv.id, date);
-    if (isValidNpsNav(row?.price_per_unit)) return { price: Number(row.price_per_unit), source: 'COMPUTED' };
+    if (isValidNpsNav(row?.price_per_unit)) return { price: Number(row.price_per_unit), source: 'COMPUTED', origin: 'transaction_compute' };
     const stored = getStoredPriceOnOrBefore(db, inv.id, portfolioId, date);
-    if (stored && isValidNpsNav(stored.price)) return stored;
-    return { price: 0, source: 'COMPUTED' };
+    if (stored && isValidNpsNav(stored.price)) return { ...stored, origin: 'prior_daily_value' };
+    return { price: 0, source: 'COMPUTED', origin: 'local_compute_fallback' };
   }
 
-  return { price: 0, source: 'COMPUTED' };
+  return { price: 0, source: 'COMPUTED', origin: 'local_compute_fallback' };
 }
 
 function getRateRows(db, rateType) {
@@ -1239,7 +1252,7 @@ function getProvidentValue(db, inv, date, portfolioId) {
   return Number(preview.closingBalance || 0);
 }
 
-function upsertDailyRow(db, row, statements = null) {
+function upsertDailyRow(db, row, statements = null, auditContext = null) {
   // Only write portfolio-scoped rows (portfolio_id NOT NULL)
   if (row.portfolio_id == null) return;
 
@@ -1269,6 +1282,17 @@ function upsertDailyRow(db, row, statements = null) {
       updated_at = datetime('now')
   `);
 
+  const selectExistingScoped = statements?.selectExistingScoped || db.prepare(`
+    SELECT price_per_unit, current_value, price_source
+    FROM daily_values
+    WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+    LIMIT 1
+  `);
+
+  const existing = ENABLE_ROW_WRITE_AUDIT
+    ? selectExistingScoped.get(normalizedRow.investment_id, normalizedRow.portfolio_id, normalizedRow.date)
+    : null;
+
   upsertScoped.run(
     normalizedRow.investment_id,
     normalizedRow.portfolio_id,
@@ -1282,6 +1306,23 @@ function upsertDailyRow(db, row, statements = null) {
     normalizedRow.price_source,
     normalizedRow.day_change
   );
+
+  if (ENABLE_ROW_WRITE_AUDIT) {
+    logBackfillInfo('[Audit] dv.write', {
+      action: existing ? 'update' : 'insert',
+      investmentId: normalizedRow.investment_id,
+      investmentName: auditContext?.investmentName || null,
+      portfolioId: normalizedRow.portfolio_id,
+      date: normalizedRow.date,
+      source: normalizedRow.price_source,
+      sourceOrigin: auditContext?.sourceOrigin || null,
+      pricePerUnit: normalizedRow.price_per_unit,
+      currentValue: normalizedRow.current_value,
+      previousSource: existing?.price_source || null,
+      phase: 'backfill_step3',
+      runDate: auditContext?.runDate || null,
+    });
+  }
 }
 
 function round2(n) {
@@ -1306,6 +1347,12 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
           price_source = excluded.price_source,
           day_change = excluded.day_change,
           updated_at = datetime('now')
+      `),
+      selectExistingScoped: db.prepare(`
+        SELECT price_per_unit, current_value, price_source
+        FROM daily_values
+        WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+        LIMIT 1
       `),
     };
 
@@ -1475,6 +1522,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     const priced = await getPriceForDate(db, inv, date, cache, portfolioId);
     price = Number(priced.price || 0);
     priceSource = priced.source || 'COMPUTED';
+    let sourceOrigin = priced.origin || 'local_compute';
 
     if (isProvidentAsset) {
       currentValue = getProvidentValue(db, inv, date, portfolioId);
@@ -1486,6 +1534,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
         price = Number(rateRow?.rate || 0);
       }
       priceSource = 'COMPUTED';
+      sourceOrigin = 'local_compute_interest';
     } else if (inv.asset_type === 'BOND') {
       const accrual = computeBondAccruedCoupon({
         investment: inv,
@@ -1574,7 +1623,11 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       profit_loss: profitLoss,
       price_source: priceSource,
       day_change: dayChange,
-    }, dailyStatements);
+    }, dailyStatements, {
+      investmentName: inv.name,
+      runDate: cache?.runDate || null,
+      sourceOrigin,
+    });
 
     prevValue = currentValue;
     carriedNetFlowSinceLastWrite = 0;
