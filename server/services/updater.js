@@ -687,9 +687,26 @@ async function updateAllPrices(db, options = {}) {
         ? (currentValue - prevValue - netFlowToday)
         : 0;
 
-      const existingRow = ENABLE_ROW_WRITE_AUDIT
-        ? getExistingDailyRowByScopeDate.get(inv.id, pid, asOfDate)
-        : null;
+      const existingRow = getExistingDailyRowByScopeDate.get(inv.id, pid, asOfDate);
+      let effectivePriceSource = resolvedPriceSource;
+      if (String(existingRow?.price_source || '').toUpperCase() === 'LIVE' && String(resolvedPriceSource || '').toUpperCase() === 'LOCF') {
+        effectivePriceSource = 'LIVE';
+        logAppWarn('[UpdatePrices][SourceGuard] Prevented LIVE to LOCF downgrade', {
+          investmentId: inv.id,
+          investmentName: inv.name,
+          portfolioId: pid,
+          date: asOfDate,
+          previousSource: existingRow?.price_source || null,
+          attemptedSource: resolvedPriceSource,
+          persistedSource: effectivePriceSource,
+          sourceOrigin,
+          providerDate: sourceProviderDate || null,
+          existingPricePerUnit: Number(existingRow?.price_per_unit || 0),
+          attemptedPricePerUnit: quantizeForStorage(resolvedPricePerUnit),
+          runTag,
+          phase: 'updater',
+        });
+      }
 
       upsertDaily.run(
         inv.id, pid, asOfDate,
@@ -699,7 +716,7 @@ async function updateAllPrices(db, options = {}) {
         quantizeForStorage(investedAmount),
         quantizeForStorage(realizedGain),
         quantizeForStorage(profitLoss),
-        resolvedPriceSource,
+        effectivePriceSource,
         quantizeForStorage(dayChange)
       );
 
@@ -709,7 +726,7 @@ async function updateAllPrices(db, options = {}) {
           inv,
           portfolioId: pid,
           asOfDate,
-          priceSource: resolvedPriceSource,
+          priceSource: effectivePriceSource,
           sourceOrigin,
           providerDate: sourceProviderDate,
           pricePerUnit: resolvedPricePerUnit,
@@ -731,7 +748,7 @@ async function updateAllPrices(db, options = {}) {
         : LOCF_STREAK_WARN_SESSIONS;
       if (
         asOfDate === today
-        && resolvedPriceSource === 'LOCF'
+        && effectivePriceSource === 'LOCF'
         && LOCF_LAG_RECONCILE_ASSET_TYPES.has(assetType)
         && isTodaySession
       ) {
@@ -941,6 +958,19 @@ async function updateAllPrices(db, options = {}) {
           apiChangePct = stockData.changePercent;
           priceSource = sourceDecision.priceSource;
           providerDateForSource = sourceDecision.providerDate;
+          if (
+            priceSource === 'LIVE'
+            && providerDateForSource
+            && providerDateForSource === today
+            && Number.isFinite(Number(pricePerUnit))
+            && Number(pricePerUnit) > 0
+          ) {
+            upsertInvestmentPriceSeries(inv.id, 'INDIAN_STOCK', stockTicker, [{
+              date: providerDateForSource,
+              close: Number(pricePerUnit),
+              source: 'YAHOO',
+            }], null);
+          }
           console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, effectivePrice=${pricePerUnit}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
           break;
         }
@@ -997,6 +1027,19 @@ async function updateAllPrices(db, options = {}) {
               priceSource = sourceDecision.priceSource;
               providerDateForSource = sourceDecision.providerDate;
               sourceOrigin = fetchMode === 'live' ? 'provider_live' : 'provider_historical';
+              if (
+                priceSource === 'LIVE'
+                && providerDateForSource
+                && providerDateForSource === today
+                && Number.isFinite(Number(pricePerUnit))
+                && Number(pricePerUnit) > 0
+              ) {
+                upsertInvestmentPriceSeries(inv.id, 'SGB', String(inv.ticker_symbol || '').trim(), [{
+                  date: providerDateForSource,
+                  close: Number(pricePerUnit),
+                  source: fetchMode === 'live' ? 'NSE_LIVE' : 'NSE_HISTORICAL_TRADE',
+                }], null);
+              }
               console.log(`  ${inv.name} (id=${inv.id}): SGB ${fetchMode} fetch returned price=${sgbData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
               logAppInfo('[UpdatePrices] SGB provider decision', {
                 investmentId: inv.id,

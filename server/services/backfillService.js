@@ -319,12 +319,17 @@ function fillShortMissingSessionSegmentsWithLocf({
   marketSessionDates,
   seriesMap,
   maxGapSessions = CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
+  locfCutoffDate = null,
 }) {
   if (!investmentId || !instrumentType || !symbol || !Array.isArray(marketSessionDates) || marketSessionDates.length === 0) {
     return { filledSessions: 0, filledSegments: 0 };
   }
 
   const series = seriesMap instanceof Map ? seriesMap : new Map();
+  let cutoff = toIsoDate(locfCutoffDate);
+  if (!cutoff) {
+    cutoff = addDays(todayIso(), -1);
+  }
   const missingSegments = getMissingSessionSegmentsFromSeries(marketSessionDates, series);
   if (!missingSegments.length) return { filledSessions: 0, filledSegments: 0 };
 
@@ -334,6 +339,7 @@ function fillShortMissingSessionSegmentsWithLocf({
 
   for (const segment of missingSegments) {
     if (!segment.length || segment.length > maxGapSessions) continue;
+    if (segment.some((d) => d >= cutoff)) continue;
     const firstDate = segment[0];
     const firstIdx = indexByDate.get(firstDate);
     if (!(Number.isInteger(firstIdx) && firstIdx > 0)) continue;
@@ -815,6 +821,7 @@ async function fetchStockSeries(symbol, startDate, endDate, options = {}) {
     symbol,
     marketSessionDates,
     seriesMap: series,
+    locfCutoffDate: options.locfCutoffDate || null,
   });
   missingSessionDates = marketSessionDates.filter((d) => !series.has(d));
   const firstMissingDate = missingSessionDates[0] || null;
@@ -851,6 +858,12 @@ async function fetchStockSeries(symbol, startDate, endDate, options = {}) {
       shouldWarnSparseCoverage = false;
       warningSuppressedReason = 'INDIAN_SAME_DAY_PENDING';
     }
+  }
+
+  const warningRunDate = toIsoDate(options?.runDate) || todayIso();
+  if (shouldWarnSparseCoverage && firstMissingDate >= warningRunDate) {
+    shouldWarnSparseCoverage = false;
+    warningSuppressedReason = 'SAME_DAY_CACHE_PENDING';
   }
 
   if (shouldWarnSparseCoverage && options?.suppressSparseWarning !== true) {
@@ -1005,7 +1018,22 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
     }
     const hist = cache.sgb.get(symbol);
     if (hist && hist.has(date)) {
-      return { price: Number(hist.get(date)), source: 'LIVE', origin: 'market_cache_exact' };
+      if (!cache.sgbSourceBySymbol) cache.sgbSourceBySymbol = new Map();
+      if (!cache.sgbSourceBySymbol.has(symbol)) {
+        const srcMap = new Map();
+        const srcRows = getSeries('SGB', symbol, cache.rangeStart || '1900-01-01', cache.rangeEnd || date);
+        for (const r of srcRows) {
+          if (r?.date) srcMap.set(r.date, String(r.source || '').toUpperCase());
+        }
+        cache.sgbSourceBySymbol.set(symbol, srcMap);
+      }
+      const cachedSource = cache.sgbSourceBySymbol.get(symbol)?.get(date);
+      const resolvedSource = cachedSource === 'LOCF' ? 'LOCF' : 'LIVE';
+      return {
+        price: Number(hist.get(date)),
+        source: resolvedSource,
+        origin: resolvedSource === 'LOCF' ? 'market_cache_exact_locf' : 'market_cache_exact',
+      };
     }
     // fallback: try latest NSE quote for today
     if (date === todayIso()) {
@@ -1289,9 +1317,25 @@ function upsertDailyRow(db, row, statements = null, auditContext = null) {
     LIMIT 1
   `);
 
-  const existing = ENABLE_ROW_WRITE_AUDIT
-    ? selectExistingScoped.get(normalizedRow.investment_id, normalizedRow.portfolio_id, normalizedRow.date)
-    : null;
+  const existing = selectExistingScoped.get(normalizedRow.investment_id, normalizedRow.portfolio_id, normalizedRow.date);
+  let effectivePriceSource = normalizedRow.price_source;
+  if (String(existing?.price_source || '').toUpperCase() === 'LIVE' && String(normalizedRow.price_source || '').toUpperCase() === 'LOCF') {
+    effectivePriceSource = 'LIVE';
+    logBackfillWarn('[Backfill][SourceGuard] Prevented LIVE to LOCF downgrade', {
+      investmentId: normalizedRow.investment_id,
+      investmentName: auditContext?.investmentName || null,
+      portfolioId: normalizedRow.portfolio_id,
+      date: normalizedRow.date,
+      previousSource: existing?.price_source || null,
+      attemptedSource: normalizedRow.price_source,
+      persistedSource: effectivePriceSource,
+      sourceOrigin: auditContext?.sourceOrigin || null,
+      runDate: auditContext?.runDate || null,
+      existingPricePerUnit: Number(existing?.price_per_unit || 0),
+      attemptedPricePerUnit: normalizedRow.price_per_unit,
+      phase: 'backfill_step3',
+    });
+  }
 
   upsertScoped.run(
     normalizedRow.investment_id,
@@ -1303,7 +1347,7 @@ function upsertDailyRow(db, row, statements = null, auditContext = null) {
     normalizedRow.invested_amount,
     normalizedRow.realized_proceeds,
     normalizedRow.profit_loss,
-    normalizedRow.price_source,
+    effectivePriceSource,
     normalizedRow.day_change
   );
 
@@ -1314,7 +1358,7 @@ function upsertDailyRow(db, row, statements = null, auditContext = null) {
       investmentName: auditContext?.investmentName || null,
       portfolioId: normalizedRow.portfolio_id,
       date: normalizedRow.date,
-      source: normalizedRow.price_source,
+      source: effectivePriceSource,
       sourceOrigin: auditContext?.sourceOrigin || null,
       pricePerUnit: normalizedRow.price_per_unit,
       currentValue: normalizedRow.current_value,
@@ -3197,6 +3241,7 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
       symbol: providerSymbol,
       marketSessionDates: sessions,
       seriesMap,
+      locfCutoffDate: runDate,
     });
     missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
     const firstMissingDate = missingSessionDates[0] || null;
@@ -3234,6 +3279,11 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
         shouldWarnSparseCoverage = false;
         warningSuppressedReason = 'INDIAN_SAME_DAY_PENDING';
       }
+    }
+
+    if (shouldWarnSparseCoverage && firstMissingDate >= runDate) {
+      shouldWarnSparseCoverage = false;
+      warningSuppressedReason = 'SAME_DAY_CACHE_PENDING';
     }
 
     if (shouldWarnSparseCoverage) {
@@ -3287,6 +3337,7 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
       symbol: providerSymbol,
       marketSessionDates: sessions,
       seriesMap,
+      locfCutoffDate: runDate,
     });
     missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
     const firstMissingDate = missingSessionDates[0] || null;
@@ -3305,6 +3356,11 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
 
     let shouldWarnSparseCoverage = true;
     let warningSuppressedReason = null;
+
+    if (shouldWarnSparseCoverage && firstMissingDate >= runDate) {
+      shouldWarnSparseCoverage = false;
+      warningSuppressedReason = 'SAME_DAY_CACHE_PENDING';
+    }
 
     if (shouldWarnSparseCoverage) {
       logBackfillWarn('[Backfill][SGBCache] Coverage still sparse after hydration for investment', {
@@ -3360,6 +3416,7 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
       symbol: providerSymbol,
       marketSessionDates: sessions,
       seriesMap,
+      locfCutoffDate: runDate,
     });
     missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
     const firstMissingDate = missingSessionDates[0] || null;
@@ -3378,6 +3435,11 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
 
     let shouldWarnSparseCoverage = true;
     let warningSuppressedReason = null;
+
+    if (shouldWarnSparseCoverage && firstMissingDate >= runDate) {
+      shouldWarnSparseCoverage = false;
+      warningSuppressedReason = 'SAME_DAY_CACHE_PENDING';
+    }
 
     if (shouldWarnSparseCoverage) {
       logBackfillWarn('[Backfill][MFCache] Coverage still sparse after hydration for investment', {
@@ -3430,6 +3492,7 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
       symbol: providerSymbol,
       marketSessionDates: sessions,
       seriesMap,
+      locfCutoffDate: runDate,
     });
     missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
     const firstMissingDate = missingSessionDates[0] || null;
@@ -3448,6 +3511,11 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
 
     let shouldWarnSparseCoverage = true;
     let warningSuppressedReason = null;
+
+    if (shouldWarnSparseCoverage && firstMissingDate >= runDate) {
+      shouldWarnSparseCoverage = false;
+      warningSuppressedReason = 'SAME_DAY_CACHE_PENDING';
+    }
 
     if (shouldWarnSparseCoverage) {
       logBackfillWarn('[Backfill][NPSCache] Coverage still sparse after hydration for investment', {
@@ -4760,11 +4828,34 @@ async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
         price_source = excluded.price_source,
         updated_at = datetime('now')
     `);
+    const selectExistingStmt = db.prepare(`
+      SELECT price_per_unit, price_source
+      FROM daily_values
+      WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+      LIMIT 1
+    `);
 
     db.transaction(() => {
       for (const { date, nav } of filtered) {
         for (const pid of portfolioIds) {
-          upsertStmt.run(investmentId, pid, date, nav, 'COMPUTED');
+          const existing = selectExistingStmt.get(investmentId, pid, date);
+          let effectiveSource = 'COMPUTED';
+          if (String(existing?.price_source || '').toUpperCase() === 'LIVE') {
+            effectiveSource = 'LIVE';
+            logBackfillWarn('[Backfill][NPS][SourceGuard] Prevented LIVE to COMPUTED downgrade', {
+              investmentId,
+              investmentName: inv?.name || null,
+              portfolioId: pid,
+              date,
+              previousSource: existing?.price_source || null,
+              attemptedSource: 'COMPUTED',
+              persistedSource: effectiveSource,
+              existingPricePerUnit: Number(existing?.price_per_unit || 0),
+              attemptedPricePerUnit: Number(nav || 0),
+              phase: 'backfill_nps_history',
+            });
+          }
+          upsertStmt.run(investmentId, pid, date, nav, effectiveSource);
         }
       }
     })();
