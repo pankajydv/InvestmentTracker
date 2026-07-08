@@ -170,4 +170,93 @@ describe('Updater price source regressions', () => {
     assert.equal(todayRow.price_source, 'LOCF');
     assert.equal(Number(todayRow.price_per_unit), 372.97);
   });
+
+  it('preserves POST source across phase transitions (no LIVE->LOCF downgrade)', async () => {
+    const { investmentId, portfolioId } = seedInvestment({
+      name: 'MSFT',
+      assetType: 'FOREIGN_STOCK',
+      ticker: 'MSFT',
+    });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const sessionDate = addDaysIso(today, -1);
+
+    // Step 1: First call writes POST (post-market session)
+    stockPriceMock = async (_symbol, options = {}) => {
+      if (options.interval === '15m') {
+        return {
+          price: 388.3,
+          change: 0,
+          changePercent: 0,
+          date: sessionDate,
+          sessionPhase: 'post',  // POST market phase
+          sessionDateIst: sessionDate,
+          officialClose: null,
+        };
+      }
+      return {
+        price: 388.3,
+        change: 0,
+        changePercent: 0,
+        date: sessionDate,
+        sessionPhase: 'post',
+        sessionDateIst: sessionDate,
+        officialClose: 388.3,
+      };
+    };
+
+    let result = await updateAllPrices(db, { assetTypes: ['FOREIGN_STOCK'] });
+    assert.equal(Number(result.errorCount || 0), 0);
+
+    let firstRow = db.prepare(
+      `SELECT price_per_unit, price_source
+       FROM daily_values
+       WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+       ORDER BY id DESC LIMIT 1`
+    ).get(investmentId, portfolioId, today);
+
+    assert.ok(firstRow, 'Expected first run to write today row');
+    assert.equal(firstRow.price_source, 'POST', 'First run should write POST (from post-market session)');
+
+    // Step 2: Second call tries to write LOCF (regular session phase)
+    stockPriceMock = async (_symbol, options = {}) => {
+      if (options.interval === '15m') {
+        return {
+          price: 388.84,
+          change: 0,
+          changePercent: 0,
+          date: sessionDate,
+          sessionPhase: 'regular',  // Market transitioned to REGULAR session
+          sessionDateIst: sessionDate,
+          officialClose: null,
+        };
+      }
+      return {
+        price: 388.84,
+        change: 0,
+        changePercent: 0,
+        date: sessionDate,
+        sessionPhase: 'regular',
+        sessionDateIst: sessionDate,
+        officialClose: 388.84,
+      };
+    };
+
+    result = await updateAllPrices(db, { assetTypes: ['FOREIGN_STOCK'] });
+    assert.equal(Number(result.errorCount || 0), 0);
+
+    let secondRow = db.prepare(
+      `SELECT price_per_unit, price_source
+       FROM daily_values
+       WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+       ORDER BY id DESC LIMIT 1`
+    ).get(investmentId, portfolioId, today);
+
+    assert.ok(secondRow, 'Expected second run to maintain today row');
+    assert.equal(
+      secondRow.price_source,
+      'POST',
+      'Second run should preserve POST (not downgrade to LOCF despite regular phase)'
+    );
+  });
 });

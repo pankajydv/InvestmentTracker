@@ -764,9 +764,19 @@ async function updateAllPrices(db, options = {}) {
 
       const existingRow = getExistingDailyRowByScopeDate.get(inv.id, pid, asOfDate);
       let effectivePriceSource = resolvedPriceSource;
-      if (String(existingRow?.price_source || '').toUpperCase() === 'LIVE' && String(resolvedPriceSource || '').toUpperCase() === 'LOCF') {
-        effectivePriceSource = 'LIVE';
-        logAppWarn('[UpdatePrices][SourceGuard] Prevented LIVE to LOCF downgrade', {
+      
+      // ─── Session Source Persistence ───────────────────────────────────
+      // Prevent downgrading explicit session sources (PRE/POST/LIVE) to LOCF.
+      // Session sources represent data from a known market session and are
+      // more authoritative than LOCF. Downgrading when market phase transitions
+      // is a degradation (e.g., POST → LOCF when regular session begins).
+      const existingSource = String(existingRow?.price_source || '').toUpperCase();
+      const isSessionSource = ['PRE', 'POST', 'LIVE'].includes(existingSource);
+      const attemptedDowngrade = isSessionSource && String(resolvedPriceSource || '').toUpperCase() === 'LOCF';
+      
+      if (attemptedDowngrade) {
+        effectivePriceSource = existingRow.price_source;
+        logAppWarn('[UpdatePrices][SourceGuard] Prevented session source downgrade to LOCF', {
           investmentId: inv.id,
           investmentName: inv.name,
           portfolioId: pid,
