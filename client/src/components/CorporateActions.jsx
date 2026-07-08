@@ -16,6 +16,7 @@ import RsuVestReview from './RsuVestReview';
 
 const TYPE_BADGE = {
   DIVIDEND: 'badge-dividend',
+  INTEREST: 'badge-dividend',
   SPLIT: 'badge-split',
   BONUS: 'badge-bonus',
   TDS: 'badge-tds',
@@ -24,6 +25,8 @@ const TYPE_BADGE = {
 const ASSET_TYPE_OPTIONS = [
   { value: 'INDIAN_STOCK', label: 'Stocks' },
   { value: 'FOREIGN_STOCK', label: 'Foreign Stocks' },
+  { value: 'BOND', label: 'Bonds' },
+  { value: 'SGB', label: 'SGBs' },
 ];
 
 const RATE_TYPES = new Set(['PPF', 'SSY', 'PF']);
@@ -278,8 +281,8 @@ export default function CorporateActions() {
                     {pendingSuggestions.map((item) => {
                       const payload = item.payload || {};
                       const next = payload.next || {};
-                      const isDividend = item.transaction_type === 'DIVIDEND';
-                      const proposedValue = isDividend
+                      const isCashAmountType = item.transaction_type === 'DIVIDEND' || item.transaction_type === 'INTEREST';
+                      const proposedValue = isCashAmountType
                         ? `₹${formatNumber(next.amount ?? 0, 2)}`
                         : `${formatNumber(next.units ?? 0, 4)} shares`;
                       return (
@@ -422,12 +425,12 @@ export default function CorporateActions() {
               <td className="px-3 py-2 text-nowrap">{formatDate(s.transaction_date)}</td>
               <td className="px-3 py-2 fw-medium">{s.investment_name}</td>
               <td className="px-3 py-2"><TypeBadge type={s.transaction_type} /></td>
-              <td className="px-3 py-2 text-end">{formatNumber(s.units, 4)}</td>
+              <td className="px-3 py-2 text-end">{s.transaction_type === 'INTEREST' ? '-' : formatNumber(s.units, 4)}</td>
               <td className="px-3 py-2 text-end">
                 {s.transaction_type === 'DIVIDEND' ? `${moneySymbol(s)}${formatNumber(s.price_per_unit, 2)}` : '-'}
               </td>
               <td className="px-3 py-2 text-end fw-medium">
-                {s.transaction_type === 'DIVIDEND' ? (
+                {s.transaction_type === 'DIVIDEND' || s.transaction_type === 'INTEREST' ? (
                   <>
                     ₹{formatNumber(s.amount, 2)}
                     {s.usd_amount != null && (
@@ -485,10 +488,10 @@ export default function CorporateActions() {
           renderRow={(c, i) => {
             const dateChanged = c.current_date && c.current_date !== c.transaction_date;
             const symbol = moneySymbol(c);
-            const currentVal = c.transaction_type === 'DIVIDEND'
+            const currentVal = (c.transaction_type === 'DIVIDEND' || c.transaction_type === 'INTEREST')
               ? `${symbol}${formatNumber(c.current_amount, 2)}`
               : `${formatNumber(c.current_units, 4)} shares`;
-            const expectedVal = c.transaction_type === 'DIVIDEND'
+            const expectedVal = (c.transaction_type === 'DIVIDEND' || c.transaction_type === 'INTEREST')
               ? `${symbol}${formatNumber(c.expected_amount, 2)}`
               : `${formatNumber(c.expected_units, 4)} shares`;
             return (
@@ -587,7 +590,7 @@ export default function CorporateActions() {
                 <td className="px-3 py-2 fw-medium">{d.investment_name}</td>
                 <td className="px-3 py-2"><TypeBadge type={d.transaction_type} /></td>
                 <td className="px-3 py-2 text-end">
-                  {d.transaction_type === 'DIVIDEND'
+                  {d.transaction_type === 'DIVIDEND' || d.transaction_type === 'INTEREST'
                     ? `${moneySymbol(d)}${formatNumber(d.amount, 2)}`
                     : `${formatNumber(d.units, 4)} shares`}
                 </td>

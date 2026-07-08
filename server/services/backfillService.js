@@ -1972,11 +1972,13 @@ function persistCorporateActionSuggestions(db, changes = [], source = 'auto_back
 
 async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDate, cache, options = {}) {
   const dryRun = options?.dryRun === true;
+  const isStockAsset = inv.asset_type === 'INDIAN_STOCK' || inv.asset_type === 'FOREIGN_STOCK';
+  const isCouponAsset = inv.asset_type === 'BOND' || inv.asset_type === 'SGB';
   if (portfolioId == null) return { inserted: 0, updated: 0, modified: 0, earliestChangedDate: null, caChanges: [] };
-  if (inv.asset_type !== 'INDIAN_STOCK' && inv.asset_type !== 'FOREIGN_STOCK') {
+  if (!isStockAsset && !isCouponAsset) {
     return { inserted: 0, updated: 0, modified: 0, earliestChangedDate: null, caChanges: [] };
   }
-  if (!inv.ticker_symbol) {
+  if (isStockAsset && !inv.ticker_symbol) {
     logBackfillWarn('[Backfill][CA] Skipping CA sync due to missing ticker symbol', {
       investmentId: inv.id,
       investmentName: inv.name,
@@ -1997,9 +1999,11 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
     return { inserted: 0, updated: 0, modified: 0, earliestChangedDate: null, caChanges: [] };
   }
 
-  const ticker = inv.asset_type === 'INDIAN_STOCK' && !inv.ticker_symbol.includes('.')
-    ? `${inv.ticker_symbol}.NS`
-    : inv.ticker_symbol;
+  const ticker = isStockAsset
+    ? (inv.asset_type === 'INDIAN_STOCK' && !inv.ticker_symbol.includes('.')
+      ? `${inv.ticker_symbol}.NS`
+      : inv.ticker_symbol)
+    : null;
 
   const CORPORATE_TYPES = new Set(['BONUS', 'SPLIT', 'RIGHTS', 'MERGER', 'CONSOLIDATION', 'DIVIDEND', 'INTEREST']);
   const SAME_DAY_UNIT_ADD_CORPORATE = new Set(['BONUS', 'SPLIT', 'RIGHTS']);
@@ -2225,12 +2229,14 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       };
     }
 
+    const compareTextMeta = normalizedDesired.transactionType !== 'INTEREST';
+
     const needsUpdate =
       !nearlyEqual(canonical.units, normalizedDesired.units) ||
       !nearlyEqual(canonical.price_per_unit, normalizedDesired.pricePerUnit) ||
       !nearlyEqual(canonical.amount, normalizedDesired.amount) ||
-      String(canonical.notes || '') !== String(normalizedDesired.notes || '') ||
-      String(canonical.broker || '') !== String(normalizedDesired.broker || '') ||
+      (compareTextMeta && String(canonical.notes || '') !== String(normalizedDesired.notes || '')) ||
+      (compareTextMeta && String(canonical.broker || '') !== String(normalizedDesired.broker || '')) ||
       !nearlyEqual(canonical.exchange_rate_used, normalizedDesired.fxRate) ||
       !nearlyEqual(canonical.usd_amount, normalizedDesired.usdAmount);
 
@@ -2277,6 +2283,189 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       earliestChangedDate = date;
     }
   };
+
+  if (isCouponAsset) {
+    const FREQUENCY_MONTHS = {
+      MONTHLY: 1,
+      QUARTERLY: 3,
+      SEMI_ANNUAL: 6,
+      ANNUAL: 12,
+    };
+
+    const normalizeFrequency = (value) => {
+      const normalized = String(value || '').trim().toUpperCase();
+      return FREQUENCY_MONTHS[normalized] ? normalized : null;
+    };
+
+    const addMonthsIso = (isoDate, months) => {
+      const d = new Date(`${isoDate}T00:00:00.000Z`);
+      if (Number.isNaN(d.getTime())) return null;
+      const day = d.getUTCDate();
+      d.setUTCDate(1);
+      d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
+      const endOfMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+      d.setUTCDate(Math.min(day, endOfMonth));
+      return d.toISOString().slice(0, 10);
+    };
+
+    const parseRateFromText = (value) => {
+      const text = String(value || '');
+      const m = text.match(/(\d{1,2}(?:\.\d{1,4})?)\s*%/);
+      if (!m) return 0;
+      const rate = Number(m[1]);
+      return Number.isFinite(rate) && rate > 0 && rate <= 100 ? rate : 0;
+    };
+
+    const median = (values = []) => {
+      const sorted = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+      if (!sorted.length) return null;
+      const mid = Math.floor(sorted.length / 2);
+      if (sorted.length % 2 === 1) return sorted[mid];
+      return (sorted[mid - 1] + sorted[mid]) / 2;
+    };
+
+    const inferFrequencyFromInterestDates = (dates = []) => {
+      if (dates.length < 2) return null;
+      const diffs = [];
+      for (let i = 1; i < dates.length; i += 1) {
+        const prev = new Date(`${dates[i - 1]}T00:00:00.000Z`).getTime();
+        const next = new Date(`${dates[i]}T00:00:00.000Z`).getTime();
+        const days = Math.round((next - prev) / 86400000);
+        if (Number.isFinite(days) && days > 0) diffs.push(days);
+      }
+      if (!diffs.length) return null;
+      const avg = diffs.reduce((s, d) => s + d, 0) / diffs.length;
+      if (avg <= 45) return 'MONTHLY';
+      if (avg <= 120) return 'QUARTERLY';
+      if (avg <= 220) return 'SEMI_ANNUAL';
+      return 'ANNUAL';
+    };
+
+    const interestRows = db.prepare(`
+      SELECT date(transaction_date) AS tx_date, amount
+      FROM transactions
+      WHERE investment_id = ?
+        AND portfolio_id = ?
+        AND transaction_type = 'INTEREST'
+        AND date(transaction_date) <= ?
+      ORDER BY date(transaction_date) ASC, id ASC
+    `).all(inv.id, portfolioId, toDate);
+
+    const interestDates = interestRows.map((r) => String(r.tx_date || '')).filter(Boolean);
+    const inferredFrequency = inferFrequencyFromInterestDates(interestDates);
+    const couponFrequency = normalizeFrequency(inv.coupon_frequency) || inferredFrequency || 'SEMI_ANNUAL';
+    const periodMonths = FREQUENCY_MONTHS[couponFrequency];
+
+    const annualCouponRate = (() => {
+      const explicitRate = Number(inv.coupon_rate || 0);
+      if (Number.isFinite(explicitRate) && explicitRate > 0) return explicitRate;
+      const fromName = parseRateFromText(inv.name);
+      if (fromName > 0) return fromName;
+      return parseRateFromText(inv.notes);
+    })();
+
+    const perUnitFromHistory = (() => {
+      const vals = [];
+      for (const row of interestRows) {
+        const amount = Number(row?.amount || 0);
+        const date = String(row?.tx_date || '');
+        if (!(amount > 0) || !date) continue;
+        const units = Number(holdingUnitsAtDateFast(date, false, false) || 0);
+        if (!(units > 0)) continue;
+        vals.push(amount / units);
+      }
+      return median(vals);
+    })();
+
+    const principalPerUnit = (() => {
+      const face = Number(inv.face_value || 0);
+      if (face > 0) return face;
+      const buyPrices = holdingRows
+        .filter((r) => String(r.transaction_type || '').toUpperCase() === 'BUY')
+        .map((r) => Number(r.units > 0 ? (db.prepare(
+          `SELECT price_per_unit FROM transactions
+           WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
+             AND UPPER(transaction_type) = 'BUY'
+           ORDER BY id ASC LIMIT 1`
+        ).get(inv.id, portfolioId, r.transaction_date)?.price_per_unit || 0) : 0))
+        .filter((v) => Number.isFinite(v) && v > 0);
+      return median(buyPrices) || 0;
+    })();
+
+    const firstScheduleDate = interestDates[0] || dayKeys[0] || null;
+    if (!firstScheduleDate || !periodMonths) {
+      return { inserted, updated, modified: inserted + updated, earliestChangedDate, caChanges };
+    }
+
+    let scheduleCursor = firstScheduleDate;
+    if (!interestDates.length) {
+      scheduleCursor = addMonthsIso(firstScheduleDate, periodMonths);
+    }
+
+    let guard = 0;
+    while (scheduleCursor && scheduleCursor <= toDate && guard < 500) {
+      guard += 1;
+
+      if (scheduleCursor >= fromDate) {
+        const units = Number(holdingUnitsAtDateFast(scheduleCursor, false, false) || 0);
+        if (units > 0) {
+          let amount = 0;
+          if (perUnitFromHistory && perUnitFromHistory > 0) {
+            amount = units * perUnitFromHistory;
+          } else if (annualCouponRate > 0 && principalPerUnit > 0) {
+            amount = units * principalPerUnit * (annualCouponRate / 100) * (periodMonths / 12);
+          }
+
+          if (amount > 0) {
+            amount = Math.round(amount * 100) / 100;
+            const notes = `AutoBackfill CA Interest (${couponFrequency.replace(/_/g, ' ')})`;
+            const change = upsertCorporateActionTxn({
+              investmentId: inv.id,
+              portfolioId,
+              transactionType: 'INTEREST',
+              date: scheduleCursor,
+              units: null,
+              pricePerUnit: null,
+              amount,
+              notes,
+              broker: null,
+              fxRate: null,
+              usdAmount: null,
+            });
+            const changeType = change?.changeType || 'unchanged';
+            if (changeType !== 'unchanged') {
+              if (changeType === 'inserted') inserted += 1;
+              else updated += 1;
+              markChangedDate(scheduleCursor);
+              caChanges.push({
+                action: changeType,
+                recordId: change.recordId,
+                investmentId: inv.id,
+                investmentName: inv.name,
+                portfolioId,
+                transactionType: 'INTEREST',
+                transactionDate: scheduleCursor,
+                previous: change.previous,
+                next: change.next,
+                deletedDuplicateIds: change.deletedDuplicateIds || [],
+                locked: !!change.locked,
+              });
+            }
+          }
+        }
+      }
+
+      scheduleCursor = addMonthsIso(scheduleCursor, periodMonths);
+    }
+
+    return {
+      inserted,
+      updated,
+      modified: inserted + updated,
+      earliestChangedDate,
+      caChanges,
+    };
+  }
 
   const dividendCacheKey = `${inv.id}:${fromDate}:${toDate}`;
   let dividends = cache.dividendEvents.get(dividendCacheKey);

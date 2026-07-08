@@ -1679,16 +1679,310 @@ module.exports = function (db) {
   // ─── Corporate Actions: Preview ─────────────────────────────────────────────
   /**
    * GET /api/stocks/corporate-actions/preview?portfolio_id=1
-   * Fetch missing corporate actions (dividends, splits/bonus) for all stocks
-   * held in the portfolio during their active transaction window.
+   * Fetch missing corporate actions:
+   * - Stocks: dividends, splits/bonus
+   * - Bonds/SGB: missing coupon interest
+   * for holdings in their active transaction window.
    */
   router.get('/corporate-actions/preview', async (req, res) => {
     try {
       const { portfolio_id, asset_type } = req.query;
       const portfolioId = portfolio_id ? parseInt(portfolio_id) : null;
-      const assetType = asset_type === 'FOREIGN_STOCK' ? 'FOREIGN_STOCK' : 'INDIAN_STOCK';
+      const allowedAssetTypes = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'BOND', 'SGB']);
+      const requestedAssetType = String(asset_type || 'INDIAN_STOCK').toUpperCase();
+      const assetType = allowedAssetTypes.has(requestedAssetType) ? requestedAssetType : 'INDIAN_STOCK';
       const currencySymbol = assetType === 'FOREIGN_STOCK' ? '$' : '₹';
       const today = new Date().toISOString().split('T')[0];
+
+      if (assetType === 'BOND' || assetType === 'SGB') {
+        let investmentQuery;
+        let investmentParams;
+        if (portfolioId) {
+          investmentQuery = `
+            SELECT DISTINCT i.id, i.name, i.asset_type, i.face_value, i.coupon_rate, i.coupon_frequency, i.notes
+            FROM investments i
+            JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
+            WHERE i.asset_type = ?`;
+          investmentParams = [portfolioId, assetType];
+        } else {
+          investmentQuery = `
+            SELECT DISTINCT i.id, i.name, i.asset_type, i.face_value, i.coupon_rate, i.coupon_frequency, i.notes
+            FROM investments i
+            WHERE i.asset_type = ?
+              AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id)`;
+          investmentParams = [assetType];
+        }
+
+        const investments = db.prepare(investmentQuery).all(...investmentParams);
+        const suggestions = [];
+        const corrections = [];
+        const deletions = [];
+        const errors = [];
+
+        const UNIT_ADD_TYPES = new Set(CORPORATE_ACTION_UNIT_ADD_TYPES);
+        const UNIT_SUB_TYPES = new Set(CORPORATE_ACTION_UNIT_SUB_TYPES);
+        const FREQUENCY_MONTHS = {
+          MONTHLY: 1,
+          QUARTERLY: 3,
+          SEMI_ANNUAL: 6,
+          ANNUAL: 12,
+        };
+
+        const normalizeFrequency = (value) => {
+          const normalized = String(value || '').trim().toUpperCase();
+          return FREQUENCY_MONTHS[normalized] ? normalized : null;
+        };
+
+        const parseRateFromText = (value) => {
+          const text = String(value || '');
+          const m = text.match(/(\d{1,2}(?:\.\d{1,4})?)\s*%/);
+          if (!m) return 0;
+          const rate = Number(m[1]);
+          return Number.isFinite(rate) && rate > 0 && rate <= 100 ? rate : 0;
+        };
+
+        const median = (values = []) => {
+          const sorted = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+          if (!sorted.length) return null;
+          const mid = Math.floor(sorted.length / 2);
+          if (sorted.length % 2 === 1) return sorted[mid];
+          return (sorted[mid - 1] + sorted[mid]) / 2;
+        };
+
+        const inferFrequencyFromInterestDates = (dates = []) => {
+          if (dates.length < 2) return null;
+          const diffs = [];
+          for (let i = 1; i < dates.length; i += 1) {
+            const prev = new Date(`${dates[i - 1]}T00:00:00.000Z`).getTime();
+            const next = new Date(`${dates[i]}T00:00:00.000Z`).getTime();
+            const days = Math.round((next - prev) / 86400000);
+            if (Number.isFinite(days) && days > 0) diffs.push(days);
+          }
+          if (!diffs.length) return null;
+          const avg = diffs.reduce((s, d) => s + d, 0) / diffs.length;
+          if (avg <= 45) return 'MONTHLY';
+          if (avg <= 120) return 'QUARTERLY';
+          if (avg <= 220) return 'SEMI_ANNUAL';
+          return 'ANNUAL';
+        };
+
+        const addMonthsIso = (isoDate, months) => {
+          const d = new Date(`${isoDate}T00:00:00.000Z`);
+          if (Number.isNaN(d.getTime())) return null;
+          const day = d.getUTCDate();
+          d.setUTCDate(1);
+          d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
+          const endOfMonth = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+          d.setUTCDate(Math.min(day, endOfMonth));
+          return d.toISOString().slice(0, 10);
+        };
+
+        for (const inv of investments) {
+          const allTxns = db.prepare(`
+            SELECT id, portfolio_id, date(transaction_date) AS transaction_date, UPPER(transaction_type) AS transaction_type,
+                   units, price_per_unit, amount, notes, locked
+            FROM transactions
+            WHERE investment_id = ?
+            ORDER BY date(transaction_date) ASC, id ASC
+          `).all(inv.id);
+
+          if (!allTxns.length) continue;
+
+          const processPortfolios = portfolioId
+            ? [portfolioId]
+            : [...new Set(allTxns.filter(t => t.portfolio_id).map(t => t.portfolio_id))];
+
+          for (const pid of processPortfolios) {
+            const txns = allTxns.filter((t) => t.portfolio_id === pid);
+            if (!txns.length) continue;
+
+            const firstTxnDate = String(txns[0].transaction_date || '');
+            const lastTxnDate = String(txns[txns.length - 1].transaction_date || '');
+            let netUnits = 0;
+            for (const t of txns) {
+              if (UNIT_ADD_TYPES.has(t.transaction_type)) netUnits += Number(t.units || 0);
+              else if (UNIT_SUB_TYPES.has(t.transaction_type)) netUnits -= Number(t.units || 0);
+            }
+
+            const exitDate = (netUnits <= 0 && lastTxnDate) ? lastTxnDate : today;
+            const windowStart = firstTxnDate;
+            const windowEnd = exitDate < today ? exitDate : today;
+            if (!windowStart || !windowEnd || windowStart > windowEnd) continue;
+
+            const dayUnits = new Map();
+            for (const t of txns) {
+              const dateKey = String(t.transaction_date || '');
+              if (!dateKey) continue;
+              const units = Number(t.units || 0);
+              if (!Number.isFinite(units) || Math.abs(units) < 1e-12) continue;
+              let delta = 0;
+              if (UNIT_ADD_TYPES.has(t.transaction_type)) delta = units;
+              else if (UNIT_SUB_TYPES.has(t.transaction_type)) delta = -units;
+              if (!delta) continue;
+              dayUnits.set(dateKey, Number(dayUnits.get(dateKey) || 0) + delta);
+            }
+
+            const dayKeys = Array.from(dayUnits.keys()).sort();
+            const cumulativeByDate = new Map();
+            let running = 0;
+            for (const d of dayKeys) {
+              running += Number(dayUnits.get(d) || 0);
+              cumulativeByDate.set(d, running);
+            }
+
+            const unitsOnOrBefore = (date) => {
+              let units = 0;
+              for (const d of dayKeys) {
+                if (d > date) break;
+                units = Number(cumulativeByDate.get(d) || units);
+              }
+              return Math.round(units * 1000) / 1000;
+            };
+
+            const interestRows = txns
+              .filter((t) => t.transaction_type === 'INTEREST')
+              .filter((t) => t.transaction_date >= windowStart && t.transaction_date <= windowEnd)
+              .sort((a, b) => String(a.transaction_date).localeCompare(String(b.transaction_date)) || Number(a.id) - Number(b.id));
+
+            const interestDates = interestRows.map((r) => String(r.transaction_date || '')).filter(Boolean);
+            const inferredFrequency = inferFrequencyFromInterestDates(interestDates);
+            const couponFrequency = normalizeFrequency(inv.coupon_frequency) || inferredFrequency || 'SEMI_ANNUAL';
+            const periodMonths = FREQUENCY_MONTHS[couponFrequency];
+
+            const annualCouponRate = (() => {
+              const explicit = Number(inv.coupon_rate || 0);
+              if (Number.isFinite(explicit) && explicit > 0) return explicit;
+              const fromName = parseRateFromText(inv.name);
+              if (fromName > 0) return fromName;
+              return parseRateFromText(inv.notes);
+            })();
+
+            const perUnitFromHistory = (() => {
+              const vals = [];
+              for (const row of interestRows) {
+                const amount = Number(row?.amount || 0);
+                const date = String(row?.transaction_date || '');
+                if (!(amount > 0) || !date) continue;
+                const units = Number(unitsOnOrBefore(date) || 0);
+                if (!(units > 0)) continue;
+                vals.push(amount / units);
+              }
+              return median(vals);
+            })();
+
+            const principalPerUnit = (() => {
+              const face = Number(inv.face_value || 0);
+              if (face > 0) return face;
+              const prices = txns
+                .filter((t) => t.transaction_type === 'BUY')
+                .map((t) => Number(t.price_per_unit || 0))
+                .filter((v) => Number.isFinite(v) && v > 0);
+              return median(prices) || 0;
+            })();
+
+            const existingByDate = new Map();
+            for (const row of interestRows) {
+              const key = String(row.transaction_date || '');
+              const arr = existingByDate.get(key) || [];
+              arr.push(row);
+              existingByDate.set(key, arr);
+            }
+            const matchedExistingIds = new Set();
+
+            const firstScheduleDate = interestDates[0] || dayKeys[0] || null;
+            if (!firstScheduleDate || !periodMonths) {
+              errors.push({ investment: inv.name, error: 'Unable to infer coupon schedule for interest detection' });
+              continue;
+            }
+
+            let scheduleCursor = interestDates.length ? firstScheduleDate : addMonthsIso(firstScheduleDate, periodMonths);
+            let guard = 0;
+            while (scheduleCursor && scheduleCursor <= windowEnd && guard < 500) {
+              guard += 1;
+              if (scheduleCursor >= windowStart) {
+                const units = Number(unitsOnOrBefore(scheduleCursor) || 0);
+                if (units > 0) {
+                  let expectedAmount = 0;
+                  if (perUnitFromHistory && perUnitFromHistory > 0) {
+                    expectedAmount = units * perUnitFromHistory;
+                  } else if (annualCouponRate > 0 && principalPerUnit > 0) {
+                    expectedAmount = units * principalPerUnit * (annualCouponRate / 100) * (periodMonths / 12);
+                  }
+
+                  if (expectedAmount > 0) {
+                    expectedAmount = Math.round(expectedAmount * 100) / 100;
+                    const existingRows = existingByDate.get(scheduleCursor) || [];
+                    const existing = existingRows.find((r) => !matchedExistingIds.has(r.id));
+                    if (existing) {
+                      matchedExistingIds.add(existing.id);
+                      if (Number(existing.locked || 0) !== 1 && Math.abs(Number(existing.amount || 0) - expectedAmount) >= 1) {
+                        corrections.push({
+                          id: existing.id,
+                          investment_id: inv.id,
+                          investment_name: inv.name,
+                          transaction_type: 'INTEREST',
+                          transaction_date: scheduleCursor,
+                          current_units: existing.units,
+                          current_amount: Number(existing.amount || 0),
+                          current_price_per_unit: existing.price_per_unit,
+                          current_date: existing.transaction_date,
+                          expected_units: null,
+                          expected_amount: expectedAmount,
+                          expected_price_per_unit: null,
+                          broker: null,
+                          portfolio_id: pid,
+                          notes: `Expected coupon interest (${couponFrequency.replace(/_/g, ' ')})`,
+                        });
+                      }
+                    } else {
+                      suggestions.push({
+                        investment_id: inv.id,
+                        investment_name: inv.name,
+                        transaction_type: 'INTEREST',
+                        transaction_date: scheduleCursor,
+                        units: null,
+                        price_per_unit: null,
+                        amount: expectedAmount,
+                        exchange_rate_used: null,
+                        usd_amount: null,
+                        fees: 0,
+                        broker: null,
+                        portfolio_id: pid,
+                        currency_symbol: '₹',
+                        notes: `Expected coupon interest (${couponFrequency.replace(/_/g, ' ')})`,
+                      });
+                    }
+                  }
+                }
+              }
+              scheduleCursor = addMonthsIso(scheduleCursor, periodMonths);
+            }
+
+            for (const row of interestRows) {
+              if (matchedExistingIds.has(row.id)) continue;
+              if (Number(row.locked || 0) === 1) continue;
+              deletions.push({
+                id: row.id,
+                investment_id: inv.id,
+                investment_name: inv.name,
+                transaction_type: row.transaction_type,
+                transaction_date: row.transaction_date,
+                units: row.units,
+                amount: row.amount,
+                price_per_unit: row.price_per_unit,
+                notes: row.notes,
+                reason: 'No matching coupon date found in inferred schedule',
+              });
+            }
+          }
+        }
+
+        suggestions.sort((a, b) => a.transaction_date.localeCompare(b.transaction_date));
+        corrections.sort((a, b) => a.transaction_date.localeCompare(b.transaction_date));
+        deletions.sort((a, b) => a.transaction_date.localeCompare(b.transaction_date));
+
+        return res.json({ suggestions, corrections, deletions, errors });
+      }
 
       // Get all stock investments of the requested type (optionally scoped to portfolio) that have a ticker
       let investmentQuery;
