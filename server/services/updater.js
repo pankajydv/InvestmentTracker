@@ -26,7 +26,7 @@ const {
 const {
   quantizeForStorage,
 } = require('./numberPrecision');
-const { upsertInvestmentPriceSeries } = require('./marketPriceCache');
+const { upsertInvestmentPriceSeries, getInvestmentSeries } = require('./marketPriceCache');
 const { markScopeDirty, runDailyBootstrapDirtyScopeEnqueue } = require('./dirtyBackfillService');
 const { todayIso, normalizeProviderDate } = require('./dateUtils');
 const { LOCF_STREAK_WARN_SESSIONS, FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS } = require('./freshnessPolicy');
@@ -483,6 +483,13 @@ async function updateAllPrices(db, options = {}) {
     WHERE investment_id = ? AND portfolio_id = ? AND date = ?
     LIMIT 1
   `);
+  const getPortfolioIdsForInvestment = db.prepare(`
+    SELECT DISTINCT portfolio_id
+    FROM transactions
+    WHERE investment_id = ?
+      AND portfolio_id IS NOT NULL
+    ORDER BY portfolio_id ASC
+  `);
 
   let successCount = 0;
   let errorCount = 0;
@@ -593,6 +600,123 @@ async function updateAllPrices(db, options = {}) {
       runTag,
       phase: 'updater',
     });
+  }
+
+  function hasRealCachePointChange(existingPoint, incomingClose, incomingSource) {
+    if (!existingPoint) return true;
+
+    const existingClose = Number(existingPoint.close);
+    const nextClose = Number(incomingClose);
+    const closeChanged = !Number.isFinite(existingClose)
+      || !Number.isFinite(nextClose)
+      || Math.abs(existingClose - nextClose) > 0.000001;
+
+    const normalizeSource = (value) => {
+      const text = String(value || '').trim().toUpperCase();
+      return text || null;
+    };
+    const sourceChanged = normalizeSource(existingPoint.source) !== normalizeSource(incomingSource);
+
+    return closeChanged || sourceChanged;
+  }
+
+  function enqueueLaggedProviderDateRecompute(inv, providerDate, reasonCode) {
+    const normalizedProviderDate = normalizeProviderDate(providerDate);
+    if (!normalizedProviderDate || normalizedProviderDate >= today) return 0;
+
+    const portfolioRows = getPortfolioIdsForInvestment.all(inv.id);
+    let marked = 0;
+
+    if (!portfolioRows.length) {
+      const dirtyDate = markScopeDirty(db, {
+        investmentId: inv.id,
+        portfolioId: null,
+        dirtyFromDate: normalizedProviderDate,
+        reason: `lagged-provider-cache-change:${reasonCode}`,
+        sourceEventId: `update-prices-lagged-cache:${today}:${inv.id}:${normalizedProviderDate}:${reasonCode}`,
+      });
+      if (dirtyDate) marked += 1;
+      return marked;
+    }
+
+    for (const row of portfolioRows) {
+      const dirtyDate = markScopeDirty(db, {
+        investmentId: inv.id,
+        portfolioId: row.portfolio_id,
+        dirtyFromDate: normalizedProviderDate,
+        reason: `lagged-provider-cache-change:${reasonCode}`,
+        sourceEventId: `update-prices-lagged-cache:${today}:${inv.id}:${row.portfolio_id}:${normalizedProviderDate}:${reasonCode}`,
+      });
+      if (dirtyDate) marked += 1;
+    }
+
+    return marked;
+  }
+
+  function maybeUpsertProviderCachePoint(inv, {
+    instrumentType,
+    symbol,
+    providerDate,
+    close,
+    source,
+    reasonCode,
+  }) {
+    const normalizedProviderDate = normalizeProviderDate(providerDate);
+    const normalizedSymbol = String(symbol || '').trim();
+    const normalizedInstrumentType = String(instrumentType || '').trim().toUpperCase();
+    const closeValue = Number(close);
+    if (!normalizedProviderDate || !normalizedSymbol || !normalizedInstrumentType || !Number.isFinite(closeValue) || closeValue <= 0) {
+      return { wrote: false, changed: false, lagged: false, enqueuedScopes: 0 };
+    }
+
+    const laggedProviderDate = normalizedProviderDate < today;
+    const existingPoint = (getInvestmentSeries(inv.id, normalizedProviderDate, normalizedProviderDate) || []).find((row) => {
+      return String(row?.date || '') === normalizedProviderDate
+        && String(row?.instrument_type || '').toUpperCase() === normalizedInstrumentType
+        && String(row?.symbol || '').trim() === normalizedSymbol;
+    }) || null;
+    const changed = hasRealCachePointChange(existingPoint, closeValue, source);
+
+    if (laggedProviderDate && !changed) {
+      logAppInfo('[UpdatePrices] Skipped unchanged lagged provider cache point', {
+        investmentId: inv.id,
+        investmentName: inv.name,
+        assetType: inv.asset_type,
+        instrumentType: normalizedInstrumentType,
+        symbol: normalizedSymbol,
+        providerDate: normalizedProviderDate,
+        close: closeValue,
+        source: source || null,
+        reasonCode,
+        runTag,
+      });
+      return { wrote: false, changed: false, lagged: true, enqueuedScopes: 0 };
+    }
+
+    upsertInvestmentPriceSeries(inv.id, normalizedInstrumentType, normalizedSymbol, [{
+      date: normalizedProviderDate,
+      close: closeValue,
+      source,
+    }], null);
+
+    if (!laggedProviderDate || !changed) {
+      return { wrote: true, changed, lagged: laggedProviderDate, enqueuedScopes: 0 };
+    }
+
+    const enqueuedScopes = enqueueLaggedProviderDateRecompute(inv, normalizedProviderDate, reasonCode);
+    if (enqueuedScopes > 0) {
+      logAppInfo('[UpdatePrices] Enqueued lagged provider-date dirty scopes after cache change', {
+        investmentId: inv.id,
+        investmentName: inv.name,
+        assetType: inv.asset_type,
+        providerDate: normalizedProviderDate,
+        reasonCode,
+        enqueuedScopes,
+        runTag,
+      });
+    }
+
+    return { wrote: true, changed: true, lagged: true, enqueuedScopes };
   }
 
   function writeInvestmentSnapshotForDate(inv, asOfDate, resolvedPricePerUnit, resolvedPriceSource, fxRateForDate = usdToInr, sourceProviderDate = null, sourceOrigin = 'local_compute') {
@@ -895,11 +1019,14 @@ async function updateAllPrices(db, options = {}) {
             priceSource = sourceDecision.priceSource;
             sourceOrigin = 'provider';
             if (sourceDecision.providerDate && Number.isFinite(Number(navData.nav)) && Number(navData.nav) > 0) {
-              upsertInvestmentPriceSeries(inv.id, 'MUTUAL_FUND', String(inv.amfi_code || '').trim(), [{
-                date: sourceDecision.providerDate,
+              maybeUpsertProviderCachePoint(inv, {
+                instrumentType: 'MUTUAL_FUND',
+                symbol: String(inv.amfi_code || '').trim(),
+                providerDate: sourceDecision.providerDate,
                 close: Number(navData.nav),
                 source: 'AMFI',
-              }], null);
+                reasonCode: 'mf_nav',
+              });
             }
           } else {
             console.warn(`  ${inv.name}: No AMFI code, computing from transactions only`);
@@ -965,11 +1092,14 @@ async function updateAllPrices(db, options = {}) {
             && Number.isFinite(Number(pricePerUnit))
             && Number(pricePerUnit) > 0
           ) {
-            upsertInvestmentPriceSeries(inv.id, 'INDIAN_STOCK', stockTicker, [{
-              date: providerDateForSource,
+            maybeUpsertProviderCachePoint(inv, {
+              instrumentType: 'INDIAN_STOCK',
+              symbol: stockTicker,
+              providerDate: providerDateForSource,
               close: Number(pricePerUnit),
               source: 'YAHOO',
-            }], null);
+              reasonCode: 'indian_stock_live',
+            });
           }
           console.log(`  ${inv.name} (id=${inv.id}): INDIAN_STOCK price fetch returned price=${stockData.price}, effectivePrice=${pricePerUnit}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
           break;
@@ -1034,11 +1164,14 @@ async function updateAllPrices(db, options = {}) {
                 && Number.isFinite(Number(pricePerUnit))
                 && Number(pricePerUnit) > 0
               ) {
-                upsertInvestmentPriceSeries(inv.id, 'SGB', String(inv.ticker_symbol || '').trim(), [{
-                  date: providerDateForSource,
+                maybeUpsertProviderCachePoint(inv, {
+                  instrumentType: 'SGB',
+                  symbol: String(inv.ticker_symbol || '').trim(),
+                  providerDate: providerDateForSource,
                   close: Number(pricePerUnit),
                   source: fetchMode === 'live' ? 'NSE_LIVE' : 'NSE_HISTORICAL_TRADE',
-                }], null);
+                  reasonCode: fetchMode === 'live' ? 'sgb_live' : 'sgb_historical',
+                });
               }
               console.log(`  ${inv.name} (id=${inv.id}): SGB ${fetchMode} fetch returned price=${sgbData.price}, providerDate=${sourceDecision.providerDate}, priceSource=${priceSource}`);
               logAppInfo('[UpdatePrices] SGB provider decision', {
@@ -1122,11 +1255,14 @@ async function updateAllPrices(db, options = {}) {
             priceSource = sourceDecision.priceSource;
             sourceOrigin = 'provider';
             if (sourceDecision.providerDate && Number.isFinite(Number(npsData.nav)) && Number(npsData.nav) > 0) {
-              upsertInvestmentPriceSeries(inv.id, 'NPS', String(inv.nps_fund_code || '').trim(), [{
-                date: sourceDecision.providerDate,
+              maybeUpsertProviderCachePoint(inv, {
+                instrumentType: 'NPS',
+                symbol: String(inv.nps_fund_code || '').trim(),
+                providerDate: sourceDecision.providerDate,
                 close: Number(npsData.nav),
                 source: 'NPS',
-              }], null);
+                reasonCode: 'nps_nav',
+              });
             }
           } catch (e) {
             console.warn(`  ${inv.name}: NPS NAV fetch failed (${e.message}), falling back to last known price`);

@@ -1373,7 +1373,7 @@ function round2(n) {
   return Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 }
 
-async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache, onProgress = null) {
+async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache, onProgress = null, options = {}) {
     // Only handle portfolio-scoped rows (portfolio_id NOT NULL)
     if (portfolioId == null) return 0;
 
@@ -1525,6 +1525,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   const isProvidentAsset = inv.asset_type === 'PF' || inv.asset_type === 'PPF' || inv.asset_type === 'SSY';
   const isMarketLinkedAsset = ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(inv.asset_type || ''));
   const trackLocfStreak = ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(inv.asset_type || ''));
+  const suppressRunDateWritesForMarketLinked = options.suppressRunDateWritesForMarketLinked === true;
   let carriedNetFlowSinceLastWrite = 0;
   for (const date of dates) {
     const dayDelta = byDate.get(date) || { unitsDelta: 0, investedDelta: 0, realizedDelta: 0, netFlowDelta: 0 };
@@ -1652,6 +1653,10 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
 
     const dayChange = currentValue - prevValue - carriedNetFlowSinceLastWrite;
     const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
+
+    if (suppressRunDateWritesForMarketLinked && isMarketLinkedAsset && date === toDate) {
+      continue;
+    }
 
     upsertDailyRow(db, {
       investment_id: inv.id,
@@ -4300,6 +4305,7 @@ async function updateDailyValues(db, options = {}) {
     runDate = todayIso(),
     invMap = new Map(),
     cache,
+    suppressRunDateWritesForMarketLinked = false,
   } = options;
 
   const details = [];
@@ -4421,6 +4427,9 @@ async function updateDailyValues(db, options = {}) {
         });
 
         logBackfillInfo(`[Backfill][Heartbeat] ${message}`);
+      },
+      {
+        suppressRunDateWritesForMarketLinked,
       }
     );
     totalRows += rows;
@@ -4731,6 +4740,7 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
     runDate,
     invMap,
     cache,
+    suppressRunDateWritesForMarketLinked: options.suppressRunDateWritesForMarketLinked === true,
   });
 
   return {
@@ -4748,7 +4758,10 @@ async function runBackfillInTwoSteps(db, options = {}) {
   const scopes = options.scopes || [];
   logBackfillInfo(`[Backfill] Starting four-step backfill for ${runDate} with ${scopes.length} scope(s)...`);
 
-  const result = await backfillDirtyScopes(db, scopes, { runDate });
+  const result = await backfillDirtyScopes(db, scopes, {
+    runDate,
+    suppressRunDateWritesForMarketLinked: options.suppressRunDateWritesForMarketLinked === true,
+  });
   logBackfillInfo('[Backfill] Four-step backfill completed.');
   return result;
 }
