@@ -13,6 +13,7 @@ const {
   fetchSGBPrice,
   fetchSGBLivePrice,
   fetchNPSNAV,
+  resolvePriceSourceFromProviderDate,
 } = require('./priceService');
 const { calculatePfInterestPreview, calculatePfValueAsOfDate, calculateSmallSavingsValueAsOfDate } = require('./pfInterestCalculator');
 const { computeBondAccruedCoupon } = require('./bondAccrualService');
@@ -140,56 +141,6 @@ let _cancelled = false;
 
 function cancelUpdate() {
   _cancelled = true;
-}
-
-function resolvePriceSourceFromProviderDate({
-  providerDate,
-  rowDate,
-  runDate,
-  assetType,
-  sessionPhase = null,
-  authoritativeClose = false,
-  allowRollingPost = false,
-  investmentId,
-  investmentName,
-}) {
-  const normalizedRowDate = normalizeProviderDate(rowDate || runDate);
-  const normalizedProviderDate = normalizeProviderDate(providerDate);
-  if (!normalizedProviderDate) {
-    logAppWarn('[UpdatePrices][ProviderDateMissing] Provider response missing date; forcing LOCF', {
-      investmentId,
-      investmentName,
-      assetType,
-      rowDate: normalizedRowDate,
-    });
-    return { priceSource: 'LOCF', providerDate: null };
-  }
-
-  const normalizedAssetType = String(assetType || '').toUpperCase();
-
-  if (normalizedAssetType === 'FOREIGN_STOCK') {
-    if (authoritativeClose && normalizedProviderDate <= normalizedRowDate) {
-      return { priceSource: 'LIVE', providerDate: normalizedProviderDate };
-    }
-
-    if (normalizedProviderDate === normalizedRowDate) {
-      if (sessionPhase === 'pre') return { priceSource: 'PRE', providerDate: normalizedProviderDate };
-      if (sessionPhase === 'post') return { priceSource: 'POST', providerDate: normalizedProviderDate };
-      return { priceSource: 'LIVE', providerDate: normalizedProviderDate };
-    }
-
-    // Rolling POST: if provider session has not advanced yet, keep POST on newer row dates.
-    if (allowRollingPost && sessionPhase === 'post' && normalizedProviderDate < normalizedRowDate) {
-      return { priceSource: 'POST', providerDate: normalizedProviderDate };
-    }
-
-    return { priceSource: 'LOCF', providerDate: normalizedProviderDate };
-  }
-
-  return {
-    priceSource: normalizedProviderDate === normalizedRowDate ? 'LIVE' : 'LOCF',
-    providerDate: normalizedProviderDate,
-  };
 }
 
 function getProvidentValueAsOfDate(db, inv, date, portfolioId = null) {

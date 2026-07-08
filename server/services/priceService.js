@@ -252,6 +252,48 @@ function getMarketDataSourceForNSE(dateIso, now = new Date()) {
   }
 }
 
+function resolvePriceSourceFromProviderDate({
+  providerDate,
+  rowDate,
+  runDate,
+  assetType,
+  sessionPhase = null,
+  authoritativeClose = false,
+  allowRollingPost = false,
+}) {
+  const normalizedRowDate = normalizeProviderDate(rowDate || runDate);
+  const normalizedProviderDate = normalizeProviderDate(providerDate);
+
+  if (!normalizedProviderDate) {
+    return { priceSource: 'LOCF', providerDate: null };
+  }
+
+  const normalizedAssetType = String(assetType || '').toUpperCase();
+
+  if (normalizedAssetType === 'FOREIGN_STOCK') {
+    if (authoritativeClose && normalizedProviderDate <= normalizedRowDate) {
+      return { priceSource: 'LIVE', providerDate: normalizedProviderDate };
+    }
+
+    if (normalizedProviderDate === normalizedRowDate) {
+      if (sessionPhase === 'pre') return { priceSource: 'PRE', providerDate: normalizedProviderDate };
+      if (sessionPhase === 'post') return { priceSource: 'POST', providerDate: normalizedProviderDate };
+      return { priceSource: 'LIVE', providerDate: normalizedProviderDate };
+    }
+
+    if (allowRollingPost && sessionPhase === 'post' && normalizedProviderDate < normalizedRowDate) {
+      return { priceSource: 'POST', providerDate: normalizedProviderDate };
+    }
+
+    return { priceSource: 'LOCF', providerDate: normalizedProviderDate };
+  }
+
+  return {
+    priceSource: normalizedProviderDate === normalizedRowDate ? 'LIVE' : 'LOCF',
+    providerDate: normalizedProviderDate,
+  };
+}
+
 // ─── Mutual Fund NAV from AMFI ────────────────────────────────────────────────
 
 /**
@@ -2221,4 +2263,5 @@ module.exports = {
   fetchNPSNAV,
   fetchNPSHistory,
   getMarketDataSourceForNSE,
+  resolvePriceSourceFromProviderDate,
 };

@@ -7,6 +7,8 @@ const {
   fetchMutualFundNAV,
   fetchStockPrice,
   fetchNPSNAV,
+  fetchSGBLivePrice,
+  resolvePriceSourceFromProviderDate,
 } = require('./priceService');
 const { fetchNPSHistory } = require('./priceService');
 const {
@@ -1046,9 +1048,19 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
         );
       } else {
         try {
-          const { fetchSGBPrice } = require('./priceService');
-          const live = await fetchSGBPrice(symbol);
-          if (live && live.price > 0) return { price: Number(live.price), source: 'LIVE', origin: 'provider_live' };
+          const live = await fetchSGBLivePrice(symbol);
+          if (live && live.price > 0) {
+            const sourceDecision = resolvePriceSourceFromProviderDate({
+              providerDate: live.date,
+              rowDate: date,
+              assetType: inv.asset_type,
+            });
+            return {
+              price: Number(live.price),
+              source: sourceDecision.priceSource,
+              origin: sourceDecision.priceSource === 'LIVE' ? 'provider_live' : 'provider_live_lag',
+            };
+          }
         } catch (e) {
           logBackfillError(`[Backfill][SGB] Live quote fetch failed for ${symbol} on ${date}: ${e?.message || e}`);
         }
@@ -1105,7 +1117,16 @@ async function getPriceForDate(db, inv, date, cache, portfolioId) {
         const quote = await fetchStockPrice(inv.ticker_symbol || inv.symbol || '');
         const live = Number(quote?.price || 0);
         if (Number.isFinite(live) && live > 0) {
-          return { price: live, source: 'LIVE', origin: 'provider' };
+          const sourceDecision = resolvePriceSourceFromProviderDate({
+            providerDate: quote?.date,
+            rowDate: date,
+            assetType: inv.asset_type,
+          });
+          return {
+            price: live,
+            source: sourceDecision.priceSource,
+            origin: sourceDecision.priceSource === 'LIVE' ? 'provider' : 'provider_lag',
+          };
         }
       } catch (e) {
         logBackfillError(`[Backfill][Stock] Live quote fetch failed for investment ${inv.id} on ${date}: ${e?.message || e}`);
