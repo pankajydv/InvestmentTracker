@@ -1171,6 +1171,67 @@ describe('Corporate Actions — Preview', () => {
     assert.ok(Array.isArray(body.deletions));
     assert.ok(Array.isArray(body.errors));
   });
+
+  it('keeps SGB coupon suggestions on flat actual-history amounts', async () => {
+    const invRes = await api('POST', '/investments', {
+      name: 'SGB 2.50 05/01/2029 Series-IX',
+      asset_type: 'SGB',
+      face_value: 5000,
+      coupon_frequency: 'SEMI_ANNUAL',
+    });
+    assert.equal(invRes.status, 201);
+
+    const investmentId = invRes.body.id;
+    const buyRes = await api('POST', '/transactions', {
+      investment_id: investmentId,
+      portfolio_id: 1,
+      transaction_type: 'BUY',
+      transaction_date: '2020-12-29',
+      units: 71,
+      price_per_unit: 4950,
+      amount: 351450,
+      fees: 0,
+    });
+    assert.equal(buyRes.status, 201);
+
+    const couponDates = [
+      '2021-07-05',
+      '2022-01-05',
+      '2022-07-05',
+      '2023-01-05',
+      '2023-07-05',
+      '2024-01-05',
+      '2024-07-05',
+      '2025-01-05',
+      '2025-07-05',
+      '2026-01-05',
+    ];
+
+    for (const transactionDate of couponDates) {
+      const txRes = await api('POST', '/transactions', {
+        investment_id: investmentId,
+        portfolio_id: 1,
+        transaction_type: 'INTEREST',
+        transaction_date: transactionDate,
+        amount: 4437.5,
+        fees: 0,
+        notes: 'SGB Series-IX coupon payment (2.50% p.a., semi-annual)',
+      });
+      assert.equal(txRes.status, 201);
+    }
+
+    const { status, body } = await api('GET', '/stocks/corporate-actions/preview?portfolio_id=1&asset_type=SGB');
+    assert.equal(status, 200);
+
+    const sgbCorrections = (body.corrections || []).filter((item) => item.investment_id === investmentId);
+    assert.equal(sgbCorrections.length, 0);
+
+    const sgbSuggestions = (body.suggestions || []).filter((item) => item.investment_id === investmentId);
+    assert.ok(sgbSuggestions.length >= 1, 'Expected at least one future SGB coupon suggestion');
+    assert.ok(sgbSuggestions.every((item) => Number(item.amount) === 4437.5));
+    assert.ok(sgbSuggestions.every((item) => String(item.notes || '').includes('/unit = INR 4437.5')));
+    assert.ok(sgbSuggestions.every((item) => !String(item.notes || '').includes('/unit/day')));
+  });
 });
 
 // ======================================================================
@@ -1419,6 +1480,7 @@ describe('Route existence — all endpoints respond (not 404)', () => {
   const postRoutes = [
     ['/stocks/amc-charge',                 { portfolio_id: 1, date: '2099-01-01', amount: 1 }],
     ['/stocks/corporate-actions/import',   { transactions: [], corrections: [], deletions: [] }],
+    ['/stocks/corporate-actions/suggestions/reset', { portfolio_id: 1 }],
     ['/stocks/contract-notes/import',      { portfolio_id: 1, broker: 'Test', trades: [] }],
   ];
 

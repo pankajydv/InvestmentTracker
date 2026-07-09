@@ -528,6 +528,11 @@ export const resolveCorporateActionSuggestions = ({ ids, decision }) =>
     method: 'POST',
     body: JSON.stringify({ ids, decision }),
   });
+export const resetCorporateActionSuggestions = ({ portfolioId } = {}) =>
+  fetchJSON('/stocks/corporate-actions/suggestions/reset', {
+    method: 'POST',
+    body: JSON.stringify({ portfolio_id: portfolioId || null }),
+  });
 
 // ─── RSU Vest Actualization ──────────────────────────────────────────────
 export const generateRsuVestSuggestions = ({ portfolioId, asOfDate } = {}) =>

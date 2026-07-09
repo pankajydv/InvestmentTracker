@@ -2513,6 +2513,8 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       return median(buyPrices) || 0;
     })();
 
+    const useDayAwareCouponAmount = inv.asset_type === 'BOND';
+
     const firstScheduleDate = interestDates[0] || dayKeys[0] || null;
     if (!firstScheduleDate || !periodMonths) {
       return { inserted, updated, modified: inserted + updated, earliestChangedDate, caChanges };
@@ -2535,9 +2537,9 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
           const periodStart = previousCouponDate ? addDaysIso(previousCouponDate, 1) : null;
           const periodDays = periodStart ? (diffIsoDays(scheduleCursor, periodStart) + 1) : null;
 
-          if (impliedDailyPerUnitFromHistory && impliedDailyPerUnitFromHistory > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+          if (useDayAwareCouponAmount && impliedDailyPerUnitFromHistory && impliedDailyPerUnitFromHistory > 0 && Number.isFinite(periodDays) && periodDays > 0) {
             amount = units * impliedDailyPerUnitFromHistory * periodDays;
-          } else if (annualCouponRate > 0 && principalPerUnit > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+          } else if (useDayAwareCouponAmount && annualCouponRate > 0 && principalPerUnit > 0 && Number.isFinite(periodDays) && periodDays > 0) {
             amount = units * principalPerUnit * (annualCouponRate / 100) * (periodDays / 365);
           } else if (perUnitFromHistory && perUnitFromHistory > 0) {
             amount = units * perUnitFromHistory;
@@ -2553,8 +2555,8 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
               units,
               amount,
               couponFrequency,
-              periodDays,
-              impliedDailyPerUnitFromHistory,
+              periodDays: useDayAwareCouponAmount ? periodDays : null,
+              impliedDailyPerUnitFromHistory: useDayAwareCouponAmount ? impliedDailyPerUnitFromHistory : null,
               perUnitFromHistory,
               annualCouponRate,
               principalPerUnit,

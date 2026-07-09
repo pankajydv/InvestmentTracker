@@ -9,6 +9,7 @@ import {
   importInterestRateSync,
   getCorporateActionSuggestions,
   resolveCorporateActionSuggestions,
+  resetCorporateActionSuggestions,
 } from '../services/api';
 import { formatNumber, formatDate } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -50,6 +51,7 @@ export default function CorporateActions() {
   const [pendingMessage, setPendingMessage] = useState('');
   const [pendingChecked, setPendingChecked] = useState({});
   const [pendingApplying, setPendingApplying] = useState(false);
+  const [pendingResetting, setPendingResetting] = useState(false);
 
   // Checked state per section
   const [checkedAdd, setCheckedAdd] = useState({});
@@ -120,6 +122,26 @@ export default function CorporateActions() {
       setPendingError(e.message || 'Failed to resolve suggestions');
     } finally {
       setPendingApplying(false);
+    }
+  };
+
+  const handleResetPendingSuggestions = async () => {
+    const confirmed = window.confirm(
+      'Reset all corporate-action suggestions for this portfolio filter? They will be regenerated on the next run using the latest logic.'
+    );
+    if (!confirmed) return;
+
+    setPendingResetting(true);
+    setPendingError('');
+    setPendingMessage('');
+    try {
+      const data = await resetCorporateActionSuggestions({ portfolioId: selectedId || null });
+      setPendingMessage(`Reset ${data.deleted || 0} suggestion records. Re-run Fetch & Analyze or wait for the next scheduler/backfill run to repopulate.`);
+      await loadPendingSuggestions();
+    } catch (e) {
+      setPendingError(e.message || 'Failed to reset suggestions');
+    } finally {
+      setPendingResetting(false);
     }
   };
 
@@ -244,9 +266,19 @@ export default function CorporateActions() {
             <strong>Pending</strong>
             <span className="text-muted ms-2">({pendingSuggestions.length})</span>
           </div>
-          <Button size="sm" variant="outline-secondary" onClick={loadPendingSuggestions} disabled={pendingLoading || pendingApplying}>
-            {pendingLoading ? 'Refreshing...' : 'Refresh'}
-          </Button>
+          <div className="d-flex gap-2">
+            <Button
+              size="sm"
+              variant="outline-danger"
+              onClick={handleResetPendingSuggestions}
+              disabled={pendingLoading || pendingApplying || pendingResetting}
+            >
+              {pendingResetting ? 'Resetting...' : 'Reset Suggestions'}
+            </Button>
+            <Button size="sm" variant="outline-secondary" onClick={loadPendingSuggestions} disabled={pendingLoading || pendingApplying || pendingResetting}>
+              {pendingLoading ? 'Refreshing...' : 'Refresh'}
+            </Button>
+          </div>
         </Card.Header>
         <Card.Body className="pt-3 pb-2">
           {pendingError && <Alert variant="danger" className="small py-2">{pendingError}</Alert>}

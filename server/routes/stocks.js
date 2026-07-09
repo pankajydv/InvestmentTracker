@@ -1999,6 +1999,8 @@ module.exports = function (db) {
               return candidates[0]?.row || null;
             };
 
+            const useDayAwareCouponAmount = inv.asset_type === 'BOND';
+
             const firstScheduleDate = interestDates[0] || dayKeys[0] || null;
             if (!firstScheduleDate || !periodMonths) {
               errors.push({ investment: inv.name, error: 'Unable to infer coupon schedule for interest detection' });
@@ -2024,9 +2026,9 @@ module.exports = function (db) {
                     const periodStart = previousCouponDate ? addDaysIso(previousCouponDate, 1) : null;
                     const periodDays = periodStart ? (diffIsoDays(scheduleCursor, periodStart) + 1) : null;
 
-                    if (impliedDailyPerUnitFromHistory && impliedDailyPerUnitFromHistory > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+                    if (useDayAwareCouponAmount && impliedDailyPerUnitFromHistory && impliedDailyPerUnitFromHistory > 0 && Number.isFinite(periodDays) && periodDays > 0) {
                       expectedAmount = units * impliedDailyPerUnitFromHistory * periodDays;
-                    } else if (annualCouponRate > 0 && principalPerUnit > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+                    } else if (useDayAwareCouponAmount && annualCouponRate > 0 && principalPerUnit > 0 && Number.isFinite(periodDays) && periodDays > 0) {
                       expectedAmount = units * principalPerUnit * (annualCouponRate / 100) * (periodDays / 365);
                     }
 
@@ -2038,8 +2040,8 @@ module.exports = function (db) {
                       units,
                       amount: expectedAmount,
                       couponFrequency,
-                      periodDays,
-                      impliedDailyPerUnitFromHistory,
+                      periodDays: useDayAwareCouponAmount ? periodDays : null,
+                      impliedDailyPerUnitFromHistory: useDayAwareCouponAmount ? impliedDailyPerUnitFromHistory : null,
                       perUnitFromHistory,
                       annualCouponRate,
                       principalPerUnit,
@@ -2800,6 +2802,42 @@ module.exports = function (db) {
     } catch (e) {
       logAppError('[Stocks] Corporate action suggestion list failed', { error: e.message });
       return res.status(500).json({ error: 'Failed to fetch suggestions: ' + e.message });
+    }
+  });
+
+  router.post('/corporate-actions/suggestions/reset', express.json(), (req, res) => {
+    try {
+      const portfolioId = Number(req.body?.portfolio_id || 0);
+      const hasPortfolio = Number.isInteger(portfolioId) && portfolioId > 0;
+
+      const hasSuggestionTable = !!db.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name = 'corporate_action_suggestions'
+      `).get();
+      if (!hasSuggestionTable) {
+        return res.json({ deleted: 0, portfolio_id: hasPortfolio ? portfolioId : null });
+      }
+
+      const result = hasPortfolio
+        ? db.prepare(`
+            DELETE FROM corporate_action_suggestions
+            WHERE source <> 'RSU_VEST'
+              AND (portfolio_id = ? OR portfolio_id IS NULL)
+          `).run(portfolioId)
+        : db.prepare(`
+            DELETE FROM corporate_action_suggestions
+            WHERE source <> 'RSU_VEST'
+          `).run();
+
+      const deleted = Number(result?.changes || 0);
+      logAppInfo('[Stocks] Corporate action suggestions reset', {
+        deleted,
+        portfolio_id: hasPortfolio ? portfolioId : null,
+      });
+      return res.json({ deleted, portfolio_id: hasPortfolio ? portfolioId : null });
+    } catch (e) {
+      logAppError('[Stocks] Corporate action suggestions reset failed', { error: e.message });
+      return res.status(500).json({ error: 'Failed to reset suggestions: ' + e.message });
     }
   });
 
