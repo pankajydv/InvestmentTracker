@@ -2117,6 +2117,17 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
     ORDER BY id ASC
   `);
 
+  const selectNearbyInterestRows = db.prepare(`
+    SELECT id, locked, units, price_per_unit, amount, notes, broker, exchange_rate_used, usd_amount,
+           date(transaction_date) AS transaction_date
+    FROM transactions
+    WHERE investment_id = ?
+      AND portfolio_id = ?
+      AND transaction_type = 'INTEREST'
+      AND date(transaction_date) BETWEEN date(?, '-1 day') AND date(?, '+1 day')
+    ORDER BY date(transaction_date) ASC, id ASC
+  `);
+
   const updateById = db.prepare(`
     UPDATE transactions
     SET units = ?,
@@ -2137,6 +2148,13 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
     return Math.abs(x - y) < 0.000001;
   };
 
+  const diffIsoDays = (leftDate, rightDate) => {
+    const left = new Date(`${leftDate}T00:00:00.000Z`).getTime();
+    const right = new Date(`${rightDate}T00:00:00.000Z`).getTime();
+    if (!Number.isFinite(left) || !Number.isFinite(right)) return null;
+    return Math.round((left - right) / 86400000);
+  };
+
   function upsertCorporateActionTxn(desired) {
     const normalizedDesired = {
       ...desired,
@@ -2147,12 +2165,25 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       usdAmount: quantizeNullableForStorage(desired.usdAmount),
     };
 
-    const rows = selectByKey.all(
+    let rows = selectByKey.all(
       normalizedDesired.investmentId,
       normalizedDesired.portfolioId,
       normalizedDesired.date,
       normalizedDesired.transactionType
     );
+
+    if (!rows.length && normalizedDesired.transactionType === 'INTEREST') {
+      rows = selectNearbyInterestRows.all(
+        normalizedDesired.investmentId,
+        normalizedDesired.portfolioId,
+        normalizedDesired.date,
+        normalizedDesired.date
+      ).sort((a, b) => {
+        const leftDelta = Math.abs(diffIsoDays(a.transaction_date, normalizedDesired.date) ?? 999);
+        const rightDelta = Math.abs(diffIsoDays(b.transaction_date, normalizedDesired.date) ?? 999);
+        return leftDelta - rightDelta || Number(a.id) - Number(b.id);
+      });
+    }
 
     if (!rows.length) {
       if (dryRun) {
@@ -2308,6 +2339,75 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       return d.toISOString().slice(0, 10);
     };
 
+    const addDaysIso = (isoDate, days) => {
+      const d = new Date(`${isoDate}T00:00:00.000Z`);
+      if (Number.isNaN(d.getTime())) return null;
+      d.setUTCDate(d.getUTCDate() + Number(days || 0));
+      return d.toISOString().slice(0, 10);
+    };
+
+    const formatDdMm = (isoDate) => {
+      if (!isoDate) return null;
+      const [year, month, day] = String(isoDate).split('-');
+      if (!year || !month || !day) return null;
+      return `${day}/${month}`;
+    };
+
+    const formatNumber = (value, decimals = 2) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '0';
+      return n.toFixed(decimals).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
+    };
+
+    const buildCouponInterestNote = ({
+      scheduleDate,
+      periodMonths,
+      units,
+      amount,
+      couponFrequency,
+      periodDays,
+      impliedDailyPerUnitFromHistory,
+      perUnitFromHistory,
+      annualCouponRate,
+      principalPerUnit,
+    }) => {
+      const frequencyLabel = String(couponFrequency || '').replace(/_/g, ' ');
+      const previousCouponDate = scheduleDate && periodMonths ? addMonthsIso(scheduleDate, -periodMonths) : null;
+      const periodStart = previousCouponDate ? addDaysIso(previousCouponDate, 1) : null;
+      const periodEnd = scheduleDate || null;
+
+      let dayPart = `${frequencyLabel} coupon period`;
+      if (periodStart && periodEnd) {
+        const startTs = new Date(`${periodStart}T00:00:00.000Z`).getTime();
+        const endTs = new Date(`${periodEnd}T00:00:00.000Z`).getTime();
+        const daySpan = Math.round((endTs - startTs) / 86400000) + 1;
+        const startLabel = formatDdMm(periodStart);
+        const endLabel = formatDdMm(periodEnd);
+        if (Number.isFinite(daySpan) && daySpan > 0 && startLabel && endLabel) {
+          dayPart = `${daySpan} days (${startLabel}-${endLabel})`;
+        }
+      }
+
+      if (impliedDailyPerUnitFromHistory && impliedDailyPerUnitFromHistory > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+        return `Gross interest: ${dayPart}; ${formatNumber(units, 3)} units x INR ${formatNumber(impliedDailyPerUnitFromHistory, 6)}/unit/day x ${formatNumber(periodDays, 0)} days = INR ${formatNumber(amount, 2)} (${frequencyLabel}, history-based)`;
+      }
+
+      if (perUnitFromHistory && perUnitFromHistory > 0) {
+        return `Gross interest: ${dayPart}; ${formatNumber(units, 3)} units x INR ${formatNumber(perUnitFromHistory, 4)}/unit = INR ${formatNumber(amount, 2)} (${frequencyLabel}, history-based)`;
+      }
+
+      if (annualCouponRate > 0 && principalPerUnit > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+        return `Gross interest: ${dayPart}; ${formatNumber(units, 3)} units x INR ${formatNumber(principalPerUnit, 2)} x ${formatNumber(annualCouponRate, 4)}% x ${formatNumber(periodDays, 0)}/365 = INR ${formatNumber(amount, 2)} (${frequencyLabel})`;
+      }
+
+      if (annualCouponRate > 0 && principalPerUnit > 0 && periodMonths > 0) {
+        const periodsPerYear = Math.round(12 / periodMonths);
+        return `Gross interest: ${dayPart}; ${formatNumber(units, 3)} units x INR ${formatNumber(principalPerUnit, 2)} x ${formatNumber(annualCouponRate, 4)}% x 1/${periodsPerYear} = INR ${formatNumber(amount, 2)} (${frequencyLabel}, fallback)`;
+      }
+
+      return `Gross interest: ${dayPart}; expected coupon amount INR ${formatNumber(amount, 2)} (${frequencyLabel})`;
+    };
+
     const parseRateFromText = (value) => {
       const text = String(value || '');
       const m = text.match(/(\d{1,2}(?:\.\d{1,4})?)\s*%/);
@@ -2377,6 +2477,27 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
       return median(vals);
     })();
 
+    const impliedDailyPerUnitFromHistory = (() => {
+      const dailyVals = [];
+      for (let i = 1; i < interestRows.length; i += 1) {
+        const current = interestRows[i];
+        const previous = interestRows[i - 1];
+        const currentDate = String(current?.tx_date || '');
+        const previousDate = String(previous?.tx_date || '');
+        const amount = Number(current?.amount || 0);
+        if (!currentDate || !previousDate || !(amount > 0)) continue;
+
+        const observedDays = diffIsoDays(currentDate, previousDate);
+        if (!(Number.isFinite(observedDays) && observedDays > 0)) continue;
+
+        const units = Number(holdingUnitsAtDateFast(currentDate, false, false) || 0);
+        if (!(units > 0)) continue;
+
+        dailyVals.push((amount / units) / observedDays);
+      }
+      return median(dailyVals);
+    })();
+
     const principalPerUnit = (() => {
       const face = Number(inv.face_value || 0);
       if (face > 0) return face;
@@ -2410,7 +2531,15 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
         const units = Number(holdingUnitsAtDateFast(scheduleCursor, false, false) || 0);
         if (units > 0) {
           let amount = 0;
-          if (perUnitFromHistory && perUnitFromHistory > 0) {
+          const previousCouponDate = addMonthsIso(scheduleCursor, -periodMonths);
+          const periodStart = previousCouponDate ? addDaysIso(previousCouponDate, 1) : null;
+          const periodDays = periodStart ? (diffIsoDays(scheduleCursor, periodStart) + 1) : null;
+
+          if (impliedDailyPerUnitFromHistory && impliedDailyPerUnitFromHistory > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+            amount = units * impliedDailyPerUnitFromHistory * periodDays;
+          } else if (annualCouponRate > 0 && principalPerUnit > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+            amount = units * principalPerUnit * (annualCouponRate / 100) * (periodDays / 365);
+          } else if (perUnitFromHistory && perUnitFromHistory > 0) {
             amount = units * perUnitFromHistory;
           } else if (annualCouponRate > 0 && principalPerUnit > 0) {
             amount = units * principalPerUnit * (annualCouponRate / 100) * (periodMonths / 12);
@@ -2418,7 +2547,18 @@ async function syncCorporateActionsForScope(db, inv, portfolioId, fromDate, toDa
 
           if (amount > 0) {
             amount = Math.round(amount * 100) / 100;
-            const notes = `AutoBackfill CA Interest (${couponFrequency.replace(/_/g, ' ')})`;
+            const notes = buildCouponInterestNote({
+              scheduleDate: scheduleCursor,
+              periodMonths,
+              units,
+              amount,
+              couponFrequency,
+              periodDays,
+              impliedDailyPerUnitFromHistory,
+              perUnitFromHistory,
+              annualCouponRate,
+              principalPerUnit,
+            });
             const change = upsertCorporateActionTxn({
               investmentId: inv.id,
               portfolioId,

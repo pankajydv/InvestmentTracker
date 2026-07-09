@@ -21,7 +21,7 @@ const {
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const CORPORATE_ACTION_UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'VEST', 'ESPP_PURCHASE'];
-const CORPORATE_ACTION_UNIT_SUB_TYPES = ['SELL', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
+const CORPORATE_ACTION_UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION'];
 
 const MONTH_INDEX = {
   january: 0,
@@ -1777,6 +1777,82 @@ module.exports = function (db) {
           return d.toISOString().slice(0, 10);
         };
 
+        const diffIsoDays = (leftDate, rightDate) => {
+          const left = new Date(`${leftDate}T00:00:00.000Z`).getTime();
+          const right = new Date(`${rightDate}T00:00:00.000Z`).getTime();
+          if (!Number.isFinite(left) || !Number.isFinite(right)) return null;
+          return Math.round((left - right) / 86400000);
+        };
+
+        const addDaysIso = (isoDate, days) => {
+          const d = new Date(`${isoDate}T00:00:00.000Z`);
+          if (Number.isNaN(d.getTime())) return null;
+          d.setUTCDate(d.getUTCDate() + Number(days || 0));
+          return d.toISOString().slice(0, 10);
+        };
+
+        const formatDdMm = (isoDate) => {
+          if (!isoDate) return null;
+          const [year, month, day] = String(isoDate).split('-');
+          if (!year || !month || !day) return null;
+          return `${day}/${month}`;
+        };
+
+        const formatNumber = (value, decimals = 2) => {
+          const n = Number(value);
+          if (!Number.isFinite(n)) return '0';
+          return n.toFixed(decimals).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
+        };
+
+        const buildCouponInterestNote = ({
+          scheduleDate,
+          periodMonths,
+          units,
+          amount,
+          couponFrequency,
+          periodDays,
+          impliedDailyPerUnitFromHistory,
+          perUnitFromHistory,
+          annualCouponRate,
+          principalPerUnit,
+        }) => {
+          const frequencyLabel = String(couponFrequency || '').replace(/_/g, ' ');
+          const previousCouponDate = scheduleDate && periodMonths ? addMonthsIso(scheduleDate, -periodMonths) : null;
+          const periodStart = previousCouponDate ? addDaysIso(previousCouponDate, 1) : null;
+          const periodEnd = scheduleDate || null;
+
+          let dayPart = `${frequencyLabel} coupon period`;
+          if (periodStart && periodEnd) {
+            const startTs = new Date(`${periodStart}T00:00:00.000Z`).getTime();
+            const endTs = new Date(`${periodEnd}T00:00:00.000Z`).getTime();
+            const daySpan = Math.round((endTs - startTs) / 86400000) + 1;
+            const startLabel = formatDdMm(periodStart);
+            const endLabel = formatDdMm(periodEnd);
+            if (Number.isFinite(daySpan) && daySpan > 0 && startLabel && endLabel) {
+              dayPart = `${daySpan} days (${startLabel}-${endLabel})`;
+            }
+          }
+
+          if (impliedDailyPerUnitFromHistory && impliedDailyPerUnitFromHistory > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+            return `Gross interest: ${dayPart}; ${formatNumber(units, 3)} units x INR ${formatNumber(impliedDailyPerUnitFromHistory, 6)}/unit/day x ${formatNumber(periodDays, 0)} days = INR ${formatNumber(amount, 2)} (${frequencyLabel}, history-based)`;
+          }
+
+          if (perUnitFromHistory && perUnitFromHistory > 0) {
+            return `Gross interest: ${dayPart}; ${formatNumber(units, 3)} units x INR ${formatNumber(perUnitFromHistory, 4)}/unit = INR ${formatNumber(amount, 2)} (${frequencyLabel}, history-based)`;
+          }
+
+          if (annualCouponRate > 0 && principalPerUnit > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+            return `Gross interest: ${dayPart}; ${formatNumber(units, 3)} units x INR ${formatNumber(principalPerUnit, 2)} x ${formatNumber(annualCouponRate, 4)}% x ${formatNumber(periodDays, 0)}/365 = INR ${formatNumber(amount, 2)} (${frequencyLabel})`;
+          }
+
+          if (annualCouponRate > 0 && principalPerUnit > 0 && periodMonths > 0) {
+            const periodsPerYear = Math.round(12 / periodMonths);
+            return `Gross interest: ${dayPart}; ${formatNumber(units, 3)} units x INR ${formatNumber(principalPerUnit, 2)} x ${formatNumber(annualCouponRate, 4)}% x 1/${periodsPerYear} = INR ${formatNumber(amount, 2)} (${frequencyLabel}, fallback)`;
+          }
+
+          return `Gross interest: ${dayPart}; expected coupon amount INR ${formatNumber(amount, 2)} (${frequencyLabel})`;
+        };
+
         for (const inv of investments) {
           const allTxns = db.prepare(`
             SELECT id, portfolio_id, date(transaction_date) AS transaction_date, UPPER(transaction_type) AS transaction_type,
@@ -1870,6 +1946,27 @@ module.exports = function (db) {
               return median(vals);
             })();
 
+            const impliedDailyPerUnitFromHistory = (() => {
+              const dailyVals = [];
+              for (let i = 1; i < interestRows.length; i += 1) {
+                const current = interestRows[i];
+                const previous = interestRows[i - 1];
+                const currentDate = String(current?.transaction_date || '');
+                const previousDate = String(previous?.transaction_date || '');
+                const amount = Number(current?.amount || 0);
+                if (!currentDate || !previousDate || !(amount > 0)) continue;
+
+                const observedDays = diffIsoDays(currentDate, previousDate);
+                if (!(Number.isFinite(observedDays) && observedDays > 0)) continue;
+
+                const units = Number(unitsOnOrBefore(currentDate) || 0);
+                if (!(units > 0)) continue;
+
+                dailyVals.push((amount / units) / observedDays);
+              }
+              return median(dailyVals);
+            })();
+
             const principalPerUnit = (() => {
               const face = Number(inv.face_value || 0);
               if (face > 0) return face;
@@ -1888,6 +1985,19 @@ module.exports = function (db) {
               existingByDate.set(key, arr);
             }
             const matchedExistingIds = new Set();
+            const findExistingInterestMatch = (targetDate) => {
+              const candidates = [];
+              for (const [dateKey, rows] of existingByDate.entries()) {
+                const deltaDays = diffIsoDays(dateKey, targetDate);
+                if (deltaDays == null || Math.abs(deltaDays) > 1) continue;
+                for (const row of rows) {
+                  if (matchedExistingIds.has(row.id)) continue;
+                  candidates.push({ row, deltaDays: Math.abs(deltaDays) });
+                }
+              }
+              candidates.sort((a, b) => a.deltaDays - b.deltaDays || Number(a.row.id) - Number(b.row.id));
+              return candidates[0]?.row || null;
+            };
 
             const firstScheduleDate = interestDates[0] || dayKeys[0] || null;
             if (!firstScheduleDate || !periodMonths) {
@@ -1910,9 +2020,30 @@ module.exports = function (db) {
                   }
 
                   if (expectedAmount > 0) {
+                    const previousCouponDate = addMonthsIso(scheduleCursor, -periodMonths);
+                    const periodStart = previousCouponDate ? addDaysIso(previousCouponDate, 1) : null;
+                    const periodDays = periodStart ? (diffIsoDays(scheduleCursor, periodStart) + 1) : null;
+
+                    if (impliedDailyPerUnitFromHistory && impliedDailyPerUnitFromHistory > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+                      expectedAmount = units * impliedDailyPerUnitFromHistory * periodDays;
+                    } else if (annualCouponRate > 0 && principalPerUnit > 0 && Number.isFinite(periodDays) && periodDays > 0) {
+                      expectedAmount = units * principalPerUnit * (annualCouponRate / 100) * (periodDays / 365);
+                    }
+
                     expectedAmount = Math.round(expectedAmount * 100) / 100;
-                    const existingRows = existingByDate.get(scheduleCursor) || [];
-                    const existing = existingRows.find((r) => !matchedExistingIds.has(r.id));
+                    const existing = findExistingInterestMatch(scheduleCursor);
+                    const noteText = buildCouponInterestNote({
+                      scheduleDate: scheduleCursor,
+                      periodMonths,
+                      units,
+                      amount: expectedAmount,
+                      couponFrequency,
+                      periodDays,
+                      impliedDailyPerUnitFromHistory,
+                      perUnitFromHistory,
+                      annualCouponRate,
+                      principalPerUnit,
+                    });
                     if (existing) {
                       matchedExistingIds.add(existing.id);
                       if (Number(existing.locked || 0) !== 1 && Math.abs(Number(existing.amount || 0) - expectedAmount) >= 1) {
@@ -1931,7 +2062,7 @@ module.exports = function (db) {
                           expected_price_per_unit: null,
                           broker: null,
                           portfolio_id: pid,
-                          notes: `Expected coupon interest (${couponFrequency.replace(/_/g, ' ')})`,
+                          notes: noteText,
                         });
                       }
                     } else {
@@ -1949,7 +2080,7 @@ module.exports = function (db) {
                         broker: null,
                         portfolio_id: pid,
                         currency_symbol: '₹',
-                        notes: `Expected coupon interest (${couponFrequency.replace(/_/g, ' ')})`,
+                        notes: noteText,
                       });
                     }
                   }

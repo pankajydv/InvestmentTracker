@@ -24,6 +24,7 @@ const {
   formatIstDate,
   addDaysIso: addDaysIsoDate,
 } = require('./dateUtils');
+const { logAppWarn } = require('./appLogger');
 
 function isoDate(date) {
   return formatIstDate(date);
@@ -422,6 +423,21 @@ const quoteAuthState = {
   expiresAtMs: 0,
 };
 
+function safeBodySnippet(body, max = 300) {
+  const text = String(body || '').replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  return text.slice(0, max);
+}
+
+function quoteHealthSnapshot() {
+  return {
+    consecutiveFailures: Number(quoteProviderHealth.consecutiveFailures || 0),
+    lastFailureCode: quoteProviderHealth.lastFailureCode || null,
+    cooldownUntilMs: Number(quoteProviderHealth.cooldownUntilMs || 0),
+    cooldownRemainingMs: Math.max(Number(quoteProviderHealth.cooldownUntilMs || 0) - Date.now(), 0),
+  };
+}
+
 function extractCookieHeader(setCookieHeader) {
   if (!Array.isArray(setCookieHeader) || setCookieHeader.length === 0) return null;
   const pairs = setCookieHeader
@@ -474,6 +490,14 @@ async function ensureYahooQuoteAuth(forceRefresh = false) {
   });
 
   if (pageResp.statusCode < 200 || pageResp.statusCode >= 400) {
+    logAppWarn('[PriceService][QuoteProvider] Auth bootstrap page request failed', {
+      provider: 'yahoo_quote_v7',
+      endpoint: 'https://finance.yahoo.com/quote/MSFT?p=MSFT',
+      statusCode: Number(pageResp.statusCode || 0),
+      forceRefresh,
+      contentType: String(pageResp.headers?.['content-type'] || ''),
+      bodySnippet: safeBodySnippet(pageResp.body),
+    });
     throw new Error(`AUTH_BOOTSTRAP_HTTP_${pageResp.statusCode || 'UNKNOWN'}`);
   }
 
@@ -497,6 +521,12 @@ async function ensureYahooQuoteAuth(forceRefresh = false) {
   }
 
   if (!crumb) {
+    logAppWarn('[PriceService][QuoteProvider] Missing crumb after auth bootstrap', {
+      provider: 'yahoo_quote_v7',
+      endpoint: 'https://query1.finance.yahoo.com/v1/test/getcrumb',
+      forceRefresh,
+      hasCookieHeader: Boolean(cookieHeader),
+    });
     throw new Error('AUTH_CRUMB_MISSING');
   }
 
@@ -639,6 +669,17 @@ async function fetchForeignStockPriceFromQuoteApi(symbol) {
     });
 
     if (resp.statusCode !== 200) {
+      logAppWarn('[PriceService][QuoteProvider] Quote endpoint returned non-200', {
+        provider: 'yahoo_quote_v7',
+        symbol,
+        endpoint: 'https://query1.finance.yahoo.com/v7/finance/quote',
+        statusCode: Number(resp.statusCode || 0),
+        forceAuthRefresh,
+        hasCookieHeader: Boolean(auth?.cookieHeader),
+        hasCrumb: Boolean(auth?.crumb),
+        contentType: String(resp.headers?.['content-type'] || ''),
+        bodySnippet: safeBodySnippet(resp.body),
+      });
       throw new Error(`HTTP_${resp.statusCode || 'UNKNOWN'}`);
     }
 
@@ -646,12 +687,34 @@ async function fetchForeignStockPriceFromQuoteApi(symbol) {
     try {
       json = JSON.parse(resp.body);
     } catch (_) {
+      logAppWarn('[PriceService][QuoteProvider] Quote endpoint JSON parse failed', {
+        provider: 'yahoo_quote_v7',
+        symbol,
+        endpoint: 'https://query1.finance.yahoo.com/v7/finance/quote',
+        statusCode: Number(resp.statusCode || 0),
+        forceAuthRefresh,
+        bodySnippet: safeBodySnippet(resp.body),
+      });
       throw new Error('QUOTE_PARSE_FAILED');
     }
 
     const quote = json?.quoteResponse?.result?.[0];
     const parsed = parseForeignQuoteSession(symbol, quote);
     if (!parsed) {
+      logAppWarn('[PriceService][QuoteProvider] Quote payload shape invalid for session parsing', {
+        provider: 'yahoo_quote_v7',
+        symbol,
+        endpoint: 'https://query1.finance.yahoo.com/v7/finance/quote',
+        forceAuthRefresh,
+        hasQuote: Boolean(quote),
+        marketState: String(quote?.marketState || ''),
+        regularMarketTime: Number(quote?.regularMarketTime || 0),
+        regularMarketPrice: Number(quote?.regularMarketPrice || 0),
+        preMarketTime: Number(quote?.preMarketTime || 0),
+        preMarketPrice: Number(quote?.preMarketPrice || 0),
+        postMarketTime: Number(quote?.postMarketTime || 0),
+        postMarketPrice: Number(quote?.postMarketPrice || 0),
+      });
       throw new Error('QUOTE_SHAPE_INVALID');
     }
     return parsed;
@@ -662,6 +725,12 @@ async function fetchForeignStockPriceFromQuoteApi(symbol) {
   } catch (err) {
     const code = String(err.message || '').toUpperCase();
     const shouldRetryWithFreshAuth = code === 'HTTP_401' || code === 'HTTP_403' || code === 'HTTP_429';
+    logAppWarn('[PriceService][QuoteProvider] Quote request failed', {
+      provider: 'yahoo_quote_v7',
+      symbol,
+      code,
+      willRetryWithFreshAuth: shouldRetryWithFreshAuth,
+    });
     if (!shouldRetryWithFreshAuth) throw err;
     return doRequest(true);
   }
@@ -687,14 +756,33 @@ async function fetchStockPrice(symbol, options = {}) {
   const instrumentType = inferStockInstrumentType(symbol);
   const requestedInterval = String(options.interval || '1d').toLowerCase();
   const shouldTryQuoteFirst = instrumentType === 'FOREIGN_STOCK' && requestedInterval === '15m';
+  const quoteProviderAllowed = shouldUseQuoteProvider();
 
-  if (shouldTryQuoteFirst && shouldUseQuoteProvider()) {
+  if (shouldTryQuoteFirst && !quoteProviderAllowed) {
+    logAppWarn('[PriceService][QuoteProvider] Quote path skipped due cooldown; using chart fallback', {
+      provider: 'yahoo_quote_v7',
+      symbol,
+      interval: requestedInterval,
+      quoteHealth: quoteHealthSnapshot(),
+      fallbackProvider: 'yahoo_chart_v8',
+    });
+  }
+
+  if (shouldTryQuoteFirst && quoteProviderAllowed) {
     try {
       const quoteData = await fetchForeignStockPriceFromQuoteApi(symbol);
       markQuoteProviderSuccess();
       return quoteData;
     } catch (quoteErr) {
       markQuoteProviderFailure(quoteErr.message);
+      logAppWarn('[PriceService][QuoteProvider] Quote path failed; falling back to chart API', {
+        provider: 'yahoo_quote_v7',
+        symbol,
+        interval: requestedInterval,
+        errorCode: String(quoteErr?.message || 'UNKNOWN').toUpperCase(),
+        quoteHealth: quoteHealthSnapshot(),
+        fallbackProvider: 'yahoo_chart_v8',
+      });
     }
   }
 
