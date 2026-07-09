@@ -1,8 +1,8 @@
 /**
  * Cron scheduler for daily price updates.
- * Intraday runs (9:25 AM–4:25 PM) focus on stocks (frequent updates).
- * Early run (4:25 AM) seeds daily snapshots across asset types.
- * Final run (10:25 PM) updates all asset types after MF NAVs settle.
+ * Intraday runs (9:35 AM–4:35 PM) focus on stocks (frequent updates).
+ * Early run (4:35 AM) seeds daily snapshots across asset types.
+ * Final run (10:35 PM) updates all asset types after MF NAVs settle.
  */
 
 const { applyEnvDefaults } = require('../config/envDefaults');
@@ -706,7 +706,7 @@ function ensureSchedulerCatchUpScopes(db, runDate, label) {
  * within the recent rolling window (DIRTY_SCOPE_LOOKBACK_SESSIONS market sessions).
  *
  * Two modes:
- *  forceAllScopes=true  (22:25 nightly): unconditionally mark ALL active scopes dirty from
+ *  forceAllScopes=true  (22:35 nightly): unconditionally mark ALL active scopes dirty from
  *    the start of the lookback window so backfill repairs everything nightly.
  *  forceAllScopes=false (all other runs): only mark dirty if the scope has any LOCF row or
  *    is missing entirely from the window.
@@ -841,7 +841,7 @@ function ensureRollingFreshnessDirtyScopes(db, runDate, label, options = {}) {
  * @param {object} [options]
  * @param {boolean} [options.skipPriceUpdate]          - run preflight only, skip actual price fetch
  * @param {string[]} [options.assetTypes]              - restrict price update to these asset types
- * @param {boolean} [options.forceFreshnessAllScopes]  - unconditionally mark all active scopes dirty (use at 22:25)
+ * @param {boolean} [options.forceFreshnessAllScopes]  - unconditionally mark all active scopes dirty (use at 22:35)
  * @param {string}  [options.complianceScanMode]       - 'full'|'incremental' (falsy = skip compliance step)
  */
 async function runSchedulerCycle(db, label, options = {}) {
@@ -859,7 +859,7 @@ async function runSchedulerCycle(db, label, options = {}) {
 
   // ── Step 1/6: Rolling freshness dirty scopes ──────────────────────────────
   // Mark active scopes dirty if they have any LOCF or missing rows in the recent
-  // lookback window.  At 22:25 (forceFreshnessAllScopes=true), mark ALL active
+  // lookback window.  At 22:35 (forceFreshnessAllScopes=true), mark ALL active
   // scopes dirty unconditionally so backfill heals everything nightly.
   logAppInfo(`[Scheduler] ${label}: Step 1/6 rolling freshness dirty scopes`, {
     runDate,
@@ -1043,64 +1043,64 @@ function startScheduler(db) {
     });
   }
 
-  // Hourly intraday runs (9:25 AM–4:25 PM IST, ALL days).
+  // Hourly intraday runs (9:35 AM–4:35 PM IST, ALL days).
   // Captures Indian session and US pre-market data (US pre-market runs 1:30 PM–7 PM IST).
   // MF/NPS reuse existing LIVE rows so provider calls are skipped when already fresh.
   const intradayTimes = [
-    '25 9 * * 1-5',    // 9:25 AM
-    '25 10 * * 1-5',   // 10:25 AM
-    '25 11 * * 1-5',   // 11:25 AM
-    '25 12 * * 1-5',   // 12:25 PM
-    '25 13 * * 1-5',   // 1:25 PM
-    '25 14 * * 1-5',   // 2:25 PM
-    '25 15 * * 1-5',   // 3:25 PM
-    '25 16 * * 1-5',   // 4:25 PM
+    '35 9 * * 1-5',    // 9:35 AM
+    '35 10 * * 1-5',   // 10:35 AM
+    '35 11 * * 1-5',   // 11:35 AM
+    '35 12 * * 1-5',   // 12:35 PM
+    '35 13 * * 1-5',   // 1:35 PM
+    '35 14 * * 1-5',   // 2:35 PM
+    '35 15 * * 1-5',   // 3:35 PM
+    '35 16 * * 1-5',   // 4:35 PM
   ];
 
   intradayTimes.forEach((cronTime, index) => {
     cron.schedule(cronTime, async () => {
       const hour = [9, 10, 11, 12, 13, 14, 15, 16][index];
-      console.log(`[Scheduler] Running ${hour}:25 intraday price update (Indian stocks + SGB + MF/NPS + FS pre-market)...`);
+      console.log(`[Scheduler] Running ${hour}:35 intraday price update (Indian stocks + SGB + MF/NPS + FS pre-market)...`);
       try {
-        await runSchedulerCycle(db, `Intraday run ${hour}:25`, {
+        await runSchedulerCycle(db, `Intraday run ${hour}:35`, {
           assetTypes: ['INDIAN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS', 'FOREIGN_STOCK'],
           reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
           useLiveSgbIntraday: true,
-          runTag: `intraday_${hour}_25`,
+          runTag: `intraday_${hour}_35`,
           complianceScanMode: ENABLE_INTRADAY_COMPLIANCE ? 'incremental' : null,
         });
       } catch (e) {
-        console.error(`[Scheduler] ${hour}:25 update failed:`, e.message);
-        logAppError(`[Scheduler] Intraday run ${hour}:25 failed`, { error: e.message });
+        console.error(`[Scheduler] ${hour}:35 update failed:`, e.message);
+        logAppError(`[Scheduler] Intraday run ${hour}:35 failed`, { error: e.message });
       }
     }, {
       timezone: 'Asia/Kolkata',
     });
   });
 
-  // US-market tracking runs (7:25 PM–11:25 PM IST, ALL days).
+  // US-market tracking runs (7:35 PM–11:35 PM IST, ALL days).
   // Covers US regular session hours (9:30 AM–4 PM EDT = 7 PM–1:30 AM IST).
   // Running on weekends keeps preflight/dirty-scope active even when US is closed.
   const usMarketTimes = [
-    '25 19 * * 1-5',  // 7:25 PM
-    '25 20 * * 1-5',  // 8:25 PM
-    '25 21 * * 1-5',  // 9:25 PM
-    '25 23 * * 1-5',  // 11:25 PM
+    '35 19 * * 1-5',  // 7:35 PM
+    '35 20 * * 1-5',  // 8:35 PM
+    '35 21 * * 1-5',  // 9:35 PM
+    '35 23 * * 1-5',  // 11:35 PM
   ];
 
   usMarketTimes.forEach((cronTime, index) => {
     cron.schedule(cronTime, async () => {
       const hour = [19, 20, 21, 23][index];
-      console.log(`[Scheduler] Running ${hour}:25 US-market update (foreign + conditional MF/NPS)...`);
+      console.log(`[Scheduler] Running ${hour}:35 US-market update (foreign + conditional MF/NPS)...`);
       try {
-        await runSchedulerCycle(db, `US-market run ${hour}:25`, {
+        await runSchedulerCycle(db, `US-market run ${hour}:35`, {
           assetTypes: ['FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS'],
           reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
-          runTag: `us_market_${hour}_25`,
+          runTag: `us_market_${hour}_35`,
         });
       } catch (e) {
-        console.error(`[Scheduler] ${hour}:25 US-market update failed:`, e.message);
-        logAppError(`[Scheduler] US-market run ${hour}:25 failed`, { error: e.message });
+        console.error(`[Scheduler] ${hour}:35 US-market update failed:`, e.message);
+        logAppError(`[Scheduler] US-market run ${hour}:35 failed`, { error: e.message });
       }
     }, {
       timezone: 'Asia/Kolkata',
@@ -1126,44 +1126,44 @@ function startScheduler(db) {
     timezone: 'Asia/Kolkata',
   });
 
-  // Early-morning baseline run at 4:25 AM IST (all days) - all asset types.
-  cron.schedule('25 4 * * *', async () => {
-    console.log('[Scheduler] Running 4:25 AM baseline update (all asset types, all days)...');
+  // Early-morning baseline run at 4:35 AM IST (all days) - all asset types.
+  cron.schedule('35 4 * * *', async () => {
+    console.log('[Scheduler] Running 4:35 AM baseline update (all asset types, all days)...');
     try {
       await runSchedulerCycle(db, 'Early morning seed run (all types)', {
         reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
         runTag: 'early_morning_seed',
       });
     } catch (e) {
-      console.error('[Scheduler] 4:25 AM seed update failed:', e.message);
+      console.error('[Scheduler] 4:35 AM seed update failed:', e.message);
       logAppError('[Scheduler] Early morning seed run failed', { error: e.message });
     }
   }, {
     timezone: 'Asia/Kolkata',
   });
 
-  // Evening baseline run at 5:25 PM IST (all days) - all asset types.
-  cron.schedule('25 17 * * *', async () => {
-    console.log('[Scheduler] Running 5:25 PM evening baseline update (all asset types, all days)...');
+  // Evening baseline run at 5:35 PM IST (all days) - all asset types.
+  cron.schedule('35 17 * * *', async () => {
+    console.log('[Scheduler] Running 5:35 PM evening baseline update (all asset types, all days)...');
     try {
       await runSchedulerCycle(db, 'Evening baseline run (all types)', {
         reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
         runTag: 'evening_baseline',
       });
     } catch (e) {
-      console.error('[Scheduler] 5:25 PM evening baseline update failed:', e.message);
+      console.error('[Scheduler] 5:35 PM evening baseline update failed:', e.message);
       logAppError('[Scheduler] Evening baseline run failed', { error: e.message });
     }
   }, {
     timezone: 'Asia/Kolkata',
   });
 
-  // Final run at 10:25 PM IST (after MF NAVs settle) — all asset types, ALL days.
+  // Final run at 10:35 PM IST (after MF NAVs settle) — all asset types, ALL days.
   // forceFreshnessAllScopes=true: unconditionally mark all active scopes dirty from the
   // 5-session rolling window so backfill heals any LOCF/missing rows every night.
   // complianceScanMode='full': run the full compliance + LOCF-quality scan as Step 6.
-  cron.schedule('25 22 * * *', async () => {
-    console.log('[Scheduler] Running 10:25 PM final price update (all asset types)...');
+  cron.schedule('35 22 * * *', async () => {
+    console.log('[Scheduler] Running 10:35 PM final price update (all asset types)...');
     try {
       await runSchedulerCycle(db, 'Final nightly run (all types)', {
         warmRecentCacheDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
@@ -1181,18 +1181,18 @@ function startScheduler(db) {
   });
 
   console.log('[Scheduler] Daily price updates scheduled:');
-  console.log('  - 4:25 AM IST (all asset types, all days)');
-  console.log('  - 5:25 PM IST (all asset types, all days)');
-  console.log('  - 9:25 AM–4:25 PM IST (hourly, Indian stocks + SGB + MF/NPS retries, weekdays)');
-  console.log('  - 7:25 PM, 8:25 PM, 9:25 PM, 11:25 PM IST (foreign stocks + conditional MF/NPS, weekdays)');
-  console.log('  - 10:25 PM IST (all asset types, all days)');
+  console.log('  - 4:35 AM IST (all asset types, all days)');
+  console.log('  - 5:35 PM IST (all asset types, all days)');
+  console.log('  - 9:35 AM–4:35 PM IST (hourly, Indian stocks + SGB + MF/NPS retries, weekdays)');
+  console.log('  - 7:35 PM, 8:35 PM, 9:35 PM, 11:35 PM IST (foreign stocks + conditional MF/NPS, weekdays)');
+  console.log('  - 10:35 PM IST (all asset types, all days)');
   logAppInfo('[Scheduler] Scheduled jobs initialized', {
     timezone: 'Asia/Kolkata',
-    earlyMorningAccrualRun: '04:25',
-    eveningBaselineRun: '17:25',
+    earlyMorningAccrualRun: '04:35',
+    eveningBaselineRun: '17:35',
     intradayRuns: 8,
-    usMarketRuns: ['19:25', '20:25', '21:25', '23:25'],
-    nightlyRun: '22:25',
+    usMarketRuns: ['19:35', '20:35', '21:35', '23:35'],
+    nightlyRun: '22:35',
     nightlyMarketCacheWarmDays: NIGHTLY_MARKET_CACHE_WARM_DAYS,
     historicalRepairMode: 'step1-generalized-only',
     foreignReconcileEnabled: ENABLE_FOREIGN_RECONCILE,
