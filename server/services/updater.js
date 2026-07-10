@@ -1080,24 +1080,24 @@ async function updateAllPrices(db, options = {}) {
         }
         case 'SGB': {
           if (inv.ticker_symbol) {
-            const shouldUseLiveSgb = options.useLiveSgbIntraday === true && /^intraday_\d+_25$/.test(String(runTag || ''));
             try {
               let sgbData = null;
               let fetchMode = 'historical';
 
-              if (shouldUseLiveSgb) {
-                try {
-                  sgbData = await fetchSGBLivePrice(inv.ticker_symbol);
-                  fetchMode = 'live';
-                } catch (liveError) {
-                  logAppWarn('[UpdatePrices] SGB live fetch failed; falling back to historical', {
-                    investmentId: inv.id,
-                    investmentName: inv.name,
-                    symbol: inv.ticker_symbol,
-                    runTag,
-                    error: liveError.message,
-                  });
-                }
+              // Always try live quote first (like Indian Stock / Yahoo Finance).
+              // fetchSGBLivePrice returns providerDate from NSE; resolvePriceSourceFromProviderDate
+              // classifies it as LIVE (market open) or LOCF (market closed/pre-open) automatically.
+              try {
+                sgbData = await fetchSGBLivePrice(inv.ticker_symbol);
+                fetchMode = 'live';
+              } catch (liveError) {
+                logAppWarn('[UpdatePrices] SGB live fetch failed; falling back to historical', {
+                  investmentId: inv.id,
+                  investmentName: inv.name,
+                  symbol: inv.ticker_symbol,
+                  runTag,
+                  error: liveError.message,
+                });
               }
 
               if (!sgbData) {
@@ -1140,7 +1140,6 @@ async function updateAllPrices(db, options = {}) {
                 investmentName: inv.name,
                 symbol: inv.ticker_symbol,
                 runTag,
-                usedLiveIntraday: shouldUseLiveSgb,
                 fetchMode,
                 providerDate: sourceDecision.providerDate,
                 priceSource,
