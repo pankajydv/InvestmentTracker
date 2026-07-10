@@ -4,7 +4,7 @@ import { usePortfolio } from '../context/PortfolioContext';
 import { Link } from 'react-router-dom';
 import { ChevronDown, Users, Settings, Check } from 'lucide-react';
 
-export default function PortfolioSelector() {
+export default function PortfolioSelector({ fullWidth = false }) {
   const {
     portfolios,
     selectionMode,
@@ -39,33 +39,37 @@ export default function PortfolioSelector() {
       : `${selectedIds.length} Portfolios`;
 
   return (
-    <div className="position-relative" ref={ref}>
+    <div className={`position-relative${fullWidth ? ' w-100' : ''}`} ref={ref}>
       <button
         onClick={() => setOpen(!open)}
-        className="d-flex align-items-center gap-2 px-3 py-2 rounded border bg-white small text-nowrap"
+        className={`d-flex align-items-center gap-2 px-3 py-2 rounded border bg-white small text-nowrap${fullWidth ? ' w-100 justify-content-between' : ''}`}
       >
-        {selectedPortfolio ? (
-          <span className="portfolio-dot flex-shrink-0" style={{ backgroundColor: selectedPortfolio.color }} />
-        ) : (
-          <Users size={16} className="text-muted" />
-        )}
-        <span className="fw-medium text-truncate" style={{ maxWidth: 132 }}>{label}</span>
-        {portfolios.length > 0 && (
-          <span className="text-muted flex-shrink-0" style={{ fontSize: '0.75rem' }}>
-            {selectedCount}/{portfolios.length}
-          </span>
-        )}
-        <ChevronDown
-          size={16}
-          className="text-muted flex-shrink-0"
-          style={{ transition: 'transform 0.2s', transform: open ? 'rotate(180deg)' : 'none' }}
-        />
+        <span className="d-flex align-items-center gap-2 flex-grow-1" style={{ minWidth: 0 }}>
+          {selectedPortfolio ? (
+            <span className="portfolio-dot flex-shrink-0" style={{ backgroundColor: selectedPortfolio.color }} />
+          ) : (
+            <Users size={16} className="text-muted" />
+          )}
+          <span className="fw-medium text-truncate" style={{ maxWidth: fullWidth ? 'none' : 132 }}>{label}</span>
+        </span>
+        <span className="d-flex align-items-center gap-2 flex-shrink-0 ms-2">
+          {portfolios.length > 0 && (
+            <span className="text-muted flex-shrink-0" style={{ fontSize: '0.75rem' }}>
+              {selectedCount}/{portfolios.length}
+            </span>
+          )}
+          <ChevronDown
+            size={16}
+            className="text-muted flex-shrink-0"
+            style={{ transition: 'transform 0.2s', transform: open ? 'rotate(180deg)' : 'none' }}
+          />
+        </span>
       </button>
 
       {open && (
         <div
           className="position-absolute top-100 start-0 mt-1 bg-white rounded shadow-lg border overflow-hidden"
-          style={{ width: 276, zIndex: 1050 }}
+          style={{ width: fullWidth ? '100%' : 276, zIndex: 1050 }}
         >
           {/* All Portfolios */}
           <button

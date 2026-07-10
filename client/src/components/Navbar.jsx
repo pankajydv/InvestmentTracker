@@ -121,7 +121,7 @@ export default function Navbar({ user, onLogout }) {
   return (
     <>
       <BsNavbar bg="white" sticky="top" className="shadow-sm border-bottom">
-        <Container fluid="lg">
+        <Container fluid="lg" className="flex-wrap">
           <BsNavbar.Brand as={Link} to="/" className="d-flex align-items-center gap-2 me-2 me-md-3">
             <TrendingUp size={28} className="text-primary" />
             <span className="fw-bold d-none d-md-inline">Investment Tracker</span>
@@ -267,6 +267,10 @@ export default function Navbar({ user, onLogout }) {
               </Dropdown.Item>
             </Dropdown.Menu>
           </Dropdown>
+
+          <div className="d-sm-none w-100 mt-2">
+            <PortfolioSelector fullWidth />
+          </div>
         </Container>
       </BsNavbar>
       <Modal show={showSettings} onHide={closeSettings} centered>
