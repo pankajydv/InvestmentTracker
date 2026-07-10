@@ -60,6 +60,20 @@ export const getAllocation = (portfolioId) => {
   const params = portfolioId ? `?portfolio_id=${portfolioId}` : '';
   return fetchJSON(`/dashboard/allocation${params}`);
 };
+export const getDashboardRollover = ({ assetType, from, to, limit, page, pageSize, portfolioId, portfolioIds } = {}) => {
+  const params = new URLSearchParams();
+  if (assetType) params.set('asset_type', String(assetType));
+  if (from) params.set('from', from);
+  if (to) params.set('to', to);
+  if (limit) params.set('limit', String(limit));
+  if (page) params.set('page', String(page));
+  if (pageSize) params.set('page_size', String(pageSize));
+  if (portfolioId) params.set('portfolio_id', String(portfolioId));
+  if (Array.isArray(portfolioIds) && portfolioIds.length > 0) {
+    params.set('portfolio_ids', portfolioIds.map((id) => String(id)).join(','));
+  }
+  return fetchJSON(`/dashboard/rollover?${params}`);
+};
 
 // Portfolios
 export const getPortfolios = () => fetchJSON('/portfolios');

@@ -24,6 +24,7 @@ const TaxReport = lazy(() => import('./components/TaxReport'));
 const AppLogs = lazy(() => import('./components/AppLogs'));
 const MetricsFaq = lazy(() => import('./components/MetricsFaq'));
 const Portfolios = lazy(() => import('./components/Portfolios'));
+const AssetTypeDashboard = lazy(() => import('./components/AssetTypeDashboard'));
 
 function RouteLoadingFallback() {
   return (
@@ -131,6 +132,7 @@ export default function App() {
               <Suspense fallback={<RouteLoadingFallback />}>
                 <Routes>
                   <Route path="/" element={<Dashboard />} />
+                  <Route path="/asset-types/:assetType" element={<AssetTypeDashboard />} />
                   <Route path="/investments" element={<Investments />} />
                   <Route path="/investments/add" element={<AddInvestment />} />
                   <Route path="/investments/import-cas" element={<CASUpload />} />

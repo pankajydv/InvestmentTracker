@@ -1027,6 +1027,42 @@ describe('Dashboard', () => {
       assert.ok('total_value' in item || 'count' in item);
     }
   });
+
+  it('GET /dashboard/rollover returns aggregate daily rows', async () => {
+    const { status, body } = await api('GET', '/dashboard/rollover?portfolio_id=1');
+    assert.equal(status, 200);
+    assert.ok(body.summary);
+    assert.ok(body.pagination);
+    assert.ok(Array.isArray(body.rows));
+    if (body.rows.length > 0) {
+      const row = body.rows[0];
+      assert.ok('date' in row);
+      assert.ok('current_value' in row);
+      assert.ok('price_source' in row);
+    }
+  });
+
+  it('GET /dashboard/rollover supports asset_type and portfolio_ids filters', async () => {
+    const { status, body } = await api('GET', '/dashboard/rollover?portfolio_ids=1,2&asset_type=INDIAN_STOCK');
+    assert.equal(status, 200);
+    assert.equal(body.scope.asset_type, 'INDIAN_STOCK');
+    assert.deepEqual(body.scope.portfolio_ids, [1, 2]);
+    assert.ok(Array.isArray(body.rows));
+  });
+
+  it('GET /dashboard/rollover defaults to an exact trailing year window', async () => {
+    const { status, body } = await api('GET', '/dashboard/rollover?portfolio_id=1&to=2026-07-10');
+    assert.equal(status, 200);
+    assert.equal(body.window.requested_from, '2025-07-11');
+    assert.equal(body.window.requested_to, '2026-07-10');
+  });
+
+  it('GET /investments/:id/daily-values defaults to an exact trailing year window', async () => {
+    const { status, body } = await api('GET', '/investments/1/daily-values?portfolio_id=1&to=2026-07-10');
+    assert.equal(status, 200);
+    assert.equal(body.window.from, '2025-07-11');
+    assert.equal(body.window.to, '2026-07-10');
+  });
 });
 
 // ======================================================================

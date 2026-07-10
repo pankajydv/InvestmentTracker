@@ -18,6 +18,17 @@ export function formatINR(amount, decimals = 0) {
   return `${sign}₹${abs.toLocaleString('en-IN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;
 }
 
+export function formatINRExact(amount, decimals = 0) {
+  if (amount == null || isNaN(amount)) return '₹0';
+
+  const value = Number(amount);
+  const sign = value < 0 ? '-' : '';
+  return `${sign}₹${Math.abs(value).toLocaleString('en-IN', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  })}`;
+}
+
 /**
  * Format number with Indian comma separations
  */

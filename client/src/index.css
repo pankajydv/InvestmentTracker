@@ -78,9 +78,83 @@ tr:hover .row-actions {
   padding-right: 0.4rem !important;
 }
 
+.dashboard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.dashboard-title-row {
+  min-width: 0;
+}
+
+.dashboard-header-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.dashboard-last-updated {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.9rem;
+  padding: 0.18rem 0.6rem;
+  border-radius: 999px;
+  background: #f4f6fa;
+  border: 1px solid #e3e8ef;
+  color: #667085;
+  font-size: 0.74rem;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.dashboard-compliance-indicator {
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+}
+
+.dashboard-compliance-healthy {
+  color: #0f6a35;
+  background: #e8f7ee;
+  border-color: #b7e4c7;
+}
+
+.dashboard-compliance-warning {
+  color: #b45309;
+  background: #fff4db;
+  border-color: #f6d28b;
+}
+
+.dashboard-compliance-error {
+  color: #b42318;
+  background: #fdecec;
+  border-color: #f5b5ad;
+}
+
+@media (max-width: 768px) {
+  .dashboard-header {
+    align-items: flex-start;
+  }
+
+  .dashboard-title-row {
+    font-size: 1.85rem;
+    line-height: 1.1;
+  }
+}
+
 .asset-allocation-card {
-  min-height: 0;
+  min-height: 102px;
   position: relative;
+  padding: 0.75rem !important;
+  border-color: #e8edf3 !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
 }
 
 .asset-allocation-pct {
@@ -102,7 +176,7 @@ tr:hover .row-actions {
 .asset-allocation-donut {
   width: 100%;
   height: 100%;
-  min-height: 120px;
+  min-height: 190px;
   flex: 1 1 auto;
 }
 
@@ -111,8 +185,12 @@ tr:hover .row-actions {
 .asset-allocation-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.5rem;
+  gap: 0.75rem;
   align-items: stretch;
+}
+
+.asset-allocation-section .card-body {
+  padding: 1rem 1rem 1.1rem;
 }
 
 @media (max-width: 430px) {
@@ -209,9 +287,10 @@ tr:hover .row-actions {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.25rem;
-  padding: 0.25rem;
-  min-height: 150px;
+  gap: 0.45rem;
+  padding: 0.65rem 0.45rem;
+  min-height: 220px;
+  align-self: stretch;
 }
 
 /* On wide screens, reserve the last column across both box rows. */
@@ -221,6 +300,7 @@ tr:hover .row-actions {
     grid-row: 1 / span 2;
     min-height: 0;
     border-left: 1px solid #eef2f7;
+    padding-left: 0.85rem;
   }
 }
 
@@ -236,8 +316,8 @@ tr:hover .row-actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 0.35rem 0.75rem;
-  margin-top: 0.35rem;
+  gap: 0.42rem 0.85rem;
+  margin-top: 0.45rem;
   max-width: 420px;
 }
 
@@ -259,6 +339,80 @@ tr:hover .row-actions {
 
 .asset-allocation-legend-label {
   font-weight: 600;
+}
+
+.rollup-card-collapsed .card-body {
+  min-height: 56px;
+}
+
+.rollup-card-collapsed .h6 {
+  font-size: 0.98rem;
+}
+
+.table-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem 1rem;
+  flex-wrap: wrap;
+}
+
+.table-toolbar-main {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.table-toolbar-status {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.table-toolbar-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0;
+}
+
+.table-toolbar-field-sm {
+  gap: 0.3rem;
+}
+
+.table-toolbar-label {
+  font-size: 0.74rem;
+  color: #667085;
+  white-space: nowrap;
+  margin-bottom: 0;
+}
+
+.table-toolbar-field .form-control {
+  min-width: 0;
+}
+
+.table-toolbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.table-compact-toggle {
+  font-size: 0.82rem;
+  line-height: 1;
+}
+
+@media (max-width: 768px) {
+  .table-toolbar {
+    align-items: stretch;
+  }
+
+  .table-toolbar-main,
+  .table-toolbar-status {
+    width: 100%;
+  }
 }
 
 .asset-allocation-legend-pct {

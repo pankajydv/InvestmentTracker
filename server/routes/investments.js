@@ -160,6 +160,16 @@ function addDaysIso(isoDate, days) {
   return d.toISOString().slice(0, 10);
 }
 
+function addYearsIso(isoDate, years) {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCFullYear(d.getUTCFullYear() + Number(years || 0));
+  return d.toISOString().slice(0, 10);
+}
+
+function getTrailingYearStartIso(isoDate) {
+  return addDaysIso(addYearsIso(isoDate, -1), 1);
+}
+
 function toNumberOrNull(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
@@ -565,6 +575,25 @@ function calculateXirr(flows) {
 }
 
 module.exports = function (db) {
+  const investmentColumns = new Set(
+    db.prepare('PRAGMA table_info(investments)').all().map((column) => column.name)
+  );
+  const selectInvestmentColumn = (columnName) => (
+    investmentColumns.has(columnName)
+      ? columnName
+      : `NULL AS ${columnName}`
+  );
+  const investmentMetadataSelect = [
+    'id',
+    'name',
+    'display_name',
+    'asset_type',
+    'ticker_symbol',
+    selectInvestmentColumn('amfi_code'),
+    selectInvestmentColumn('nps_fund_code'),
+    selectInvestmentColumn('isin_code'),
+  ].join(', ');
+
   router.get('/:id/historical-prices', (req, res) => {
     try {
       const investmentId = Number(req.params.id);
@@ -573,7 +602,7 @@ module.exports = function (db) {
       }
 
       const investment = db.prepare(`
-        SELECT id, name, display_name, asset_type, ticker_symbol, amfi_code, nps_fund_code, isin_code
+        SELECT ${investmentMetadataSelect}
         FROM investments
         WHERE id = ?
       `).get(investmentId);
@@ -591,7 +620,7 @@ module.exports = function (db) {
 
       const today = todayIso();
       const toDate = parseDateOnly(req.query.to) || today;
-      const fromDate = parseDateOnly(req.query.from) || addDaysIso(toDate, -365);
+      const fromDate = parseDateOnly(req.query.from) || getTrailingYearStartIso(toDate);
       if (fromDate > toDate) {
         return res.status(400).json({ error: 'from must be less than or equal to to' });
       }
@@ -607,7 +636,7 @@ module.exports = function (db) {
         ? Math.min(Math.floor(pageSizeRaw), 5000)
         : (Number.isFinite(legacyLimitRaw) && legacyLimitRaw > 0
           ? Math.min(Math.floor(legacyLimitRaw), 5000)
-          : 365);
+          : 366);
 
       const rowsAll = getInvestmentSeries(investmentId, fromDate, toDate);
       const totalRows = rowsAll.length;
@@ -708,7 +737,7 @@ module.exports = function (db) {
       }
 
       const investment = db.prepare(`
-        SELECT id, name, display_name, asset_type, ticker_symbol, amfi_code, nps_fund_code, isin_code
+        SELECT ${investmentMetadataSelect}
         FROM investments
         WHERE id = ?
       `).get(investmentId);
@@ -719,7 +748,7 @@ module.exports = function (db) {
 
       const today = todayIso();
       const toDate = parseDateOnly(req.query.to) || today;
-      const fromDate = parseDateOnly(req.query.from) || addDaysIso(toDate, -365);
+      const fromDate = parseDateOnly(req.query.from) || getTrailingYearStartIso(toDate);
       if (fromDate > toDate) {
         return res.status(400).json({ error: 'from must be less than or equal to to' });
       }
@@ -735,7 +764,7 @@ module.exports = function (db) {
         ? Math.min(Math.floor(pageSizeRaw), 5000)
         : (Number.isFinite(legacyLimitRaw) && legacyLimitRaw > 0
           ? Math.min(Math.floor(legacyLimitRaw), 5000)
-          : 365);
+          : 366);
 
       const portfolioIdRaw = req.query.portfolio_id;
       const portfolioId = portfolioIdRaw == null || portfolioIdRaw === ''
@@ -887,7 +916,7 @@ module.exports = function (db) {
 
       const today = todayIso();
       const toDate = parseDateOnly(req.query.to) || today;
-      const fromDate = parseDateOnly(req.query.from) || addDaysIso(toDate, -365);
+      const fromDate = parseDateOnly(req.query.from) || getTrailingYearStartIso(toDate);
       if (fromDate > toDate) {
         return res.status(400).json({ error: 'from must be less than or equal to to' });
       }
@@ -903,7 +932,7 @@ module.exports = function (db) {
         ? Math.min(Math.floor(pageSizeRaw), 5000)
         : (Number.isFinite(legacyLimitRaw) && legacyLimitRaw > 0
           ? Math.min(Math.floor(legacyLimitRaw), 5000)
-          : 365);
+          : 366);
 
       // Get FX rates from market price cache for USDINR=X
       const fxRows = getSeries('FX', 'USDINR=X', fromDate, toDate);

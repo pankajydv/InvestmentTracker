@@ -1,8 +1,8 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal, Dropdown, Collapse } from 'react-bootstrap';
 import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions, getInvestmentDailyValues } from '../services/api';
-import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
+import { formatINR, formatINRExact, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil, Wallet, PiggyBank, BarChart3, TrendingUp, TrendingDown } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -134,8 +134,13 @@ export default function InvestmentDetail() {
     from: '',
     to: '',
     page: 1,
-    pageSize: 365,
+    pageSize: 366,
   });
+  const dailyValuesFiltersRef = useRef(dailyValuesFilters);
+
+  useEffect(() => {
+    dailyValuesFiltersRef.current = dailyValuesFilters;
+  }, [dailyValuesFilters]);
   const [showAddTxn, setShowAddTxn] = useState(false);
   const [selectedInterval, setSelectedInterval] = useState('1D');
   const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
@@ -207,7 +212,7 @@ export default function InvestmentDetail() {
   };
 
   const loadDailyValuesData = useCallback(async (filters = null) => {
-    const effectiveFilters = filters || dailyValuesFilters;
+    const effectiveFilters = filters || dailyValuesFiltersRef.current;
     try {
       setDailyValuesLoading(true);
       setDailyValuesError('');
@@ -219,17 +224,24 @@ export default function InvestmentDetail() {
         portfolioId: selectedId,
       });
       setDailyValuesData(result);
+      setDailyValuesFilters((prev) => ({
+        ...prev,
+        from: prev.from || result?.window?.requested_from || '',
+        to: prev.to || result?.window?.requested_to || '',
+        page: Number(result?.pagination?.page || prev.page || 1),
+        pageSize: Number(result?.pagination?.page_size || prev.pageSize || 366),
+      }));
     } catch (e) {
       setDailyValuesError(e.message || 'Failed to load daily values');
       setDailyValuesData(null);
     } finally {
       setDailyValuesLoading(false);
     }
-  }, [id, selectedId, dailyValuesFilters]);
+  }, [id, selectedId]);
 
   useEffect(() => {
     if (!dailyValuesExpanded) return;
-    loadDailyValuesData();
+    loadDailyValuesData(dailyValuesFiltersRef.current);
   }, [dailyValuesExpanded, loadDailyValuesData]);
 
   const handleDelete = async () => {
@@ -1480,8 +1492,7 @@ export default function InvestmentDetail() {
         <Card.Body>
           <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
             <div>
-              <h2 className="h6 fw-semibold mb-1">Daily Values</h2>
-              <div className="small text-muted">Stored daily snapshots for this investment in the current detail-page scope.</div>
+              <h2 className="h6 fw-semibold mb-0">Daily Values</h2>
             </div>
             <Button
               size="sm"
@@ -1502,14 +1513,15 @@ export default function InvestmentDetail() {
           <Collapse in={dailyValuesExpanded}>
             <div>
               <Form
-                className="d-flex flex-wrap align-items-end gap-2 mb-3"
+                className="table-toolbar mb-2"
                 onSubmit={(e) => {
                   e.preventDefault();
                   loadDailyValuesData();
                 }}
               >
-                <Form.Group>
-                  <Form.Label className="small mb-1">From</Form.Label>
+                <div className="table-toolbar-main">
+                <Form.Group className="table-toolbar-field">
+                  <span className="table-toolbar-label">From</span>
                   <Form.Control
                     size="sm"
                     type="date"
@@ -1517,8 +1529,8 @@ export default function InvestmentDetail() {
                     onChange={(e) => setDailyValuesFilters((prev) => ({ ...prev, from: e.target.value, page: 1 }))}
                   />
                 </Form.Group>
-                <Form.Group>
-                  <Form.Label className="small mb-1">To</Form.Label>
+                <Form.Group className="table-toolbar-field">
+                  <span className="table-toolbar-label">To</span>
                   <Form.Control
                     size="sm"
                     type="date"
@@ -1526,8 +1538,8 @@ export default function InvestmentDetail() {
                     onChange={(e) => setDailyValuesFilters((prev) => ({ ...prev, to: e.target.value, page: 1 }))}
                   />
                 </Form.Group>
-                <Form.Group>
-                  <Form.Label className="small mb-1">Rows per page</Form.Label>
+                <Form.Group className="table-toolbar-field table-toolbar-field-sm">
+                  <span className="table-toolbar-label">Rows</span>
                   <Form.Control
                     size="sm"
                     type="number"
@@ -1539,11 +1551,11 @@ export default function InvestmentDetail() {
                       pageSize: Math.max(1, Math.min(5000, Number(e.target.value || 365))),
                       page: 1,
                     }))}
-                    style={{ width: 110 }}
+                    style={{ width: 92 }}
                   />
                 </Form.Group>
-                <Form.Group>
-                  <Form.Label className="small mb-1">Page</Form.Label>
+                <Form.Group className="table-toolbar-field table-toolbar-field-sm">
+                  <span className="table-toolbar-label">Page</span>
                   <Form.Control
                     size="sm"
                     type="number"
@@ -1553,74 +1565,58 @@ export default function InvestmentDetail() {
                       ...prev,
                       page: Math.max(1, Number(e.target.value || 1)),
                     }))}
-                    style={{ width: 90 }}
+                    style={{ width: 74 }}
                   />
                 </Form.Group>
                 <Button size="sm" type="submit" variant="outline-primary" disabled={dailyValuesLoading}>
-                  {dailyValuesLoading ? 'Loading...' : 'Refresh'}
+                  {dailyValuesLoading ? '...' : 'Go'}
                 </Button>
-              </Form>
-
-              {dailyValuesError && <div className="text-danger small mb-2">{dailyValuesError}</div>}
-
-              {dailyValuesData?.pagination && (
-                <div className="d-flex flex-wrap align-items-center gap-2 small mb-3">
-                  <Button
-                    size="sm"
-                    variant="outline-secondary"
-                    disabled={dailyValuesLoading || !dailyValuesData.pagination.has_previous}
-                    onClick={() => {
-                      const nextFilters = { ...dailyValuesFilters, page: Math.max(1, dailyValuesFilters.page - 1) };
-                      setDailyValuesFilters(nextFilters);
-                      loadDailyValuesData(nextFilters);
-                    }}
-                  >
-                    Previous
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline-secondary"
-                    disabled={dailyValuesLoading || !dailyValuesData.pagination.has_next}
-                    onClick={() => {
-                      const nextFilters = { ...dailyValuesFilters, page: dailyValuesFilters.page + 1 };
-                      setDailyValuesFilters(nextFilters);
-                      loadDailyValuesData(nextFilters);
-                    }}
-                  >
-                    Next
-                  </Button>
-                  <span className="rounded-3 px-2 py-1 bg-light">
-                    Page {dailyValuesData.pagination.page} of {dailyValuesData.pagination.total_pages}
-                  </span>
-                  <span className="rounded-3 px-2 py-1 bg-light">
-                    Latest shown: {dailyValuesData.window?.displayed_from || '-'}
-                  </span>
-                  <span className="rounded-3 px-2 py-1 bg-light">
-                    Oldest shown: {dailyValuesData.window?.displayed_to || '-'}
-                  </span>
-                </div>
-              )}
-
-              {dailyValuesData?.summary && (
-                <div className="d-flex flex-wrap gap-2 small mb-3">
-                  <span className="rounded-3 px-2 py-1 bg-light">Rows in window: {dailyValuesData.summary.rows_in_window}</span>
-                  <span className="rounded-3 px-2 py-1 bg-light">Rows returned: {dailyValuesData.summary.rows_returned}</span>
-                  <span className="rounded-3 px-2 py-1 bg-light">Latest row: {dailyValuesData.summary.latest_row_date || '-'}</span>
-                  <span className="rounded-3 px-2 py-1 bg-light">Oldest row: {dailyValuesData.summary.oldest_row_date || '-'}</span>
-                </div>
-              )}
-
-              <div className="d-flex justify-content-between align-items-center mb-2">
-                <h3 className="h6 fw-semibold mb-0">Daily Value Rows</h3>
                 <Button
                   size="sm"
                   variant="link"
-                  className="p-0 text-decoration-none"
+                  className="p-0 text-decoration-none table-compact-toggle"
                   onClick={() => setDailyValuesShowMore((prev) => !prev)}
                 >
-                  {dailyValuesShowMore ? '<< Less fields' : 'More fields >>'}
+                  {dailyValuesShowMore ? 'Less fields' : 'More fields'}
                 </Button>
-              </div>
+                </div>
+
+                {dailyValuesData?.pagination && (
+                  <div className="table-toolbar-status small">
+                    <Button
+                      size="sm"
+                      type="button"
+                      variant="outline-secondary"
+                      disabled={dailyValuesLoading || !dailyValuesData.pagination.has_previous}
+                      onClick={() => {
+                        const nextFilters = { ...dailyValuesFilters, page: Math.max(1, dailyValuesFilters.page - 1) };
+                        setDailyValuesFilters(nextFilters);
+                        loadDailyValuesData(nextFilters);
+                      }}
+                    >
+                      Prev
+                    </Button>
+                    <Button
+                      size="sm"
+                      type="button"
+                      variant="outline-secondary"
+                      disabled={dailyValuesLoading || !dailyValuesData.pagination.has_next}
+                      onClick={() => {
+                        const nextFilters = { ...dailyValuesFilters, page: dailyValuesFilters.page + 1 };
+                        setDailyValuesFilters(nextFilters);
+                        loadDailyValuesData(nextFilters);
+                      }}
+                    >
+                      Next
+                    </Button>
+                    <span className="rounded-3 px-2 py-1 bg-light">
+                      {dailyValuesData.pagination.page}/{dailyValuesData.pagination.total_pages}
+                    </span>
+                  </div>
+                )}
+              </Form>
+
+              {dailyValuesError && <div className="text-danger small mb-2">{dailyValuesError}</div>}
               {dailyValuesLoading ? (
                 <div className="py-3 d-flex align-items-center gap-2 text-muted small">
                   <Spinner animation="border" size="sm" /> Loading daily values...
@@ -1658,7 +1654,7 @@ export default function InvestmentDetail() {
                             {!selectedId && <td>{row.portfolio_id == null ? 'All portfolios' : `Portfolio ${row.portfolio_id}`}</td>}
                             <td className="text-end">{row.price_per_unit == null ? '-' : formatNumber(row.price_per_unit, 4)}</td>
                             <td className="text-end">{row.current_value == null ? '-' : formatINR(row.current_value)}</td>
-                            <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINR(row.day_change)}</td>
+                            <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINRExact(row.day_change)}</td>
                             <td>{row.price_source || '-'}</td>
                             {dailyValuesShowMore && <td className="text-end">{row.total_units == null ? '-' : formatNumber(row.total_units, 4)}</td>}
                             {dailyValuesShowMore && <td className="text-end">{row.invested_amount == null ? '-' : formatINR(row.invested_amount)}</td>}

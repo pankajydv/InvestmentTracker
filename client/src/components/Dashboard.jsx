@@ -1,14 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Card, Row, Col, Table, Spinner, Alert, Button, Badge } from 'react-bootstrap';
+import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardSummary, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle, ShieldAlert, ShieldCheck, ShieldX } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
+import DashboardRolloverTable from './DashboardRolloverTable';
 
 function AllocationChartTooltip({ active, payload }) {
   if (!active || !payload || !payload.length) return null;
@@ -811,11 +812,6 @@ export default function Dashboard() {
   const tableColumnWidthsWithAsOfDate = ['26%', '10%', '10.5%', '10.5%', '10.5%', '10.5%', '9%', '13%'];
   const mobileTableColumnWidths = ['31%', '14%', '17%', '16%', '22%'];
 
-  const handleAllocationClick = (event, type) => {
-    event.preventDefault();
-    scrollToSection(`section-${type}`);
-  };
-
   const complianceSnapshot = dailyHealth?.compliance || complianceStatus?.compliance || null;
   const isBannerDismissed = (id, signature) => dismissedBanners[id] === signature;
   const dismissBanner = (id, signature) => setDismissedBanners((prev) => ({ ...prev, [id]: signature }));
@@ -849,32 +845,35 @@ export default function Dashboard() {
   );
   const prewarnScopes = Number(dailyHealth?.counts?.prewarn_scopes || 0);
   const complianceIndicator = dailyHealth?.status === 'error'
-    ? { variant: 'danger', label: 'Compliance: Error' }
+    ? { icon: ShieldX, tone: 'error', title: 'Compliance error' }
     : dailyHealth?.status === 'warning'
-      ? { variant: 'danger', label: 'Compliance: Warning' }
+      ? { icon: ShieldAlert, tone: 'warning', title: 'Compliance warning' }
       : prewarnScopes > 0
-        ? { variant: 'warning', label: 'Compliance: Pre-warn' }
-        : { variant: 'success', label: 'Compliance: Healthy' };
+        ? { icon: ShieldAlert, tone: 'warning', title: 'Compliance pre-warning' }
+        : { icon: ShieldCheck, tone: 'healthy', title: 'Compliance healthy' };
+  const ComplianceIcon = complianceIndicator.icon;
 
   return (
     <div className="dashboard-page">
-      <div className="d-flex justify-content-between align-items-center mb-4">
+      <div className="dashboard-header mb-4">
         {selectedPortfolio ? (
-          <div className="d-flex align-items-center gap-2">
+          <div className="dashboard-title-row d-flex align-items-center gap-2">
             <span className="portfolio-dot" style={{ backgroundColor: selectedPortfolio.color }} />
             <h1 className="h4 fw-bold mb-0">{selectedPortfolio.name}</h1>
           </div>
-        ) : portfolioCount > 0 ? (
-          <h1 className="h4 fw-bold mb-0">
-            {portfolioCount} Portfolio{portfolioCount !== 1 ? 's' : ''} Combined
-          </h1>
         ) : <div />}
-        <div className="text-muted small d-flex align-items-center gap-2">
-          <Badge bg={complianceIndicator.variant}>{complianceIndicator.label}</Badge>
-          <span>
-            {hideSold ? 'Sold investments hidden' : 'Showing sold investments'}
-            {' · '}
-            {includeFullySoldInReturns ? 'Returns include fully sold investments' : 'Returns exclude fully sold investments'}
+        <div className="dashboard-header-meta">
+          {lastUpdate && (
+            <span className="dashboard-last-updated">
+              Updated {formatDate(lastUpdate)} {new Date(lastUpdate).toLocaleTimeString('en-IN')}
+            </span>
+          )}
+          <span
+            className={`dashboard-compliance-indicator dashboard-compliance-${complianceIndicator.tone}`}
+            title={complianceIndicator.title}
+            aria-label={complianceIndicator.title}
+          >
+            <ComplianceIcon size={16} />
           </span>
         </div>
       </div>
@@ -1171,15 +1170,14 @@ export default function Dashboard() {
                   >
                     {allocationPct.toFixed(1)}%
                   </span>
-                  <a
-                    href={`#section-${type}`}
+                  <Link
+                    to={`/asset-types/${type}`}
                     className="text-decoration-underline fw-semibold"
                     style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}
-                    onClick={(event) => handleAllocationClick(event, type)}
                     title={ASSET_TYPE_FULL_NAMES[type]}
                   >
                     {ASSET_TYPE_LABELS[type]} ↓
-                  </a>
+                  </Link>
                   <div className="fw-semibold text-nowrap" style={{ fontSize: '1.05rem' }}>{formatINR(info.totalValue)}</div>
                   <div className="asset-metric-line">
                     <span className="asset-metric-label">LT:</span>
@@ -1260,365 +1258,12 @@ export default function Dashboard() {
         </Card.Body>
       </Card>
 
-      {/* Investment-wise Breakdown Tables */}
-      {!showDetailTables && investments.length > 0 && (
-        <Card className="shadow-sm mb-4">
-          <Card.Body className="d-flex align-items-center gap-2 text-muted">
-            <Spinner animation="border" size="sm" />
-            Loading holdings breakdown...
-          </Card.Body>
-        </Card>
-      )}
-      {showDetailTables && sortedAssetEntries.map(([type, info]) => {
-        const totalUnits = info.investments.reduce((sum, inv) => sum + (Number(inv.total_units) || 0), 0);
-        const activeInvestments = info.investments.filter((inv) => (Number(inv.total_units) || 0) > 0.0001);
-        const totalActiveUnits = activeInvestments.reduce((sum, inv) => sum + (Number(inv.total_units) || 0), 0);
-        const weightedLivePrice = totalActiveUnits > 0
-          ? activeInvestments.reduce((sum, inv) => sum + ((Number(inv.price_per_unit) || 0) * (Number(inv.total_units) || 0)), 0) / totalActiveUnits
-          : null;
-        const weightedAvgCostWeight = activeInvestments.reduce((sum, inv) => {
-          const avgCost = Number(inv.avg_cost_per_unit_native);
-          const units = Number(inv.total_units) || 0;
-          return Number.isFinite(avgCost) && units > 0 ? sum + units : sum;
-        }, 0);
-        const weightedAvgCostPerUnit = weightedAvgCostWeight > 0
-          ? activeInvestments.reduce((sum, inv) => {
-            const avgCost = Number(inv.avg_cost_per_unit_native);
-            const units = Number(inv.total_units) || 0;
-            if (!Number.isFinite(avgCost) || units <= 0) return sum;
-            return sum + (avgCost * units);
-          }, 0) / weightedAvgCostWeight
-          : null;
-        const weightedPriceCurrency = activeInvestments[0]?.currency || 'INR';
-        const latestTypeDate = info.investments.reduce((maxDate, inv) => {
-          if (!inv.date) return maxDate;
-          return !maxDate || inv.date > maxDate ? inv.date : maxDate;
-        }, null);
-        const totalDayChangePct = Number(info.intervalChangePct ?? 0);
-        const dayChangePctSuffix = '';
-        const totalAbsPct = Number(info.totalInvested || 0) > 0
-          ? (Number(info.totalProfitLoss || 0) / Number(info.totalInvested || 0)) * 100
-          : 0;
-        const totalCurrentInvested = (Number(info.totalInvested) || 0) - (Number(info.totalRealizedGain) || 0);
-        const showAsOfDateColumn = info.investments.some((inv) => !!inv.day_change_uses_fallback);
-        const sortColumns = getSortColumnsForType(type);
-        const desktopColumns = showAsOfDateColumn
-          ? [
-              sortColumns[0],
-              { key: 'asOfDate', label: 'As of Date' },
-              ...sortColumns.slice(1),
-            ]
-          : sortColumns;
-        const tableColumns = isMobile ? mobileSortColumns : desktopColumns;
-        const columnWidths = isMobile
-          ? mobileTableColumnWidths
-          : (showAsOfDateColumn ? tableColumnWidthsWithAsOfDate : tableColumnWidths);
-
-        return (
-        <Card key={type} id={`section-${type}`} className="shadow-sm mb-4">
-          <Card.Header className="bg-white d-flex justify-content-between align-items-center">
-            <h2 className="h6 fw-semibold mb-0" title={ASSET_TYPE_FULL_NAMES[type]}>
-              {(ASSET_TYPE_FULL_NAMES[type] || ASSET_TYPE_LABELS[type])} ({info.investments.length})
-            </h2>
-            <div className="d-flex align-items-center gap-2">
-              <Link to={`/investments?type=${type}`} className="small text-decoration-none d-flex align-items-center gap-1">
-                View All <ArrowRight size={12} />
-              </Link>
-            </div>
-          </Card.Header>
-          <div className="responsive-table">
-            <Table hover size="sm" className="mb-0 small holdings-table" style={{ tableLayout: 'fixed' }}>
-              <colgroup>
-                {columnWidths.map((width, idx) => (
-                  <col key={`${type}-col-${idx}`} style={{ width }} />
-                ))}
-              </colgroup>
-              <thead className="table-light">
-                <tr>
-                  {tableColumns.map(col => {
-                    const sc = sortConfigs[type];
-                    const isSortable = col.key !== 'asOfDate';
-                    return (
-                      <th
-                        key={col.key}
-                        className={`px-3 holdings-col-${col.key}${col.end ? ' text-end' : ''}`}
-                        style={{ cursor: isSortable ? 'pointer' : 'default', userSelect: 'none' }}
-                        onClick={isSortable ? () => handleSort(type, col.key) : undefined}
-                      >
-                        <div>{col.label}
-                        {isSortable && sc?.key === col.key && (
-                          <span className="ms-1" style={{ fontSize: '0.6rem' }}>
-                            {sc.direction === 'desc' ? '▼' : '▲'}
-                          </span>
-                        )}
-                        </div>
-                        {col.subLabel && (
-                          <div className="text-muted fw-normal" style={{ fontSize: '0.68rem', lineHeight: 1.15 }}>
-                            {col.subLabel}
-                            {isIntervalSwitching && col.key === 'dayChange' && (
-                              <Spinner animation="border" size="sm" className="ms-1" />
-                            )}
-                          </div>
-                        )}
-                      </th>
-                    );
-                  })}
-                </tr>
-              </thead>
-              <tbody>
-                {sortInvestments(type, info.investments).map((inv) => (
-                  <tr key={inv.id}>
-                    {tableColumns.map((col) => {
-                      if (col.key === 'name') {
-                        return (
-                          <td key={`${inv.id}-name`} className="px-3 holdings-col-name">
-                            <Link to={`/investments/${inv.id}`} className="fw-medium text-decoration-none">
-                              {inv.name}
-                            </Link>
-                            <div className="d-flex align-items-center gap-2 mt-1">
-                              {inv.asset_type === 'MUTUAL_FUND' && inv.open_folios_count !== undefined ? (
-                                <span className="text-muted" style={{ fontSize: '0.7rem' }}>Folios: {inv.open_folios_count}</span>
-                              ) : inv.amfi_code ? (
-                                <span className="text-muted" style={{ fontSize: '0.7rem' }}>{inv.amfi_code}</span>
-                              ) : null}
-                            </div>
-                          </td>
-                        );
-                      }
-
-                      if (col.key === 'asOfDate') {
-                        return (
-                          <td key={`${inv.id}-asOfDate`} className="px-3 text-center holdings-col-asOfDate text-nowrap">
-                            {inv.day_change_uses_fallback && inv.day_change_as_of_date
-                              ? formatAsOfDate(inv.day_change_as_of_date)
-                              : '-'}
-                          </td>
-                        );
-                      }
-
-                      if (col.key === 'price') {
-                        const acquiredUnits = Number(inv.acquired_units) || 0;
-                        const avgCostText = acquiredUnits > 0.0001
-                          ? (String(inv.currency || 'INR').toUpperCase() === 'INR'
-                            ? formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)
-                            : `${inv.avg_cost_per_unit_native == null ? `${getCurrencySymbol(inv.currency)}N/A` : formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)} | ₹${formatNumber(inv.invested_amount / inv.acquired_units, 2)}`)
-                          : '';
-                        return (
-                          <td key={`${inv.id}-price`} className="px-3 text-end holdings-col-price">
-                            {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type) ? (
-                              <div className="fw-medium">
-                                {Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-'}
-                              </div>
-                            ) : (
-                              <div className="fw-medium">{formatWithSymbol(inv.price_per_unit, inv.currency, 2)}</div>
-                            )}
-                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>{avgCostText}</div>
-                          </td>
-                        );
-                      }
-
-                      if (col.key === 'dayChange') {
-                        return (
-                          <td key={`${inv.id}-dayChange`} className="px-3 text-end holdings-col-dayChange">
-                            {isIntervalSwitching ? (
-                              <>
-                                <div className="fw-medium text-muted">...</div>
-                                <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
-                              </>
-                            ) : (
-                              <>
-                                <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>
-                                <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>
-                                  {formatPct(inv.day_change_pct)}{dayChangePctSuffix}
-                                </div>
-                              </>
-                            )}
-                          </td>
-                        );
-                      }
-
-                      if (col.key === 'totalCost') {
-                        return (
-                          <td key={`${inv.id}-totalCost`} className="px-3 text-end holdings-col-totalCost">
-                            <div className="fw-medium">{formatNumber((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
-                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                              {formatNumber(inv.invested_amount, 0)}
-                            </div>
-                          </td>
-                        );
-                      }
-
-                      if (col.key === 'currentValue') {
-                        return (
-                          <td key={`${inv.id}-currentValue`} className="px-3 text-end holdings-col-currentValue">
-                            <div className="fw-medium">{formatNumber(inv.current_value, 0)}</div>
-                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                              {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
-                            </div>
-                          </td>
-                        );
-                      }
-
-                      if (col.key === 'portfolioPct') {
-                        return (
-                          <td key={`${inv.id}-portfolioPct`} className="px-3 text-end holdings-col-portfolioPct">
-                            <div className="fw-medium">{(inv.portfolio_pct || 0).toFixed(2)}%</div>
-                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                              {info.totalValue > 0 ? (((inv.current_value || 0) / info.totalValue) * 100).toFixed(2) : '0.00'}%
-                            </div>
-                          </td>
-                        );
-                      }
-
-                      if (col.key === 'totalReturn') {
-                        return (
-                          <td key={`${inv.id}-totalReturn`} className="px-3 text-end holdings-col-totalReturn">
-                            <div className={`fw-semibold ${profitColor(inv.profit_loss)}`}>
-                              {inv.profit_loss >= 0 ? '+' : ''}{formatNumber(inv.profit_loss, 0)}
-                            </div>
-                            <div className={profitColor(inv.profit_loss_pct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
-                              {isMobile
-                                ? `${formatPct(inv.profit_loss_pct)}|${inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}`
-                                : `${formatPct(inv.profit_loss_pct)} | ${inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}`}
-                            </div>
-                          </td>
-                        );
-                      }
-
-                      return null;
-                    })}
-                  </tr>
-                ))}
-                {/* Total Row */}
-                <tr className="table-light fw-semibold">
-                  {tableColumns.map((col) => {
-                    if (col.key === 'name') {
-                      return <td key={`${type}-total-name`} className="px-3 holdings-col-name">Total</td>;
-                    }
-
-                    if (col.key === 'asOfDate') {
-                      return (
-                        <td key={`${type}-total-asOfDate`} className="px-3 text-center holdings-col-asOfDate text-nowrap">
-                          {info.dayChangeFallbackCount > 0
-                            ? (info.dayChangeAsOfMixed
-                              ? 'Mixed'
-                              : (info.dayChangeAsOfDate ? formatAsOfDate(info.dayChangeAsOfDate) : '-'))
-                            : '-'}
-                        </td>
-                      );
-                    }
-
-                    if (col.key === 'price') {
-                      return (
-                        <td key={`${type}-total-price`} className="px-3 text-end holdings-col-price">
-                          {INTEREST_RATE_ASSET_TYPES.has(type) ? (
-                            <>
-                              <div className="fw-medium">-</div>
-                              {!isMobile && (
-                                <div className="text-muted" style={{ fontSize: '0.7rem' }}>{latestTypeDate ? formatDate(latestTypeDate) : ''}</div>
-                              )}
-                            </>
-                          ) : (
-                            <>
-                              <div className="fw-medium">
-                                {weightedLivePrice == null
-                                  ? '-'
-                                  : formatWithSymbol(weightedLivePrice, weightedPriceCurrency, 2)}
-                              </div>
-                              {!isMobile && (
-                                <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                                  {weightedAvgCostPerUnit == null
-                                    ? ''
-                                    : formatWithSymbol(weightedAvgCostPerUnit, weightedPriceCurrency, 2)}
-                                </div>
-                              )}
-                            </>
-                          )}
-                        </td>
-                      );
-                    }
-
-                    if (col.key === 'dayChange') {
-                      return (
-                        <td key={`${type}-total-dayChange`} className="px-3 text-end holdings-col-dayChange">
-                          {isIntervalSwitching ? (
-                            <>
-                              <div className="fw-medium text-muted">...</div>
-                              <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
-                            </>
-                          ) : (
-                            <>
-                              <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
-                              <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>
-                                {formatPct(totalDayChangePct)}{dayChangePctSuffix}
-                              </div>
-                            </>
-                          )}
-                        </td>
-                      );
-                    }
-
-                    if (col.key === 'totalCost') {
-                      return (
-                        <td key={`${type}-total-totalCost`} className="px-3 text-end holdings-col-totalCost">
-                          <div className="fw-medium">{formatNumber(totalCurrentInvested, 0)}</div>
-                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                            {formatNumber(info.totalInvested, 0)}
-                          </div>
-                        </td>
-                      );
-                    }
-
-                    if (col.key === 'currentValue') {
-                      return (
-                        <td key={`${type}-total-currentValue`} className="px-3 text-end holdings-col-currentValue">
-                          <div className="fw-medium">{formatNumber(info.totalValue, 0)}</div>
-                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                            {totalUnits > 0.0001 ? `${formatNumber(totalUnits, 4)} Units` : ''}
-                          </div>
-                        </td>
-                      );
-                    }
-
-                    if (col.key === 'portfolioPct') {
-                      return (
-                        <td key={`${type}-total-portfolioPct`} className="px-3 text-end holdings-col-portfolioPct">
-                          <div className="fw-medium">
-                            {portfolio.total_value > 0 ? ((info.totalValue / portfolio.total_value) * 100).toFixed(2) : '0.00'}%
-                          </div>
-                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>100.00%</div>
-                        </td>
-                      );
-                    }
-
-                    if (col.key === 'totalReturn') {
-                      return (
-                        <td key={`${type}-total-totalReturn`} className={`px-3 text-end holdings-col-totalReturn ${profitColor(info.totalProfitLoss)}`}>
-                          <div className="fw-semibold">
-                            {info.totalProfitLoss >= 0 ? '+' : ''}{formatNumber(info.totalProfitLoss, 0)}
-                          </div>
-                          <div className={profitColor(totalAbsPct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
-                            {isMobile
-                              ? `${formatPct(totalAbsPct)}|${info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}`
-                              : `${formatPct(totalAbsPct)} | ${info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}`}
-                          </div>
-                        </td>
-                      );
-                    }
-
-                    return null;
-                  })}
-                </tr>
-              </tbody>
-            </Table>
-          </div>
-          <Card.Footer className="bg-white border-top-0 pt-0">
-            <div className="small text-muted text-end">
-              Cash Proceeds: {info.totalRealizedGain >= 0 ? '+' : ''}{formatINR(info.totalRealizedGain || 0)}
-            </div>
-          </Card.Footer>
-        </Card>
-      );})}
+      <DashboardRolloverTable
+        title="Portfolio Chance History"
+        showSource={false}
+        compactCollapsed={true}
+        defaultExpanded
+      />
 
       {/* Empty state */}
       {investments.length === 0 && (
@@ -1632,12 +1277,6 @@ export default function Dashboard() {
         </Card>
       )}
 
-      {/* Last update info */}
-      {lastUpdate && (
-        <div className="text-center text-muted mt-3" style={{ fontSize: '0.75rem' }}>
-          Last updated: {formatDate(lastUpdate)} at {new Date(lastUpdate).toLocaleTimeString('en-IN')}
-        </div>
-      )}
     </div>
   );
 }

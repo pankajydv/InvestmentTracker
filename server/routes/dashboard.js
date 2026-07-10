@@ -286,6 +286,61 @@ function getDashboardMarketState(now = new Date()) {
   };
 }
 
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addDaysIso(isoDate, days) {
+  const date = new Date(`${isoDate}T00:00:00.000Z`);
+  if (!Number.isFinite(date.getTime())) return isoDate;
+  date.setUTCDate(date.getUTCDate() + Number(days || 0));
+  return date.toISOString().slice(0, 10);
+}
+
+function addYearsIso(isoDate, years) {
+  const date = new Date(`${isoDate}T00:00:00.000Z`);
+  if (!Number.isFinite(date.getTime())) return isoDate;
+  date.setUTCFullYear(date.getUTCFullYear() + Number(years || 0));
+  return date.toISOString().slice(0, 10);
+}
+
+function getTrailingYearStartIso(isoDate) {
+  return addDaysIso(addYearsIso(isoDate, -1), 1);
+}
+
+function parseDateOnly(value) {
+  if (!value) return null;
+  const text = String(value).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  const date = new Date(`${text}T00:00:00.000Z`);
+  if (!Number.isFinite(date.getTime())) return null;
+  return text;
+}
+
+function parsePortfolioIds(query) {
+  const raw = query?.portfolio_ids ?? query?.portfolio_id;
+  if (raw == null || raw === '') return [];
+
+  const ids = String(raw)
+    .split(',')
+    .map((part) => Number(String(part).trim()))
+    .filter((value) => Number.isInteger(value) && value > 0);
+
+  const uniqueIds = [...new Set(ids)];
+  if (!uniqueIds.length) {
+    throw new Error('Invalid portfolio id');
+  }
+  return uniqueIds;
+}
+
+function resolveAggregatedSource(row) {
+  if (!row) return '-';
+  const sourceCount = Number(row.source_count || 0);
+  if (sourceCount <= 0) return '-';
+  if (sourceCount === 1) return row.min_source || '-';
+  return 'MIXED';
+}
+
 module.exports = function (db) {
 
   // ─── Portfolio Summary (Dashboard) ────────────────────────────────────
@@ -2048,6 +2103,147 @@ module.exports = function (db) {
       const { asset_type: _assetType, ...rest } = row;
       return rest;
     }));
+  });
+
+  router.get('/rollover', (req, res) => {
+    try {
+      const portfolioIds = parsePortfolioIds(req.query);
+      const assetType = String(req.query.asset_type || '').trim().toUpperCase() || null;
+      const toDate = parseDateOnly(req.query.to) || todayIso();
+      const fromDate = parseDateOnly(req.query.from) || getTrailingYearStartIso(toDate);
+
+      if (fromDate > toDate) {
+        return res.status(400).json({ error: 'from must be less than or equal to to' });
+      }
+
+      const pageRaw = Number(req.query.page);
+      const page = Number.isFinite(pageRaw) && pageRaw > 0
+        ? Math.floor(pageRaw)
+        : 1;
+
+      const pageSizeRaw = Number(req.query.page_size);
+      const legacyLimitRaw = Number(req.query.limit);
+      const pageSize = Number.isFinite(pageSizeRaw) && pageSizeRaw > 0
+        ? Math.min(Math.floor(pageSizeRaw), 5000)
+        : (Number.isFinite(legacyLimitRaw) && legacyLimitRaw > 0
+          ? Math.min(Math.floor(legacyLimitRaw), 5000)
+          : 366);
+
+      const filters = [
+        'dv.date >= ?',
+        'dv.date <= ?',
+        'i.exclude_from_tracking = 0',
+      ];
+      const params = [fromDate, toDate];
+
+      if (assetType) {
+        filters.push('i.asset_type = ?');
+        params.push(assetType);
+      }
+
+      if (portfolioIds.length > 0) {
+        filters.push(`dv.portfolio_id IN (${portfolioIds.map(() => '?').join(', ')})`);
+        params.push(...portfolioIds);
+      } else {
+        filters.push('dv.portfolio_id IS NOT NULL');
+      }
+
+      const whereClause = filters.join(' AND ');
+      const totalRows = Number(db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM (
+          SELECT dv.date
+          FROM daily_values dv
+          JOIN investments i ON i.id = dv.investment_id
+          WHERE ${whereClause}
+          GROUP BY dv.date
+        ) grouped_dates
+      `).get(...params)?.count || 0);
+
+      const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+      const currentPage = Math.min(page, totalPages);
+      const offset = (currentPage - 1) * pageSize;
+
+      const rows = db.prepare(`
+        SELECT
+          dv.date,
+          SUM(COALESCE(dv.current_value, 0)) AS current_value,
+          SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
+          SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
+          SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
+          SUM(COALESCE(dv.day_change, 0)) AS day_change,
+          COUNT(*) AS contributing_rows,
+          COUNT(DISTINCT dv.portfolio_id) AS contributing_portfolios,
+          COUNT(DISTINCT COALESCE(dv.price_source, 'UNKNOWN')) AS source_count,
+          MIN(COALESCE(dv.price_source, 'UNKNOWN')) AS min_source
+        FROM daily_values dv
+        JOIN investments i ON i.id = dv.investment_id
+        WHERE ${whereClause}
+        GROUP BY dv.date
+        ORDER BY dv.date DESC
+        LIMIT ? OFFSET ?
+      `).all(...params, pageSize, offset);
+
+      const bounds = db.prepare(`
+        SELECT
+          MAX(dv.date) AS latest_row_date,
+          MIN(dv.date) AS oldest_row_date
+        FROM daily_values dv
+        JOIN investments i ON i.id = dv.investment_id
+        WHERE ${whereClause}
+      `).get(...params) || {};
+
+      const normalizedRows = rows.map((row) => {
+        const currentValue = Number(row.current_value) || 0;
+        const dayChange = Number(row.day_change) || 0;
+        const previousValue = currentValue - dayChange;
+        return {
+          date: row.date,
+          current_value: currentValue,
+          invested_amount: Number(row.invested_amount) || 0,
+          realized_proceeds: Number(row.realized_proceeds) || 0,
+          profit_loss: Number(row.profit_loss) || 0,
+          day_change: dayChange,
+          day_change_pct: previousValue > 0 ? (dayChange / previousValue) * 100 : 0,
+          price_source: resolveAggregatedSource(row),
+          contributing_rows: Number(row.contributing_rows) || 0,
+          contributing_portfolios: Number(row.contributing_portfolios) || 0,
+        };
+      });
+
+      res.json({
+        scope: {
+          asset_type: assetType,
+          portfolio_ids: portfolioIds,
+          portfolio_scope: portfolioIds.length === 0
+            ? 'all'
+            : (portfolioIds.length === 1 ? 'single' : 'selected'),
+        },
+        pagination: {
+          page: currentPage,
+          page_size: pageSize,
+          total_pages: totalPages,
+          total_rows: totalRows,
+          has_previous: currentPage > 1,
+          has_next: currentPage < totalPages,
+        },
+        window: {
+          requested_from: fromDate,
+          requested_to: toDate,
+          displayed_from: normalizedRows[0]?.date || null,
+          displayed_to: normalizedRows[normalizedRows.length - 1]?.date || null,
+        },
+        summary: {
+          rows_in_window: totalRows,
+          rows_returned: normalizedRows.length,
+          latest_row_date: bounds.latest_row_date || null,
+          oldest_row_date: bounds.oldest_row_date || null,
+        },
+        rows: normalizedRows,
+      });
+    } catch (e) {
+      return res.status(400).json({ error: e.message || 'Failed to fetch dashboard rollover rows' });
+    }
   });
 
   // ─── Asset allocation breakdown ───────────────────────────────────────

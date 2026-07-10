@@ -121,7 +121,7 @@ export default function Navbar({ user, onLogout }) {
   return (
     <>
       <BsNavbar bg="white" sticky="top" className="shadow-sm border-bottom">
-        <Container fluid="lg" className="flex-wrap">
+        <Container fluid="lg" className="flex-wrap flex-sm-nowrap">
           <BsNavbar.Brand as={Link} to="/" className="d-flex align-items-center gap-2 me-2 me-md-3">
             <TrendingUp size={28} className="text-primary" />
             <span className="fw-bold d-none d-md-inline">Investment Tracker</span>
