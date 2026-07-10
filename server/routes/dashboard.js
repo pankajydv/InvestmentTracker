@@ -963,18 +963,34 @@ module.exports = function (db) {
       if (!latestRow) {
         inv.day_change = 0;
         inv.day_change_pct = 0;
+        inv.day_change_opening_value = 0;
         inv.day_change_as_of_date = null;
         inv.day_change_uses_fallback = false;
         continue;
       }
 
-      const dayChangeResolved = resolveDisplayDayChangeFromRows(rowsDesc, inv.asset_type);
+      const scopedRows = isPresetYesterday && intervalToDate
+        ? rowsDesc.filter((row) => row.date && row.date <= intervalToDate)
+        : rowsDesc;
+      const scopedLatestRow = scopedRows[0] || null;
+
+      if (!scopedLatestRow) {
+        inv.day_change = 0;
+        inv.day_change_pct = 0;
+        inv.day_change_opening_value = 0;
+        inv.day_change_as_of_date = null;
+        inv.day_change_uses_fallback = false;
+        continue;
+      }
+
+      const dayChangeResolved = resolveDisplayDayChangeFromRows(scopedRows, inv.asset_type);
 
       inv.day_change = Number(dayChangeResolved.dayChange || 0);
-      const prevValue = Number(latestRow.current_value || 0) - Number(inv.day_change || 0);
+      const prevValue = Number(scopedLatestRow.current_value || 0) - Number(inv.day_change || 0);
       inv.day_change_pct = prevValue > 0
         ? (inv.day_change / prevValue) * 100
         : 0;
+      inv.day_change_opening_value = prevValue > 0 ? prevValue : 0;
       inv.day_change_as_of_date = dayChangeResolved.asOfDate || null;
       inv.day_change_uses_fallback = !!dayChangeResolved.usedFallback;
     }
@@ -1235,6 +1251,7 @@ module.exports = function (db) {
           totalProfitLoss: Number(totals?.totalProfitLoss) || 0,
           totalRealizedGain: Number(totals?.totalRealizedGain) || 0,
           dayChange: 0,
+          dayChangeOpeningValue: 0,
           dayChangeAsOfDate: emptyAsOfSummary.asOfDate,
           dayChangeAsOfMixed: emptyAsOfSummary.mixed,
           dayChangeFallbackCount: 0,
@@ -1242,6 +1259,7 @@ module.exports = function (db) {
       }
       byType[inv.asset_type].investments.push(inv);
       byType[inv.asset_type].dayChange += Number(inv.day_change) || 0;
+      byType[inv.asset_type].dayChangeOpeningValue += Number(inv.day_change_opening_value) || 0;
       if (inv.day_change_uses_fallback) {
         byType[inv.asset_type].dayChangeFallbackCount += 1;
       }
@@ -1259,7 +1277,9 @@ module.exports = function (db) {
     // 1D/Yesterday: compute intervalChangePct directly from accumulated dayChange vs totalValue.
     if (isPresetOneDay || isPresetYesterday) {
       for (const info of Object.values(byType)) {
-        const prevValue = (Number(info.totalValue) || 0) - (Number(info.dayChange) || 0);
+        const prevValue = isPresetYesterday
+          ? (Number(info.dayChangeOpeningValue) || 0)
+          : ((Number(info.totalValue) || 0) - (Number(info.dayChange) || 0));
         info.intervalChangePct = prevValue > 0 ? ((Number(info.dayChange) || 0) / prevValue) * 100 : 0;
       }
     }
