@@ -127,7 +127,7 @@ export default function App() {
         <AppSettingsProvider>
           <div style={{ minHeight: '100%', backgroundColor: '#f8f9fa' }}>
             <Navbar user={user} onLogout={handleLogout} />
-            <main className="container py-4">
+            <main className="container py-4 app-main-shell">
               <Suspense fallback={<RouteLoadingFallback />}>
                 <Routes>
                   <Route path="/" element={<Dashboard />} />

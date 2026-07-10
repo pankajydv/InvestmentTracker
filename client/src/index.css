@@ -115,6 +115,67 @@ tr:hover .row-actions {
   align-items: stretch;
 }
 
+@media (max-width: 430px) {
+  .app-main-shell {
+    padding-left: 0.4rem;
+    padding-right: 0.4rem;
+  }
+
+  .asset-allocation-section .card-body {
+    padding: 0.85rem;
+  }
+
+  .asset-allocation-section .h6 {
+    margin-bottom: 0.75rem !important;
+  }
+
+  .asset-allocation-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.35rem;
+  }
+
+  .asset-allocation-card {
+    padding: 0.45rem !important;
+  }
+
+  .asset-allocation-card .fw-semibold.text-nowrap {
+    font-size: 1rem !important;
+    margin-top: 0.12rem;
+  }
+
+  .asset-allocation-pct {
+    top: 0.25rem;
+    right: 0.25rem;
+    font-size: 0.6rem;
+    padding: 0.08rem 0.26rem;
+  }
+
+  .asset-allocation-card > a {
+    font-size: 0.9rem !important;
+  }
+
+  .asset-metric-label {
+    font-size: 0.63rem;
+    margin-right: 0.1rem;
+  }
+
+  .asset-metric-value {
+    font-size: 0.68rem;
+  }
+
+  .asset-metric-rate {
+    font-size: 0.67rem;
+  }
+
+  .asset-metric-rate-suffix {
+    display: none;
+  }
+
+  .asset-metric-separator {
+    margin: 0 0.06rem;
+  }
+}
+
 @media (min-width: 768px) {
   .asset-allocation-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));

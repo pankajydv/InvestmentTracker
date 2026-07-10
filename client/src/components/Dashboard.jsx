@@ -1145,7 +1145,7 @@ export default function Dashboard() {
       </Row>
 
       {/* Asset Allocation */}
-      <Card className="shadow-sm mb-4">
+      <Card className="shadow-sm mb-4 asset-allocation-section">
         <Card.Body>
           <h2 className="h6 fw-semibold mb-3">Asset Allocation</h2>
           <div className="asset-allocation-grid">
@@ -1206,7 +1206,8 @@ export default function Dashboard() {
                         </span>
                         <span className="asset-metric-separator">·</span>
                         <span className={`asset-metric-rate ${intervalClass}`}>
-                          {formatPct(intervalChangePct)}{intervalPctSuffix}
+                          {formatPct(intervalChangePct)}
+                          <span className="asset-metric-rate-suffix">{intervalPctSuffix}</span>
                         </span>
                       </>
                     )}
