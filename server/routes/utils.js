@@ -34,6 +34,10 @@ const MARKET_DATA_CUTOFF_MINUTES_IST = Object.freeze({
 });
 const FOREIGN_UNEXPECTED_LOCF_RECENT_DAYS = 4;
 const FOREIGN_UNEXPECTED_LOCF_THRESHOLD_SESSIONS = 1;
+const NAV_COMPLIANCE_ASSET_TYPES_KEY = 'NAV_COMPLIANCE_ASSET_TYPES';
+const NAV_COMPLIANCE_WARN_AFTER_SESSIONS_KEY = 'NAV_COMPLIANCE_WARN_AFTER_SESSIONS';
+const NAV_COMPLIANCE_DEFAULT_ASSET_TYPES = 'MF,NPS';
+const NAV_COMPLIANCE_DEFAULT_WARN_AFTER_SESSIONS = 2.0;
 
 const complianceJobStore = new Map();
 let complianceJobSeq = 0;
@@ -312,6 +316,64 @@ function addDaysIso(isoDate, days) {
   return d.toISOString().split('T')[0];
 }
 
+function getConfigValue(db, key) {
+  const row = db.prepare('SELECT value FROM config WHERE key = ? LIMIT 1').get(key);
+  return row?.value != null ? String(row.value) : null;
+}
+
+function parseCsvUpperSet(rawValue) {
+  return new Set(
+    String(rawValue || '')
+      .split(',')
+      .map((part) => part.trim().toUpperCase())
+      .filter(Boolean)
+  );
+}
+
+function normalizeNavAssetTypeToken(token) {
+  const upper = String(token || '').trim().toUpperCase();
+  if (!upper) return null;
+  if (upper === 'MF' || upper === 'MUTUAL_FUND') return 'MUTUAL_FUND';
+  if (upper === 'NPS') return 'NPS';
+  return upper;
+}
+
+function resolveNavComplianceSettings(db) {
+  const configuredTypes = getConfigValue(db, NAV_COMPLIANCE_ASSET_TYPES_KEY)
+    || process.env.NAV_COMPLIANCE_ASSET_TYPES
+    || NAV_COMPLIANCE_DEFAULT_ASSET_TYPES;
+  const typeSet = parseCsvUpperSet(configuredTypes);
+  const normalizedAssetTypes = new Set(
+    Array.from(typeSet)
+      .map((token) => normalizeNavAssetTypeToken(token))
+      .filter(Boolean)
+  );
+
+  const configuredWarnAfter = getConfigValue(db, NAV_COMPLIANCE_WARN_AFTER_SESSIONS_KEY)
+    || process.env.NAV_COMPLIANCE_WARN_AFTER_SESSIONS;
+  const parsedWarnAfter = Number(configuredWarnAfter);
+
+  return {
+    assetTypes: normalizedAssetTypes,
+    warnAfterSessions: Number.isFinite(parsedWarnAfter) && parsedWarnAfter > 0
+      ? parsedWarnAfter
+      : NAV_COMPLIANCE_DEFAULT_WARN_AFTER_SESSIONS,
+  };
+}
+
+function countSessionLag(lastDate, expectedDate, marketHolidaySet, assetType) {
+  if (!expectedDate) return 0;
+  if (lastDate && lastDate >= expectedDate) return 0;
+
+  let cursor = lastDate ? addDaysIso(lastDate, 1) : expectedDate;
+  let lag = 0;
+  while (cursor <= expectedDate) {
+    if (isMarketSessionDate(cursor, marketHolidaySet, assetType)) lag += 1;
+    cursor = addDaysIso(cursor, 1);
+  }
+  return lag;
+}
+
 function normalizeIndianStockSymbol(symbol) {
   const raw = String(symbol || '').trim();
   if (!raw) return null;
@@ -429,6 +491,8 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       missing_count: 0,
       unexpected_locf_count: 0,
       pending_locf_count: 0,
+      first_locf_warning_date: null,
+      locf_warning_count: 0,
       compliance_error_count: 0,
       overdue_locf_count: 0,
       stale: false,
@@ -495,6 +559,8 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       missing_count: 0,
       unexpected_locf_count: 0,
       pending_locf_count: 0,
+      first_locf_warning_date: null,
+      locf_warning_count: 0,
       compliance_error_count: ipoCarryComplianceErrorCount,
       overdue_locf_count: 0,
       compliance_error_reason: ipoCarryComplianceErrorReason,
@@ -547,6 +613,8 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       missing_count: 0,
       unexpected_locf_count: 0,
       pending_locf_count: 0,
+      first_locf_warning_date: null,
+      locf_warning_count: 0,
       compliance_error_count: ipoCarryComplianceErrorCount,
       overdue_locf_count: 0,
       compliance_error_reason: ipoCarryComplianceErrorReason,
@@ -576,6 +644,9 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
   let overdueLocfCount = 0;
   let firstMissingDate = null;
   let locfStreak = 0;
+  let locfStreakStartDate = null;
+  let firstLocfWarningDate = null;
+  let locfWarningCount = 0;
   let complianceErrorReason = ipoCarryComplianceErrorReason;
   const latestExpectedDate = expectedDates[expectedDates.length - 1] || null;
   const effectiveRecentWindowDays = String(scope.asset_type || '').toUpperCase() === 'FOREIGN_STOCK'
@@ -600,6 +671,7 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       missingCount += 1;
       if (!firstMissingDate) firstMissingDate = date;
       locfStreak = 0;
+      locfStreakStartDate = null;
       continue;
     }
 
@@ -608,6 +680,7 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       if (locfState.pending) {
         pendingLocfCount += 1;
         locfStreak = 0;
+        locfStreakStartDate = null;
         continue;
       }
       if (locfState.overdue) {
@@ -622,12 +695,22 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
       && isMarketSessionDate(date, marketHolidaySet, scope.asset_type);
 
     if (isUnexpectedLocfCandidate) {
+      if (locfStreak === 0) {
+        locfStreakStartDate = date;
+      }
       locfStreak += 1;
       if (locfStreak > Math.max(0, effectiveThresholdSessions)) {
         unexpectedLocfCount += 1;
+        if (!firstLocfWarningDate) {
+          firstLocfWarningDate = locfStreakStartDate;
+        }
+        if (firstLocfWarningDate && locfStreakStartDate === firstLocfWarningDate) {
+          locfWarningCount = locfStreak;
+        }
       }
     } else {
       locfStreak = 0;
+      locfStreakStartDate = null;
     }
   }
 
@@ -640,6 +723,8 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
     missing_count: missingCount,
     unexpected_locf_count: unexpectedLocfCount,
     pending_locf_count: pendingLocfCount,
+    first_locf_warning_date: firstLocfWarningDate,
+    locf_warning_count: locfWarningCount,
     overdue_locf_count: overdueLocfCount,
     compliance_error_count: ipoCarryComplianceErrorCount + overdueLocfCount,
     compliance_error_reason: complianceErrorReason,
@@ -653,6 +738,7 @@ module.exports = function (db) {
     try {
       const runDate = parseDateOnly(req.query.run_date) || todayIso();
       const portfolioId = req.query.portfolio_id ? Number(req.query.portfolio_id) : null;
+      const navCompliance = resolveNavComplianceSettings(db);
 
       if (portfolioId != null && (!Number.isInteger(portfolioId) || portfolioId <= 0)) {
         return res.status(400).json({ error: 'portfolio_id must be a positive integer' });
@@ -688,29 +774,82 @@ module.exports = function (db) {
 
       const details = scopes.map((scope) => buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByInvestment));
 
-      const issues = details
-        .filter((row) => row.missing_count > 0 || row.unexpected_locf_count > 0 || row.compliance_error_count > 0 || row.stale)
+      const dirtyRows = db.prepare(`
+        SELECT investment_id, portfolio_id, MIN(dirty_from_date) AS dirty_from_date
+        FROM dirty_backfill_scope
+        WHERE status IN ('pending', 'running', 'failed')
+          AND dirty_from_date <= ?
+          ${portfolioId != null ? 'AND portfolio_id = ?' : ''}
+        GROUP BY investment_id, portfolio_id
+      `).all(...(portfolioId != null ? [runDate, portfolioId] : [runDate]));
+
+      const dirtyByScope = new Map(
+        dirtyRows.map((row) => [`${Number(row.investment_id)}::${Number(row.portfolio_id)}`, String(row.dirty_from_date || '') || null])
+      );
+
+      const detailsWithDirty = details.map((row) => ({
+        ...row,
+        dirty_from_date: dirtyByScope.get(`${Number(row.investment_id)}::${Number(row.portfolio_id)}`) || null,
+      })).map((row) => {
+        const assetType = String(row.asset_type || '').toUpperCase();
+        const isNavScoped = navCompliance.assetTypes.has(assetType);
+        const navSessionLag = isNavScoped
+          ? countSessionLag(row.last_row_date, row.latest_expected_date, marketHolidaySet, assetType)
+          : 0;
+        const navWithinWarningWindow = isNavScoped && navSessionLag <= navCompliance.warnAfterSessions;
+        const effectiveMissingCount = navWithinWarningWindow ? 0 : Number(row.missing_count || 0);
+        const effectiveUnexpectedLocfCount = navWithinWarningWindow ? 0 : Number(row.unexpected_locf_count || 0);
+        const effectiveOverdueLocfCount = navWithinWarningWindow ? 0 : Number(row.overdue_locf_count || 0);
+        const effectiveComplianceErrors = Math.max(
+          0,
+          Number(row.compliance_error_count || 0) - (Number(row.overdue_locf_count || 0) - effectiveOverdueLocfCount)
+        );
+        const effectiveStale = navWithinWarningWindow ? false : !!row.stale;
+        const effectiveDirtyFromDate = navWithinWarningWindow ? null : row.dirty_from_date;
+        const effectiveLocfWarningCount = navWithinWarningWindow ? 0 : Number(row.locf_warning_count || 0);
+        const navPrewarn = isNavScoped && navSessionLag > 0 && navWithinWarningWindow;
+
+        return {
+          ...row,
+          nav_session_lag: navSessionLag,
+          nav_prewarn: navPrewarn,
+          missing_count: effectiveMissingCount,
+          unexpected_locf_count: effectiveUnexpectedLocfCount,
+          overdue_locf_count: effectiveOverdueLocfCount,
+          compliance_error_count: effectiveComplianceErrors,
+          stale: effectiveStale,
+          dirty_from_date: effectiveDirtyFromDate,
+          locf_warning_count: effectiveLocfWarningCount,
+        };
+      });
+
+      const issues = detailsWithDirty
+        .filter((row) => row.missing_count > 0
+          || row.unexpected_locf_count > 0
+          || row.compliance_error_count > 0
+          || row.stale
+          || !!row.dirty_from_date
+          || Number(row.locf_warning_count || 0) > 0)
         .sort((a, b) => {
+          if (!!b.dirty_from_date !== !!a.dirty_from_date) return Number(!!b.dirty_from_date) - Number(!!a.dirty_from_date);
           if (b.compliance_error_count !== a.compliance_error_count) return b.compliance_error_count - a.compliance_error_count;
+          if (b.locf_warning_count !== a.locf_warning_count) return b.locf_warning_count - a.locf_warning_count;
           if (b.missing_count !== a.missing_count) return b.missing_count - a.missing_count;
           if (b.unexpected_locf_count !== a.unexpected_locf_count) return b.unexpected_locf_count - a.unexpected_locf_count;
           return String(a.first_missing_date || '').localeCompare(String(b.first_missing_date || ''));
         });
 
-      const pendingDirtyCount = db.prepare(
-        "SELECT COUNT(*) AS c FROM dirty_backfill_scope WHERE status IN ('pending', 'running')"
-      ).get()?.c || 0;
-
       const counts = {
-        scopes_checked: details.length,
+        scopes_checked: detailsWithDirty.length,
         issue_scopes: issues.length,
-        compliance_errors: details.reduce((sum, row) => sum + Number(row.compliance_error_count || 0), 0),
-        missing_rows: details.reduce((sum, row) => sum + Number(row.missing_count || 0), 0),
-        unexpected_locf: details.reduce((sum, row) => sum + Number(row.unexpected_locf_count || 0), 0),
-        pending_locf: details.reduce((sum, row) => sum + Number(row.pending_locf_count || 0), 0),
-        overdue_locf: details.reduce((sum, row) => sum + Number(row.overdue_locf_count || 0), 0),
-        stale_scopes: details.filter((row) => row.stale).length,
-        pending_dirty_scopes: Number(pendingDirtyCount || 0),
+        compliance_errors: detailsWithDirty.reduce((sum, row) => sum + Number(row.compliance_error_count || 0), 0),
+        missing_rows: detailsWithDirty.reduce((sum, row) => sum + Number(row.missing_count || 0), 0),
+        unexpected_locf: detailsWithDirty.reduce((sum, row) => sum + Number(row.unexpected_locf_count || 0), 0),
+        pending_locf: detailsWithDirty.reduce((sum, row) => sum + Number(row.pending_locf_count || 0), 0),
+        overdue_locf: detailsWithDirty.reduce((sum, row) => sum + Number(row.overdue_locf_count || 0), 0),
+        stale_scopes: detailsWithDirty.filter((row) => row.stale).length,
+        pending_dirty_scopes: detailsWithDirty.filter((row) => !!row.dirty_from_date).length,
+        prewarn_scopes: detailsWithDirty.filter((row) => !!row.nav_prewarn).length,
       };
 
       const status = counts.missing_rows > 0 || counts.compliance_errors > 0

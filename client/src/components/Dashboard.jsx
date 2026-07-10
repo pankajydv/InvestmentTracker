@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
+import { Card, Row, Col, Table, Spinner, Alert, Button, Badge } from 'react-bootstrap';
 import { getDashboardSummary, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
@@ -312,6 +312,7 @@ function combineHealthStatuses(results) {
       overdue_locf: 0,
       stale_scopes: 0,
       pending_dirty_scopes: 0,
+      prewarn_scopes: 0,
     },
     compliance: {
       runDate: null,
@@ -341,6 +342,7 @@ function combineHealthStatuses(results) {
     merged.counts.overdue_locf += Number(counts.overdue_locf || 0);
     merged.counts.stale_scopes += Number(counts.stale_scopes || 0);
     merged.counts.pending_dirty_scopes += Number(counts.pending_dirty_scopes || 0);
+    merged.counts.prewarn_scopes += Number(counts.prewarn_scopes || 0);
 
     const compliance = result.compliance || {};
     merged.compliance.runDate = [merged.compliance.runDate, compliance.runDate]
@@ -845,6 +847,14 @@ export default function Dashboard() {
     || complianceSnapshot?.lastScan?.runDate
     || complianceSnapshot?.scanFloor
   );
+  const prewarnScopes = Number(dailyHealth?.counts?.prewarn_scopes || 0);
+  const complianceIndicator = dailyHealth?.status === 'error'
+    ? { variant: 'danger', label: 'Compliance: Error' }
+    : dailyHealth?.status === 'warning'
+      ? { variant: 'danger', label: 'Compliance: Warning' }
+      : prewarnScopes > 0
+        ? { variant: 'warning', label: 'Compliance: Pre-warn' }
+        : { variant: 'success', label: 'Compliance: Healthy' };
 
   return (
     <div className="dashboard-page">
@@ -859,10 +869,13 @@ export default function Dashboard() {
             {portfolioCount} Portfolio{portfolioCount !== 1 ? 's' : ''} Combined
           </h1>
         ) : <div />}
-        <div className="text-muted small">
-          {hideSold ? 'Sold investments hidden' : 'Showing sold investments'}
-          {' · '}
-          {includeFullySoldInReturns ? 'Returns include fully sold investments' : 'Returns exclude fully sold investments'}
+        <div className="text-muted small d-flex align-items-center gap-2">
+          <Badge bg={complianceIndicator.variant}>{complianceIndicator.label}</Badge>
+          <span>
+            {hideSold ? 'Sold investments hidden' : 'Showing sold investments'}
+            {' · '}
+            {includeFullySoldInReturns ? 'Returns include fully sold investments' : 'Returns exclude fully sold investments'}
+          </span>
         </div>
       </div>
 
@@ -919,8 +932,6 @@ export default function Dashboard() {
             <span className="fw-semibold">Compliance:</span>{' '}
             {hasRecordedComplianceScan ? (
               <>
-                Run {complianceSnapshot?.lastScan?.mode || '-'} on {complianceSnapshot?.lastScan?.runDate || '-'} |{' '}
-                Scan floor {complianceSnapshot?.scanFloor || '-'} |{' '}
                 Dirty from {complianceSnapshot?.dirtyFrom || '-'} |{' '}
                 Open gaps {complianceSnapshot?.openGapCount || 0} |{' '}
                 Backlog {complianceSnapshot?.hasBacklog ? 'yes' : 'no'}
@@ -942,10 +953,9 @@ export default function Dashboard() {
                     <th>Investment</th>
                     <th>Portfolio</th>
                     <th>First Missing</th>
-                    <th className="text-end">Missing</th>
-                    <th className="text-end">Compliance</th>
-                    <th className="text-end">Unexpected LOCF</th>
-                    <th>Last Row</th>
+                    <th>Dirty From</th>
+                    <th>First LOCF</th>
+                    <th className="text-end">LOCF Count</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -958,10 +968,9 @@ export default function Dashboard() {
                       </td>
                       <td>{issue.portfolio_name || '-'}</td>
                       <td>{issue.first_missing_date || '-'}</td>
-                      <td className="text-end">{issue.missing_count || 0}</td>
-                      <td className="text-end">{issue.compliance_error_count || 0}</td>
-                      <td className="text-end">{issue.unexpected_locf_count || 0}</td>
-                      <td>{issue.last_row_date || '-'}</td>
+                      <td>{issue.dirty_from_date || '-'}</td>
+                      <td>{issue.first_locf_warning_date || '-'}</td>
+                      <td className="text-end">{issue.locf_warning_count || 0}</td>
                     </tr>
                   ))}
                 </tbody>
