@@ -1725,172 +1725,22 @@ function updateAggregateDailyRange(db, fromDate, toDate, options = {}) {
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   const dates = buildDateRange(fromDate, toDate);
 
-  const rangeSnapshots = db.prepare(`
-    SELECT
-      dv.date,
-      dv.investment_id,
-      dv.portfolio_id,
-      i.asset_type,
-      COALESCE(dv.current_value, 0) AS current_value,
-      COALESCE(dv.invested_amount, 0) AS invested_amount,
-      COALESCE(dv.profit_loss, 0) AS profit_loss,
-      COALESCE(dv.realized_proceeds, 0) AS realized_proceeds,
-      COALESCE(dv.day_change, 0) AS day_change
-    FROM daily_values dv
-    JOIN investments i ON i.id = dv.investment_id
-    WHERE dv.date >= ?
-      AND dv.date <= ?
-      AND dv.portfolio_id IS NOT NULL
-      AND i.exclude_from_tracking != 1
-    ORDER BY dv.date ASC, dv.investment_id ASC, dv.portfolio_id ASC
-  `).all(fromDate, toDate);
-
-  const snapshotsByDate = new Map();
-  for (const row of rangeSnapshots) {
-    const list = snapshotsByDate.get(row.date) || [];
-    list.push(row);
-    snapshotsByDate.set(row.date, list);
-  }
-
-  const prevPortfolioRows = db.prepare(`
-    SELECT pd.portfolio_id, pd.total_value
-    FROM portfolio_daily pd
-    INNER JOIN (
-      SELECT portfolio_id, MAX(date) as max_date
-      FROM portfolio_daily
-      WHERE date < ?
-      GROUP BY portfolio_id
-    ) prev ON pd.portfolio_id = prev.portfolio_id
-      AND pd.date = prev.max_date
-  `).all(fromDate);
-
-  const prevAssetRows = db.prepare(`
-    SELECT atd.portfolio_id, atd.asset_type, atd.total_value
-    FROM asset_type_daily atd
-    INNER JOIN (
-      SELECT portfolio_id, asset_type, MAX(date) AS max_date
-      FROM asset_type_daily
-      WHERE date < ?
-      GROUP BY portfolio_id, asset_type
-    ) prev ON atd.portfolio_id = prev.portfolio_id
-      AND atd.asset_type = prev.asset_type
-      AND atd.date = prev.max_date
-  `).all(fromDate);
-
-  const prevPortfolioValue = new Map();
-  for (const row of prevPortfolioRows) {
-    prevPortfolioValue.set(portfolioKey(row.portfolio_id), Number(row.total_value || 0));
-  }
-  const prevAssetValue = new Map();
-  for (const row of prevAssetRows) {
-    prevAssetValue.set(assetKey(row.portfolio_id, row.asset_type), Number(row.total_value || 0));
-  }
-
-  db.prepare('DELETE FROM portfolio_daily WHERE date >= ? AND date <= ?').run(fromDate, toDate);
-  db.prepare('DELETE FROM asset_type_daily WHERE date >= ? AND date <= ?').run(fromDate, toDate);
-
-  const insertPortfolioDaily = db.prepare(`
-    INSERT INTO portfolio_daily (portfolio_id, date, total_value, total_invested, total_profit_loss, total_profit_loss_pct, day_change, day_change_pct)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const insertAssetDaily = db.prepare(`
-    INSERT INTO asset_type_daily (
-      portfolio_id,
-      asset_type,
-      date,
-      total_value,
-      total_invested,
-      total_profit_loss,
-      total_realized_proceeds,
-      total_unrealized_gain,
-      total_profit_loss_pct,
-      day_change,
-      day_change_pct
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const tx = db.transaction(() => {
+  // Rebuild each date with the SAME canonical carry-forward builders used by the incremental
+  // price-update path (updatePortfolioDaily / updateAssetTypeDaily). Delegating to them keeps
+  // range rebuilds byte-for-byte identical to single-date refreshes. A previous exact-date
+  // aggregation here silently dropped fully-exited positions (0 units, but non-zero gross
+  // invested + realized) on any date lacking a row, so backfilled history diverged from the
+  // price-update path and produced an artificial step in the Performance charts.
+  const rebuildAll = db.transaction(() => {
     for (let i = 0; i < dates.length; i += 1) {
       const date = dates[i];
-      const changed = snapshotsByDate.get(date) || [];
-      const portfolioTotalsForDate = new Map();
-      const assetTotalsForDate = new Map();
-
-      for (const row of changed) {
-        const p = ensurePortfolioTotals(portfolioTotalsForDate, row.portfolio_id);
-        p.total_value += Number(row.current_value || 0);
-        p.total_invested += Number(row.invested_amount || 0);
-        p.total_profit_loss += Number(row.profit_loss || 0);
-        p.day_change += Number(row.day_change || 0);
-
-        const a = ensureAssetTotals(assetTotalsForDate, row.portfolio_id, row.asset_type);
-        const currentValue = Number(row.current_value || 0);
-        const investedAmount = Number(row.invested_amount || 0);
-        const profitLoss = Number(row.profit_loss || 0);
-        const realizedProceeds = Number(row.realized_proceeds || 0);
-        const dayChange = Number(row.day_change || 0);
-        const unrealizedGain = currentValue - (investedAmount - realizedProceeds);
-
-        a.total_value += currentValue;
-        a.total_invested += investedAmount;
-        a.total_profit_loss += profitLoss;
-        a.total_realized_proceeds += realizedProceeds;
-        a.total_unrealized_gain += unrealizedGain;
-        a.day_change += dayChange;
-      }
-
-      for (const [pidKey, totals] of portfolioTotalsForDate.entries()) {
-        const pid = Number(pidKey);
-        const prev = prevPortfolioValue.has(portfolioKey(pid))
-          ? prevPortfolioValue.get(portfolioKey(pid))
-          : Number(totals.total_value || 0);
-        const dayChangePct = prev > 0 ? (Number(totals.day_change || 0) / prev) * 100 : 0;
-        const profitPct = Number(totals.total_invested || 0) > 0
-          ? (Number(totals.total_profit_loss || 0) / Number(totals.total_invested || 0)) * 100
-          : 0;
-
-        insertPortfolioDaily.run(
-          pid,
-          date,
-          quantizeForStorage(totals.total_value),
-          quantizeForStorage(totals.total_invested),
-          quantizeForStorage(totals.total_profit_loss),
-          quantizeForStorage(profitPct),
-          quantizeForStorage(totals.day_change),
-          quantizeForStorage(dayChangePct)
-        );
-        prevPortfolioValue.set(portfolioKey(pid), Number(totals.total_value || 0));
-      }
-
-      for (const [k, totals] of assetTotalsForDate.entries()) {
-        const prev = prevAssetValue.get(k) || 0;
-        const dayChangePct = prev > 0 ? (Number(totals.day_change || 0) / prev) * 100 : 0;
-        const totalInvested = Number(totals.total_invested || 0);
-        const totalProfitLoss = Number(totals.total_profit_loss || 0);
-        const totalProfitLossPct = totalInvested > 0 ? (totalProfitLoss / totalInvested) * 100 : 0;
-
-        insertAssetDaily.run(
-          totals.portfolio_id,
-          totals.asset_type,
-          date,
-          quantizeForStorage(totals.total_value),
-          quantizeForStorage(totals.total_invested),
-          quantizeForStorage(totals.total_profit_loss),
-          quantizeForStorage(totals.total_realized_proceeds),
-          quantizeForStorage(totals.total_unrealized_gain),
-          quantizeForStorage(totalProfitLossPct),
-          quantizeForStorage(totals.day_change),
-          quantizeForStorage(dayChangePct)
-        );
-        prevAssetValue.set(k, Number(totals.total_value || 0));
-      }
-
+      updatePortfolioDaily(db, date);
+      updateAssetTypeDaily(db, date);
       if (onProgress) onProgress(i + 1, dates.length, date);
     }
   });
 
-  tx();
+  rebuildAll();
 }
 
 module.exports = {

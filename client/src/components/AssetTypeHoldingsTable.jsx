@@ -164,7 +164,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
   };
 
   return (
-    <Card className="shadow-sm mb-4">
+    <Card className="shadow-sm">
       <Card.Header className="bg-white d-flex justify-content-between align-items-center">
         <h2 className="h6 fw-semibold mb-0" title={ASSET_TYPE_FULL_NAMES[type]}>
           {(ASSET_TYPE_FULL_NAMES[type] || ASSET_TYPE_LABELS[type])} ({info.investments.length})

@@ -4,7 +4,7 @@ import { getDashboardRollover } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { formatINR, formatINRExact, formatNumber, profitColor } from '../utils/formatters';
 
-export default function DashboardRolloverTable({ title, description, assetType = null, showSource = true, compactCollapsed = false, defaultExpanded = false }) {
+export default function DashboardRolloverTable({ title, description, assetType = null, showSource = true, compactCollapsed = false, defaultExpanded = false, wrapperClassName = 'shadow-sm mt-4' }) {
   const { selectedIds } = usePortfolio();
   const selectedIdsKey = (selectedIds || []).join(',');
   const DEFAULT_PAGE_SIZE = 366;
@@ -64,7 +64,7 @@ export default function DashboardRolloverTable({ title, description, assetType =
     : (showSource ? 5 : 4);
 
   return (
-    <Card className={`shadow-sm mt-4 ${compactCollapsed && !expanded ? 'rollup-card-collapsed' : ''}`}>
+    <Card className={`${wrapperClassName} ${compactCollapsed && !expanded ? 'rollup-card-collapsed' : ''}`}>
       <Card.Body className={compactCollapsed && !expanded ? 'py-2 px-3' : undefined}>
         <div className={`d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 ${expanded ? 'mb-2' : 'mb-0'}`}>
           <div>

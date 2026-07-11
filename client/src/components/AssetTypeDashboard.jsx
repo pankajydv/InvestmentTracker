@@ -526,6 +526,7 @@ export default function AssetTypeDashboard() {
         title={`${pageTitle} Daily Investment Value`}
         description="Stored daily aggregate snapshots for this asset type in the current dashboard scope."
         assetType={assetType}
+        wrapperClassName="shadow-sm"
       />
 
       {data.lastUpdate && (

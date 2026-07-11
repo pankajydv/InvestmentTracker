@@ -174,7 +174,12 @@ export default function Performance() {
   const chartData = activeSeries.map((d) => ({
     date: d.date,
     value: d.total_value || 0,
-    invested: d.total_invested || 0,
+    // Net invested = gross invested minus realized proceeds (cost basis of currently held
+    // units). Equivalent to total_value - total_profit_loss, so the gap between the Portfolio
+    // Value and Net Invested lines equals the Profit/Loss shown below. Plotting gross
+    // total_invested here was misleading: it includes capital already sold/exited, making the
+    // invested line sit above current value even when the portfolio is in profit.
+    invested: (Number(d.total_value) || 0) - (Number(d.total_profit_loss) || 0),
     profit: d.total_profit_loss || 0,
   }));
 
@@ -327,7 +332,7 @@ export default function Performance() {
                     <Tooltip
                       formatter={(value, name) => [
                         `₹${Number(value).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`,
-                        name === 'value' ? 'Portfolio Value' : name === 'invested' ? 'Invested' : 'Profit/Loss',
+                        name,
                       ]}
                       labelFormatter={(d) => new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}
                     />
@@ -344,7 +349,7 @@ export default function Performance() {
                     <Area
                       type="monotone"
                       dataKey="invested"
-                      name="Invested"
+                      name="Net Invested"
                       stroke="#9ca3af"
                       fill="#e5e7eb"
                       fillOpacity={0.2}

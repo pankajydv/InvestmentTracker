@@ -20,7 +20,6 @@ const {
 const { computeBondAccruedCoupon } = require('./bondAccrualService');
 const {
   getSeries,
-  upsertPriceSeries,
   upsertInvestmentPriceSeries,
   getInvestmentSeries,
   getInvestmentNearestOnOrBefore,
@@ -28,6 +27,7 @@ const {
   hydrateStockSeriesForPhase2,
   getMarketSessionDates,
   getNearestOnOrBefore,
+  getLocfCoverableSessionDates,
 } = require('./marketPriceCache');
 const { updateAggregateDailyRange } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
@@ -314,66 +314,6 @@ function getMaxContiguousMissingCount(marketSessionDates, seriesMap) {
   return segments.reduce((maxGap, segment) => Math.max(maxGap, segment.length), 0);
 }
 
-function fillShortMissingSessionSegmentsWithLocf({
-  investmentId,
-  instrumentType,
-  symbol,
-  marketSessionDates,
-  seriesMap,
-  maxGapSessions = CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
-  locfCutoffDate = null,
-}) {
-  if (!investmentId || !instrumentType || !symbol || !Array.isArray(marketSessionDates) || marketSessionDates.length === 0) {
-    return { filledSessions: 0, filledSegments: 0 };
-  }
-
-  const series = seriesMap instanceof Map ? seriesMap : new Map();
-  let cutoff = toIsoDate(locfCutoffDate);
-  if (!cutoff) {
-    cutoff = addDays(todayIso(), -1);
-  }
-  const missingSegments = getMissingSessionSegmentsFromSeries(marketSessionDates, series);
-  if (!missingSegments.length) return { filledSessions: 0, filledSegments: 0 };
-
-  const indexByDate = new Map(marketSessionDates.map((d, idx) => [d, idx]));
-  const locfPoints = [];
-  let filledSegments = 0;
-
-  for (const segment of missingSegments) {
-    if (!segment.length || segment.length > maxGapSessions) continue;
-    if (segment.some((d) => d >= cutoff)) continue;
-    const firstDate = segment[0];
-    const firstIdx = indexByDate.get(firstDate);
-    if (!(Number.isInteger(firstIdx) && firstIdx > 0)) continue;
-
-    const prevDate = marketSessionDates[firstIdx - 1];
-    const prevClose = Number(series.get(prevDate));
-    if (!Number.isFinite(prevClose) || prevClose <= 0) continue;
-
-    for (const date of segment) {
-      if (series.has(date)) continue;
-      series.set(date, prevClose);
-      locfPoints.push({
-        date,
-        open: prevClose,
-        high: prevClose,
-        low: prevClose,
-        close: prevClose,
-        adjClose: prevClose,
-        volume: null,
-        source: 'LOCF',
-      });
-    }
-    filledSegments += 1;
-  }
-
-  if (locfPoints.length) {
-    upsertInvestmentPriceSeries(investmentId, instrumentType, symbol, locfPoints, 'LOCF');
-  }
-
-  return { filledSessions: locfPoints.length, filledSegments };
-}
-
 function buildMissingSymbolWindows(inv, missingSegments, cache) {
   if (!inv || !Array.isArray(missingSegments) || missingSegments.length === 0) return [];
 
@@ -458,7 +398,6 @@ function buildMissingNpsWindows(inv, missingSegments) {
 }
 
 const AGGREGATE_RESUME_KEY = 'backfill_aggregate_resume_v1';
-const CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS = 3;
 const ENABLE_ROW_WRITE_AUDIT = String(process.env.APP_ROW_WRITE_AUDIT_LOG || 'true').toLowerCase() === 'true';
 
 function readAggregateResumeState(db) {
@@ -816,28 +755,9 @@ async function fetchStockSeries(symbol, startDate, endDate, options = {}) {
 
   const marketSessionDates = getMarketSessionDates(startDate, endDate, instrumentType);
   const firstCachedSessionDate = marketSessionDates.find((d) => series.has(d));
-  let missingSessionDates = marketSessionDates.filter((d) => !series.has(d));
-  const locfGapFill = fillShortMissingSessionSegmentsWithLocf({
-    investmentId: options.investmentId || null,
-    instrumentType,
-    symbol,
-    marketSessionDates,
-    seriesMap: series,
-    locfCutoffDate: options.locfCutoffDate || null,
-  });
-  missingSessionDates = marketSessionDates.filter((d) => !series.has(d));
+  const locfCoverableDates = getLocfCoverableSessionDates(rows, marketSessionDates, instrumentType, options.locfCutoffDate || null);
+  const missingSessionDates = marketSessionDates.filter((d) => !series.has(d) && !locfCoverableDates.has(d));
   const firstMissingDate = missingSessionDates[0] || null;
-
-  if (locfGapFill.filledSessions > 0) {
-    logBackfillInfo('[Backfill][StockCache] Filled short contiguous gaps with LOCF', {
-      investmentId: options.investmentId || null,
-      symbol,
-      instrumentType,
-      filledSessions: locfGapFill.filledSessions,
-      filledSegments: locfGapFill.filledSegments,
-      maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
-    });
-  }
 
   let shouldWarnSparseCoverage = !!firstMissingDate;
   let warningSuppressedReason = null;
@@ -3590,30 +3510,11 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
 
     const instrumentType = inferStockInstrumentType(inv?.ticker_symbol || null, inv?.asset_type || null);
     const sessions = getMarketSessionDates(startDate, endDate, instrumentType);
-    let missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
     const providerSymbol = String(inv?.ticker_symbol || seriesRows.find((row) => row?.symbol)?.symbol || '').trim();
-    const locfGapFill = fillShortMissingSessionSegmentsWithLocf({
-      investmentId: invId,
-      instrumentType,
-      symbol: providerSymbol,
-      marketSessionDates: sessions,
-      seriesMap,
-      locfCutoffDate: runDate,
-    });
-    missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
+    const locfCoverableDates = getLocfCoverableSessionDates(seriesRows, sessions, instrumentType, runDate);
+    const missingSessionDates = sessions.filter((d) => !seriesMap.has(d) && !locfCoverableDates.has(d));
     const firstMissingDate = missingSessionDates[0] || null;
     if (!firstMissingDate) continue;
-
-    if (locfGapFill.filledSessions > 0) {
-      logBackfillInfo('[Backfill][StockCache] Filled short contiguous gaps with LOCF for investment', {
-        investmentId: invId,
-        investmentName: inv?.name || null,
-        tickerSymbol: inv?.ticker_symbol || null,
-        filledSessions: locfGapFill.filledSessions,
-        filledSegments: locfGapFill.filledSegments,
-        maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
-      });
-    }
 
     let shouldWarnSparseCoverage = true;
     let warningSuppressedReason = null;
@@ -3654,9 +3555,8 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
         expectedSessions: sessions.length,
         firstMissingDate,
         missingSessionCount: missingSessionDates.length,
-        maxContiguousMissingSessions: getMaxContiguousMissingCount(sessions, seriesMap),
-        locfFilledSessions: locfGapFill.filledSessions,
-        locfFilledSegments: locfGapFill.filledSegments,
+        maxContiguousMissingSessions: getMaxContiguousMissingCount(sessions, new Set([...seriesMap.keys(), ...locfCoverableDates])),
+        locfCoverableSessions: locfCoverableDates.size,
       });
     } else {
       logBackfillInfo('[Backfill][StockCache] Sparse coverage warning suppressed for investment', {
@@ -3686,30 +3586,11 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
     const seriesMap = new Map(seriesRows.map((row) => [row.date, Number(row.close)]));
 
     const sessions = getMarketSessionDates(startDate, endDate, 'SGB');
-    let missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
     const providerSymbol = String(inv?.ticker_symbol || seriesRows.find((row) => row?.symbol)?.symbol || '').trim();
-    const locfGapFill = fillShortMissingSessionSegmentsWithLocf({
-      investmentId: invId,
-      instrumentType: 'SGB',
-      symbol: providerSymbol,
-      marketSessionDates: sessions,
-      seriesMap,
-      locfCutoffDate: runDate,
-    });
-    missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
+    const locfCoverableDates = getLocfCoverableSessionDates(seriesRows, sessions, 'SGB', runDate);
+    const missingSessionDates = sessions.filter((d) => !seriesMap.has(d) && !locfCoverableDates.has(d));
     const firstMissingDate = missingSessionDates[0] || null;
     if (!firstMissingDate) continue;
-
-    if (locfGapFill.filledSessions > 0) {
-      logBackfillInfo('[Backfill][SGBCache] Filled short contiguous gaps with LOCF for investment', {
-        investmentId: invId,
-        investmentName: inv?.name || null,
-        symbol: inv?.ticker_symbol || null,
-        filledSessions: locfGapFill.filledSessions,
-        filledSegments: locfGapFill.filledSegments,
-        maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
-      });
-    }
 
     let shouldWarnSparseCoverage = true;
     let warningSuppressedReason = null;
@@ -3730,9 +3611,8 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
         expectedSessions: sessions.length,
         firstMissingDate,
         missingSessionCount: missingSessionDates.length,
-        maxContiguousMissingSessions: getMaxContiguousMissingCount(sessions, seriesMap),
-        locfFilledSessions: locfGapFill.filledSessions,
-        locfFilledSegments: locfGapFill.filledSegments,
+        maxContiguousMissingSessions: getMaxContiguousMissingCount(sessions, new Set([...seriesMap.keys(), ...locfCoverableDates])),
+        locfCoverableSessions: locfCoverableDates.size,
       });
     } else {
       logBackfillInfo('[Backfill][SGBCache] Sparse coverage warning suppressed for investment', {
@@ -3765,30 +3645,11 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
     const seriesMap = new Map(seriesRows.map((row) => [row.date, Number(row.close)]));
 
     const sessions = getMarketSessionDates(startDate, endDate, 'MUTUAL_FUND');
-    let missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
     const providerSymbol = String(inv?.amfi_code || inv?.ticker_symbol || seriesRows.find((row) => row?.symbol)?.symbol || '').trim();
-    const locfGapFill = fillShortMissingSessionSegmentsWithLocf({
-      investmentId: invId,
-      instrumentType: 'MUTUAL_FUND',
-      symbol: providerSymbol,
-      marketSessionDates: sessions,
-      seriesMap,
-      locfCutoffDate: runDate,
-    });
-    missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
+    const locfCoverableDates = getLocfCoverableSessionDates(seriesRows, sessions, 'MUTUAL_FUND', runDate);
+    const missingSessionDates = sessions.filter((d) => !seriesMap.has(d) && !locfCoverableDates.has(d));
     const firstMissingDate = missingSessionDates[0] || null;
     if (!firstMissingDate) continue;
-
-    if (locfGapFill.filledSessions > 0) {
-      logBackfillInfo('[Backfill][MFCache] Filled short contiguous gaps with LOCF for investment', {
-        investmentId: invId,
-        investmentName: inv?.name || null,
-        fundCode: inv?.ticker_symbol || null,
-        filledSessions: locfGapFill.filledSessions,
-        filledSegments: locfGapFill.filledSegments,
-        maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
-      });
-    }
 
     let shouldWarnSparseCoverage = true;
     let warningSuppressedReason = null;
@@ -3809,9 +3670,8 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
         expectedSessions: sessions.length,
         firstMissingDate,
         missingSessionCount: missingSessionDates.length,
-        maxContiguousMissingSessions: getMaxContiguousMissingCount(sessions, seriesMap),
-        locfFilledSessions: locfGapFill.filledSessions,
-        locfFilledSegments: locfGapFill.filledSegments,
+        maxContiguousMissingSessions: getMaxContiguousMissingCount(sessions, new Set([...seriesMap.keys(), ...locfCoverableDates])),
+        locfCoverableSessions: locfCoverableDates.size,
       });
     } else {
       logBackfillInfo('[Backfill][MFCache] Sparse coverage warning suppressed for investment', {
@@ -3841,30 +3701,11 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
     const seriesMap = new Map(seriesRows.map((row) => [row.date, Number(row.close)]));
 
     const sessions = getMarketSessionDates(startDate, endDate, 'NPS');
-    let missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
     const providerSymbol = String(inv?.nps_fund_code || inv?.ticker_symbol || seriesRows.find((row) => row?.symbol)?.symbol || '').trim();
-    const locfGapFill = fillShortMissingSessionSegmentsWithLocf({
-      investmentId: invId,
-      instrumentType: 'NPS',
-      symbol: providerSymbol,
-      marketSessionDates: sessions,
-      seriesMap,
-      locfCutoffDate: runDate,
-    });
-    missingSessionDates = sessions.filter((d) => !seriesMap.has(d));
+    const locfCoverableDates = getLocfCoverableSessionDates(seriesRows, sessions, 'NPS', runDate);
+    const missingSessionDates = sessions.filter((d) => !seriesMap.has(d) && !locfCoverableDates.has(d));
     const firstMissingDate = missingSessionDates[0] || null;
     if (!firstMissingDate) continue;
-
-    if (locfGapFill.filledSessions > 0) {
-      logBackfillInfo('[Backfill][NPSCache] Filled short contiguous gaps with LOCF for investment', {
-        investmentId: invId,
-        investmentName: inv?.name || null,
-        scheme: inv?.ticker_symbol || null,
-        filledSessions: locfGapFill.filledSessions,
-        filledSegments: locfGapFill.filledSegments,
-        maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
-      });
-    }
 
     let shouldWarnSparseCoverage = true;
     let warningSuppressedReason = null;
@@ -3885,9 +3726,8 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
         expectedSessions: sessions.length,
         firstMissingDate,
         missingSessionCount: missingSessionDates.length,
-        maxContiguousMissingSessions: getMaxContiguousMissingCount(sessions, seriesMap),
-        locfFilledSessions: locfGapFill.filledSessions,
-        locfFilledSegments: locfGapFill.filledSegments,
+        maxContiguousMissingSessions: getMaxContiguousMissingCount(sessions, new Set([...seriesMap.keys(), ...locfCoverableDates])),
+        locfCoverableSessions: locfCoverableDates.size,
       });
     } else {
       logBackfillInfo('[Backfill][NPSCache] Sparse coverage warning suppressed for investment', {
@@ -4310,33 +4150,18 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
     const fxExact = loadSeriesMapFromLocalCache('FX', 'USDINR=X', fxStart, fxEnd, (row) => row.close);
     const fxSessionDates = getMarketSessionDates(fxStart, fxEnd, 'FOREIGN_STOCK');
     let carry = getLocalFxRateOnOrBefore(fxStart);
-    // Don't persist LOCF to fx_rate_cache for the most recent date (let the provider populate it).
-    // We still carry forward in-memory so ongoing backfill calculations have a rate to use.
-    const fxLocfPersistCutoff = addDays(fxEnd, -1);
-    const fxLocfPoints = [];
+    // LOCF is never persisted to fx_rate_cache. We still carry forward in-memory so
+    // ongoing backfill calculations have a rate to use for provider-gap sessions.
     for (const d of fxSessionDates) {
       const exact = fxExact.get(d);
       if (exact != null && Number.isFinite(Number(exact)) && Number(exact) > 0) {
         carry = Number(exact);
-      } else if (carry != null && Number.isFinite(Number(carry)) && Number(carry) > 0) {
-        // Only persist LOCF for historical dates; leave recent dates to the provider fetch.
-        if (d <= fxLocfPersistCutoff) {
-          fxLocfPoints.push({
-            date: d,
-            close: Number(carry),
-            source: 'LOCF',
-          });
-        }
       }
       // Always populate in-memory cache for any date in the window so backfill
       // calculations have a carry-forward rate even for the most recent sessions.
       if (carry != null && Number.isFinite(Number(carry)) && Number(carry) > 0) {
         cache.fx.set(d, Number(carry));
       }
-    }
-
-    if (fxLocfPoints.length > 0) {
-      upsertPriceSeries('FX', 'USDINR=X', fxLocfPoints, 'LOCF');
     }
 
     for (const window of foreignFxWindows) {
@@ -4665,6 +4490,10 @@ async function updateDailyValues(db, options = {}) {
   let completedScopes = 0;
   let earliestTouchedDate = runDate;
   let earliestAggregateDate = null;
+  // Ground-truth probe: capture the DB clock BEFORE any recompute writes so that after
+  // Step-3 we can detect the EARLIEST daily_values date actually touched during this run
+  // (via updated_at) and widen the rollup refresh accordingly. See Step-4 below.
+  const aggregateFloorProbeTs = db.prepare("SELECT datetime('now') AS ts").get().ts;
   const forwardReplaySummary = {
     historicalScopeCount: 0,
     maxReplayDays: 0,
@@ -4836,6 +4665,29 @@ async function updateDailyValues(db, options = {}) {
   }
 
   logBackfillInfo(`[Backfill][Step-3] Completed daily recompute. scopes=${totalScopes}, rowsWritten=${totalRows}`);
+
+  // Robustness: the aggregate refresh window is normally derived from each dirty scope's
+  // dirty_from_date. If a recompute rewrote daily_values rows further back than expected
+  // (or a wide historical rebuild ran), the rollup tables (portfolio_daily / asset_type_daily)
+  // would silently drift out of sync with daily_values. Widen the floor to the EARLIEST
+  // daily_values date actually touched during this run so the rollup rebuild always covers
+  // every changed row rather than only the planned dirty_from_date.
+  try {
+    const touchedFloor = db.prepare(
+      'SELECT MIN(date) AS d FROM daily_values WHERE portfolio_id IS NOT NULL AND updated_at >= ?'
+    ).get(aggregateFloorProbeTs)?.d || null;
+    if (touchedFloor && (earliestAggregateDate == null || touchedFloor < earliestAggregateDate)) {
+      logBackfillInfo('[Backfill][Step-4] Widened aggregate refresh floor to earliest touched daily_values date.', {
+        scopeDerivedEarliestAggregateDate: earliestAggregateDate,
+        touchedFloor,
+      });
+      earliestAggregateDate = touchedFloor;
+    }
+  } catch (floorErr) {
+    logBackfillWarn('[Backfill][Step-4] Failed to compute touched-date floor; falling back to scope-derived earliestAggregateDate.', {
+      error: floorErr.message,
+    });
+  }
 
   if (!earliestAggregateDate) {
     clearAggregateResumeState(db);

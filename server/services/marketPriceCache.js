@@ -1143,10 +1143,11 @@ function hasRequiredProviderOhlcv(row, instrumentType) {
   return hasOpen && hasHigh && hasLow && hasVolume;
 }
 
-function hasCompleteCoverage(cachedRows, marketSessionDates, instrumentType = null) {
+function hasCompleteCoverage(cachedRows, marketSessionDates, instrumentType = null, extraCoveredDates = null) {
   if (!marketSessionDates.length) return true;
   const cached = buildRowMap(cachedRows);
   return marketSessionDates.every((date) => {
+    if (extraCoveredDates && extraCoveredDates.has(date)) return true;
     if (!cached.has(date)) return false;
     return hasRequiredProviderOhlcv(cached.get(date), instrumentType);
   });
@@ -1204,10 +1205,13 @@ function splitFingerprint(events) {
   );
 }
 
-function getSeriesMissingStartDate(rows, marketSessionDates, instrumentType = null) {
+function getSeriesMissingStartDate(rows, marketSessionDates, instrumentType = null, extraCoveredDates = null) {
   if (!Array.isArray(marketSessionDates) || marketSessionDates.length === 0) return null;
   const cached = buildRowMap(rows || []);
-  return marketSessionDates.find((date) => !cached.has(date) || !hasRequiredProviderOhlcv(cached.get(date), instrumentType)) || null;
+  return marketSessionDates.find((date) => {
+    if (extraCoveredDates && extraCoveredDates.has(date)) return false;
+    return !cached.has(date) || !hasRequiredProviderOhlcv(cached.get(date), instrumentType);
+  }) || null;
 }
 
 function getSparseMissingWindows(rows, marketSessionDates, instrumentType = null, options = {}) {
@@ -1216,6 +1220,7 @@ function getSparseMissingWindows(rows, marketSessionDates, instrumentType = null
   const cached = buildRowMap(rows || []);
   const normalizedType = normalizeInstrumentType(instrumentType);
   const ignorePrefixUntilFirstCovered = !!options.ignorePrefixUntilFirstCovered;
+  const extraCovered = options.extraCoveredDates || null;
 
   let startIndex = 0;
   if (ignorePrefixUntilFirstCovered) {
@@ -1236,7 +1241,8 @@ function getSparseMissingWindows(rows, marketSessionDates, instrumentType = null
 
   for (let i = startIndex; i < marketSessionDates.length; i += 1) {
     const date = marketSessionDates[i];
-    const covered = cached.has(date) && hasRequiredProviderOhlcv(cached.get(date), normalizedType);
+    const covered = (extraCovered && extraCovered.has(date))
+      || (cached.has(date) && hasRequiredProviderOhlcv(cached.get(date), normalizedType));
 
     if (!covered) {
       if (!windowStart) windowStart = date;
@@ -1258,7 +1264,7 @@ function getSparseMissingWindows(rows, marketSessionDates, instrumentType = null
   return windows;
 }
 
-function getHydrationMissingWindows(rows, marketSessionDates, instrumentType = null) {
+function getHydrationMissingWindows(rows, marketSessionDates, instrumentType = null, extraCoveredDates = null) {
   if (!Array.isArray(marketSessionDates) || marketSessionDates.length === 0) return [];
 
   const normalizedType = normalizeInstrumentType(instrumentType);
@@ -1268,12 +1274,13 @@ function getHydrationMissingWindows(rows, marketSessionDates, instrumentType = n
   const sparseWindows = useSparseWindows
     ? getSparseMissingWindows(rows, marketSessionDates, normalizedType, {
       ignorePrefixUntilFirstCovered: normalizedType === 'SGB',
+      extraCoveredDates,
     })
     : [];
 
   if (sparseWindows.length > 0) return sparseWindows;
 
-  const missingStart = getSeriesMissingStartDate(rows, marketSessionDates, normalizedType);
+  const missingStart = getSeriesMissingStartDate(rows, marketSessionDates, normalizedType, extraCoveredDates);
   if (!missingStart) return [];
   return [{ from: missingStart, to: marketSessionDates[marketSessionDates.length - 1] }];
 }
@@ -1356,8 +1363,9 @@ async function hydrateStockSeriesForPhase2({
   }
 
   let cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
-  if (!hasCompleteCoverage(cachedRows, marketSessionDates, instrumentType) && typeof fetchRange === 'function' && marketSessionDates.length > 0) {
-    const missingStart = getSeriesMissingStartDate(cachedRows, marketSessionDates, instrumentType);
+  const locfCoverableForFetch = getLocfCoverableSessionDates(cachedRows, marketSessionDates, instrumentType, normalizedFreshnessSkipFromDate || null);
+  if (!hasCompleteCoverage(cachedRows, marketSessionDates, instrumentType, locfCoverableForFetch) && typeof fetchRange === 'function' && marketSessionDates.length > 0) {
+    const missingStart = getSeriesMissingStartDate(cachedRows, marketSessionDates, instrumentType, locfCoverableForFetch);
     if (missingStart) {
       const suppressRecentMissing = !!(
         normalizedFreshnessSkipFromDate
@@ -1424,38 +1432,8 @@ async function hydrateStockSeriesForPhase2({
     }
   }
 
-  const shortGapLocf = buildShortContiguousLocfPoints(cachedRows, marketSessionDates, {
-    maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
-    locfCutoffDate: normalizedFreshnessSkipFromDate,
-  });
-  if (shortGapLocf.points.length > 0) {
-    upsertPriceSeries(instrumentType, symbol, shortGapLocf.points, 'LOCF', investmentId);
-    cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
-    if (typeof onInfo === 'function') {
-      onInfo(
-        `[MarketCache][LOCF] Auto-filled short contiguous provider-miss sessions (<=${CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS})`,
-        {
-          investmentId,
-          instrumentType,
-          symbol,
-          filledSessions: shortGapLocf.filledSessions,
-          filledSegments: shortGapLocf.filledSegments,
-          unfilledShortSegments: shortGapLocf.unfilledShortSegments,
-        }
-      );
-    }
-  }
-
-  const locfCutoffDate = normalizedFreshnessSkipFromDate || null;
-  const locfPoints = buildLocfPoints(cachedRows, marketSessionDates, instrumentType, locfCutoffDate, (message, meta) => {
-    if (typeof onInfo === 'function') {
-      onInfo(`[MarketCache][LOCF] ${message}`, { ...meta, investmentId, instrumentType, symbol });
-    }
-  });
-  if (locfPoints.length > 0) {
-    upsertPriceSeries(instrumentType, symbol, locfPoints, 'LOCF', investmentId);
-    cachedRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
-  }
+  // LOCF is no longer materialized into the market cache. Provider gaps are carried
+  // forward at read time (nearest-on-or-before) when daily_values are computed.
 
   if (splitRebuildTriggered && typeof onInfo === 'function') {
     onInfo(`[MarketCache][SplitCheck] Completed split-triggered hydrate for ${symbol}`, {
@@ -1675,6 +1653,31 @@ function buildShortContiguousLocfPoints(rows, marketSessionDates, options = {}) 
   };
 }
 
+// Returns the set of session dates that LOCF (last-observation-carried-forward) would
+// cover for a provider series, WITHOUT materializing any rows in the cache tables. Used
+// to compute provider-fetch windows and to suppress sparse-coverage warnings for gaps
+// that are expected to be carried forward at read time. Combines short contiguous gaps
+// (<= CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS) and longer volume-gated gaps.
+function getLocfCoverableSessionDates(rows, marketSessionDates, instrumentType = null, locfCutoffDate = null) {
+  const covered = new Set();
+  if (!Array.isArray(marketSessionDates) || marketSessionDates.length === 0) return covered;
+
+  const shortGap = buildShortContiguousLocfPoints(rows, marketSessionDates, {
+    maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
+    locfCutoffDate,
+  });
+  for (const point of shortGap.points) {
+    if (point?.date) covered.add(point.date);
+  }
+
+  const longGap = buildLocfPoints(rows, marketSessionDates, instrumentType, locfCutoffDate);
+  for (const point of longGap) {
+    if (point?.date) covered.add(point.date);
+  }
+
+  return covered;
+}
+
 function nearlyEqual(a, b, epsilon = 1e-6) {
   if (a == null && b == null) return true;
   if (a == null || b == null) return false;
@@ -1744,12 +1747,13 @@ async function hydrateHistoricalPriceSeries({
     }
   }
 
-  if (hasCompleteCoverage(cachedRows, marketSessionDates, instrumentType)) {
+  const locfCoverableForFetch = getLocfCoverableSessionDates(cachedRows, marketSessionDates, instrumentType, normalizedFreshnessSkipFromDate || null);
+  if (hasCompleteCoverage(cachedRows, marketSessionDates, instrumentType, locfCoverableForFetch)) {
     return cachedRows;
   }
 
   if (typeof fetchRange === 'function' && marketSessionDates.length > 0) {
-    const windows = getHydrationMissingWindows(cachedRows, marketSessionDates, instrumentType);
+    const windows = getHydrationMissingWindows(cachedRows, marketSessionDates, instrumentType, locfCoverableForFetch);
 
     if (windows.length > 0) {
       let totalFetchedPoints = 0;
@@ -1830,41 +1834,15 @@ async function hydrateHistoricalPriceSeries({
     }
   }
 
-  const refreshed = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
-  const shortGapLocf = buildShortContiguousLocfPoints(refreshed, marketSessionDates, {
-    maxGapSessions: CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS,
-    locfCutoffDate: normalizedFreshnessSkipFromDate,
-  });
-  if (shortGapLocf.points.length > 0) {
-    upsertPriceSeries(instrumentType, symbol, shortGapLocf.points, 'LOCF', contextInvestmentId);
-    if (typeof onInfo === 'function') {
-      const investmentIdFromMeta = contextMeta?.investmentId ?? null;
-      onInfo(
-        `[MarketCache][LOCF] Auto-filled short contiguous provider-miss sessions (<=${CONTIGUOUS_MISSING_LOCF_MAX_SESSIONS})`,
-        {
-          investmentId: investmentIdFromMeta,
-          instrumentType,
-          symbol,
-          filledSessions: shortGapLocf.filledSessions,
-          filledSegments: shortGapLocf.filledSegments,
-          unfilledShortSegments: shortGapLocf.unfilledShortSegments,
-        }
-      );
-    }
-  }
-
-  const postShortGapRows = getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
-  const locfCutoffDate = normalizedFreshnessSkipFromDate || null;
-  const locfPoints = buildLocfPoints(postShortGapRows, marketSessionDates, instrumentType, locfCutoffDate);
-  if (locfPoints.length > 0) {
-    upsertPriceSeries(instrumentType, symbol, locfPoints, 'LOCF', contextInvestmentId);
-  }
-
+  // LOCF is no longer materialized into the price cache. Provider gaps are carried
+  // forward at read time (nearest-on-or-before) when daily_values are computed.
   return getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
 }
 
 function upsertPricePoint(point) {
   if (!point || !point.instrumentType || !point.symbol || !point.date) return;
+  // LOCF values are never persisted to cache tables; they are derived at read time.
+  if (String(point.source ?? '').toUpperCase() === 'LOCF') return;
   const conn = getCacheDb();
   const normalizedDate = normalizeDate(point.date);
   if (!normalizedDate) return;
@@ -1958,7 +1936,11 @@ function upsertPricePoint(point) {
 function upsertPriceSeries(instrumentType, symbol, points, source = null, investmentId = null) {
   if (!instrumentType || !symbol || !Array.isArray(points) || points.length === 0) return;
   const conn = getCacheDb();
-  const normalizedPoints = points.map(normalizeCachePoint).filter(Boolean);
+  // LOCF values are never persisted to cache tables; they are derived at read time
+  // (nearest-on-or-before) when daily_values are computed. Drop any LOCF-sourced points.
+  const providerPoints = points.filter((p) => String(p?.source ?? source ?? '').toUpperCase() !== 'LOCF');
+  if (providerPoints.length === 0) return;
+  const normalizedPoints = providerPoints.map(normalizeCachePoint).filter(Boolean);
   if (isFxInstrumentType(instrumentType)) {
     const stmtFx = conn.prepare(`
       INSERT INTO fx_rate_cache (date, rate, source, fetched_at, updated_at)
@@ -2109,7 +2091,10 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
   const conn = getCacheDb();
   const investmentSymbol = String(providerSymbol || '').trim();
   if (!investmentSymbol) return;
-  const normalizedPoints = points.map(normalizeCachePoint).filter(Boolean);
+  // LOCF values are never persisted to cache tables; they are derived at read time.
+  const providerPoints = points.filter((p) => String(p?.source ?? source ?? '').toUpperCase() !== 'LOCF');
+  if (!providerPoints.length) return;
+  const normalizedPoints = providerPoints.map(normalizeCachePoint).filter(Boolean);
   if (!normalizedPoints.length) return;
 
   const stmt = conn.prepare(`
@@ -2209,6 +2194,7 @@ module.exports = {
   getInvestmentNearestOnOrBefore,
   getMarketSessionDates,
   getSeriesMissingStartDate,
+  getLocfCoverableSessionDates,
   hydrateHistoricalPriceSeries,
   hydrateStockSeriesForPhase2,
 };

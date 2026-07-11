@@ -1256,7 +1256,7 @@ async function fetchHistoricalUSDToINR(date) {
   if (nearestCached && nearestCached.close != null) {
     const locfRate = Number(nearestCached.close);
     if (Number.isFinite(locfRate) && locfRate > 0) {
-      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: locfRate, source: 'LOCF' });
+      // LOCF is not persisted to the FX cache; carry forward at read time only.
       return locfRate;
     }
   }
@@ -1264,7 +1264,9 @@ async function fetchHistoricalUSDToINR(date) {
   console.warn(`fetchHistoricalUSDToINR: could not get rate for ${date}, using current rate`);
   const currentRate = await fetchUSDToINR();
   if (Number.isFinite(Number(currentRate)) && Number(currentRate) > 0) {
-    upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: Number(currentRate), source: 'YAHOO' });
+    // Last-resort spot rate is a proxy for a missing historical date; return it for this
+    // run but do NOT persist it (avoids anchoring today's rate onto a past date as a
+    // provider observation). Real provider data is fetched/cached on subsequent runs.
     return Number(currentRate);
   }
 
