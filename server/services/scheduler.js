@@ -1081,10 +1081,10 @@ function startScheduler(db) {
   // Covers US regular session hours (9:30 AM–4 PM EDT = 7 PM–1:30 AM IST).
   // Running on weekends keeps preflight/dirty-scope active even when US is closed.
   const usMarketTimes = [
-    '35 19 * * 1-5',  // 7:35 PM
-    '35 20 * * 1-5',  // 8:35 PM
-    '35 21 * * 1-5',  // 9:35 PM
-    '35 23 * * 1-5',  // 11:35 PM
+    '35 19 * * *',  // 7:35 PM
+    '35 20 * * *',  // 8:35 PM
+    '35 21 * * *',  // 9:35 PM
+    '35 23 * * *',  // 11:35 PM
   ];
 
   usMarketTimes.forEach((cronTime, index) => {
@@ -1141,6 +1141,30 @@ function startScheduler(db) {
     timezone: 'Asia/Kolkata',
   });
 
+  // Saturday daytime baseline runs (10:25 AM and 2:25 PM IST) - all asset types.
+  // Purpose: ensure same-day rollover/housekeeping still lands on Saturdays.
+  const saturdayDaytimeRuns = [
+    { cronTime: '25 10 * * 6', hourLabel: '10:25 AM', runTag: 'saturday_10_25' },
+    { cronTime: '25 14 * * 6', hourLabel: '2:25 PM', runTag: 'saturday_14_25' },
+  ];
+
+  saturdayDaytimeRuns.forEach(({ cronTime, hourLabel, runTag }) => {
+    cron.schedule(cronTime, async () => {
+      console.log(`[Scheduler] Running ${hourLabel} Saturday baseline update (all asset types)...`);
+      try {
+        await runSchedulerCycle(db, `Saturday baseline run ${hourLabel} (all types)`, {
+          reuseLiveTodayAssetTypes: ['MUTUAL_FUND', 'NPS'],
+          runTag,
+        });
+      } catch (e) {
+        console.error(`[Scheduler] ${hourLabel} Saturday baseline update failed:`, e.message);
+        logAppError(`[Scheduler] Saturday baseline run ${hourLabel} failed`, { error: e.message });
+      }
+    }, {
+      timezone: 'Asia/Kolkata',
+    });
+  });
+
   // Evening baseline run at 5:35 PM IST (all days) - all asset types.
   cron.schedule('35 17 * * *', async () => {
     console.log('[Scheduler] Running 5:35 PM evening baseline update (all asset types, all days)...');
@@ -1181,13 +1205,15 @@ function startScheduler(db) {
 
   console.log('[Scheduler] Daily price updates scheduled:');
   console.log('  - 4:35 AM IST (all asset types, all days)');
+  console.log('  - 10:25 AM and 2:25 PM IST (all asset types, Saturdays only)');
   console.log('  - 5:35 PM IST (all asset types, all days)');
   console.log('  - 9:35 AM–4:35 PM IST (hourly, Indian stocks + SGB + MF/NPS retries, weekdays)');
-  console.log('  - 7:35 PM, 8:35 PM, 9:35 PM, 11:35 PM IST (foreign stocks + conditional MF/NPS, weekdays)');
+  console.log('  - 7:35 PM, 8:35 PM, 9:35 PM, 11:35 PM IST (foreign stocks + conditional MF/NPS, all days)');
   console.log('  - 10:35 PM IST (all asset types, all days)');
   logAppInfo('[Scheduler] Scheduled jobs initialized', {
     timezone: 'Asia/Kolkata',
     earlyMorningAccrualRun: '04:35',
+    saturdayDaytimeRuns: ['10:25', '14:25'],
     eveningBaselineRun: '17:35',
     intradayRuns: 8,
     usMarketRuns: ['19:35', '20:35', '21:35', '23:35'],
