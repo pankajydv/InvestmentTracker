@@ -36,3 +36,14 @@ __pycache__/
 # Configs
 configs/gcp-client.json
 configs/ssh-key*
+
+# Secrets & backup artifacts (never commit)
+_secrets/
+*.age
+*.gpg
+*.7z
+investtrack-secrets*
+**/rclone.conf
+scripts/server/backup-db.env
+scripts/server/litestream.yml
+*.age-key

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Investment Tracker off-box DB backup
+
+[Timer]
+# 02:30 UTC daily (matches the documented backup window). Persistent=true runs a
+# missed backup on next boot (e.g. if the VM was off at 02:30).
+OnCalendar=*-*-* 02:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const util = require('util');
+const zlib = require('zlib');
 const { applyEnvDefaults } = require('../config/envDefaults');
 
 applyEnvDefaults();
@@ -9,7 +10,7 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data'
 const LOG_DIR = process.env.APP_LOG_DIR || path.join(DATA_DIR, 'logs');
 const APP_MODE = String(process.env.APP_MODE || 'production').toLowerCase();
 const IS_PRODUCTION_MODE = APP_MODE !== 'dev' && APP_MODE !== 'development' && APP_MODE !== 'test';
-const RETENTION_DAYS = Math.max(1, Number(process.env.APP_LOG_RETENTION_DAYS || (IS_PRODUCTION_MODE ? 10 : 30)));
+const RETENTION_DAYS = Math.max(1, Number(process.env.APP_LOG_RETENTION_DAYS || 30));
 const IST_OFFSET_MINUTES = 330;
 const LOG_FILE_PREFIX = 'invest-tracker';
 const LOG_TO_CONSOLE = String(
@@ -28,6 +29,7 @@ const BASE_CONSOLE = {
 };
 
 let consoleCaptureInstalled = false;
+let lastMaintenanceDate = null;
 
 function toIstDate(date = new Date()) {
   return new Date(date.getTime() + (IST_OFFSET_MINUTES * 60 * 1000));
@@ -73,7 +75,8 @@ function pruneOldLogs() {
     for (const file of files) {
       if (!file.isFile()) continue;
       const name = file.name;
-      if (!name.startsWith(`${LOG_FILE_PREFIX}-`) || !name.endsWith('.log')) continue;
+      if (!name.startsWith(`${LOG_FILE_PREFIX}-`)) continue;
+      if (!name.endsWith('.log') && !name.endsWith('.log.gz')) continue;
       const fullPath = path.join(LOG_DIR, name);
       const stat = fs.statSync(fullPath);
       if (stat.mtimeMs < cutoff) {
@@ -83,6 +86,56 @@ function pruneOldLogs() {
   } catch (_) {
     console.error('[ERROR] [Logger] Failed while pruning old log files');
   }
+}
+
+// Gzip a rotated log file (preserving its mtime so retention counts from the
+// log's own date), then remove the uncompressed original.
+function compressLogFile(fullPath) {
+  try {
+    const gzPath = `${fullPath}.gz`;
+    if (fs.existsSync(gzPath)) return;
+    let mtime = null;
+    try { mtime = fs.statSync(fullPath).mtime; } catch (_) {}
+    const src = fs.createReadStream(fullPath);
+    const gzip = zlib.createGzip();
+    const dest = fs.createWriteStream(gzPath);
+    const onError = () => {
+      try { fs.rmSync(gzPath, { force: true }); } catch (_) {}
+    };
+    src.on('error', onError);
+    gzip.on('error', onError);
+    dest.on('error', onError);
+    dest.on('finish', () => {
+      try { if (mtime) fs.utimesSync(gzPath, mtime, mtime); } catch (_) {}
+      fs.rm(fullPath, { force: true }, () => {});
+    });
+    src.pipe(gzip).pipe(dest);
+  } catch (_) {
+    console.error('[ERROR] [Logger] Failed to compress rotated log file');
+  }
+}
+
+// Compress every prior-day log; today's stays uncompressed.
+function compressOldLogs() {
+  try {
+    const today = currentDateStamp();
+    const files = fs.readdirSync(LOG_DIR, { withFileTypes: true });
+    for (const file of files) {
+      if (!file.isFile()) continue;
+      const m = file.name.match(/^invest-tracker-(\d{4}-\d{2}-\d{2})\.log$/);
+      if (!m || m[1] === today) continue;
+      compressLogFile(path.join(LOG_DIR, file.name));
+    }
+  } catch (_) {
+    console.error('[ERROR] [Logger] Failed while compressing old log files');
+  }
+}
+
+// Daily maintenance: keep today's log plain, gzip older ones, delete > retention.
+function runLogMaintenance() {
+  ensureLogDir();
+  compressOldLogs();
+  pruneOldLogs();
 }
 
 function writeLog(_prefix, level, message, meta = null, options = null) {
@@ -112,7 +165,11 @@ function writeLog(_prefix, level, message, meta = null, options = null) {
     }
 
     if (!skipPrune) {
-      pruneOldLogs();
+      const stamp = currentDateStamp();
+      if (stamp !== lastMaintenanceDate) {
+        lastMaintenanceDate = stamp;
+        runLogMaintenance();
+      }
     }
   } catch (_) {
     BASE_CONSOLE.error('[ERROR] [Logger] Failed to write application log entry');
@@ -194,6 +251,14 @@ function getBackfillLogPathForDate(dateStamp = currentDateStamp()) {
 
 function getLogDir() {
   return LOG_DIR;
+}
+
+// Run maintenance once at startup: gzip prior days' logs and prune > retention.
+try {
+  runLogMaintenance();
+  lastMaintenanceDate = currentDateStamp();
+} catch (_) {
+  // best-effort
 }
 
 module.exports = {

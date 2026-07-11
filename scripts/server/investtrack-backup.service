@@ -1,0 +1,13 @@
+[Unit]
+Description=Investment Tracker off-box encrypted DB backup to Backblaze B2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust path if you install the script elsewhere
+ExecStart=/usr/local/bin/investtrack-backup-db.sh
+# Config location (override BACKUP_DB_ENV if needed)
+Environment=BACKUP_DB_ENV=/etc/investtrack/backup-db.env
+Nice=10
+IOSchedulingClass=idle

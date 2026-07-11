@@ -1,0 +1,23 @@
+# Investment Tracker Caddy site config (blue/green ready).
+# Install to /etc/caddy/Caddyfile on the server (one-time), then reload Caddy.
+#
+# The reverse_proxy upstream is kept in a SEPARATE file that the deploy script
+# rewrites to point at the active color's port (8081 blue / 8082 green). Caddy's
+# graceful `reload` then swaps traffic with zero dropped connections.
+
+investtrack.duckdns.org {
+	encode gzip zstd
+	import /etc/caddy/investtrack-upstream.caddy
+}
+
+# --- One-time setup on the server (see docs Runbook C) --------------------
+# 1. Create the initial upstream file at the CURRENT port (8080) so nothing
+#    breaks during prep:
+#      echo 'reverse_proxy 127.0.0.1:8080' | sudo tee /etc/caddy/investtrack-upstream.caddy
+# 2. Install this Caddyfile (back up the old one first):
+#      sudo cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.pre-bluegreen
+#      sudo cp Caddyfile.example /etc/caddy/Caddyfile
+#      sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
+# 3. Install the switch helper + sudoers (see Runbook C). The next deploy then
+#    brings up blue on 8081 and removes the legacy 8080 container.
+# ----------------------------------------------------------------------------

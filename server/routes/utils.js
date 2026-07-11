@@ -1154,7 +1154,7 @@ module.exports = function (db) {
             updated_at: new Date(stat.mtimeMs).toISOString(),
           };
         })
-        .filter((file) => /^invest-tracker-\d{4}-\d{2}-\d{2}\.log$/.test(file.name))
+        .filter((file) => /^invest-tracker-\d{4}-\d{2}-\d{2}\.log(\.gz)?$/.test(file.name))
         .sort((a, b) => b.name.localeCompare(a.name));
 
       return res.json({
@@ -1170,7 +1170,7 @@ module.exports = function (db) {
   router.get('/log-files/:name', (req, res) => {
     try {
       const fileName = String(req.params.name || '').trim();
-      if (!/^invest-tracker-\d{4}-\d{2}-\d{2}\.log$/.test(fileName)) {
+      if (!/^invest-tracker-\d{4}-\d{2}-\d{2}\.log(\.gz)?$/.test(fileName)) {
         return res.status(400).json({ error: 'Invalid log file name' });
       }
 

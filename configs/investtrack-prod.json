@@ -26,7 +26,7 @@
     "ALLOWED_EMAILS": "abc.xyz@gmail.com",
     "SESSION_SECRET": "change-me-in-env-file",
     "APP_LOG_DIR": "/data/logs",
-    "APP_LOG_RETENTION_DAYS": 10,
+    "APP_LOG_RETENTION_DAYS": 30,
     "APP_LOG_TO_CONSOLE": false,
     "INTRADAY_BACKFILL_MAX_SCOPES": 25,
     "ENABLE_INTRADAY_COMPLIANCE": false,
@@ -54,8 +54,8 @@
     "enabled": true,
     "timezone": "Asia/Kolkata",
     "schedules": {
-      "intradayStocks": "9:25 AM - 4:25 PM IST (weekdays)",
-      "dailyFinal": "10:25 PM IST (weekdays)"
+      "intradayStocks": "9:35 AM - 4:35 PM IST (weekdays)",
+      "dailyFinal": "10:35 PM IST (all days)"
     }
   },
   "backup": {

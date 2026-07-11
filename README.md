@@ -2,6 +2,11 @@
 
 Personal investment tracker for Indian and global assets with daily valuation, performance analytics, statement imports, and self-healing backfill/compliance workflows.
 
+## Documentation
+
+- [Troubleshooting & Operations](docs/Troubleshooting.md) — architecture, layered debugging, blue/green deploys, backup/restore
+- [Metrics Basis](docs/Metrics.md) — cost-basis vs attribution reporting lenses
+
 ## What You Get
 
 - Multi-portfolio tracking for family accounts
@@ -114,13 +119,14 @@ Why this order:
 
 ## Scheduler and Compliance
 
-Scheduler windows (IST):
+Scheduler windows (IST, `Asia/Kolkata`; run only when `ENABLE_SCHEDULER=true`):
 
-- Daily 9:25 AM to 4:25 PM: Indian stocks and SGB runs
-- Daily 7:25 PM, 8:25 PM, 9:25 PM: Foreign Stocks intraday runs
-- Daily 10:25 PM: authoritative MF/NPS plus Foreign Stocks intraday refresh
-- Daily 12:01 AM: bootstrap all asset types
-- Daily 4:25 AM: authoritative Foreign Stocks previous-session finalization
+- 9:35 AM–4:35 PM hourly (weekdays): Indian stocks + SGB + MF/NPS + Foreign Stock pre-market
+- 7:35 PM, 8:35 PM, 9:35 PM, 11:35 PM (weekdays): Foreign Stocks + conditional MF/NPS (US session)
+- 12:01 AM (all days): day-rollover sweep across all asset types
+- 4:35 AM (all days): early-morning baseline, all asset types
+- 5:35 PM (all days): evening baseline, all asset types
+- 10:35 PM (all days): authoritative final run (after MF NAVs settle) + full compliance scan
 
 Self-healing compliance loop:
 
@@ -156,22 +162,19 @@ Key APIs:
 
 Production shape:
 
-1. Oracle Ubuntu VM hosts Docker container
-2. Caddy terminates TLS and reverse-proxies to app on 127.0.0.1:8080
-3. SQLite persisted with host mount /data -> container /data
-4. Runtime env file stored at /opt/investment-tracker.env
+1. Oracle Ubuntu VM (ap-mumbai-1) hosts the app as Docker containers
+2. Caddy terminates TLS and reverse-proxies to the **active** app container via an
+   includable upstream file (`/etc/caddy/investtrack-upstream.caddy`)
+3. **Zero-downtime blue/green deploys:** two containers alternate —
+   `investment-tracker-blue` (:8081) and `investment-tracker-green` (:8082). The
+   deploy starts the new color, health-checks it, flips Caddy, then retires the old
+   color; a failed build aborts before touching the live container
+4. SQLite persisted with host mount `/data` -> container `/data`
+5. Runtime env file at `/opt/investment-tracker.env`
 
-Container run shape:
-
-```bash
-sudo docker run -d \
-  --name investment-tracker \
-  --restart unless-stopped \
-  -p 8080:8080 \
-  -v /data:/data \
-  --env-file /opt/investment-tracker.env \
-  investment-tracker:latest
-```
+Deploys are automated by `scripts/deploy-remote.sh` (run by the GitHub Actions
+workflow). See **[Troubleshooting](docs/Troubleshooting.md)**
+for the architecture diagram, blue/green flow, rollback, and one-time server prep.
 
 ## CI/CD Deployment Workflow
 
@@ -191,6 +194,16 @@ Optional workflow inputs:
 
 - allow_db_migrations (default false)
 - backup_before_deploy (default true)
+
+## Backups & Recovery
+
+- **Database:** nightly (02:30 UTC) gzip snapshot of `/data/investments.db` to
+  **Google Drive → `InvestTrackBackups/db`** (30-day retention) + local `/data/backups`.
+- **Secrets/config** (SSH key, `Caddyfile`, OAuth client, env): **Google Drive →
+  Investments → InvestTrack**.
+- **Logs:** app-managed rotation (today plain, older gzipped, >30 days deleted).
+
+Restore steps and full operations reference: **[Troubleshooting](docs/Troubleshooting.md)**.
 
 ## Deployment Validation Checklist
 
