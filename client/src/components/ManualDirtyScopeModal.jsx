@@ -15,6 +15,12 @@ function normalizeDateStrategy(strategy) {
   return strategy === 'fixed_date' ? 'max_of_fixed_and_scope_first' : strategy;
 }
 
+function formatScopeName(scope) {
+  const rawName = String(scope?.portfolio_name || '').trim();
+  if (rawName && !/^portfolio\s*\d*$/i.test(rawName)) return rawName;
+  return 'Portfolio';
+}
+
 export default function ManualDirtyScopeModal({ show, onHide }) {
   const [loading, setLoading] = useState(false);
   const [previewing, setPreviewing] = useState(false);
@@ -169,7 +175,7 @@ export default function ManualDirtyScopeModal({ show, onHide }) {
                   <div style={{ fontSize: '0.75rem', maxHeight: '150px', overflowY: 'auto' }}>
                     {previewData.scopes.slice(0, 5).map((s, i) => (
                       <div key={i} className="text-muted">
-                        Investment {s.investment_id} ({s.portfolio_name || `Portfolio ${s.portfolio_id}`}) from {s.dirty_from_date}
+                        Investment {s.investment_id} ({formatScopeName(s)}) from {s.dirty_from_date}
                       </div>
                     ))}
                     {previewData.scopes.length > 5 && (

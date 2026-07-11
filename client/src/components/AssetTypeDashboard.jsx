@@ -5,7 +5,7 @@ import { ArrowLeft, PiggyBank, TrendingDown, TrendingUp, Wallet } from 'lucide-r
 import { getDashboardSummary, getDashboardVersion } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
-import { formatDate, formatINR, formatNumber, formatPct, profitColor, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS } from '../utils/formatters';
+import { formatDate, formatINR, formatNumber, formatPct, profitColor, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS, ASSET_TYPE_SLUG_TO_KEY } from '../utils/formatters';
 import { getDashboardCacheKey, getCachedDashboardSummary, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
 import AssetTypeHoldingsTable from './AssetTypeHoldingsTable';
 import DashboardRolloverTable from './DashboardRolloverTable';
@@ -230,7 +230,9 @@ function ErrorMessage({ message }) {
 }
 
 export default function AssetTypeDashboard() {
-  const { assetType } = useParams();
+  const { assetType: assetTypeSlug } = useParams();
+  // Resolve URL slug (e.g. 'mf') back to the enum key (e.g. 'MUTUAL_FUND')
+  const assetType = ASSET_TYPE_SLUG_TO_KEY[assetTypeSlug?.toLowerCase()] || assetTypeSlug?.toUpperCase();
   const { selectedId, selectedIds, selectedPortfolio } = usePortfolio();
   const { settings, loading: settingsLoading } = useAppSettings();
   const [data, setData] = useState(null);
@@ -523,7 +525,7 @@ export default function AssetTypeDashboard() {
       />
 
       <DashboardRolloverTable
-        title={`${pageTitle} Daily Investment Value`}
+        title={`Daily ${pageTitle} Value History`}
         description="Stored daily aggregate snapshots for this asset type in the current dashboard scope."
         assetType={assetType}
         wrapperClassName="shadow-sm"

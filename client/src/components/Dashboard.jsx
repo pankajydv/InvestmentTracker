@@ -4,13 +4,13 @@ import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardSummary, getDashboardVersion, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
-import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER } from '../utils/formatters';
+import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_SLUG } from '../utils/formatters';
 import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle, ShieldAlert, ShieldCheck, ShieldX } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
 import DashboardRolloverTable from './DashboardRolloverTable';
-import { resolvePortfolioColor } from '../utils/portfolioColors';
+import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { getDashboardCacheKey, getCachedDashboardSummary, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
 
 function AllocationChartTooltip({ active, payload }) {
@@ -36,6 +36,32 @@ function AllocationChartTooltip({ active, payload }) {
 
 const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MOBILE_BREAKPOINT_PX = 768;
+
+function renderPortfolioScope(portfolioLike) {
+  const rawName = String(portfolioLike?.name || portfolioLike?.portfolio_name || '').trim();
+  const isGenericName = /^portfolio\s*\d*$/i.test(rawName);
+  const ownerLabel = resolvePortfolioOwnerLabel(portfolioLike);
+  const label = ownerLabel || (!isGenericName && rawName ? rawName : 'Portfolio');
+  const color = resolvePortfolioColor(portfolioLike);
+  const title = rawName || 'Portfolio';
+
+  return (
+    <span className="d-inline-flex align-items-center gap-2" title={title}>
+      <span
+        style={{
+          width: 10,
+          height: 10,
+          borderRadius: '50%',
+          display: 'inline-block',
+          backgroundColor: color,
+          border: '1px solid rgba(0,0,0,0.15)',
+          flexShrink: 0,
+        }}
+      />
+      <span>{label}</span>
+    </span>
+  );
+}
 
 function sortAssetTypeEntries(byType) {
   return Object.entries(byType || {}).sort(([typeA], [typeB]) => {
@@ -961,7 +987,7 @@ export default function Dashboard() {
                           {issue.investment_name}
                         </Link>
                       </td>
-                      <td>{issue.portfolio_name || '-'}</td>
+                      <td>{renderPortfolioScope({ portfolio_name: issue.portfolio_name })}</td>
                       <td>{issue.first_missing_date || '-'}</td>
                       <td>{issue.dirty_from_date || '-'}</td>
                       <td>{issue.first_locf_warning_date || '-'}</td>
@@ -1167,7 +1193,7 @@ export default function Dashboard() {
                     {allocationPct.toFixed(1)}%
                   </span>
                   <Link
-                    to={`/asset-types/${type}`}
+                    to={`/asset-types/${ASSET_TYPE_SLUG[type] || type.toLowerCase()}`}
                     className="text-decoration-underline fw-semibold"
                     style={{ fontSize: '0.95rem', color: ASSET_TYPE_COLORS[type] || '#6c757d' }}
                     title={ASSET_TYPE_FULL_NAMES[type]}
@@ -1255,7 +1281,7 @@ export default function Dashboard() {
       </Card>
 
       <DashboardRolloverTable
-        title="Portfolio Change History"
+        title="Daily Portfolio Value History"
         showSource={false}
         compactCollapsed={true}
       />

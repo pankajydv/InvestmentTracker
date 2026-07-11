@@ -129,7 +129,7 @@ export default function Investments() {
         <Row className="g-3">
           {investments.map((inv) => (
             <Col key={inv.id} md={6} lg={4}>
-              <Card as={Link} to={`/investments/${inv.id}`} state={{ investmentsSearch: searchParams.toString() }} className="shadow-sm h-100 text-decoration-none" style={{ transition: 'box-shadow 0.2s' }}>
+              <Card as={Link} to={`/investments/${inv.id}`} state={{ investmentsSearch: searchParams.toString(), fromLabel: 'Investments' }} className="shadow-sm h-100 text-decoration-none" style={{ transition: 'box-shadow 0.2s' }}>
                 <Card.Body className="p-3">
                   <div className="d-flex justify-content-between align-items-start mb-1">
                     <div>

@@ -790,7 +790,7 @@ export default function Transactions() {
                           <td className="px-3 py-2 text-nowrap">{formatDate(txn.transaction_date)}</td>
                           <td className="px-3 py-2">
                             <div className="d-flex align-items-center gap-2">
-                              <Link to={`/investments/${txn.investment_id}`} state={{ from: 'transactions', transactionsSearch: window.location.search }} className="text-primary fw-medium text-decoration-none">
+                              <Link to={`/investments/${txn.investment_id}`} state={{ from: 'transactions', transactionsSearch: window.location.search, fromLabel: 'Transactions' }} className="text-primary fw-medium text-decoration-none">
                                 {txn.investment_name}
                               </Link>
                               {(selectedIds.length !== 1) && txn.portfolio_name && (

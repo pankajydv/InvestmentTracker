@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal, Dropdown, Collapse } from 'react-bootstrap';
-import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions, getInvestmentDailyValues } from '../services/api';
+import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions, getInvestmentDailyValues, getPortfolios } from '../services/api';
 import { formatINR, formatINRExact, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
+import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil, Wallet, PiggyBank, BarChart3, TrendingUp, TrendingDown } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -130,6 +131,7 @@ export default function InvestmentDetail() {
   const [dailyValuesError, setDailyValuesError] = useState('');
   const [dailyValuesData, setDailyValuesData] = useState(null);
   const [dailyValuesShowMore, setDailyValuesShowMore] = useState(false);
+  const [portfolioMeta, setPortfolioMeta] = useState({});
   const [dailyValuesFilters, setDailyValuesFilters] = useState({
     from: '',
     to: '',
@@ -243,6 +245,59 @@ export default function InvestmentDetail() {
     if (!dailyValuesExpanded) return;
     loadDailyValuesData(dailyValuesFiltersRef.current);
   }, [dailyValuesExpanded, loadDailyValuesData]);
+
+  useEffect(() => {
+    getPortfolios().then((rows) => {
+      const map = {};
+      for (const p of rows || []) {
+        map[p.id] = {
+          name: p.name,
+          color: resolvePortfolioColor(p),
+          ownerLabel: resolvePortfolioOwnerLabel(p),
+        };
+      }
+      setPortfolioMeta(map);
+    }).catch(() => {});
+  }, []);
+
+  const renderScopeCell = useCallback((row) => {
+    if (row?.portfolio_id == null) return 'All portfolios';
+
+    const meta = portfolioMeta[row.portfolio_id] || {};
+    const rawName = String(meta.name || row.portfolio_name || '').trim();
+    const isGenericName = /^portfolio\s*\d*$/i.test(rawName);
+    const ownerLabel = meta.ownerLabel || resolvePortfolioOwnerLabel({
+      name: rawName,
+      portfolio_name: rawName,
+      color: meta.color || row.portfolio_color,
+      portfolio_color: meta.color || row.portfolio_color,
+    });
+    const label = ownerLabel || (!isGenericName && rawName ? rawName : 'Portfolio');
+    const dotColor = meta.color || resolvePortfolioColor({
+      name: rawName,
+      portfolio_name: rawName,
+      color: row.portfolio_color,
+      portfolio_color: row.portfolio_color,
+    });
+    const title = rawName || `Portfolio ${row.portfolio_id}`;
+
+    return (
+      <span className="d-inline-flex align-items-center gap-2" title={title}>
+        <span
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: '50%',
+            display: 'inline-block',
+            backgroundColor: dotColor,
+            border: '1px solid rgba(0,0,0,0.15)',
+            flexShrink: 0,
+          }}
+        />
+        <span>{label}</span>
+      </span>
+    );
+  }, [portfolioMeta]);
 
   const handleDelete = async () => {
     if (!window.confirm('Delete this investment and all its data?')) return;
@@ -867,9 +922,9 @@ export default function InvestmentDetail() {
       {/* Header */}
       <div className="d-flex flex-column flex-sm-row justify-content-between align-items-start gap-3 mb-4">
         <div>
-          <Link to={cameFrom === 'transactions' ? `/transactions${transactionsSearch}` : `/investments${investmentsSearch ? `?${investmentsSearch}` : ''}`} className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">
-            <ArrowLeft size={16} /> Back to {cameFrom === 'transactions' ? 'Transactions' : 'Investments'}
-          </Link>
+          <button onClick={() => navigate(-1)} className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2 btn btn-link p-0 border-0">
+            <ArrowLeft size={16} /> Back to {location.state?.fromLabel ?? (cameFrom === 'transactions' ? 'Transactions' : 'Investments')}
+          </button>
           <h1 className="h4 fw-bold mb-1">{data.display_name || data.name}</h1>
           <div className="d-flex align-items-center gap-2">
             <Badge bg="primary" className="bg-opacity-10 text-primary" title={ASSET_TYPE_FULL_NAMES[data.asset_type]}>{ASSET_TYPE_LABELS[data.asset_type]}</Badge>
@@ -1492,7 +1547,7 @@ export default function InvestmentDetail() {
         <Card.Body>
           <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
             <div>
-              <h2 className="h6 fw-semibold mb-0">Daily Price & Value</h2>
+              <h2 className="h6 fw-semibold mb-0">Daily Price & Value History</h2>
             </div>
             <Button
               size="sm"
@@ -1506,7 +1561,7 @@ export default function InvestmentDetail() {
               }}
               aria-expanded={dailyValuesExpanded}
             >
-              {dailyValuesExpanded ? 'Collapse Daily Price & Value' : 'Expand Daily Price & Value'}
+              {dailyValuesExpanded ? 'Collapse Daily Price & Value History' : 'Expand Daily Price & Value History'}
             </Button>
           </div>
 
@@ -1651,7 +1706,7 @@ export default function InvestmentDetail() {
                         dailyValuesData.rows.map((row) => (
                           <tr key={row.id}>
                             <td>{row.date}</td>
-                            {!selectedId && <td>{row.portfolio_id == null ? 'All portfolios' : `Portfolio ${row.portfolio_id}`}</td>}
+                            {!selectedId && <td>{renderScopeCell(row)}</td>}
                             <td className="text-end">{row.price_per_unit == null ? '-' : formatNumber(row.price_per_unit, 4)}</td>
                             <td className="text-end">{row.current_value == null ? '-' : formatINR(row.current_value)}</td>
                             <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINRExact(row.day_change)}</td>

@@ -110,6 +110,20 @@ export const ASSET_TYPE_FULL_NAMES = {
   SGB: 'Sovereign Gold Bonds',
 };
 
+/**
+ * URL slug for each asset type (lowercase short label), e.g. MUTUAL_FUND → 'mf'
+ */
+export const ASSET_TYPE_SLUG = Object.fromEntries(
+  Object.entries(ASSET_TYPE_LABELS).map(([key, label]) => [key, label.toLowerCase()])
+);
+
+/**
+ * Reverse map from URL slug to asset type key, e.g. 'mf' → 'MUTUAL_FUND'
+ */
+export const ASSET_TYPE_SLUG_TO_KEY = Object.fromEntries(
+  Object.entries(ASSET_TYPE_LABELS).map(([key, label]) => [label.toLowerCase(), key])
+);
+
 export const ASSET_TYPE_DISPLAY_ORDER = {
   INDIAN_STOCK: 1,
   MUTUAL_FUND: 2,

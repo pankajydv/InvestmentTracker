@@ -4,7 +4,7 @@ import { Card, Form, Button, Modal, Row, Col, Spinner, Alert, Nav, Table } from 
 import { getPortfolios, updatePortfolio, deletePortfolio, createPortfolio, getExpenses, getExpensesSummary, addAmcCharge, deleteExpense } from '../services/api';
 import { formatINR, formatDate, profitColor } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
-import { resolvePortfolioColor } from '../utils/portfolioColors';
+import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { Users, Pencil, Trash2, Plus, Check, X, Receipt } from 'lucide-react';
 
 const COLORS = ['#f59e0b', '#3b82f6', '#10b981', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316'];
@@ -17,6 +17,13 @@ const EXPENSE_TYPE_LABELS = {
   OTHER: 'Other',
 };
 const EXPENSE_TYPES = Object.keys(EXPENSE_TYPE_LABELS);
+
+function resolveScopeLabel(portfolioLike) {
+  const rawName = String(portfolioLike?.name || portfolioLike?.portfolio_name || '').trim();
+  const isGenericName = /^portfolio\s*\d*$/i.test(rawName);
+  const ownerLabel = resolvePortfolioOwnerLabel(portfolioLike);
+  return ownerLabel || (!isGenericName && rawName ? rawName : 'Portfolio');
+}
 
 export default function Portfolios() {
   const { refreshPortfolios, portfolios: ctxPortfolios, selectedId, selectedIds, selectedPortfolio } = usePortfolio();
@@ -439,7 +446,7 @@ export default function Portfolios() {
                       <td>
                         <span className="d-flex align-items-center gap-2">
                           <span className="portfolio-dot" style={{ backgroundColor: resolvePortfolioColor(e), width: 10, height: 10 }} />
-                          {e.portfolio_name}
+                          {resolveScopeLabel(e)}
                         </span>
                       </td>
                       <td><span className="badge bg-secondary bg-opacity-10 text-dark">{EXPENSE_TYPE_LABELS[e.expense_type] || e.expense_type}</span></td>

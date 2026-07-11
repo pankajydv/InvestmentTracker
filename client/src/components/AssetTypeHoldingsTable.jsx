@@ -218,7 +218,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                   if (col.key === 'name') {
                     return (
                       <td key={`${inv.id}-name`} className="px-3 holdings-col-name">
-                        <Link to={`/investments/${inv.id}`} className="fw-medium text-decoration-none">
+                        <Link to={`/investments/${inv.id}`} state={{ from: 'asset-type', fromLabel: ASSET_TYPE_LABELS[type] }} className="fw-medium text-decoration-none">
                           {inv.name}
                         </Link>
                         <div className="d-flex align-items-center gap-2 mt-1">
