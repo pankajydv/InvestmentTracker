@@ -4,7 +4,7 @@ import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardSummary, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
-import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
+import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER } from '../utils/formatters';
 import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle, ShieldAlert, ShieldCheck, ShieldX } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
@@ -31,18 +31,6 @@ function AllocationChartTooltip({ active, payload }) {
     </div>
   );
 }
-
-const ASSET_TYPE_DISPLAY_ORDER = {
-  INDIAN_STOCK: 1,
-  MUTUAL_FUND: 2,
-  NPS: 3,
-  SGB: 4,
-  BOND: 5,
-  PF: 6,
-  PPF: 7,
-  SSY: 8,
-  FOREIGN_STOCK: 9,
-};
 
 const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const DASHBOARD_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -855,13 +843,13 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard-page">
-      <div className="dashboard-header mb-4">
+      <div className={`dashboard-header mb-4 ${selectedPortfolio ? '' : 'dashboard-header-no-title'}`}>
         {selectedPortfolio ? (
           <div className="dashboard-title-row d-flex align-items-center gap-2">
             <span className="portfolio-dot" style={{ backgroundColor: selectedPortfolio.color }} />
             <h1 className="h4 fw-bold mb-0">{selectedPortfolio.name}</h1>
           </div>
-        ) : <div />}
+        ) : null}
         <div className="dashboard-header-meta">
           {lastUpdate && (
             <span className="dashboard-last-updated">
@@ -907,7 +895,7 @@ export default function Dashboard() {
       {dailyHealth && dailyHealth.status !== 'ok' && !isBannerDismissed('health', healthBannerSig) && (
         <Alert
           variant={dailyHealth.status === 'error' ? 'danger' : 'warning'}
-          className="py-2 mb-4"
+          className="py-2 mb-4 dashboard-health-alert"
           dismissible
           onClose={() => dismissBanner('health', healthBannerSig)}
         >
@@ -915,8 +903,11 @@ export default function Dashboard() {
             <div className="d-flex align-items-center gap-2">
               <AlertTriangle size={16} />
               <span className="fw-semibold">Daily values health warning</span>
-              <span className="small">
+              <span className="small d-none d-md-inline">
                 Missing: {dailyHealth.counts?.missing_rows || 0} | Compliance errors: {dailyHealth.counts?.compliance_errors || 0} | Unexpected LOCF: {dailyHealth.counts?.unexpected_locf || 0} | Pending LOCF: {dailyHealth.counts?.pending_locf || 0} | Stale scopes: {dailyHealth.counts?.stale_scopes || 0}
+              </span>
+              <span className="small d-inline d-md-none">
+                Missing {dailyHealth.counts?.missing_rows || 0} | Errors {dailyHealth.counts?.compliance_errors || 0}
               </span>
             </div>
             <Button
@@ -927,7 +918,7 @@ export default function Dashboard() {
               {showHealthDetails ? 'Hide details' : 'Show details'}
             </Button>
           </div>
-          <div className="small mt-2">
+          <div className="small mt-2 d-none d-md-block">
             <span className="fw-semibold">Compliance:</span>{' '}
             {hasRecordedComplianceScan ? (
               <>
@@ -1259,10 +1250,9 @@ export default function Dashboard() {
       </Card>
 
       <DashboardRolloverTable
-        title="Portfolio Chance History"
+        title="Portfolio Change History"
         showSource={false}
         compactCollapsed={true}
-        defaultExpanded
       />
 
       {/* Empty state */}

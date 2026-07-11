@@ -121,8 +121,8 @@ export default function Navbar({ user, onLogout }) {
   return (
     <>
       <BsNavbar bg="white" sticky="top" className="shadow-sm border-bottom">
-        <Container fluid="lg" className="flex-wrap flex-sm-nowrap">
-          <BsNavbar.Brand as={Link} to="/" className="d-flex align-items-center gap-2 me-2 me-md-3">
+        <Container fluid="lg" className="flex-wrap flex-sm-nowrap mobile-nav-shell">
+          <BsNavbar.Brand as={Link} to="/" className="d-flex align-items-center gap-2 me-2 me-md-3 mobile-nav-brand">
             <TrendingUp size={28} className="text-primary" />
             <span className="fw-bold d-none d-md-inline">Investment Tracker</span>
           </BsNavbar.Brand>
@@ -131,7 +131,7 @@ export default function Navbar({ user, onLogout }) {
             <PortfolioSelector />
           </div>
 
-          <Nav className="align-items-center gap-1 flex-nowrap">
+          <Nav className="align-items-center gap-1 flex-nowrap mobile-primary-nav">
             {PRIMARY_NAV_ITEMS.map(({ path, label, shortLabel, icon: Icon }) => (
               <Nav.Link
                 key={path}
@@ -163,11 +163,11 @@ export default function Navbar({ user, onLogout }) {
             </Nav.Link>
           </Nav>
 
-          <div className="d-flex d-md-none align-items-center gap-2 me-2">
+          <div className="d-flex d-md-none align-items-center gap-2 me-2 mobile-nav-pwa">
             <PWAInstallButton />
           </div>
 
-          <Dropdown align="end" className="ms-auto">
+          <Dropdown align="end" className="ms-auto mobile-nav-profile">
             <Dropdown.Toggle
               as="button"
               id="profile-menu"
@@ -268,7 +268,7 @@ export default function Navbar({ user, onLogout }) {
             </Dropdown.Menu>
           </Dropdown>
 
-          <div className="d-sm-none w-100 mt-2">
+          <div className="d-sm-none w-100 mt-2 mobile-nav-portfolio-row">
             <PortfolioSelector fullWidth />
           </div>
         </Container>

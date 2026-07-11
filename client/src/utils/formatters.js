@@ -110,6 +110,30 @@ export const ASSET_TYPE_FULL_NAMES = {
   SGB: 'Sovereign Gold Bonds',
 };
 
+export const ASSET_TYPE_DISPLAY_ORDER = {
+  INDIAN_STOCK: 1,
+  MUTUAL_FUND: 2,
+  NPS: 3,
+  SGB: 4,
+  BOND: 5,
+  PF: 6,
+  PPF: 7,
+  SSY: 8,
+  FOREIGN_STOCK: 9,
+};
+
+export const ASSET_TYPE_FILTER_ORDER = [
+  'INDIAN_STOCK',
+  'MUTUAL_FUND',
+  'NPS',
+  'SGB',
+  'BOND',
+  'PF',
+  'PPF',
+  'SSY',
+  'FOREIGN_STOCK',
+];
+
 /**
  * Asset type colors for charts
  */

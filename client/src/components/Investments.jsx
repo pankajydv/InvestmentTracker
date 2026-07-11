@@ -1,13 +1,25 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { Row, Col, Card, Spinner, Form, Button } from 'react-bootstrap';
+import { Row, Col, Card, Spinner } from 'react-bootstrap';
 import { getCorporateActionSuggestionCount, getInvestments } from '../services/api';
-import { formatINR, formatPct, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
-import { PlusCircle, Filter, RefreshCw, Percent } from 'lucide-react';
+import { ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_FILTER_ORDER } from '../utils/formatters';
+import { PlusCircle, RefreshCw, Percent } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 
-const ASSET_TYPES = ['', 'MUTUAL_FUND', 'INDIAN_STOCK', 'FOREIGN_STOCK', 'NPS', 'PPF', 'SSY', 'PF', 'BOND', 'SGB'];
+const TYPE_ALL = '';
+
+function compareInvestments(a, b) {
+  const typeA = String(a?.asset_type || '').toUpperCase();
+  const typeB = String(b?.asset_type || '').toUpperCase();
+  const orderA = ASSET_TYPE_DISPLAY_ORDER[typeA] ?? 999;
+  const orderB = ASSET_TYPE_DISPLAY_ORDER[typeB] ?? 999;
+  if (orderA !== orderB) return orderA - orderB;
+
+  const nameA = String(a?.display_name || a?.name || '').toLowerCase();
+  const nameB = String(b?.display_name || b?.name || '').toLowerCase();
+  return nameA.localeCompare(nameB);
+}
 
 export default function Investments() {
   const { selectedId, selectedIds } = usePortfolio();
@@ -53,10 +65,10 @@ export default function Investments() {
             merged.push(inv);
           }
         }
-        setInvestments(merged);
+        setInvestments(merged.sort(compareInvestments));
       } else {
         const result = await getInvestments(typeFilter, selectedId, { hideSold });
-        setInvestments(result);
+        setInvestments([...(result || [])].sort(compareInvestments));
       }
     } catch (e) {
       console.error(e);
@@ -69,22 +81,28 @@ export default function Investments() {
     <div>
       <div className="d-flex flex-column flex-sm-row justify-content-between align-items-start align-items-sm-center gap-3 mb-4">
         <h1 className="h4 fw-bold mb-0">Investments</h1>
-        <div className="d-flex align-items-center gap-2 flex-wrap">
-          <div className="d-flex align-items-center gap-2">
-            <Filter size={16} className="text-muted" />
-            <Form.Select
-              size="sm"
-              value={typeFilter}
-              onChange={(e) => setSearchParams(e.target.value ? { type: e.target.value } : {})}
-              style={{ width: 'auto' }}
+        <div className="d-flex align-items-center gap-2 flex-wrap investments-toolbar">
+          <div className="d-flex align-items-center gap-2 flex-nowrap overflow-auto investments-type-filters" role="group" aria-label="Filter by asset type">
+            <button
+              type="button"
+              className={`btn btn-sm ${typeFilter === TYPE_ALL ? 'btn-primary' : 'btn-outline-secondary'}`}
+              onClick={() => setSearchParams({})}
             >
-              <option value="">All Types</option>
-              {ASSET_TYPES.filter(Boolean).map((t) => (
-                <option key={t} value={t}>{ASSET_TYPE_LABELS[t]}</option>
-              ))}
-            </Form.Select>
+              All
+            </button>
+            {ASSET_TYPE_FILTER_ORDER.map((assetType) => (
+              <button
+                key={assetType}
+                type="button"
+                className={`btn btn-sm ${typeFilter === assetType ? 'btn-primary' : 'btn-outline-secondary'}`}
+                title={ASSET_TYPE_FULL_NAMES[assetType] || assetType}
+                onClick={() => setSearchParams({ type: assetType })}
+              >
+                {ASSET_TYPE_LABELS[assetType] || assetType}
+              </button>
+            ))}
           </div>
-          <span className="small text-muted">
+          <span className="small text-muted investments-sold-status">
             {hideSold ? 'Sold investments hidden' : 'Showing sold investments'}
           </span>
           <Link to="/interest-rates" className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
