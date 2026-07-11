@@ -16,6 +16,7 @@
   "dependencies": {
     "adm-zip": "^0.5.16",
     "better-sqlite3": "^11.7.0",
+    "compression": "^1.8.1",
     "concurrently": "^9.1.0",
     "cors": "^2.8.5",
     "express": "^4.21.0",

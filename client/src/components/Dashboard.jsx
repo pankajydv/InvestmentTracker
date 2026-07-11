@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
-import { getDashboardSummary, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
+import { getDashboardSummary, getDashboardVersion, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER } from '../utils/formatters';
@@ -11,6 +11,7 @@ import { useAppSettings } from '../context/AppSettingsContext';
 import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
 import DashboardRolloverTable from './DashboardRolloverTable';
 import { resolvePortfolioColor } from '../utils/portfolioColors';
+import { getDashboardCacheKey, getCachedDashboardSummary, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
 
 function AllocationChartTooltip({ active, payload }) {
   if (!active || !payload || !payload.length) return null;
@@ -34,45 +35,7 @@ function AllocationChartTooltip({ active, payload }) {
 }
 
 const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
-const DASHBOARD_CACHE_TTL_MS = 2 * 60 * 1000;
 const MOBILE_BREAKPOINT_PX = 768;
-const dashboardSummaryCache = new Map();
-
-function getDashboardCacheKey({
-  targetPortfolioId,
-  hideSold,
-  includeFullySoldInReturns,
-  selectedInterval,
-  customFromDate,
-  customToDate,
-}) {
-  return JSON.stringify({
-    targetPortfolioId: targetPortfolioId ?? null,
-    hideSold: !!hideSold,
-    includeFullySoldInReturns: !!includeFullySoldInReturns,
-    selectedInterval: selectedInterval || '1D',
-    customFromDate: customFromDate || null,
-    customToDate: customToDate || null,
-  });
-}
-
-function getCachedDashboardSummary(cacheKey) {
-  const cached = dashboardSummaryCache.get(cacheKey);
-  if (!cached) return null;
-  if ((Date.now() - cached.ts) > DASHBOARD_CACHE_TTL_MS) {
-    dashboardSummaryCache.delete(cacheKey);
-    return null;
-  }
-  return cached.data;
-}
-
-function setCachedDashboardSummary(cacheKey, data) {
-  if (!data) return;
-  dashboardSummaryCache.set(cacheKey, {
-    ts: Date.now(),
-    data,
-  });
-}
 
 function sortAssetTypeEntries(byType) {
   return Object.entries(byType || {}).sort(([typeA], [typeB]) => {
@@ -583,20 +546,43 @@ export default function Dashboard() {
       customFromDate,
       customToDate,
     });
-    const cachedSummary = getCachedDashboardSummary(cacheKey);
+    const cachedEntry = getCachedDashboardSummary(cacheKey);
 
     try {
       if (showBlockingLoader) setLoading(true);
       else setRefreshing(true);
       setShowHealthDetails(false);
 
-      if (showBlockingLoader && cachedSummary) {
-        setData(cachedSummary);
+      // Instant paint from the persisted cache (validated against server version next).
+      if (showBlockingLoader && cachedEntry) {
+        setData(cachedEntry.data);
         setLoading(false);
         setShowDetailTables(true);
       }
 
-      if (showBlockingLoader && !cachedSummary) {
+      // Version gate: when we hold a cached copy, ask the server for the current
+      // data version. If it is unchanged, the cached copy is authoritative and we
+      // skip the expensive summary fetch. Any error falls through to a live fetch.
+      if (cachedEntry && cachedEntry.dataVersion != null) {
+        let serverVersion = null;
+        try {
+          const v = await getDashboardVersion();
+          serverVersion = v?.dataVersion ?? null;
+        } catch (_e) {
+          serverVersion = null;
+        }
+        if (runId !== loadRunRef.current) return;
+        if (serverVersion != null && String(serverVersion) === String(cachedEntry.dataVersion)) {
+          setData(cachedEntry.data);
+          setLoading(false);
+          setShowDetailTables(true);
+          setError(null);
+          lastLoadedIntervalSigRef.current = intervalSig;
+          return;
+        }
+      }
+
+      if (showBlockingLoader && !cachedEntry) {
         setShowDetailTables(false);
         const fastResult = await getDashboardSummary(targetPortfolioId, {
           hideSold,
@@ -608,7 +594,7 @@ export default function Dashboard() {
         });
         if (runId !== loadRunRef.current) return;
         setData(fastResult);
-        setCachedDashboardSummary(cacheKey, fastResult);
+        setCachedDashboardSummary(cacheKey, fastResult, fastResult?.dataVersion);
         setLoading(false);
 
         await new Promise((resolve) => {
@@ -632,7 +618,7 @@ export default function Dashboard() {
         if (runId !== loadRunRef.current) return;
         setData((prev) => {
           const merged = mergeXirrEnrichment(prev, fullResult);
-          setCachedDashboardSummary(cacheKey, merged);
+          setCachedDashboardSummary(cacheKey, merged, fullResult?.dataVersion ?? merged?.dataVersion);
           return merged;
         });
       } else {
@@ -646,7 +632,7 @@ export default function Dashboard() {
         });
         if (runId !== loadRunRef.current) return;
         setData(result);
-        setCachedDashboardSummary(cacheKey, result);
+        setCachedDashboardSummary(cacheKey, result, result?.dataVersion);
         setShowDetailTables(true);
       }
 

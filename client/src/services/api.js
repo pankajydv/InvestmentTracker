@@ -1,6 +1,11 @@
 const API_BASE = '/api';
 
-async function fetchJSON(url, options = {}) {
+// De-duplicate concurrent identical GET requests: a burst of re-renders that
+// fire the same URL will share a single in-flight network request instead of
+// hammering the (synchronous, single-threaded) server. Cleared on settle.
+const inFlightGets = new Map();
+
+async function doFetchJSON(url, options = {}) {
   const res = await fetch(`${API_BASE}${url}`, {
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
@@ -13,6 +18,20 @@ async function fetchJSON(url, options = {}) {
   return res.json();
 }
 
+async function fetchJSON(url, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  if (method !== 'GET') {
+    return doFetchJSON(url, options);
+  }
+  const existing = inFlightGets.get(url);
+  if (existing) return existing;
+  const promise = doFetchJSON(url, options).finally(() => {
+    inFlightGets.delete(url);
+  });
+  inFlightGets.set(url, promise);
+  return promise;
+}
+
 // Auth
 export const getAuthConfig = () => fetchJSON('/auth/config');
 export const loginWithGoogle = (credential) =>
@@ -21,6 +40,7 @@ export const getCurrentUser = () => fetchJSON('/auth/me');
 export const logout = () => fetchJSON('/auth/logout', { method: 'POST' });
 
 // Dashboard
+export const getDashboardVersion = () => fetchJSON('/dashboard/version');
 export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);

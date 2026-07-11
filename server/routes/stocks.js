@@ -9,6 +9,7 @@ const { OFFERINGS, generateEsppSchedule } = require('../services/esppGrantServic
 const { parseOpenLots, parseClosedLots, reconcileVestTransactions } = require('../services/fidelityVestReconciler');
 const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisitionImportService');
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
+const { isSnapshotEnabled, getDataVersion, getCachedSnapshot, putSnapshot } = require('../services/dashboardSnapshotService');
 const { logAppInfo, logAppWarn, logAppError } = require('../services/appLogger');
 const { quantizeForStorage, quantizeNullableForStorage } = require('../services/numberPrecision');
 const { getNearestOnOrBefore } = require('../services/marketPriceCache');
@@ -2690,6 +2691,12 @@ module.exports = function (db) {
     try {
       const portfolioId = Number(req.query?.portfolio_id || 0);
       const hasPortfolio = Number.isInteger(portfolioId) && portfolioId > 0;
+      const cacheVersion = isSnapshotEnabled() ? getDataVersion(db) : null;
+      const cacheKey = cacheVersion != null ? `ca-sugg-count:${hasPortfolio ? portfolioId : 'all'}` : null;
+      if (cacheKey) {
+        const cached = getCachedSnapshot(db, cacheKey, cacheVersion);
+        if (cached) return res.json(cached);
+      }
       const row = hasPortfolio
         ? db.prepare(`
             SELECT COUNT(*) AS count
@@ -2704,7 +2711,9 @@ module.exports = function (db) {
             WHERE status = 'pending'
               AND source <> 'RSU_VEST'
           `).get();
-      res.json({ count: Number(row?.count || 0) });
+      const payload = { count: Number(row?.count || 0) };
+      if (cacheKey) putSnapshot(db, cacheKey, cacheVersion, payload);
+      res.json(payload);
     } catch (e) {
       logAppError('[Stocks] Corporate action suggestion count failed', { error: e.message });
       res.status(500).json({ error: 'Failed to fetch suggestion count: ' + e.message });
@@ -3064,6 +3073,12 @@ module.exports = function (db) {
     try {
       const portfolioId = Number(req.query?.portfolio_id || 0);
       const hasPortfolio = Number.isInteger(portfolioId) && portfolioId > 0;
+      const cacheVersion = isSnapshotEnabled() ? getDataVersion(db) : null;
+      const cacheKey = cacheVersion != null ? `rsu-sugg-count:${hasPortfolio ? portfolioId : 'all'}` : null;
+      if (cacheKey) {
+        const cached = getCachedSnapshot(db, cacheKey, cacheVersion);
+        if (cached) return res.json(cached);
+      }
       const row = hasPortfolio
         ? db.prepare(`
             SELECT COUNT(*) AS count FROM corporate_action_suggestions
@@ -3074,7 +3089,9 @@ module.exports = function (db) {
             SELECT COUNT(*) AS count FROM corporate_action_suggestions
             WHERE status = 'pending' AND source = 'RSU_VEST'
           `).get();
-      res.json({ count: Number(row?.count || 0) });
+      const payload = { count: Number(row?.count || 0) };
+      if (cacheKey) putSnapshot(db, cacheKey, cacheVersion, payload);
+      res.json(payload);
     } catch (e) {
       logAppError('[Stocks] RSU vest suggestion count failed', { error: e.message });
       res.status(500).json({ error: 'Failed to fetch RSU vest suggestion count: ' + e.message });

@@ -3,6 +3,14 @@ const router = express.Router();
 const { getMarketSessionDates } = require('../services/marketPriceCache');
 const { calculateIntervalXIRR } = require('../services/xirrCalculator');
 const { getCachedXirr, generateCacheKey } = require('../services/xirrCacheService');
+const {
+  isSnapshotEnabled,
+  ensureDashboardSnapshotTable,
+  getDataVersion,
+  buildSnapshotKey,
+  getCachedSnapshot,
+  putSnapshot,
+} = require('../services/dashboardSnapshotService');
 const { DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS } = require('../services/freshnessPolicy');
 const {
   ACQUIRED_UNITS_INFLOW_TYPES_SQL,
@@ -343,6 +351,12 @@ function resolveAggregatedSource(row) {
 
 module.exports = function (db) {
 
+  try {
+    ensureDashboardSnapshotTable(db);
+  } catch (_e) {
+    // fail open: snapshot reads/writes guard themselves individually
+  }
+
   // ─── Portfolio Summary (Dashboard) ────────────────────────────────────
   router.get('/summary', (req, res) => {
     const { portfolio_id, hide_sold } = req.query;
@@ -352,6 +366,35 @@ module.exports = function (db) {
     const includeSoldInReturns = hideSold ? includeSoldInReturnsRequested : true;
     const xirrModeRaw = String(req.query.xirr_mode || 'full').trim().toLowerCase();
     const xirrMode = xirrModeRaw === 'portfolio_only' ? 'portfolio_only' : 'full';
+
+    // ── Snapshot read-through cache ────────────────────────────────────────
+    // Serve a previously-built payload when it matches the current data version.
+    // Any miss / version mismatch / error falls through to a live recompute.
+    let snapshotKey = null;
+    let snapshotVersion = null;
+    if (isSnapshotEnabled()) {
+      try {
+        snapshotVersion = getDataVersion(db);
+        snapshotKey = buildSnapshotKey({
+          portfolioId: portfolio_id != null ? portfolio_id : null,
+          hideSold,
+          includeFullySoldInReturns: includeSoldInReturns,
+          xirrMode,
+          interval: String(req.query.interval || '1D').trim().toUpperCase(),
+          customFromDate: req.query.custom_from_date || null,
+          customToDate: req.query.custom_to_date || null,
+        });
+        if (snapshotKey) {
+          const cachedPayload = getCachedSnapshot(db, snapshotKey, snapshotVersion);
+          if (cachedPayload) {
+            return res.json(cachedPayload);
+          }
+        }
+      } catch (_e) {
+        // Fail open: fall through to live computation.
+        snapshotKey = null;
+      }
+    }
 
     // Check if prices are stale (today's data missing from aggregates)
     const today = new Date();
@@ -1695,7 +1738,7 @@ module.exports = function (db) {
       marketState,
     };
 
-    res.json({
+    const responsePayload = {
       portfolio: portfolioSummary,
       investments,
       byType,
@@ -1706,6 +1749,23 @@ module.exports = function (db) {
       xirrMode,
       intervalXIRR,
       intervalMeta,
+      lastUpdate: db.prepare("SELECT value FROM config WHERE key = 'last_price_update'").get()?.value,
+      dataVersion: snapshotVersion != null ? snapshotVersion : getDataVersion(db),
+    };
+
+    // Store into the read-through cache under the version observed at request start.
+    // If the version advanced mid-request, the next read simply misses and recomputes.
+    if (isSnapshotEnabled() && snapshotKey && snapshotVersion != null) {
+      putSnapshot(db, snapshotKey, snapshotVersion, responsePayload);
+    }
+
+    res.json(responsePayload);
+  });
+
+  // ─── Data version (lightweight cache-validation probe) ─────────────────
+  router.get('/version', (req, res) => {
+    res.json({
+      dataVersion: getDataVersion(db),
       lastUpdate: db.prepare("SELECT value FROM config WHERE key = 'last_price_update'").get()?.value,
     });
   });

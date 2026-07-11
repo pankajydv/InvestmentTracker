@@ -2,10 +2,11 @@ import React, { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { Alert, Button, Card, Col, Row, Spinner } from 'react-bootstrap';
 import { ArrowLeft, PiggyBank, TrendingDown, TrendingUp, Wallet } from 'lucide-react';
-import { getDashboardSummary } from '../services/api';
+import { getDashboardSummary, getDashboardVersion } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { formatDate, formatINR, formatNumber, formatPct, profitColor, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS } from '../utils/formatters';
+import { getDashboardCacheKey, getCachedDashboardSummary, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
 import AssetTypeHoldingsTable from './AssetTypeHoldingsTable';
 import DashboardRolloverTable from './DashboardRolloverTable';
 
@@ -246,13 +247,54 @@ export default function AssetTypeDashboard() {
   const includeFullySoldInReturns = hideSold ? settings.includeFullySoldInReturns : true;
 
   useEffect(() => {
+    let cancelled = false;
     const loadData = async () => {
       if (settingsLoading) return;
       if (selectedInterval === 'CUSTOM' && (!customFromDate || !customToDate)) return;
 
+      const isMulti = selectedIds.length > 1;
+      // Namespaced ('at') so asset-type entries (always full XIRR) never mix with the
+      // main dashboard's two-phase entries.
+      const cacheKey = getDashboardCacheKey({
+        targetPortfolioId: isMulti ? null : selectedId,
+        hideSold,
+        includeFullySoldInReturns,
+        selectedInterval,
+        customFromDate,
+        customToDate,
+        extra: isMulti ? `at:combine:${selectedIdsKey}` : 'at',
+      });
+      const cachedEntry = getCachedDashboardSummary(cacheKey);
+
       try {
         setLoading(true);
         setIsIntervalSwitching(true);
+
+        // Instant paint from persisted cache (validated against server version next).
+        if (cachedEntry) {
+          setData(cachedEntry.data);
+          setLoading(false);
+        }
+
+        // Version gate: skip the expensive summary fetch when nothing changed.
+        if (cachedEntry && cachedEntry.dataVersion != null) {
+          let serverVersion = null;
+          try {
+            const v = await getDashboardVersion();
+            serverVersion = v?.dataVersion ?? null;
+          } catch (_e) {
+            serverVersion = null;
+          }
+          if (cancelled) return;
+          if (serverVersion != null && String(serverVersion) === String(cachedEntry.dataVersion)) {
+            setData(cachedEntry.data);
+            setError(null);
+            setLoading(false);
+            setIsIntervalSwitching(false);
+            return;
+          }
+        }
+
         const requestOptions = {
           hideSold,
           includeFullySoldInReturns,
@@ -263,25 +305,36 @@ export default function AssetTypeDashboard() {
         };
 
         let result;
-        if (selectedIds.length > 1) {
+        let resultVersion = null;
+        if (isMulti) {
           const results = await Promise.all(selectedIds.map((id) => getDashboardSummary(id, requestOptions)));
           result = combineDashboardSummaries(results, selectedIds);
+          resultVersion = results.find((r) => r?.dataVersion != null)?.dataVersion ?? null;
         } else {
           result = await getDashboardSummary(selectedId, requestOptions);
+          resultVersion = result?.dataVersion ?? null;
         }
+        if (cancelled) return;
 
         setData(result);
+        setCachedDashboardSummary(cacheKey, result, resultVersion);
         setError(null);
       } catch (e) {
+        if (cancelled) return;
         setError(e.message || 'Failed to load asset type dashboard');
       } finally {
+        if (cancelled) return;
         setLoading(false);
         setIsIntervalSwitching(false);
       }
     };
 
     loadData();
-  }, [selectedId, selectedIds, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading, selectedInterval, customFromDate, customToDate]);
+    // selectedIds is intentionally omitted: it is a fresh array each render and would
+    // refire this effect on every render. selectedIdsKey is the stable content signal.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; };
+  }, [selectedId, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading, selectedInterval, customFromDate, customToDate]);
 
   if (loading) return <LoadingSpinner />;
   if (error) return <ErrorMessage message={error} />;

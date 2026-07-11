@@ -30,6 +30,7 @@ const {
 const { upsertInvestmentPriceSeries, getInvestmentSeries } = require('./marketPriceCache');
 const { markScopeDirty } = require('./dirtyBackfillService');
 const { todayIso, normalizeProviderDate } = require('./dateUtils');
+const { bumpDataVersion } = require('./dashboardSnapshotService');
 const { LOCF_STREAK_WARN_SESSIONS, FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS } = require('./freshnessPolicy');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -1379,6 +1380,14 @@ async function updateAllPrices(db, options = {}) {
   // Update last price update time
   db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'last_price_update'")
     .run(new Date().toISOString());
+
+  // Advance the dashboard data version so cached snapshots are invalidated after
+  // a scheduler/cron price update (which is not an HTTP mutation).
+  try {
+    bumpDataVersion(db);
+  } catch (_e) {
+    // best-effort; snapshot invalidation must never break a price update
+  }
 
   // Persist daily watermark only for fully successful, non-cancelled runs.
   let watermarkUpdated = false;

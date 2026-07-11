@@ -75,6 +75,7 @@ jobs:
              ALLOWED_EMAILS=${{ secrets.ALLOWED_EMAILS }} \
              ENABLE_SCHEDULER=true \
              ALLOW_DB_MIGRATIONS=false \
+             GIT_SHA=${{ github.sha }} \
              ${{ steps.config.outputs.oracle_deploy_dir }}/deploy-remote.sh"
 
       - name: Verify deployment

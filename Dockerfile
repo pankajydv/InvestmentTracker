@@ -1,6 +1,10 @@
 # ── Stage 1: Build frontend ──────────────────────────────────────────
 FROM node:20-alpine AS frontend-build
 WORKDIR /app/client
+# Per-deploy service-worker cache version (git SHA when available); used by
+# scripts/stamp-sw.mjs during `npm run build` for no-touch cache busting.
+ARG SW_BUILD_ID=""
+ENV SW_BUILD_ID=$SW_BUILD_ID
 COPY client/package*.json ./
 RUN npm ci
 COPY client/ ./

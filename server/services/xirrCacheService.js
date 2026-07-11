@@ -184,11 +184,12 @@ function cacheXirr(db, cacheKey, portfolioId, interval, xirrResult, validForHour
 function invalidatePortfolioXirrCache(db, portfolioId = null) {
   try {
     if (portfolioId === null || portfolioId === undefined) {
-      // Invalidate all portfolio caches
-      db.prepare('DELETE FROM xirr_cache WHERE portfolio_id IS NOT NULL').run();
+      // Invalidate everything, including the combined (portfolio_id IS NULL) rows.
+      db.prepare('DELETE FROM xirr_cache').run();
     } else {
-      // Invalidate specific portfolio
-      db.prepare('DELETE FROM xirr_cache WHERE portfolio_id = ?').run(portfolioId);
+      // Invalidate the specific portfolio AND the combined "all" rows, since the
+      // combined view aggregates every portfolio and is stale after any change.
+      db.prepare('DELETE FROM xirr_cache WHERE portfolio_id = ? OR portfolio_id IS NULL').run(portfolioId);
     }
   } catch (err) {
     logAppWarn('Failed to invalidate XIRR cache', {

@@ -112,7 +112,7 @@ log "Active color: ${ACTIVE_COLOR:-none} -> deploying ${NEW_COLOR} on :${NEW_POR
 
 # Step 6: Build new image
 log "Building Docker image..."
-docker build -t "$IMAGE" . || error "Docker build failed"
+docker build --build-arg SW_BUILD_ID="${GIT_SHA:-}" -t "$IMAGE" . || error "Docker build failed"
 log "Image built successfully"
 
 # Step 7: Remove any stale container of the target color, then start the new one

@@ -9,6 +9,7 @@ const { runSchedulerCycle } = require('../services/scheduler');
 const { getPendingDirtyScopes, markDirtyForAssetTypeFromDate, markDirtyFromTransactions, runDirtyBackfillPreflight, markDirtyScopesFromSelector } = require('../services/dirtyBackfillService');
 const { ONE_DAY_CHANGE_POLICY, getOneDayChangePolicy, getUnexpectedLocfPolicy } = require('../services/assetPolicy');
 const { getComplianceScanState, scanAndRepairComplianceGaps } = require('../services/compliance/complianceScanService');
+const { isSnapshotEnabled, getDataVersion, getCachedSnapshot, putSnapshot } = require('../services/dashboardSnapshotService');
 const { todayIso } = require('../services/backfillService');
 const { logAppInfo, logAppError, getLogDir } = require('../services/appLogger');
 
@@ -744,6 +745,14 @@ module.exports = function (db) {
         return res.status(400).json({ error: 'portfolio_id must be a positive integer' });
       }
 
+      // Version-gated cache: this scan is expensive and blocks the event loop.
+      const cacheVersion = isSnapshotEnabled() ? getDataVersion(db) : null;
+      const cacheKey = cacheVersion != null ? `health:${portfolioId ?? 'all'}:${runDate}` : null;
+      if (cacheKey) {
+        const cached = getCachedSnapshot(db, cacheKey, cacheVersion);
+        if (cached) return res.json(cached);
+      }
+
       const marketHolidaySet = loadMarketHolidaySet(db, runDate);
 
       const scopes = db.prepare(`
@@ -858,13 +867,15 @@ module.exports = function (db) {
 
       const compliance = getComplianceScanState(runDate, db);
 
-      res.json({
+      const healthPayload = {
         run_date: runDate,
         status,
         counts,
         compliance,
         issues,
-      });
+      };
+      if (cacheKey) putSnapshot(db, cacheKey, cacheVersion, healthPayload);
+      res.json(healthPayload);
     } catch (e) {
       logAppError('[Health] daily-values-health failed', { error: e.message });
       res.status(500).json({ error: e.message || 'Failed to compute daily values health' });
@@ -1111,15 +1122,23 @@ module.exports = function (db) {
   router.get('/compliance-status', (req, res) => {
     try {
       const runDate = parseDateOnly(req.query.run_date) || todayIso();
+      const cacheVersion = isSnapshotEnabled() ? getDataVersion(db) : null;
+      const cacheKey = cacheVersion != null ? `compliance-status:${runDate}` : null;
+      if (cacheKey) {
+        const cached = getCachedSnapshot(db, cacheKey, cacheVersion);
+        if (cached) return res.json(cached);
+      }
       const compliance = getComplianceScanState(runDate, db);
       const status = compliance.openGapCount > 0
         ? 'warning'
         : (compliance.hasBacklog ? 'pending' : 'ok');
-      res.json({
+      const payload = {
         run_date: runDate,
         status,
         compliance,
-      });
+      };
+      if (cacheKey) putSnapshot(db, cacheKey, cacheVersion, payload);
+      res.json(payload);
     } catch (e) {
       logAppError('[Health] compliance-status failed', { error: e.message });
       res.status(500).json({ error: e.message || 'Failed to fetch compliance status' });
