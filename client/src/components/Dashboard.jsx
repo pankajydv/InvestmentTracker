@@ -10,6 +10,7 @@ import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
 import DashboardRolloverTable from './DashboardRolloverTable';
+import { resolvePortfolioColor } from '../utils/portfolioColors';
 
 function AllocationChartTooltip({ active, payload }) {
   if (!active || !payload || !payload.length) return null;
@@ -434,7 +435,7 @@ function mergeXirrEnrichment(baseData, enrichedData) {
 }
 
 export default function Dashboard() {
-  const { selectedId, selectedIds, selectedPortfolio } = usePortfolio();
+  const { selectedId, selectedIds, selectedPortfolio, selectedPortfolios, portfolios } = usePortfolio();
   const { settings, loading: settingsLoading } = useAppSettings();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -840,16 +841,34 @@ export default function Dashboard() {
         ? { icon: ShieldAlert, tone: 'warning', title: 'Compliance pre-warning' }
         : { icon: ShieldCheck, tone: 'healthy', title: 'Compliance healthy' };
   const ComplianceIcon = complianceIndicator.icon;
+  const headerPortfolios = (selectedPortfolios && selectedPortfolios.length)
+    ? selectedPortfolios
+    : (portfolios || []);
+  const headerPortfolioDots = headerPortfolios.slice(0, 4);
+  const headerPortfolioOverflow = Math.max(0, headerPortfolios.length - headerPortfolioDots.length);
+  const headerDotAria = selectedPortfolio
+    ? 'Selected portfolio'
+    : (selectedIds.length > 1 ? 'Selected portfolios' : 'Portfolio selection');
 
   return (
     <div className="dashboard-page">
-      <div className={`dashboard-header mb-4 ${selectedPortfolio ? '' : 'dashboard-header-no-title'}`}>
-        {selectedPortfolio ? (
-          <div className="dashboard-title-row d-flex align-items-center gap-2">
-            <span className="portfolio-dot" style={{ backgroundColor: selectedPortfolio.color }} />
-            <h1 className="h4 fw-bold mb-0">{selectedPortfolio.name}</h1>
-          </div>
-        ) : null}
+      <div className="dashboard-header mb-4">
+        <div className="dashboard-title-row dashboard-portfolio-strip" aria-label={headerDotAria}>
+          {headerPortfolioDots.map((portfolio) => (
+            <span
+              key={portfolio.id}
+              className="portfolio-dot dashboard-portfolio-dot"
+              style={{ backgroundColor: resolvePortfolioColor(portfolio) }}
+              title={portfolio.name}
+              aria-label={portfolio.name}
+            />
+          ))}
+          {headerPortfolioOverflow > 0 && (
+            <span className="dashboard-portfolio-overflow" title={`${headerPortfolioOverflow} more portfolios`}>
+              +{headerPortfolioOverflow}
+            </span>
+          )}
+        </div>
         <div className="dashboard-header-meta">
           {lastUpdate && (
             <span className="dashboard-last-updated">

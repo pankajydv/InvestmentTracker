@@ -4,6 +4,7 @@ import { Card, Table, Spinner, Form, Modal, Button, Row, Col } from 'react-boots
 import { getTransactions, getBrokers, getTransactionTypes, getInvestmentNames, getPortfolios, updateTransaction, deleteTransaction } from '../services/api';
 import { formatNumber, formatDate, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
+import { resolvePortfolioColor } from '../utils/portfolioColors';
 
 const TRANSACTION_TYPES_DEFAULT = [
   'BUY', 'SELL', 'DIVIDEND', 'INTEREST', 'RECONCILE', 'BONUS', 'IPO', 'AMC', 'TRANSFER',
@@ -252,7 +253,7 @@ export default function Transactions() {
     getPortfolios().then((rows) => {
       const map = {};
       for (const p of rows || []) {
-        map[p.id] = { name: p.name, color: p.color };
+        map[p.id] = { name: p.name, color: resolvePortfolioColor(p) };
       }
       setPortfolioMeta(map);
     }).catch(() => {});

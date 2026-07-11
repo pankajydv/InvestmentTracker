@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { usePortfolio } from '../context/PortfolioContext';
+import { resolvePortfolioColor } from '../utils/portfolioColors';
 
 import { Link } from 'react-router-dom';
 import { ChevronDown, Users, Settings, Check } from 'lucide-react';
@@ -46,7 +47,7 @@ export default function PortfolioSelector({ fullWidth = false }) {
       >
         <span className="d-flex align-items-center gap-2 flex-grow-1" style={{ minWidth: 0 }}>
           {selectedPortfolio ? (
-            <span className="portfolio-dot flex-shrink-0" style={{ backgroundColor: selectedPortfolio.color }} />
+            <span className="portfolio-dot flex-shrink-0" style={{ backgroundColor: resolvePortfolioColor(selectedPortfolio) }} />
           ) : (
             <Users size={16} className="text-muted" />
           )}
@@ -107,7 +108,7 @@ export default function PortfolioSelector({ fullWidth = false }) {
             >
               <span
                 className="portfolio-dot flex-shrink-0"
-                style={{ backgroundColor: p.color, width: 14, height: 14 }}
+                style={{ backgroundColor: resolvePortfolioColor(p), width: 14, height: 14 }}
               />
               <div className="flex-grow-1" style={{ minWidth: 0 }}>
                 <div className="fw-medium text-truncate">{p.name}</div>

@@ -120,6 +120,34 @@ tr:hover .row-actions {
   min-width: 0;
 }
 
+.dashboard-portfolio-strip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  min-height: 1.4rem;
+}
+
+.dashboard-portfolio-dot {
+  width: 11px;
+  height: 11px;
+  border: 1px solid rgba(15, 23, 42, 0.22);
+}
+
+.dashboard-portfolio-overflow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.15rem;
+  height: 1.15rem;
+  padding: 0 0.2rem;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: #47546a;
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
 .dashboard-header-meta {
   display: flex;
   align-items: center;
@@ -176,8 +204,23 @@ tr:hover .row-actions {
   }
 
   .dashboard-title-row {
-    font-size: 1.85rem;
-    line-height: 1.1;
+    line-height: 1;
+  }
+
+  .dashboard-portfolio-strip {
+    gap: 0.24rem;
+    min-height: 1.2rem;
+  }
+
+  .dashboard-portfolio-dot {
+    width: 10px;
+    height: 10px;
+  }
+
+  .dashboard-portfolio-overflow {
+    min-width: 1.05rem;
+    height: 1.05rem;
+    font-size: 0.64rem;
   }
 
   .dashboard-last-updated {
