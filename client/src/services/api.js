@@ -52,6 +52,18 @@ export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInR
   if (customToDate) params.set('custom_to_date', String(customToDate));
   return fetchJSON(`/dashboard/summary?${params}`);
 };
+// Exact per-asset-type interval change/% + portfolio interval XIRR for an arbitrary portfolio
+// subset. Used to overlay the non-additive interval metrics onto a client-combined summary.
+export const getAssetIntervalMetrics = ({ portfolioIds, interval, customFromDate, customToDate } = {}) => {
+  const params = new URLSearchParams();
+  if (Array.isArray(portfolioIds) && portfolioIds.length > 0) {
+    params.set('portfolio_ids', portfolioIds.map((id) => String(id)).join(','));
+  }
+  if (interval) params.set('interval', String(interval));
+  if (customFromDate) params.set('custom_from_date', String(customFromDate));
+  if (customToDate) params.set('custom_to_date', String(customToDate));
+  return fetchJSON(`/dashboard/asset-interval-metrics?${params}`);
+};
 // Batch endpoint: fetch summary, health, and allocation in single request (optimized)
 export const getDashboardBatch = (portfolioId, { requests = 'summary,health,allocation', hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate, runDate } = {}) => {
   const params = new URLSearchParams();
@@ -75,8 +87,7 @@ export const getPerformance = (period, from, to, portfolioId) => {
   return fetchJSON(`/dashboard/performance?${params}`);
 };
 export const getInvestmentPerformance = (id, period) =>
-  fetchJSON(`/dashboard/performance/${id}?period=${period}`);
-export const getAllocation = (portfolioId) => {
+  fetchJSON(`/dashboard/performance/${id}?period=${period}`);export const getAllocation = (portfolioId) => {
   const params = portfolioId ? `?portfolio_id=${portfolioId}` : '';
   return fetchJSON(`/dashboard/allocation${params}`);
 };

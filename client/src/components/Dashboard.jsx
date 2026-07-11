@@ -1130,7 +1130,7 @@ export default function Dashboard() {
               ) : (
                 <>
                   <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
-                    {formatINR(data?.intervalXIRR?.interval_change || 0, 0, { sensitive: false })}
+                    {formatINR(data?.intervalXIRR?.interval_change || 0, 0)}
                   </div>
                   {isDayChangeMode ? (
                     <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
@@ -1226,7 +1226,7 @@ export default function Dashboard() {
                     ) : (
                       <>
                         <span className={`asset-metric-value ${intervalClass}`}>
-                          {info.dayChange >= 0 ? '+' : ''}{formatINR(info.dayChange, 0, { sensitive: false })}
+                          {info.dayChange >= 0 ? '+' : ''}{formatINR(info.dayChange, 0)}
                         </span>
                         <span className="asset-metric-separator">·</span>
                         <span className={`asset-metric-rate ${intervalClass}`}>

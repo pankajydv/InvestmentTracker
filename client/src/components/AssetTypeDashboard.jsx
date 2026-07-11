@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { Alert, Button, Card, Col, Row, Spinner } from 'react-bootstrap';
 import { ArrowLeft, PiggyBank, TrendingDown, TrendingUp, Wallet } from 'lucide-react';
-import { getDashboardSummary, getDashboardVersion } from '../services/api';
+import { getDashboardSummary, getDashboardVersion, getAssetIntervalMetrics } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { formatDate, formatINR, formatNumber, formatPct, profitColor, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS, ASSET_TYPE_SLUG_TO_KEY, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
@@ -185,6 +185,14 @@ function combineDashboardSummaries(results, selectedIds) {
     }
   }
 
+  // Derive interval change % per asset type from the aggregated amounts. The per-portfolio
+  // server responses compute this, but the multi-portfolio combine rebuilds byType and must
+  // recompute it, otherwise the card and totals row show 0.00% against a non-zero amount.
+  for (const entry of Object.values(byType)) {
+    const prevValue = (Number(entry.totalValue) || 0) - (Number(entry.dayChange) || 0);
+    entry.intervalChangePct = prevValue > 0 ? ((Number(entry.dayChange) || 0) / prevValue) * 100 : 0;
+  }
+
   const portfolioAsOfDates = investments.map((inv) => inv.day_change_as_of_date).filter(Boolean);
   const uniquePortfolioAsOfDates = [...new Set(portfolioAsOfDates)];
   if (uniquePortfolioAsOfDates.length === 1) {
@@ -235,7 +243,7 @@ export default function AssetTypeDashboard() {
   const { assetType: assetTypeSlug } = useParams();
   // Resolve URL slug (e.g. 'mf') back to the enum key (e.g. 'MUTUAL_FUND')
   const assetType = ASSET_TYPE_SLUG_TO_KEY[assetTypeSlug?.toLowerCase()] || assetTypeSlug?.toUpperCase();
-  const { selectedId, selectedIds, selectedPortfolio } = usePortfolio();
+  const { selectionMode, selectedId, selectedIds, selectedPortfolio } = usePortfolio();
   const { settings, loading: settingsLoading } = useAppSettings();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -256,17 +264,23 @@ export default function AssetTypeDashboard() {
       if (settingsLoading) return;
       if (selectedInterval === 'CUSTOM' && (!customFromDate || !customToDate)) return;
 
-      const isMulti = selectedIds.length > 1;
+      // Scope resolution mirrors the main Dashboard: the 'all' scope is served by a single
+      // server aggregate (portfolio_id=null) whose interval %/XIRR is computed and cached
+      // server-side, so we reuse it verbatim instead of re-deriving in the browser. Only a
+      // genuine partial subset ('some' with >1 id) has no server endpoint and must be combined
+      // client-side (exact for additive amounts; interval % is only exact for 1D there).
+      const isAllScope = selectionMode === 'all';
+      const isPartialMulti = !isAllScope && selectedIds.length > 1;
       // Namespaced ('at') so asset-type entries (always full XIRR) never mix with the
       // main dashboard's two-phase entries.
       const cacheKey = getDashboardCacheKey({
-        targetPortfolioId: isMulti ? null : selectedId,
+        targetPortfolioId: isAllScope ? null : (isPartialMulti ? null : selectedId),
         hideSold,
         includeFullySoldInReturns,
         selectedInterval,
         customFromDate,
         customToDate,
-        extra: isMulti ? `at:combine:${selectedIdsKey}` : 'at',
+        extra: isPartialMulti ? `at:combine:${selectedIdsKey}` : 'at',
       });
       const cachedEntry = getCachedDashboardSummary(cacheKey);
 
@@ -310,12 +324,41 @@ export default function AssetTypeDashboard() {
 
         let result;
         let resultVersion = null;
-        if (isMulti) {
+        if (isPartialMulti) {
           const results = await Promise.all(selectedIds.map((id) => getDashboardSummary(id, requestOptions)));
           result = combineDashboardSummaries(results, selectedIds);
           resultVersion = results.find((r) => r?.dataVersion != null)?.dataVersion ?? null;
+
+          // The client combine is exact for additive amounts and for the 1D/YD % (derived from
+          // aggregated day_change vs opening value). For every other interval the % is a
+          // non-additive XIRR that only the server can solve over unioned cashflows, so overlay
+          // the server's exact per-type interval change/% and portfolio interval XIRR here.
+          const usesXirrInterval = selectedInterval !== '1D' && selectedInterval !== 'YD';
+          if (usesXirrInterval) {
+            try {
+              const metrics = await getAssetIntervalMetrics({
+                portfolioIds: selectedIds,
+                interval: selectedInterval,
+                customFromDate: customFromDate || undefined,
+                customToDate: customToDate || undefined,
+              });
+              if (metrics?.byType && result?.byType) {
+                for (const [type, m] of Object.entries(metrics.byType)) {
+                  if (!result.byType[type] || !m) continue;
+                  result.byType[type].dayChange = m.dayChange;
+                  result.byType[type].intervalChangePct = m.intervalChangePct;
+                }
+              }
+              if (metrics?.intervalXIRR) {
+                result.intervalXIRR = { ...(result.intervalXIRR || {}), ...metrics.intervalXIRR };
+              }
+            } catch (_e) {
+              // Fall back to the combine's approximate interval % if the overlay fetch fails.
+            }
+          }
         } else {
-          result = await getDashboardSummary(selectedId, requestOptions);
+          // 'all' scope -> portfolio_id=null (server aggregate); single scope -> selectedId.
+          result = await getDashboardSummary(isAllScope ? null : selectedId, requestOptions);
           resultVersion = result?.dataVersion ?? null;
         }
         if (cancelled) return;
@@ -388,9 +431,9 @@ export default function AssetTypeDashboard() {
             <ArrowLeft size={16} /> Back to Dashboard
           </Link>
           <h1 className="h4 fw-bold mb-1">{pageTitle}</h1>
-          <div className="text-muted small">
-            {selectedPortfolio ? `${selectedPortfolio.name} portfolio` : 'Selected dashboard scope'}
-          </div>
+          {selectedPortfolio && (
+            <div className="text-muted small">{`${selectedPortfolio.name} portfolio`}</div>
+          )}
         </div>
       </div>
 
@@ -491,7 +534,7 @@ export default function AssetTypeDashboard() {
               ) : (
                 <>
                   <div className={`fs-3 fw-bold ${profitColor(typeInfo.dayChange)}`}>
-                    {formatINR(typeInfo.dayChange || 0, 0, { sensitive: false })}
+                    {formatINR(typeInfo.dayChange || 0, 0)}
                   </div>
                   <div className={`small ${profitColor(intervalChangePct)}`}>
                     Change: {formatPct(intervalChangePct)}{selectedInterval === '1D' || selectedInterval === 'YD' ? '' : ' p.a.'}

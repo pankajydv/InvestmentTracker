@@ -664,6 +664,31 @@ tr:hover .row-actions {
   font-weight: 500;
 }
 
+.app-navbar {
+  background: linear-gradient(180deg, #eef5ff 0%, #e3efff 100%) !important;
+  border-bottom: 1px solid #c4d7f5 !important;
+  box-shadow: 0 8px 20px rgba(22, 77, 163, 0.08), 0 1px 0 rgba(255, 255, 255, 0.7) inset;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+
+.app-navbar .nav-link {
+  color: #4b5563 !important;
+  transition: background-color 0.2s ease, color 0.2s ease, transform 0.2s ease;
+}
+
+.app-navbar .nav-link:hover {
+  background-color: rgba(37, 99, 235, 0.1);
+  color: #1d4ed8 !important;
+  transform: translateY(-1px);
+}
+
+.app-navbar .nav-link.active-nav {
+  color: #1d4ed8 !important;
+  background: rgba(37, 99, 235, 0.14);
+  box-shadow: 0 1px 2px rgba(29, 78, 216, 0.2) inset;
+}
+
 .mobile-nav-shell {
   width: 100%;
   max-width: 100%;

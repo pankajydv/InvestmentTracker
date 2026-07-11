@@ -122,7 +122,7 @@ export default function Navbar({ user, onLogout }) {
 
   return (
     <>
-      <BsNavbar bg="white" sticky="top" className="shadow-sm border-bottom">
+      <BsNavbar bg="white" sticky="top" className="shadow-sm border-bottom app-navbar">
         <Container fluid="lg" className="flex-wrap flex-sm-nowrap mobile-nav-shell">
           <BsNavbar.Brand as={Link} to="/" className="d-flex align-items-center gap-2 me-2 me-md-3 mobile-nav-brand">
             <TrendingUp size={28} className="text-primary" />

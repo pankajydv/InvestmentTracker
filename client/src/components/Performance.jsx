@@ -273,7 +273,7 @@ export default function Performance() {
                 <Card.Body>
                   <div className="small text-muted mb-1">Period Return</div>
                   <div className={`fs-4 fw-bold ${profitColor(periodReturn)}`}>
-                    {periodReturn >= 0 ? '+' : ''}{formatINR(periodReturn, 0, { sensitive: false })}
+                    {periodReturn >= 0 ? '+' : ''}{formatINR(periodReturn, 0)}
                   </div>
                   <div className={`small ${profitColor(periodReturnPct)}`}>
                     {formatPct(periodReturnPct)}

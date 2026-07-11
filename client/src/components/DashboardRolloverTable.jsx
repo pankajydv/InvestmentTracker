@@ -230,7 +230,7 @@ export default function DashboardRolloverTable({ title, description, assetType =
                         <tr key={row.date}>
                           <td>{row.date}</td>
                           <td className="text-end">{formatINR(row.current_value)}</td>
-                          <td className={`text-end ${profitColor(row.day_change)}`}>{formatINRExact(row.day_change, 0, { sensitive: false })}</td>
+                          <td className={`text-end ${profitColor(row.day_change)}`}>{formatINRExact(row.day_change, 0)}</td>
                           <td className={`text-end ${profitColor(row.day_change_pct)}`}>{formatNumber(row.day_change_pct, 2)}%</td>
                           {showSource && <td className="ps-4">{row.price_source || '-'}</td>}
                           {showMore && <td className="text-end">{formatINR(row.invested_amount)}</td>}

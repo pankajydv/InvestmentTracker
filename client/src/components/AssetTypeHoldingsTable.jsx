@@ -280,7 +280,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                           </>
                         ) : (
                           <>
-                            <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatNumber(inv.day_change, 0)}</div>
+                            <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatSensitiveAmount(inv.day_change, 0)}</div>
                             <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>
                               {formatPct(inv.day_change_pct)}
                             </div>
@@ -400,7 +400,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                         </>
                       ) : (
                         <>
-                          <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatNumber(info.dayChange, 0)}</div>
+                          <div className={`fw-medium ${profitColor(info.dayChange)}`}>{formatSensitiveAmount(info.dayChange, 0)}</div>
                           <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>
                             {formatPct(totalDayChangePct)}
                           </div>

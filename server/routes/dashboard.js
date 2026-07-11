@@ -349,6 +349,201 @@ function resolveAggregatedSource(row) {
   return 'MIXED';
 }
 
+// Build a portfolio-scope SQL predicate that works for a single portfolio, an arbitrary
+// subset, or "all". `ids` is an array of positive integers; an empty array means "all
+// portfolios" (portfolio_id IS NOT NULL), matching the historical single/all branches.
+function portfolioScopeClause(column, ids) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return { clause: `${column} IS NOT NULL`, params: [] };
+  }
+  const placeholders = ids.map(() => '?').join(', ');
+  return { clause: `${column} IN (${placeholders})`, params: [...ids] };
+}
+
+// Resolve the [from, to] window for a preset/custom interval from the latest snapshot date.
+// Mirrors the /summary handler's date math so subset requests land on identical bounds.
+function resolveIntervalWindow(latestDateInDb, intervalParam, customFromDate, customToDate) {
+  if (customFromDate && customToDate) {
+    return { intervalFromDate: String(customFromDate).trim(), intervalToDate: String(customToDate).trim() };
+  }
+  if (!latestDateInDb) {
+    return { intervalFromDate: '2000-01-01', intervalToDate: '2000-01-01' };
+  }
+  let intervalFromDate = null;
+  let intervalToDate = latestDateInDb;
+  const d = new Date(latestDateInDb);
+  switch (String(intervalParam || '1D').toUpperCase()) {
+    case '1D': d.setDate(d.getDate() - 1); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case 'YD': {
+      const yTo = new Date(latestDateInDb); yTo.setDate(yTo.getDate() - 1);
+      intervalToDate = yTo.toISOString().split('T')[0];
+      const yFrom = new Date(intervalToDate); yFrom.setDate(yFrom.getDate() - 1);
+      intervalFromDate = yFrom.toISOString().split('T')[0];
+      break;
+    }
+    case '2D': d.setDate(d.getDate() - 2); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '1W': d.setDate(d.getDate() - 7); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '1M': d.setMonth(d.getMonth() - 1); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '3M': d.setMonth(d.getMonth() - 3); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '6M': d.setMonth(d.getMonth() - 6); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '1Y': d.setFullYear(d.getFullYear() - 1); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '2Y': d.setFullYear(d.getFullYear() - 2); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '3Y': d.setFullYear(d.getFullYear() - 3); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '5Y': d.setFullYear(d.getFullYear() - 5); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '7Y': d.setFullYear(d.getFullYear() - 7); intervalFromDate = d.toISOString().split('T')[0]; break;
+    case '10Y': d.setFullYear(d.getFullYear() - 10); intervalFromDate = d.toISOString().split('T')[0]; break;
+    default: d.setDate(d.getDate() - 1); intervalFromDate = d.toISOString().split('T')[0];
+  }
+  return { intervalFromDate, intervalToDate };
+}
+
+// Money-weighted, non-1D interval change per asset type plus the portfolio-level interval
+// XIRR, computed for an arbitrary portfolio scope. This is the single source of truth shared
+// by the /summary handler and the /asset-interval-metrics endpoint so single, subset, and
+// "all" scopes stay numerically identical (the % is a non-additive XIRR that cannot be
+// reconstructed by averaging per-portfolio values — it must be solved over unioned cashflows).
+//   scopeIds: [] => all portfolios; [id] => single; [id,...] => subset.
+//   assetTypes: which asset types to emit (types with no in-range snapshots resolve to 0).
+function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], intervalFromDate, intervalToDate }) {
+  const emptyResult = {
+    byType: {},
+    intervalXIRR: {
+      interval_change: 0,
+      xirr_pct: null,
+      confidence: 'error',
+      error: 'Interval bounds unavailable',
+      from_date: intervalFromDate || null,
+      to_date: intervalToDate || null,
+    },
+  };
+  if (!intervalFromDate || !intervalToDate) return emptyResult;
+
+  const dailyScope = portfolioScopeClause('portfolio_id', scopeIds);
+  const txnScope = portfolioScopeClause('t.portfolio_id', scopeIds);
+
+  const findBoundsForType = db.prepare(`
+    SELECT MIN(date) AS chosen_from, MAX(date) AS chosen_to
+    FROM asset_type_daily
+    WHERE ${dailyScope.clause} AND asset_type = ? AND date >= ? AND date <= ?
+  `);
+  // asset_type_daily is unique per (portfolio_id, asset_type, date), so SUM(total_value)
+  // equals the single row for one portfolio and the combined value for a subset/all.
+  const valueForType = db.prepare(`
+    SELECT COALESCE(SUM(total_value), 0) AS total_value
+    FROM asset_type_daily
+    WHERE ${dailyScope.clause} AND asset_type = ? AND date = ?
+  `);
+  const intervalTransactionsForType = db.prepare(`
+    SELECT
+      DATE(t.transaction_date) AS txn_date,
+      t.transaction_type,
+      COALESCE(t.amount, 0) AS amount,
+      COALESCE(t.fees, 0) AS fees,
+      t.notes
+    FROM transactions t
+    JOIN investments i ON i.id = t.investment_id
+    WHERE ${txnScope.clause}
+      AND i.asset_type = ?
+      AND DATE(t.transaction_date) >= ?
+      AND DATE(t.transaction_date) <= ?
+    ORDER BY DATE(t.transaction_date)
+  `);
+  const firstActivityDateForType = db.prepare(`
+    SELECT MIN(DATE(t.transaction_date)) AS first_date
+    FROM transactions t
+    JOIN investments i ON i.id = t.investment_id
+    WHERE ${txnScope.clause} AND i.asset_type = ?
+  `);
+
+  const byType = {};
+  const portfolioIntervalCashflows = [];
+
+  for (const assetTypeKey of assetTypes) {
+    // Default: no in-range snapshots -> zero interval movement for this type.
+    byType[assetTypeKey] = {
+      dayChange: 0,
+      intervalChangePct: 0,
+      intervalFromDate: null,
+      intervalToDate: null,
+    };
+
+    const bounds = findBoundsForType.get(...dailyScope.params, assetTypeKey, intervalFromDate, intervalToDate);
+    const chosenFrom = bounds?.chosen_from || null;
+    const chosenTo = bounds?.chosen_to || null;
+    if (!chosenFrom || !chosenTo || chosenFrom > chosenTo) continue;
+
+    // Inception window: request reaches back to/before the position ever existed -> opening 0
+    // and every contribution counts, collapsing the interval to lifetime P&L.
+    const firstActivityDate = firstActivityDateForType.get(...txnScope.params, assetTypeKey)?.first_date || null;
+    const isInceptionWindow = !!firstActivityDate && intervalFromDate <= firstActivityDate;
+
+    const openingValue = isInceptionWindow
+      ? 0
+      : Number(valueForType.get(...dailyScope.params, assetTypeKey, chosenFrom)?.total_value || 0);
+    const closingValue = Number(valueForType.get(...dailyScope.params, assetTypeKey, chosenTo)?.total_value || 0);
+
+    const transactionsFromDate = isInceptionWindow ? intervalFromDate : chosenFrom;
+    const intervalTransactions = intervalTransactionsForType.all(...txnScope.params, assetTypeKey, transactionsFromDate, chosenTo);
+
+    const intervalCashflows = [];
+    if (openingValue !== 0) {
+      intervalCashflows.push({ amount: -openingValue, date: new Date(`${chosenFrom}T00:00:00.000Z`) });
+    }
+    for (const txn of intervalTransactions) {
+      const amount = Number(txn.amount) || 0;
+      const fees = Number(txn.fees) || 0;
+      let cashflow = 0;
+      const treatAsInternal = isInternalXirrCashflow(assetTypeKey, txn.transaction_type);
+      const treatAsAccrualOnly = isAccrualOnlyXirrCashflow(txn.transaction_type, txn.notes);
+      if (treatAsAccrualOnly) {
+        cashflow = 0;
+      } else if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+        cashflow = -(amount + fees);
+      } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
+        cashflow = amount - fees;
+      }
+      if (Math.abs(cashflow) > 1e-9) {
+        intervalCashflows.push({ amount: cashflow, date: new Date(`${txn.txn_date}T00:00:00.000Z`) });
+      }
+    }
+    if (closingValue !== 0) {
+      intervalCashflows.push({ amount: closingValue, date: new Date(`${chosenTo}T00:00:00.000Z`) });
+    }
+
+    portfolioIntervalCashflows.push(...intervalCashflows);
+
+    const intervalXirrRate = calculateXirr(intervalCashflows);
+    const intervalNetProfit = intervalCashflows.reduce((sum, flow) => sum + flow.amount, 0);
+
+    byType[assetTypeKey] = {
+      dayChange: intervalNetProfit,
+      intervalChangePct: intervalXirrRate == null
+        ? (openingValue > 0 ? (intervalNetProfit / openingValue) * 100 : 0)
+        : intervalXirrRate * 100,
+      intervalFromDate: chosenFrom,
+      intervalToDate: chosenTo,
+    };
+  }
+
+  const portfolioIntervalRate = calculateXirr(portfolioIntervalCashflows);
+  const portfolioIntervalDayChange = Object.values(byType)
+    .reduce((sum, info) => sum + (Number(info.dayChange) || 0), 0);
+
+  return {
+    byType,
+    intervalXIRR: {
+      interval_change: portfolioIntervalDayChange,
+      xirr_pct: portfolioIntervalRate == null ? null : portfolioIntervalRate * 100,
+      confidence: portfolioIntervalRate == null ? 'error' : 'full',
+      error: portfolioIntervalRate == null
+        ? 'Interval XIRR could not be solved for the combined cashflows'
+        : null,
+      from_date: intervalFromDate,
+      to_date: intervalToDate,
+    },
+  };
+}
+
 module.exports = function (db) {
 
   try {
@@ -1382,239 +1577,26 @@ module.exports = function (db) {
       }
     }
 
-    // Non-1D: compute asset-type interval change from asset_type_daily using strict in-range bounds.
+    // Non-1D: compute asset-type interval change from asset_type_daily using strict in-range
+    // bounds. Delegated to the shared scope-aware helper (computeScopeIntervalMetrics) so the
+    // single-portfolio, "all", and arbitrary-subset scopes are numerically identical — the % is
+    // a non-additive XIRR that must be solved over unioned cashflows, not averaged.
     if (!isPresetOneDay && !isPresetYesterday && intervalFromDate && intervalToDate) {
-      const findBoundsForType = portfolio_id
-        ? db.prepare(`
-            SELECT
-              MIN(date) AS chosen_from,
-              MAX(date) AS chosen_to
-            FROM asset_type_daily
-            WHERE portfolio_id = ?
-              AND asset_type = ?
-              AND date >= ?
-              AND date <= ?
-          `)
-        : db.prepare(`
-            SELECT
-              MIN(date) AS chosen_from,
-              MAX(date) AS chosen_to
-            FROM asset_type_daily
-            WHERE portfolio_id IS NOT NULL
-              AND asset_type = ?
-              AND date >= ?
-              AND date <= ?
-          `);
-
-      const openingValueForType = portfolio_id
-        ? db.prepare(`
-            SELECT COALESCE(total_value, 0) AS total_value
-            FROM asset_type_daily
-            WHERE portfolio_id = ?
-              AND asset_type = ?
-              AND date = ?
-            LIMIT 1
-          `)
-        : db.prepare(`
-            SELECT COALESCE(SUM(total_value), 0) AS total_value
-            FROM asset_type_daily
-            WHERE portfolio_id IS NOT NULL
-              AND asset_type = ?
-              AND date = ?
-          `);
-
-      const closingValueForType = portfolio_id
-        ? db.prepare(`
-            SELECT COALESCE(total_value, 0) AS total_value
-            FROM asset_type_daily
-            WHERE portfolio_id = ?
-              AND asset_type = ?
-              AND date = ?
-            LIMIT 1
-          `)
-        : db.prepare(`
-            SELECT COALESCE(SUM(total_value), 0) AS total_value
-            FROM asset_type_daily
-            WHERE portfolio_id IS NOT NULL
-              AND asset_type = ?
-              AND date = ?
-          `);
-
-      const intervalTransactionsForType = portfolio_id
-        ? db.prepare(`
-            SELECT
-              DATE(t.transaction_date) AS txn_date,
-              t.transaction_type,
-              COALESCE(t.amount, 0) AS amount,
-              COALESCE(t.fees, 0) AS fees,
-              t.notes
-            FROM transactions t
-            JOIN investments i ON i.id = t.investment_id
-            WHERE t.portfolio_id = ?
-              AND i.asset_type = ?
-              AND DATE(t.transaction_date) >= ?
-              AND DATE(t.transaction_date) <= ?
-            ORDER BY DATE(t.transaction_date)
-          `)
-        : db.prepare(`
-            SELECT
-              DATE(t.transaction_date) AS txn_date,
-              t.transaction_type,
-              COALESCE(t.amount, 0) AS amount,
-              COALESCE(t.fees, 0) AS fees,
-              t.notes
-            FROM transactions t
-            JOIN investments i ON i.id = t.investment_id
-            WHERE t.portfolio_id IS NOT NULL
-              AND i.asset_type = ?
-              AND DATE(t.transaction_date) >= ?
-              AND DATE(t.transaction_date) <= ?
-            ORDER BY DATE(t.transaction_date)
-          `);
-
-      // Earliest activity (first transaction) per asset-type/scope. Used to detect when the
-      // requested interval window reaches back to or before the position ever existed. In that
-      // "inception" case the opening wealth is genuinely 0 (nothing was held yet), so the interval
-      // must anchor opening at 0 and count EVERY contribution/allocation from the very first
-      // transaction — otherwise the value already embedded in the first daily snapshot (e.g. the
-      // ESPP day-1 discount gain between contribution date and allocation date) is silently
-      // excluded, making the interval fall short of lifetime P&L by that embedded gain.
-      const firstActivityDateForType = portfolio_id
-        ? db.prepare(`
-            SELECT MIN(DATE(t.transaction_date)) AS first_date
-            FROM transactions t
-            JOIN investments i ON i.id = t.investment_id
-            WHERE t.portfolio_id = ?
-              AND i.asset_type = ?
-          `)
-        : db.prepare(`
-            SELECT MIN(DATE(t.transaction_date)) AS first_date
-            FROM transactions t
-            JOIN investments i ON i.id = t.investment_id
-            WHERE t.portfolio_id IS NOT NULL
-              AND i.asset_type = ?
-          `);
-
-      const portfolioIntervalCashflows = [];
+      const metrics = computeScopeIntervalMetrics(db, {
+        scopeIds: portfolio_id ? [Number(portfolio_id)] : [],
+        assetTypes: Object.keys(byType),
+        intervalFromDate,
+        intervalToDate,
+      });
       for (const [assetTypeKey, info] of Object.entries(byType)) {
-        const bounds = portfolio_id
-          ? findBoundsForType.get(portfolio_id, assetTypeKey, intervalFromDate, intervalToDate)
-          : findBoundsForType.get(assetTypeKey, intervalFromDate, intervalToDate);
-
-        const chosenFrom = bounds?.chosen_from || null;
-        const chosenTo = bounds?.chosen_to || null;
-        if (!chosenFrom || !chosenTo || chosenFrom > chosenTo) {
-          info.dayChange = 0;
-          info.intervalChangePct = 0;
-          info.intervalFromDate = null;
-          info.intervalToDate = null;
-          continue;
-        }
-
-        // Inception mode: the requested window starts on or before the position's first-ever
-        // transaction, so the window fully contains the holding's life. Opening wealth = 0 and
-        // ALL transactions (from the first contribution onward) are counted, which makes the
-        // interval collapse exactly to lifetime P&L (closing + realized − invested). Any window
-        // that starts AFTER the first transaction is a genuine partial window and keeps the
-        // original behavior untouched (opening = market value at the first in-window snapshot).
-        const firstActivityDate = portfolio_id
-          ? firstActivityDateForType.get(portfolio_id, assetTypeKey)?.first_date || null
-          : firstActivityDateForType.get(assetTypeKey)?.first_date || null;
-        const isInceptionWindow = !!firstActivityDate && intervalFromDate <= firstActivityDate;
-
-        // Opening: 0 when the window reaches back to inception; otherwise the market value at the
-        // first in-window snapshot (unchanged partial-window behavior).
-        const openingValue = isInceptionWindow
-          ? 0
-          : (portfolio_id
-            ? Number(openingValueForType.get(portfolio_id, assetTypeKey, chosenFrom)?.total_value || 0)
-            : Number(openingValueForType.get(assetTypeKey, chosenFrom)?.total_value || 0));
-
-        const closingValue = portfolio_id
-          ? Number(closingValueForType.get(portfolio_id, assetTypeKey, chosenTo)?.total_value || 0)
-          : Number(closingValueForType.get(assetTypeKey, chosenTo)?.total_value || 0);
-
-        // Transaction lower bound: in inception mode extend back to the requested window start so
-        // pre-allocation contributions (which produced the first snapshot's value) are included;
-        // in partial mode keep the first in-window snapshot date exactly as before.
-        const transactionsFromDate = isInceptionWindow ? intervalFromDate : chosenFrom;
-        const intervalTransactions = portfolio_id
-          ? intervalTransactionsForType.all(portfolio_id, assetTypeKey, transactionsFromDate, chosenTo)
-          : intervalTransactionsForType.all(assetTypeKey, transactionsFromDate, chosenTo);
-
-        const intervalCashflows = [];
-        if (openingValue !== 0) {
-          intervalCashflows.push({
-            amount: -openingValue,
-            date: new Date(`${chosenFrom}T00:00:00.000Z`),
-          });
-        }
-
-        for (const txn of intervalTransactions) {
-          const amount = Number(txn.amount) || 0;
-          const fees = Number(txn.fees) || 0;
-          let cashflow = 0;
-          const treatAsInternal = isInternalXirrCashflow(assetTypeKey, txn.transaction_type);
-          const treatAsAccrualOnly = isAccrualOnlyXirrCashflow(txn.transaction_type, txn.notes);
-
-          if (treatAsAccrualOnly) {
-            cashflow = 0;
-          } else if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
-            cashflow = -(amount + fees);
-          } else if (CASH_INFLOW_TYPES.has(txn.transaction_type) && !treatAsInternal) {
-            cashflow = amount - fees;
-          }
-
-          if (Math.abs(cashflow) > 1e-9) {
-            intervalCashflows.push({
-              amount: cashflow,
-              date: new Date(`${txn.txn_date}T00:00:00.000Z`),
-            });
-          }
-        }
-
-        if (closingValue !== 0) {
-          intervalCashflows.push({
-            amount: closingValue,
-            date: new Date(`${chosenTo}T00:00:00.000Z`),
-          });
-        }
-
-        portfolioIntervalCashflows.push(...intervalCashflows);
-
-        const intervalXirrRate = calculateXirr(intervalCashflows);
-
-        // Consistent basis (option A): the ₹ figure is the net money gained/lost over the
-        // interval — the sum of the very same cashflows the XIRR is solved from
-        // (= closing - opening + proceeds/income - contributions). Because both the amount
-        // and the % derive from one flow set, their signs always agree.
-        const intervalNetProfit = intervalCashflows.reduce((sum, flow) => sum + flow.amount, 0);
-
-        info.dayChange = intervalNetProfit;
-        info.intervalChangePct = intervalXirrRate == null
-          ? (openingValue > 0 ? (intervalNetProfit / openingValue) * 100 : 0)
-          : intervalXirrRate * 100;
-        info.intervalFromDate = chosenFrom;
-        info.intervalToDate = chosenTo;
+        const m = metrics.byType[assetTypeKey];
+        if (!m) continue;
+        info.dayChange = m.dayChange;
+        info.intervalChangePct = m.intervalChangePct;
+        info.intervalFromDate = m.intervalFromDate;
+        info.intervalToDate = m.intervalToDate;
       }
-
-      // Top-level interval XIRR: same engine (calculateXirr) and same cashflows as the
-      // per-type cards, unioned across all asset types (portfolio total = sum of its parts).
-      // Never silently fall back to raw period return; a null solve is an explicit error.
-      const portfolioIntervalRate = calculateXirr(portfolioIntervalCashflows);
-      const portfolioIntervalDayChange = Object.values(byType)
-        .reduce((sum, info) => sum + (Number(info.dayChange) || 0), 0);
-      intervalXIRR = {
-        ...intervalXIRR,
-        interval_change: portfolioIntervalDayChange,
-        xirr_pct: portfolioIntervalRate == null ? null : portfolioIntervalRate * 100,
-        confidence: portfolioIntervalRate == null ? 'error' : 'full',
-        error: portfolioIntervalRate == null
-          ? 'Interval XIRR could not be solved for the combined cashflows'
-          : null,
-        from_date: intervalFromDate,
-        to_date: intervalToDate,
-      };
+      intervalXIRR = { ...intervalXIRR, ...metrics.intervalXIRR };
     }
 
     const totalInvestedByScope = byTypeTotals.reduce((sum, row) => sum + (Number(row.totalInvested) || 0), 0);
@@ -1802,6 +1784,72 @@ module.exports = function (db) {
     }
 
     res.json(responsePayload);
+  });
+
+  // ─── Asset-type interval metrics for an arbitrary portfolio subset ─────
+  // The /summary endpoint only understands a single portfolio or "all". For a genuine subset
+  // (e.g. 2 of 3 portfolios) the client combines the additive fields locally but cannot rebuild
+  // the non-additive interval XIRR / %. This endpoint computes those exactly for any scope using
+  // the same shared engine as /summary, and is snapshot-cached + version-gated for speed.
+  router.get('/asset-interval-metrics', (req, res) => {
+    try {
+      let scopeIds;
+      try {
+        scopeIds = parsePortfolioIds(req.query);
+      } catch (_e) {
+        return res.status(400).json({ error: 'Invalid portfolio id' });
+      }
+
+      const intervalParam = String(req.query.interval || '1D').trim().toUpperCase();
+      const customFromDate = req.query.custom_from_date || null;
+      const customToDate = req.query.custom_to_date || null;
+
+      const latestDateInDb = db.prepare(`
+        SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id IS NOT NULL
+      `).get()?.max_date || null;
+      const { intervalFromDate, intervalToDate } = resolveIntervalWindow(
+        latestDateInDb, intervalParam, customFromDate, customToDate,
+      );
+
+      // Snapshot cache (version-gated). Skip ad-hoc custom ranges to bound the key space.
+      const cacheKey = (customFromDate || customToDate)
+        ? null
+        : JSON.stringify({
+            kind: 'interval-metrics',
+            scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
+            interval: intervalParam,
+          });
+      let version = null;
+      if (isSnapshotEnabled() && cacheKey) {
+        try {
+          version = getDataVersion(db);
+          const cached = getCachedSnapshot(db, cacheKey, version);
+          if (cached) return res.json(cached);
+        } catch (_e) {
+          version = null;
+        }
+      }
+
+      const dailyScope = portfolioScopeClause('portfolio_id', scopeIds);
+      const assetTypes = db.prepare(`
+        SELECT DISTINCT asset_type
+        FROM asset_type_daily
+        WHERE ${dailyScope.clause} AND date >= ? AND date <= ?
+      `).all(...dailyScope.params, intervalFromDate, intervalToDate).map((r) => r.asset_type);
+
+      const metrics = computeScopeIntervalMetrics(db, {
+        scopeIds, assetTypes, intervalFromDate, intervalToDate,
+      });
+      const payload = { ...metrics, from_date: intervalFromDate, to_date: intervalToDate };
+
+      if (isSnapshotEnabled() && cacheKey && version != null) {
+        try { putSnapshot(db, cacheKey, version, payload); } catch (_e) { /* fail open */ }
+      }
+
+      return res.json(payload);
+    } catch (e) {
+      return res.status(500).json({ error: e.message || 'Failed to compute interval metrics' });
+    }
   });
 
   // ─── Data version (lightweight cache-validation probe) ─────────────────

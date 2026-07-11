@@ -2,7 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal, Dropdown, Collapse } from 'react-bootstrap';
 import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions, getInvestmentDailyValues, getPortfolios } from '../services/api';
-import { formatINR, formatINRExact, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
+import { formatINR, formatINRExact, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
 import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil, Wallet, PiggyBank, BarChart3, TrendingUp, TrendingDown } from 'lucide-react';
@@ -908,7 +908,7 @@ export default function InvestmentDetail() {
     !isPPF && data.latestValue
       ? {
           label: detailDayChangeAsOf ? `1D Change (As of ${formatDate(detailDayChangeAsOf)})` : '1D Change',
-          value: formatNumber(detailDayChange, 0),
+          value: isPrivacyMaskEnabled() ? getMaskedValue() : formatNumber(detailDayChange, 0),
           color: profitColor(detailDayChange),
         }
       : null,
@@ -1057,7 +1057,7 @@ export default function InvestmentDetail() {
               )}
 
               <div className={`fw-bold ${profitColor(intervalChange)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
-                {formatINR(intervalChange, 0, { sensitive: false })}
+                {formatINR(intervalChange, 0)}
               </div>
               {isDayChangeMode && (
                 <>
@@ -1711,7 +1711,7 @@ export default function InvestmentDetail() {
                             {!selectedId && <td>{renderScopeCell(row)}</td>}
                             <td className="text-end">{row.price_per_unit == null ? '-' : formatNumber(row.price_per_unit, 4)}</td>
                             <td className="text-end">{row.current_value == null ? '-' : formatINR(row.current_value)}</td>
-                            <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINRExact(row.day_change, 0, { sensitive: false })}</td>
+                            <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINRExact(row.day_change, 0)}</td>
                             <td className="ps-4">{row.price_source || '-'}</td>
                             {dailyValuesShowMore && <td className="text-end">{row.total_units == null ? '-' : formatNumber(row.total_units, 4)}</td>}
                             {dailyValuesShowMore && <td className="text-end">{row.invested_amount == null ? '-' : formatINR(row.invested_amount)}</td>}
