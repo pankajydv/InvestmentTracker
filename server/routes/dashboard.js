@@ -1472,6 +1472,29 @@ module.exports = function (db) {
             ORDER BY DATE(t.transaction_date)
           `);
 
+      // Earliest activity (first transaction) per asset-type/scope. Used to detect when the
+      // requested interval window reaches back to or before the position ever existed. In that
+      // "inception" case the opening wealth is genuinely 0 (nothing was held yet), so the interval
+      // must anchor opening at 0 and count EVERY contribution/allocation from the very first
+      // transaction — otherwise the value already embedded in the first daily snapshot (e.g. the
+      // ESPP day-1 discount gain between contribution date and allocation date) is silently
+      // excluded, making the interval fall short of lifetime P&L by that embedded gain.
+      const firstActivityDateForType = portfolio_id
+        ? db.prepare(`
+            SELECT MIN(DATE(t.transaction_date)) AS first_date
+            FROM transactions t
+            JOIN investments i ON i.id = t.investment_id
+            WHERE t.portfolio_id = ?
+              AND i.asset_type = ?
+          `)
+        : db.prepare(`
+            SELECT MIN(DATE(t.transaction_date)) AS first_date
+            FROM transactions t
+            JOIN investments i ON i.id = t.investment_id
+            WHERE t.portfolio_id IS NOT NULL
+              AND i.asset_type = ?
+          `);
+
       const portfolioIntervalCashflows = [];
       for (const [assetTypeKey, info] of Object.entries(byType)) {
         const bounds = portfolio_id
@@ -1488,17 +1511,36 @@ module.exports = function (db) {
           continue;
         }
 
-        const openingValue = portfolio_id
-          ? Number(openingValueForType.get(portfolio_id, assetTypeKey, chosenFrom)?.total_value || 0)
-          : Number(openingValueForType.get(assetTypeKey, chosenFrom)?.total_value || 0);
+        // Inception mode: the requested window starts on or before the position's first-ever
+        // transaction, so the window fully contains the holding's life. Opening wealth = 0 and
+        // ALL transactions (from the first contribution onward) are counted, which makes the
+        // interval collapse exactly to lifetime P&L (closing + realized − invested). Any window
+        // that starts AFTER the first transaction is a genuine partial window and keeps the
+        // original behavior untouched (opening = market value at the first in-window snapshot).
+        const firstActivityDate = portfolio_id
+          ? firstActivityDateForType.get(portfolio_id, assetTypeKey)?.first_date || null
+          : firstActivityDateForType.get(assetTypeKey)?.first_date || null;
+        const isInceptionWindow = !!firstActivityDate && intervalFromDate <= firstActivityDate;
+
+        // Opening: 0 when the window reaches back to inception; otherwise the market value at the
+        // first in-window snapshot (unchanged partial-window behavior).
+        const openingValue = isInceptionWindow
+          ? 0
+          : (portfolio_id
+            ? Number(openingValueForType.get(portfolio_id, assetTypeKey, chosenFrom)?.total_value || 0)
+            : Number(openingValueForType.get(assetTypeKey, chosenFrom)?.total_value || 0));
 
         const closingValue = portfolio_id
           ? Number(closingValueForType.get(portfolio_id, assetTypeKey, chosenTo)?.total_value || 0)
           : Number(closingValueForType.get(assetTypeKey, chosenTo)?.total_value || 0);
 
+        // Transaction lower bound: in inception mode extend back to the requested window start so
+        // pre-allocation contributions (which produced the first snapshot's value) are included;
+        // in partial mode keep the first in-window snapshot date exactly as before.
+        const transactionsFromDate = isInceptionWindow ? intervalFromDate : chosenFrom;
         const intervalTransactions = portfolio_id
-          ? intervalTransactionsForType.all(portfolio_id, assetTypeKey, chosenFrom, chosenTo)
-          : intervalTransactionsForType.all(assetTypeKey, chosenFrom, chosenTo);
+          ? intervalTransactionsForType.all(portfolio_id, assetTypeKey, transactionsFromDate, chosenTo)
+          : intervalTransactionsForType.all(assetTypeKey, transactionsFromDate, chosenTo);
 
         const intervalCashflows = [];
         if (openingValue !== 0) {

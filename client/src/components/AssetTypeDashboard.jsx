@@ -523,7 +523,7 @@ export default function AssetTypeDashboard() {
       />
 
       <DashboardRolloverTable
-        title={`${pageTitle} Daily Rollup Table`}
+        title={`${pageTitle} Daily Investment Value`}
         description="Stored daily aggregate snapshots for this asset type in the current dashboard scope."
         assetType={assetType}
       />

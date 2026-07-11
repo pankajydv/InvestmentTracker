@@ -1492,7 +1492,7 @@ export default function InvestmentDetail() {
         <Card.Body>
           <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
             <div>
-              <h2 className="h6 fw-semibold mb-0">Daily Values</h2>
+              <h2 className="h6 fw-semibold mb-0">Daily Price & Value</h2>
             </div>
             <Button
               size="sm"
@@ -1506,7 +1506,7 @@ export default function InvestmentDetail() {
               }}
               aria-expanded={dailyValuesExpanded}
             >
-              {dailyValuesExpanded ? 'Collapse Daily Values' : 'Expand Daily Values'}
+              {dailyValuesExpanded ? 'Collapse Daily Price & Value' : 'Expand Daily Price & Value'}
             </Button>
           </div>
 
@@ -1631,7 +1631,7 @@ export default function InvestmentDetail() {
                         <th className="text-end">Price</th>
                         <th className="text-end">Current Value</th>
                         <th className="text-end">1D Change</th>
-                        <th>Source</th>
+                        <th className="ps-4">Source</th>
                         {dailyValuesShowMore && <th className="text-end">Units</th>}
                         {dailyValuesShowMore && <th className="text-end">Invested</th>}
                         {dailyValuesShowMore && <th className="text-end">Realized</th>}
@@ -1655,7 +1655,7 @@ export default function InvestmentDetail() {
                             <td className="text-end">{row.price_per_unit == null ? '-' : formatNumber(row.price_per_unit, 4)}</td>
                             <td className="text-end">{row.current_value == null ? '-' : formatINR(row.current_value)}</td>
                             <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINRExact(row.day_change)}</td>
-                            <td>{row.price_source || '-'}</td>
+                            <td className="ps-4">{row.price_source || '-'}</td>
                             {dailyValuesShowMore && <td className="text-end">{row.total_units == null ? '-' : formatNumber(row.total_units, 4)}</td>}
                             {dailyValuesShowMore && <td className="text-end">{row.invested_amount == null ? '-' : formatINR(row.invested_amount)}</td>}
                             {dailyValuesShowMore && <td className="text-end">{row.realized_proceeds == null ? '-' : formatINR(row.realized_proceeds)}</td>}

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Row, Col, Card, Spinner } from 'react-bootstrap';
 import { getCorporateActionSuggestionCount, getInvestments } from '../services/api';
-import { ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_FILTER_ORDER } from '../utils/formatters';
+import { ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_FILTER_ORDER } from '../utils/formatters';
 import { PlusCircle, RefreshCw, Percent } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
@@ -10,12 +10,6 @@ import { useAppSettings } from '../context/AppSettingsContext';
 const TYPE_ALL = '';
 
 function compareInvestments(a, b) {
-  const typeA = String(a?.asset_type || '').toUpperCase();
-  const typeB = String(b?.asset_type || '').toUpperCase();
-  const orderA = ASSET_TYPE_DISPLAY_ORDER[typeA] ?? 999;
-  const orderB = ASSET_TYPE_DISPLAY_ORDER[typeB] ?? 999;
-  if (orderA !== orderB) return orderA - orderB;
-
   const nameA = String(a?.display_name || a?.name || '').toLowerCase();
   const nameB = String(b?.display_name || b?.name || '').toLowerCase();
   return nameA.localeCompare(nameB);

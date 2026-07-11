@@ -211,7 +211,7 @@ export default function DashboardRolloverTable({ title, description, assetType =
                       <th className="text-end">Current Value</th>
                       <th className="text-end">1D Change</th>
                       <th className="text-end">1D %</th>
-                      {showSource && <th>Source</th>}
+                      {showSource && <th className="ps-4">Source</th>}
                       {showMore && <th className="text-end">Invested</th>}
                       {showMore && <th className="text-end">Realized</th>}
                       {showMore && <th className="text-end">P/L</th>}
@@ -230,7 +230,7 @@ export default function DashboardRolloverTable({ title, description, assetType =
                           <td className="text-end">{formatINR(row.current_value)}</td>
                           <td className={`text-end ${profitColor(row.day_change)}`}>{formatINRExact(row.day_change)}</td>
                           <td className={`text-end ${profitColor(row.day_change_pct)}`}>{formatNumber(row.day_change_pct, 2)}%</td>
-                          {showSource && <td>{row.price_source || '-'}</td>}
+                          {showSource && <td className="ps-4">{row.price_source || '-'}</td>}
                           {showMore && <td className="text-end">{formatINR(row.invested_amount)}</td>}
                           {showMore && <td className="text-end">{formatINR(row.realized_proceeds)}</td>}
                           {showMore && <td className={`text-end ${profitColor(row.profit_loss)}`}>{formatINR(row.profit_loss)}</td>}
