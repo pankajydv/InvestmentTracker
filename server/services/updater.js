@@ -28,7 +28,7 @@ const {
   quantizeForStorage,
 } = require('./numberPrecision');
 const { upsertInvestmentPriceSeries, getInvestmentSeries } = require('./marketPriceCache');
-const { markScopeDirty, runDailyBootstrapDirtyScopeEnqueue } = require('./dirtyBackfillService');
+const { markScopeDirty } = require('./dirtyBackfillService');
 const { todayIso, normalizeProviderDate } = require('./dateUtils');
 const { LOCF_STREAK_WARN_SESSIONS, FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS } = require('./freshnessPolicy');
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -1376,47 +1376,6 @@ async function updateAllPrices(db, options = {}) {
     updateAssetTypeDaily(db, dateToRefresh);
   }
 
-  // Resilient daily bootstrap: the first run that materializes today's records
-  // enqueues a small catch-up dirty window for all active tracked scopes.
-  // Claim/state management inside the helper ensures this is effectively once-per-day
-  // while still allowing retries if a prior attempt failed or got stuck.
-  let dailyBootstrapResult = null;
-  if (!_cancelled && successCount > 0) {
-    try {
-      dailyBootstrapResult = runDailyBootstrapDirtyScopeEnqueue(db, {
-        runDate: today,
-        lookbackDays: 2,
-        trigger: runTag || 'update-all-prices',
-      });
-
-      if (dailyBootstrapResult.attempted) {
-        logAppInfo('[UpdatePrices] Daily bootstrap dirty-scope enqueue completed', {
-          date: today,
-          runTag,
-          dirtyFromDate: dailyBootstrapResult.dirtyFromDate,
-          lookbackDays: dailyBootstrapResult.lookbackDays,
-          enqueued: dailyBootstrapResult.enqueued,
-          attempt: dailyBootstrapResult.attempt || null,
-          trigger: dailyBootstrapResult.trigger,
-        });
-      } else {
-        logAppInfo('[UpdatePrices] Daily bootstrap dirty-scope enqueue skipped', {
-          date: today,
-          runTag,
-          status: dailyBootstrapResult.status,
-          dirtyFromDate: dailyBootstrapResult.dirtyFromDate,
-          lookbackDays: dailyBootstrapResult.lookbackDays,
-        });
-      }
-    } catch (e) {
-      logAppError('[UpdatePrices] Daily bootstrap dirty-scope enqueue failed', {
-        date: today,
-        runTag,
-        error: e?.message || String(e),
-      });
-    }
-  }
-
   // Update last price update time
   db.prepare("UPDATE config SET value = ?, updated_at = datetime('now') WHERE key = 'last_price_update'")
     .run(new Date().toISOString());
@@ -1446,8 +1405,6 @@ async function updateAllPrices(db, options = {}) {
     totalProcessed: successCount + errorCount + skippedCount,
     totalCount,
     watermarkUpdated,
-    dailyBootstrapStatus: dailyBootstrapResult?.status || null,
-    dailyBootstrapEnqueued: dailyBootstrapResult?.enqueued || 0,
     elapsedSec: Math.max(Math.round((Date.now() - runStartedAt) / 1000), 0),
   });
   return {

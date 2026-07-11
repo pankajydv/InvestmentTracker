@@ -10,7 +10,7 @@ applyEnvDefaults();
 
 const cron = require('node-cron');
 const { updateAllPrices } = require('./updater');
-const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate, markScopeDirty } = require('./dirtyBackfillService');
+const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate, markScopeDirty, runDailyBootstrapDirtyScopeEnqueue } = require('./dirtyBackfillService');
 const {
   fetchMutualFundHistory,
   fetchHistoricalUSDToINR,
@@ -868,7 +868,25 @@ async function runSchedulerCycle(db, label, options = {}) {
   const rollingFreshness = ensureRollingFreshnessDirtyScopes(db, runDate, label, {
     forceAllScopes: !!options.forceFreshnessAllScopes,
   });
-  logAppInfo(`[Scheduler] ${label}: Step 1/6 completed`, { rollingFreshness });
+
+  // Daily bootstrap re-check of the recent window runs here (before preflight) so
+  // the SAME cycle's preflight repairs and drains it. It is idempotent per run date
+  // and conditional (only enqueues scopes that are actually behind), so healthy
+  // already-fresh scopes never generate residual pending dirty scopes.
+  let dailyBootstrap = null;
+  try {
+    dailyBootstrap = runDailyBootstrapDirtyScopeEnqueue(db, {
+      runDate,
+      lookbackDays: 2,
+      conditional: true,
+      trigger: options.runTag || label || 'scheduler-cycle',
+    });
+  } catch (bootstrapErr) {
+    logAppError(`[Scheduler] ${label}: Step 1/6 daily bootstrap enqueue failed (non-fatal)`, {
+      error: bootstrapErr.message,
+    });
+  }
+  logAppInfo(`[Scheduler] ${label}: Step 1/6 completed`, { rollingFreshness, dailyBootstrap });
 
   // ── Step 2/6: Scheduler cycle started (context snapshot) ─────────────────
   logAppInfo(`[Scheduler] ${label}: Step 2/6 scheduler cycle started`, {
@@ -914,12 +932,14 @@ async function runSchedulerCycle(db, label, options = {}) {
     preflightRunDate,
   });
   const catchUp = ensureSchedulerCatchUpScopes(db, preflightRunDate, label);
+  const foreignReconcile = ensureForeignReconcileScopes(db, preflightRunDate, label, catchUp);
   const locfReconcile = ensureMarketLinkedLocfReconcileScopes(db, preflightRunDate, label);
   const preflight = await runDirtyBackfillPreflight(db, preflightRunDate, {
     suppressRunDateWritesForMarketLinked: options.skipPriceUpdate !== true,
   });
   logAppInfo(`[Scheduler] ${label}: Step 4/6 completed (catch-up + backfill preflight)`, {
     catchUp,
+    foreignReconcile,
     locfReconcile,
     preflight,
   });
@@ -929,12 +949,13 @@ async function runSchedulerCycle(db, label, options = {}) {
       runDate,
       preflightRunDate,
       rollingFreshness,
+      dailyBootstrap,
       catchUp,
       foreignReconcile,
       locfReconcile,
       preflight,
     });
-    return { preflightOnly: true, rollingFreshness, catchUp, locfReconcile, preflight };
+    return { preflightOnly: true, rollingFreshness, dailyBootstrap, catchUp, foreignReconcile, locfReconcile, preflight };
   }
 
   const warmRecentCacheDays = Number(options.warmRecentCacheDays || 0);
@@ -956,7 +977,9 @@ async function runSchedulerCycle(db, label, options = {}) {
     runDate,
     preflightRunDate,
     rollingFreshness,
+    dailyBootstrap,
     catchUp,
+    foreignReconcile,
     locfReconcile,
     preflight,
     cacheWarm,
@@ -994,7 +1017,7 @@ async function runSchedulerCycle(db, label, options = {}) {
     logAppInfo(`[Scheduler] ${label}: Step 6/6 compliance scan skipped (no mode specified)`);
   }
 
-  return { rollingFreshness, catchUp, locfReconcile, preflight, result, xirrCacheResult, complianceResult };
+  return { rollingFreshness, dailyBootstrap, catchUp, foreignReconcile, locfReconcile, preflight, result, xirrCacheResult, complianceResult };
   } finally {
     isSchedulerCycleRunning = false;
   }

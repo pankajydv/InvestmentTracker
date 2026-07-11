@@ -252,11 +252,61 @@ function parseJsonSafe(value) {
   }
 }
 
+/**
+ * Select active tracked scopes that are genuinely BEHIND on recent daily values:
+ * scopes with no daily_values rows at all, or whose latest materialized row predates
+ * yesterday. Scopes that are current through yesterday (today may still be an expected
+ * LOCF) are intentionally excluded so we don't re-backfill already-fresh data.
+ */
+function enqueueBehindTrackedScopes(db, runDate, dirtyFromDate, reason, sourceEventId) {
+  const yesterday = addDaysIso(runDate, -1);
+  const rows = db.prepare(`
+    SELECT
+      i.id AS investment_id,
+      t.portfolio_id,
+      COALESCE(SUM(
+        CASE
+          WHEN t.transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(t.units, 0)
+          WHEN t.transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(t.units, 0)
+          ELSE 0
+        END
+      ), 0) AS net_units,
+      (
+        SELECT MAX(dv.date)
+        FROM daily_values dv
+        WHERE dv.investment_id = i.id AND dv.portfolio_id = t.portfolio_id
+      ) AS latest_dv_date
+    FROM investments i
+    JOIN transactions t ON t.investment_id = i.id
+    WHERE i.is_active != 0
+      AND COALESCE(i.exclude_from_tracking, 0) != 1
+      AND t.portfolio_id IS NOT NULL
+    GROUP BY i.id, t.portfolio_id
+    HAVING net_units > ${EXITED_UNITS_EPSILON}
+  `).all();
+
+  let enqueued = 0;
+  for (const row of rows) {
+    const latest = row.latest_dv_date ? String(row.latest_dv_date) : null;
+    if (latest && latest >= yesterday) continue;
+    const dirtyDate = markScopeDirty(db, {
+      investmentId: row.investment_id,
+      portfolioId: row.portfolio_id,
+      dirtyFromDate,
+      reason,
+      sourceEventId,
+    });
+    if (dirtyDate) enqueued += 1;
+  }
+  return enqueued;
+}
+
 function runDailyBootstrapDirtyScopeEnqueue(db, options = {}) {
   const runDate = normalizeDirtyDate(options.runDate) || todayIso();
   const lookbackDays = Math.max(1, Math.floor(Number(options.lookbackDays) || 2));
   const staleRunSeconds = Math.max(60, Math.floor(Number(options.staleRunSeconds) || 900));
   const trigger = String(options.trigger || 'unknown').trim() || 'unknown';
+  const conditional = options.conditional === true;
   const stateKey = 'daily_scope_bootstrap_state';
   const dirtyFromDate = addDaysIso(runDate, -lookbackDays);
   const nowIso = new Date().toISOString();
@@ -335,7 +385,9 @@ function runDailyBootstrapDirtyScopeEnqueue(db, options = {}) {
   try {
     const reason = 'daily-bootstrap-catchup';
     const sourceEventId = `daily-bootstrap:${runDate}`;
-    const enqueued = markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourceEventId);
+    const enqueued = conditional
+      ? enqueueBehindTrackedScopes(db, runDate, dirtyFromDate, reason, sourceEventId)
+      : markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourceEventId);
     const completedAt = new Date().toISOString();
     const finalState = {
       status: 'completed',
