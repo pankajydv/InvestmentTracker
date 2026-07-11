@@ -4,7 +4,7 @@ import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardSummary, getDashboardVersion, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
-import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_SLUG } from '../utils/formatters';
+import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_SLUG, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
 import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle, ShieldAlert, ShieldCheck, ShieldX } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
@@ -12,6 +12,7 @@ import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } 
 import DashboardRolloverTable from './DashboardRolloverTable';
 import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { getDashboardCacheKey, getCachedDashboardSummary, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
+import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 function AllocationChartTooltip({ active, payload }) {
   if (!active || !payload || !payload.length) return null;
@@ -424,6 +425,7 @@ function mergeXirrEnrichment(baseData, enrichedData) {
 }
 
 export default function Dashboard() {
+  usePrivacyMaskRefresh();
   const { selectedId, selectedIds, selectedPortfolio, selectedPortfolios, portfolios } = usePortfolio();
   const { settings, loading: settingsLoading } = useAppSettings();
   const [data, setData] = useState(null);
@@ -702,7 +704,9 @@ export default function Dashboard() {
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
   const totalRealizedGain = Number(portfolio.total_realized_proceeds) || 0;
   const currentInvested = (Number(portfolio.total_invested) || 0) - totalRealizedGain;
-  const formatINRExact = (amount) => {
+  const formatINRExact = (amount, options = {}) => {
+    const sensitive = options?.sensitive !== false;
+    if (sensitive && isPrivacyMaskEnabled()) return getMaskedValue({ currencySymbol: '₹' });
     if (amount == null || Number.isNaN(Number(amount))) return '₹0';
     const value = Number(amount);
     const sign = value < 0 ? '-' : '';
@@ -1126,7 +1130,7 @@ export default function Dashboard() {
               ) : (
                 <>
                   <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
-                    {formatINR(data?.intervalXIRR?.interval_change || 0)}
+                    {formatINR(data?.intervalXIRR?.interval_change || 0, 0, { sensitive: false })}
                   </div>
                   {isDayChangeMode ? (
                     <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
@@ -1222,7 +1226,7 @@ export default function Dashboard() {
                     ) : (
                       <>
                         <span className={`asset-metric-value ${intervalClass}`}>
-                          {info.dayChange >= 0 ? '+' : ''}{formatINR(info.dayChange)}
+                          {info.dayChange >= 0 ? '+' : ''}{formatINR(info.dayChange, 0, { sensitive: false })}
                         </span>
                         <span className="asset-metric-separator">·</span>
                         <span className={`asset-metric-rate ${intervalClass}`}>

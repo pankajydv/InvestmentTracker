@@ -2,12 +2,14 @@ import React, { useEffect, useState } from 'react';
 import { Card, Table } from 'react-bootstrap';
 import { Link } from 'react-router-dom';
 import { ArrowRight } from 'lucide-react';
-import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
+import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
+import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 const INTEREST_RATE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MOBILE_BREAKPOINT_PX = 768;
 
 export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue, selectedInterval, isIntervalSwitching }) {
+  usePrivacyMaskRefresh();
   const [sortConfig, setSortConfig] = useState({ key: null, direction: 'asc' });
   const [isMobile, setIsMobile] = useState(
     () => (typeof window !== 'undefined' ? window.innerWidth < MOBILE_BREAKPOINT_PX : false),
@@ -39,6 +41,11 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
     const symbol = getCurrencySymbol(currency);
     const value = Number(amount) || 0;
     return `${value < 0 ? '-' : ''}${symbol}${formatNumber(Math.abs(value), decimals)}`;
+  };
+
+  const formatSensitiveAmount = (amount, decimals = 0, { currencySymbol = '' } = {}) => {
+    if (isPrivacyMaskEnabled()) return getMaskedValue({ currencySymbol });
+    return formatNumber(amount, decimals);
   };
 
   const formatAsOfDate = (dateValue) => {
@@ -286,9 +293,9 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                   if (col.key === 'totalCost') {
                     return (
                       <td key={`${inv.id}-totalCost`} className="px-3 text-end holdings-col-totalCost">
-                        <div className="fw-medium">{formatNumber((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
+                        <div className="fw-medium">{formatSensitiveAmount((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
                         <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                          {formatNumber(inv.invested_amount, 0)}
+                          {formatSensitiveAmount(inv.invested_amount, 0)}
                         </div>
                       </td>
                     );
@@ -297,7 +304,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                   if (col.key === 'currentValue') {
                     return (
                       <td key={`${inv.id}-currentValue`} className="px-3 text-end holdings-col-currentValue">
-                        <div className="fw-medium">{formatNumber(inv.current_value, 0)}</div>
+                        <div className="fw-medium">{formatSensitiveAmount(inv.current_value, 0)}</div>
                         <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                           {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
                         </div>
@@ -320,7 +327,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                     return (
                       <td key={`${inv.id}-totalReturn`} className="px-3 text-end holdings-col-totalReturn">
                         <div className={`fw-semibold ${profitColor(inv.profit_loss)}`}>
-                          {inv.profit_loss >= 0 ? '+' : ''}{formatNumber(inv.profit_loss, 0)}
+                          {formatSensitiveAmount(inv.profit_loss, 0)}
                         </div>
                         <div className={profitColor(inv.profit_loss_pct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
                           {isMobile
@@ -406,9 +413,9 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                 if (col.key === 'totalCost') {
                   return (
                     <td key={`${type}-total-totalCost`} className="px-3 text-end holdings-col-totalCost">
-                      <div className="fw-medium">{formatNumber(totalCurrentInvested, 0)}</div>
+                      <div className="fw-medium">{formatSensitiveAmount(totalCurrentInvested, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                        {formatNumber(info.totalInvested, 0)}
+                        {formatSensitiveAmount(info.totalInvested, 0)}
                       </div>
                     </td>
                   );
@@ -417,7 +424,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                 if (col.key === 'currentValue') {
                   return (
                     <td key={`${type}-total-currentValue`} className="px-3 text-end holdings-col-currentValue">
-                      <div className="fw-medium">{formatNumber(info.totalValue, 0)}</div>
+                      <div className="fw-medium">{formatSensitiveAmount(info.totalValue, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                         {totalUnits > 0.0001 ? `${formatNumber(totalUnits, 4)} Units` : ''}
                       </div>
@@ -440,7 +447,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                   return (
                     <td key={`${type}-total-totalReturn`} className={`px-3 text-end holdings-col-totalReturn ${profitColor(info.totalProfitLoss)}`}>
                       <div className="fw-semibold">
-                        {info.totalProfitLoss >= 0 ? '+' : ''}{formatNumber(info.totalProfitLoss, 0)}
+                        {formatSensitiveAmount(info.totalProfitLoss, 0)}
                       </div>
                       <div className={profitColor(totalAbsPct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
                         {isMobile

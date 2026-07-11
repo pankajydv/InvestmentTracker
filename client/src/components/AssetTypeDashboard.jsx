@@ -5,10 +5,11 @@ import { ArrowLeft, PiggyBank, TrendingDown, TrendingUp, Wallet } from 'lucide-r
 import { getDashboardSummary, getDashboardVersion } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
-import { formatDate, formatINR, formatNumber, formatPct, profitColor, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS, ASSET_TYPE_SLUG_TO_KEY } from '../utils/formatters';
+import { formatDate, formatINR, formatNumber, formatPct, profitColor, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS, ASSET_TYPE_SLUG_TO_KEY, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
 import { getDashboardCacheKey, getCachedDashboardSummary, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
 import AssetTypeHoldingsTable from './AssetTypeHoldingsTable';
 import DashboardRolloverTable from './DashboardRolloverTable';
+import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 function combineDashboardSummaries(results, selectedIds) {
   if (!Array.isArray(results) || !results.length) return null;
@@ -230,6 +231,7 @@ function ErrorMessage({ message }) {
 }
 
 export default function AssetTypeDashboard() {
+  usePrivacyMaskRefresh();
   const { assetType: assetTypeSlug } = useParams();
   // Resolve URL slug (e.g. 'mf') back to the enum key (e.g. 'MUTUAL_FUND')
   const assetType = ASSET_TYPE_SLUG_TO_KEY[assetTypeSlug?.toLowerCase()] || assetTypeSlug?.toUpperCase();
@@ -366,7 +368,9 @@ export default function AssetTypeDashboard() {
       : selectedInterval === 'YD'
         ? 'Yesterday Change'
         : `${selectedInterval} Change`;
-  const formatINRExact = (amount) => {
+  const formatINRExact = (amount, options = {}) => {
+    const sensitive = options?.sensitive !== false;
+    if (sensitive && isPrivacyMaskEnabled()) return getMaskedValue({ currencySymbol: '₹' });
     if (amount == null || Number.isNaN(Number(amount))) return '₹0';
     const value = Number(amount);
     const sign = value < 0 ? '-' : '';
@@ -487,7 +491,7 @@ export default function AssetTypeDashboard() {
               ) : (
                 <>
                   <div className={`fs-3 fw-bold ${profitColor(typeInfo.dayChange)}`}>
-                    {formatINR(typeInfo.dayChange || 0)}
+                    {formatINR(typeInfo.dayChange || 0, 0, { sensitive: false })}
                   </div>
                   <div className={`small ${profitColor(intervalChangePct)}`}>
                     Change: {formatPct(intervalChangePct)}{selectedInterval === '1D' || selectedInterval === 'YD' ? '' : ' p.a.'}

@@ -3,6 +3,7 @@ import { Card, Row, Col, Spinner, Button } from 'react-bootstrap';
 import { getPerformance } from '../services/api';
 import { formatINR, formatPct, profitColor, TIME_PERIODS } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
+import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts';
@@ -95,6 +96,7 @@ function combinePerformanceResults(results, startDate, endDate, periodLabel = 'c
 }
 
 export default function Performance() {
+  usePrivacyMaskRefresh();
   const { selectedId, selectedIds } = usePortfolio();
   const [period, setPeriod] = useState('1M');
   const [selectedAssetType, setSelectedAssetType] = useState('ALL');
@@ -271,7 +273,7 @@ export default function Performance() {
                 <Card.Body>
                   <div className="small text-muted mb-1">Period Return</div>
                   <div className={`fs-4 fw-bold ${profitColor(periodReturn)}`}>
-                    {periodReturn >= 0 ? '+' : ''}{formatINR(periodReturn)}
+                    {periodReturn >= 0 ? '+' : ''}{formatINR(periodReturn, 0, { sensitive: false })}
                   </div>
                   <div className={`small ${profitColor(periodReturnPct)}`}>
                     {formatPct(periodReturnPct)}

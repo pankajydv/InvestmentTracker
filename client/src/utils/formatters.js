@@ -1,7 +1,22 @@
 /**
  * Format number as Indian currency (₹)
  */
-export function formatINR(amount, decimals = 0) {
+export function isPrivacyMaskEnabled() {
+  if (typeof document !== 'undefined' && document.body) {
+    if (document.body.dataset.privacyMasked === '1') return true;
+    if (document.body.dataset.privacyMasked === '0') return false;
+  }
+  // Always default to masked mode for safety on fresh page load.
+  return true;
+}
+
+export function getMaskedValue({ currencySymbol = '' } = {}) {
+  return currencySymbol ? `${currencySymbol}****` : '****';
+}
+
+export function formatINR(amount, decimals = 0, options = {}) {
+  const sensitive = options?.sensitive !== false;
+  if (sensitive && isPrivacyMaskEnabled()) return getMaskedValue({ currencySymbol: '₹' });
   if (amount == null || isNaN(amount)) return '₹0';
 
   const abs = Math.abs(amount);
@@ -18,7 +33,9 @@ export function formatINR(amount, decimals = 0) {
   return `${sign}₹${abs.toLocaleString('en-IN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;
 }
 
-export function formatINRExact(amount, decimals = 0) {
+export function formatINRExact(amount, decimals = 0, options = {}) {
+  const sensitive = options?.sensitive !== false;
+  if (sensitive && isPrivacyMaskEnabled()) return getMaskedValue({ currencySymbol: '₹' });
   if (amount == null || isNaN(amount)) return '₹0';
 
   const value = Number(amount);

@@ -7,6 +7,7 @@ import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/port
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil, Wallet, PiggyBank, BarChart3, TrendingUp, TrendingDown } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
+import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
 const UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
@@ -116,6 +117,7 @@ function calculateXirr(flows) {
 }
 
 export default function InvestmentDetail() {
+  usePrivacyMaskRefresh();
   const { id } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
@@ -1055,7 +1057,7 @@ export default function InvestmentDetail() {
               )}
 
               <div className={`fw-bold ${profitColor(intervalChange)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
-                {formatINR(intervalChange)}
+                {formatINR(intervalChange, 0, { sensitive: false })}
               </div>
               {isDayChangeMode && (
                 <>
@@ -1709,7 +1711,7 @@ export default function InvestmentDetail() {
                             {!selectedId && <td>{renderScopeCell(row)}</td>}
                             <td className="text-end">{row.price_per_unit == null ? '-' : formatNumber(row.price_per_unit, 4)}</td>
                             <td className="text-end">{row.current_value == null ? '-' : formatINR(row.current_value)}</td>
-                            <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINRExact(row.day_change)}</td>
+                            <td className={`text-end ${profitColor(row.day_change)}`}>{row.day_change == null ? '-' : formatINRExact(row.day_change, 0, { sensitive: false })}</td>
                             <td className="ps-4">{row.price_source || '-'}</td>
                             {dailyValuesShowMore && <td className="text-end">{row.total_units == null ? '-' : formatNumber(row.total_units, 4)}</td>}
                             {dailyValuesShowMore && <td className="text-end">{row.invested_amount == null ? '-' : formatINR(row.invested_amount)}</td>}

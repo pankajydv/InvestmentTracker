@@ -664,9 +664,36 @@ tr:hover .row-actions {
   font-weight: 500;
 }
 
+.mobile-nav-shell {
+  width: 100%;
+  max-width: 100%;
+  flex-wrap: nowrap !important;
+  gap: 0.4rem;
+  overflow: visible;
+}
+
+.mobile-nav-brand,
+.mobile-nav-pwa,
+.mobile-nav-profile {
+  flex: 0 0 auto;
+}
+
+.mobile-primary-nav {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.mobile-primary-nav::-webkit-scrollbar {
+  display: none;
+}
+
 @media (max-width: 575.98px) {
   .mobile-nav-shell {
-    row-gap: 0.4rem;
+    align-items: center;
+    row-gap: 0;
   }
 
   .mobile-nav-brand {
@@ -676,12 +703,11 @@ tr:hover .row-actions {
 
   .mobile-primary-nav {
     order: 2;
-    width: auto;
-    max-width: 100%;
+    width: 100%;
     overflow-x: auto;
     overflow-y: hidden;
     flex-wrap: nowrap !important;
-    margin: 0 0.2rem;
+    margin: 0;
     padding: 0;
     border-top: 0;
   }
@@ -702,11 +728,6 @@ tr:hover .row-actions {
   .mobile-nav-profile {
     order: 4;
     margin-left: 0 !important;
-  }
-
-  .mobile-nav-portfolio-row {
-    order: 5;
-    margin-top: 0 !important;
   }
 
   .mobile-primary-nav .badge {

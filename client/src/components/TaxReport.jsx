@@ -4,6 +4,7 @@ import { Download } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { getTaxReport } from '../services/api';
 import { formatINR, formatDate, formatNumber, profitColor } from '../utils/formatters';
+import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 function fyOptions() {
   const start = 2020;
@@ -82,6 +83,7 @@ function combineTaxReports(reports) {
 }
 
 export default function TaxReport() {
+  usePrivacyMaskRefresh();
   const { selectedId, selectedIds, portfolios } = usePortfolio();
   const options = useMemo(() => fyOptions(), []);
   const [fy, setFy] = useState(options[0]);

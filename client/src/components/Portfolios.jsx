@@ -6,6 +6,7 @@ import { formatINR, formatDate, profitColor } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { Users, Pencil, Trash2, Plus, Check, X, Receipt } from 'lucide-react';
+import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 const COLORS = ['#f59e0b', '#3b82f6', '#10b981', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316'];
 
@@ -26,6 +27,7 @@ function resolveScopeLabel(portfolioLike) {
 }
 
 export default function Portfolios() {
+  usePrivacyMaskRefresh();
   const { refreshPortfolios, portfolios: ctxPortfolios, selectedId, selectedIds, selectedPortfolio } = usePortfolio();
   const [searchParams, setSearchParams] = useSearchParams();
   const [tab, setTab] = useState(searchParams.get('tab') || 'members');

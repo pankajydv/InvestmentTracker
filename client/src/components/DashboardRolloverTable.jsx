@@ -3,8 +3,10 @@ import { Card, Button, Collapse, Form, Spinner, Table } from 'react-bootstrap';
 import { getDashboardRollover } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { formatINR, formatINRExact, formatNumber, profitColor } from '../utils/formatters';
+import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 export default function DashboardRolloverTable({ title, description, assetType = null, showSource = true, compactCollapsed = false, defaultExpanded = false, wrapperClassName = 'shadow-sm mt-4' }) {
+  usePrivacyMaskRefresh();
   const { selectedIds } = usePortfolio();
   const selectedIdsKey = (selectedIds || []).join(',');
   const DEFAULT_PAGE_SIZE = 366;
@@ -228,7 +230,7 @@ export default function DashboardRolloverTable({ title, description, assetType =
                         <tr key={row.date}>
                           <td>{row.date}</td>
                           <td className="text-end">{formatINR(row.current_value)}</td>
-                          <td className={`text-end ${profitColor(row.day_change)}`}>{formatINRExact(row.day_change)}</td>
+                          <td className={`text-end ${profitColor(row.day_change)}`}>{formatINRExact(row.day_change, 0, { sensitive: false })}</td>
                           <td className={`text-end ${profitColor(row.day_change_pct)}`}>{formatNumber(row.day_change_pct, 2)}%</td>
                           {showSource && <td className="ps-4">{row.price_source || '-'}</td>}
                           {showMore && <td className="text-end">{formatINR(row.invested_amount)}</td>}

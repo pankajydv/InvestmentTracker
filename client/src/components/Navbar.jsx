@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { Navbar as BsNavbar, Nav, Container, Button, Dropdown, Modal, Form, Alert } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, ArrowLeftRight, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing, DatabaseZap, Trash2 } from 'lucide-react';
+import { BarChart3, PlusCircle, TrendingUp, List, ArrowLeftRight, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing, DatabaseZap, Trash2, Eye, EyeOff } from 'lucide-react';
 import { HolidaysListModal, HolidaysSyncModal } from './HolidaysMenuItems';
 import ManualDirtyScopeModal from './ManualDirtyScopeModal';
 import PurgeMarketPriceCacheModal from './PurgeMarketPriceCacheModal';
@@ -10,6 +10,7 @@ import { triggerPriceUpdate, cancelPriceUpdate, exportData, getCorporateActionSu
 import PortfolioSelector from './PortfolioSelector';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { usePortfolio } from '../context/PortfolioContext';
+import { usePrivacyMaskState } from '../utils/privacyMode';
 
 const PRIMARY_NAV_ITEMS = [
   { path: '/', label: 'Dashboard', shortLabel: 'Dashboard', icon: BarChart3 },
@@ -22,6 +23,7 @@ const PRIMARY_NAV_ITEMS = [
 export default function Navbar({ user, onLogout }) {
   const location = useLocation();
   const { selectedId } = usePortfolio();
+  const { masked, toggleMasked } = usePrivacyMaskState();
   const { settings, loading: settingsLoading, saving: settingsSaving, error: settingsError, saveSettings } = useAppSettings();
   const [updating, setUpdating] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -164,7 +166,30 @@ export default function Navbar({ user, onLogout }) {
           </Nav>
 
           <div className="d-flex d-md-none align-items-center gap-2 me-2 mobile-nav-pwa">
+            <Button
+              variant="light"
+              className="border d-inline-flex align-items-center justify-content-center"
+              style={{ width: 34, height: 34, padding: 0 }}
+              onClick={toggleMasked}
+              title={masked ? 'Show sensitive amounts' : 'Hide sensitive amounts'}
+              aria-label={masked ? 'Show sensitive amounts' : 'Hide sensitive amounts'}
+            >
+              {masked ? <EyeOff size={16} /> : <Eye size={16} />}
+            </Button>
             <PWAInstallButton />
+          </div>
+
+          <div className="d-none d-md-flex align-items-center me-2">
+            <Button
+              variant="light"
+              className="border d-inline-flex align-items-center justify-content-center"
+              style={{ width: 34, height: 34, padding: 0 }}
+              onClick={toggleMasked}
+              title={masked ? 'Show sensitive amounts' : 'Hide sensitive amounts'}
+              aria-label={masked ? 'Show sensitive amounts' : 'Hide sensitive amounts'}
+            >
+              {masked ? <EyeOff size={16} /> : <Eye size={16} />}
+            </Button>
           </div>
 
           <Dropdown align="end" className="ms-auto mobile-nav-profile">
@@ -267,10 +292,6 @@ export default function Navbar({ user, onLogout }) {
               </Dropdown.Item>
             </Dropdown.Menu>
           </Dropdown>
-
-          <div className="d-sm-none w-100 mt-2 mobile-nav-portfolio-row">
-            <PortfolioSelector fullWidth />
-          </div>
         </Container>
       </BsNavbar>
       <Modal show={showSettings} onHide={closeSettings} centered>
