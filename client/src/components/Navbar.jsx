@@ -294,6 +294,10 @@ export default function Navbar({ user, onLogout }) {
           </Dropdown>
         </Container>
       </BsNavbar>
+
+      <div className="d-sm-none mobile-portfolio-bar bg-white border-bottom px-3 py-2">
+        <PortfolioSelector fullWidth />
+      </div>
       <Modal show={showSettings} onHide={closeSettings} centered>
         <Modal.Header closeButton={!settingsSaving}>
           <Modal.Title className="h5 mb-0">Settings</Modal.Title>
