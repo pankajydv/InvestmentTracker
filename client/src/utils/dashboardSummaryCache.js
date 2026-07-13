@@ -7,7 +7,9 @@
 // open on quota errors (network remains the source of truth).
 
 const DASHBOARD_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-const DASHBOARD_CACHE_PREFIX = 'itrack:dash:v1:';
+// v2: combined multi-portfolio payloads now carry an aggregated `intervalXIRR`.
+// Bumped from v1 so entries cached with the old shape (no subset intervalXIRR) are ignored.
+const DASHBOARD_CACHE_PREFIX = 'itrack:dash:v2:';
 const DASHBOARD_CACHE_MAX_ENTRIES = 24;
 
 export function getDashboardCacheKey({

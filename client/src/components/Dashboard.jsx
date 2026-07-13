@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
-import { getDashboardSummary, getDashboardVersion, getDailyValuesHealthStatus, getDashboardBatch } from '../services/api';
+import { getDashboardSummary, getDashboardVersion, getDailyValuesHealthStatus, getDashboardBatch, getAssetIntervalMetrics } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_SLUG, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
@@ -83,6 +83,9 @@ function combineDashboardSummaries(results, selectedIds) {
   let firstXirrPct = null;
   let xirrPctSet = false;
   let xirrPctConsistent = true;
+  let intervalChangeSum = 0;
+  let intervalXirrSeen = false;
+  let intervalMeta = null;
   const firstRollupWarning = results.find((r) => r?.rollupWarning)?.rollupWarning || null;
   const portfolio = {
     total_value: 0,
@@ -103,6 +106,18 @@ function combineDashboardSummaries(results, selectedIds) {
     portfolio.total_realized_proceeds += Number(p.total_realized_proceeds) || 0;
     portfolio.day_change += Number(p.day_change) || 0;
     totalExpenses += Number(result?.totalExpenses) || 0;
+
+    // interval_change (absolute money) is additive across portfolios; the % is recomputed below
+    // against the combined opening value. For non-1D/YD intervals the caller overlays the
+    // server's exact (non-additive) intervalXIRR on top of this aggregate.
+    const ix = result?.intervalXIRR;
+    if (ix && ix.interval_change != null) {
+      intervalChangeSum += Number(ix.interval_change) || 0;
+      intervalXirrSeen = true;
+      if (!intervalMeta) {
+        intervalMeta = { from_date: ix.from_date ?? null, to_date: ix.to_date ?? null };
+      }
+    }
 
     if (p.xirr_pct != null) {
       if (!xirrPctSet) {
@@ -265,10 +280,25 @@ function combineDashboardSummaries(results, selectedIds) {
     ? (portfolio.day_change / prevPortfolioValue) * 100
     : 0;
 
+  const prevIntervalValue = portfolio.total_value - intervalChangeSum;
+  const intervalXIRR = intervalXirrSeen
+    ? {
+        interval_change: intervalChangeSum,
+        interval_change_pct: prevIntervalValue > 0
+          ? (intervalChangeSum / prevIntervalValue) * 100
+          : 0,
+        xirr_pct: null,
+        confidence: 'combined',
+        from_date: intervalMeta?.from_date ?? null,
+        to_date: intervalMeta?.to_date ?? null,
+      }
+    : null;
+
   return {
     portfolio,
     investments,
     byType,
+    intervalXIRR,
     portfolioCount: selectedIds.length,
     totalExpenses,
     rollupWarning: firstRollupWarning,
@@ -426,7 +456,7 @@ function mergeXirrEnrichment(baseData, enrichedData) {
 
 export default function Dashboard() {
   usePrivacyMaskRefresh();
-  const { selectedId, selectedIds, selectedPortfolio, selectedPortfolios, portfolios } = usePortfolio();
+  const { selectionMode, selectedId, selectedIds, selectedPortfolio, selectedPortfolios, portfolios } = usePortfolio();
   const { settings, loading: settingsLoading } = useAppSettings();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -565,7 +595,13 @@ export default function Dashboard() {
       && lastLoadedIntervalSigRef.current !== intervalSig;
     if (isIntervalRefresh) setIsIntervalSwitching(true);
     const showBlockingLoader = !data;
-    const targetPortfolioId = selectedIds.length > 1 ? null : selectedId;
+    // Scope resolution: 'all' is served by a single server aggregate (portfolio_id=null).
+    // A genuine partial subset ('some' with >1 id) has no server summary endpoint and must be
+    // combined client-side (exact for additive amounts; interval % overlaid from the server for
+    // non-1D/YD intervals). Single scope maps straight to selectedId.
+    const isAllScope = selectionMode === 'all';
+    const isPartialMulti = !isAllScope && selectedIds.length > 1;
+    const targetPortfolioId = isAllScope ? null : (isPartialMulti ? null : selectedId);
     const cacheKey = getDashboardCacheKey({
       targetPortfolioId,
       hideSold,
@@ -573,6 +609,7 @@ export default function Dashboard() {
       selectedInterval,
       customFromDate,
       customToDate,
+      extra: isPartialMulti ? `combine:${selectedIdsKey}` : undefined,
     });
     const cachedEntry = getCachedDashboardSummary(cacheKey);
 
@@ -610,7 +647,58 @@ export default function Dashboard() {
         }
       }
 
-      if (showBlockingLoader && !cachedEntry) {
+      if (isPartialMulti) {
+        // No server summary endpoint for a partial subset: fetch each selected portfolio and
+        // combine client-side. Additive amounts and the 1D/YD % are exact from the combine.
+        setShowDetailTables(false);
+        const requestOptions = {
+          hideSold,
+          includeFullySoldInReturns,
+          xirrMode: 'full',
+          interval: selectedInterval,
+          customFromDate: customFromDate || undefined,
+          customToDate: customToDate || undefined,
+        };
+        const results = await Promise.all(
+          selectedIds.map((id) => getDashboardSummary(id, requestOptions)),
+        );
+        if (runId !== loadRunRef.current) return;
+        const combined = combineDashboardSummaries(results, selectedIds);
+        const resultVersion = results.find((r) => r?.dataVersion != null)?.dataVersion ?? null;
+
+        // Every interval other than 1D/YD is a non-additive XIRR that only the server can solve
+        // over unioned cashflows, so overlay the server's exact per-type change/% and portfolio
+        // interval XIRR for the same subset.
+        const usesXirrInterval = selectedInterval !== '1D' && selectedInterval !== 'YD';
+        if (usesXirrInterval && combined) {
+          try {
+            const metrics = await getAssetIntervalMetrics({
+              portfolioIds: selectedIds,
+              interval: selectedInterval,
+              customFromDate: customFromDate || undefined,
+              customToDate: customToDate || undefined,
+            });
+            if (runId !== loadRunRef.current) return;
+            if (metrics?.byType && combined.byType) {
+              for (const [type, m] of Object.entries(metrics.byType)) {
+                if (!combined.byType[type] || !m) continue;
+                combined.byType[type].dayChange = m.dayChange;
+                combined.byType[type].intervalChangePct = m.intervalChangePct;
+              }
+            }
+            if (metrics?.intervalXIRR) {
+              combined.intervalXIRR = { ...(combined.intervalXIRR || {}), ...metrics.intervalXIRR };
+            }
+          } catch (_e) {
+            // Fall back to the combine's approximate interval % if the overlay fetch fails.
+          }
+        }
+        if (runId !== loadRunRef.current) return;
+        setData(combined);
+        setCachedDashboardSummary(cacheKey, combined, resultVersion);
+        setLoading(false);
+        setShowDetailTables(true);
+      } else if (showBlockingLoader && !cachedEntry) {
         setShowDetailTables(false);
         const fastResult = await getDashboardSummary(targetPortfolioId, {
           hideSold,
