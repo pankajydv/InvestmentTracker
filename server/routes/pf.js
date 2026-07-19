@@ -9,6 +9,7 @@ const express = require('express');
 const multer = require('multer');
 const { parsePFStatements } = require('../services/pfStatementParser');
 const { logAppInfo, logAppError } = require('../services/appLogger');
+const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -403,10 +404,24 @@ module.exports = function (db) {
    */
   router.post('/manual', express.json(), async (req, res) => {
     try {
-      const { portfolio_id, date, type, eeAmount, erAmount, epsAmount, notes } = req.body;
+      const { portfolio_id, date, type, amount, eeAmount, erAmount, epsAmount, notes } = req.body;
 
       if (!portfolio_id || !date || !type) {
         return res.status(400).json({ error: 'portfolio_id, date, and type are required' });
+      }
+
+      const normalizedType = String(type || '').trim().toUpperCase();
+      const explicitAmount = amount === undefined || amount === null || amount === '' ? null : Number(amount);
+      const legacyEeAmount = eeAmount === undefined || eeAmount === null || eeAmount === '' ? null : Number(eeAmount);
+      const legacyErAmount = erAmount === undefined || erAmount === null || erAmount === '' ? null : Number(erAmount);
+      const legacyEpsAmount = epsAmount === undefined || epsAmount === null || epsAmount === '' ? null : Number(epsAmount);
+
+      if (explicitAmount != null && (!Number.isFinite(explicitAmount) || explicitAmount <= 0)) {
+        return res.status(400).json({ error: 'amount must be a positive number' });
+      }
+
+      if (explicitAmount == null && legacyEeAmount == null && legacyErAmount == null && legacyEpsAmount == null) {
+        return res.status(400).json({ error: 'amount is required' });
       }
 
       const portfolioId = parseInt(portfolio_id);
@@ -447,13 +462,22 @@ module.exports = function (db) {
 
       const dirtyCandidates = [];
 
+      const accountRef = pfInv.account_number || `PF-${portfolioId}`;
+      const statementLabel = getPFStatementLabel(date);
+      const baseManualNote = (notes || '').trim() || `Manual Entry (${normalizedType})`;
+      const makeNote = (extra = null, fallbackAccountRef = accountRef) => {
+        const prefix = `A/c: ${fallbackAccountRef}, From: ${statementLabel}`;
+        const noteParts = [prefix];
+        if (extra) noteParts.push(extra);
+        noteParts.push(`Note: ${baseManualNote}`);
+        return noteParts.join(', ');
+      };
+
+      const isContributionType = ['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'EPS_CONTRIBUTION'].includes(normalizedType);
+
       const importTxn = db.transaction(() => {
         let insertedCount = 0;
         let epsInvestmentId = null;
-        const baseManualNote = (notes || '').trim() || `Manual Entry (${type})`;
-        const accountRef = pfInv.account_number || `PF-${portfolioId}`;
-        const statementLabel = getPFStatementLabel(date);
-        const manualMainNote = `A/c: ${accountRef}, From: ${statementLabel}, Note: ${baseManualNote}`;
 
         const existingEpsInv = findEpsInv.get(portfolioId);
         if (existingEpsInv) {
@@ -463,27 +487,30 @@ module.exports = function (db) {
           epsInvestmentId = created.lastInsertRowid;
         }
 
-        // Employee contribution
-        if (eeAmount > 0 && type !== 'EMPLOYER_CONTRIBUTION') {
-          insertTransaction.run(pfInv.id, portfolioId, 'DEPOSIT', date, eeAmount, manualMainNote);
-          dirtyCandidates.push({ investment_id: pfInv.id, portfolio_id: portfolioId, transaction_date: date });
+        if (explicitAmount != null) {
+          const targetInvestmentId = normalizedType === 'EPS_CONTRIBUTION' ? epsInvestmentId : pfInv.id;
+          const note = normalizedType === 'EPS_CONTRIBUTION'
+            ? makeNote(null, `EPS-${portfolioId}`)
+            : makeNote();
+          insertTransaction.run(targetInvestmentId, portfolioId, normalizedType, date, explicitAmount, note);
+          dirtyCandidates.push({ investment_id: targetInvestmentId, portfolio_id: portfolioId, transaction_date: date });
           insertedCount++;
-        }
+        } else {
+          // Legacy split-mode support for older UI payloads.
+          if (legacyEeAmount != null && legacyEeAmount > 0 && (normalizedType === 'DEPOSIT' || normalizedType === 'EMPLOYEE_CONTRIBUTION')) {
+            insertTransaction.run(pfInv.id, portfolioId, 'DEPOSIT', date, legacyEeAmount, makeNote());
+            dirtyCandidates.push({ investment_id: pfInv.id, portfolio_id: portfolioId, transaction_date: date });
+            insertedCount++;
+          }
 
-        // Employer contribution
-        if (erAmount > 0 && type !== 'DEPOSIT') {
-          insertTransaction.run(pfInv.id, portfolioId, 'EMPLOYER_CONTRIBUTION', date, erAmount, manualMainNote);
-          dirtyCandidates.push({ investment_id: pfInv.id, portfolio_id: portfolioId, transaction_date: date });
-          insertedCount++;
-        }
+          if (legacyErAmount != null && legacyErAmount > 0 && (normalizedType === 'EMPLOYER_CONTRIBUTION' || normalizedType === 'DEPOSIT' || normalizedType === 'EMPLOYEE_CONTRIBUTION')) {
+            insertTransaction.run(pfInv.id, portfolioId, 'EMPLOYER_CONTRIBUTION', date, legacyErAmount, makeNote());
+            dirtyCandidates.push({ investment_id: pfInv.id, portfolio_id: portfolioId, transaction_date: date });
+            insertedCount++;
+          }
 
-        // EPS contribution
-        if (epsAmount > 0 && epsInvestmentId) {
-          // Calculate EPS as the difference if not provided
-          const epsToInsert = epsAmount > 0 ? epsAmount : (erAmount - eeAmount);
-          if (epsToInsert > 0) {
-            const epsNote = `Derived from manual EPF split: Employee PF ${Number(eeAmount || 0).toFixed(2)} - Employer EPF ${Number(erAmount || 0).toFixed(2)} = EPS ${Number(epsToInsert).toFixed(2)}. A/c: ${accountRef}, From: ${statementLabel}, Note: ${baseManualNote}`;
-            insertTransaction.run(epsInvestmentId, portfolioId, 'EPS_CONTRIBUTION', date, epsToInsert, epsNote);
+          if (legacyEpsAmount != null && legacyEpsAmount > 0 && epsInvestmentId) {
+            insertTransaction.run(epsInvestmentId, portfolioId, 'EPS_CONTRIBUTION', date, legacyEpsAmount, makeNote(null, `EPS-${portfolioId}`));
             dirtyCandidates.push({ investment_id: epsInvestmentId, portfolio_id: portfolioId, transaction_date: date });
             insertedCount++;
           }

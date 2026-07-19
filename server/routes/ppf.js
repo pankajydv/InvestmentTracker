@@ -8,6 +8,7 @@ const express = require('express');
 const multer = require('multer');
 const { parsePPFStatements } = require('../services/ppfStatementParser');
 const { logAppInfo, logAppError } = require('../services/appLogger');
+const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });

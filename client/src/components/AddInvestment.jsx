@@ -156,8 +156,7 @@ export default function AddInvestment() {
   const [pfManualForm, setPfManualForm] = useState({
     date: new Date().toISOString().split('T')[0],
     type: 'DEPOSIT',
-    eeAmount: '',
-    erAmount: '',
+    amount: '',
     notes: '',
   });
 
@@ -178,6 +177,16 @@ export default function AddInvestment() {
     }
   }, [assetType]);
 
+  useEffect(() => {
+    if (assetType === 'PPF' || assetType === 'SSY') {
+      const allowedTypes = new Set(['DEPOSIT', 'WITHDRAWAL', 'INTEREST', 'RECONCILE']);
+      setTxn((prev) => ({
+        ...prev,
+        transaction_type: allowedTypes.has(prev.transaction_type) ? prev.transaction_type : 'DEPOSIT',
+      }));
+    }
+  }, [assetType]);
+
   const updateTxn = (field, value) => {
     const updated = { ...txn, [field]: value };
     if ((field === 'units' || field === 'price_per_unit') && updated.units && updated.price_per_unit) {
@@ -185,6 +194,17 @@ export default function AddInvestment() {
     }
     setTxn(updated);
   };
+
+  const PF_MANUAL_TYPES = [
+    { value: 'DEPOSIT', label: 'Employee Contribution', amountLabel: 'Employee contribution' },
+    { value: 'EMPLOYER_CONTRIBUTION', label: 'Employer Contribution', amountLabel: 'Employer contribution' },
+    { value: 'VOLUNTARY_CONTRIBUTION', label: 'Voluntary Contribution', amountLabel: 'Voluntary contribution' },
+    { value: 'INTEREST', label: 'Interest', amountLabel: 'Interest amount' },
+    { value: 'WITHDRAWAL', label: 'Withdrawal', amountLabel: 'Withdrawal amount' },
+    { value: 'RECONCILE', label: 'Reconcile', amountLabel: 'Reconcile amount' },
+  ];
+
+  const pfManualTypeMeta = PF_MANUAL_TYPES.find((item) => item.value === pfManualForm.type) || PF_MANUAL_TYPES[0];
 
   const handleMfSearch = async () => {
     if (mfSearch.length < 2) return;
@@ -808,23 +828,16 @@ export default function AddInvestment() {
     setPfError('');
     if (!portfolioId) return setPfError('Please select a portfolio first');
     if (!pfManualForm.date) return setPfError('Please select a date');
-    if ((!pfManualForm.eeAmount || pfManualForm.eeAmount === '0') && 
-        (!pfManualForm.erAmount || pfManualForm.erAmount === '0')) {
-      return setPfError('Please enter at least Employee or Employer contribution amount');
+    if (!pfManualForm.amount || parseFloat(pfManualForm.amount) <= 0) {
+      return setPfError('Please enter an amount');
     }
 
     setPfImporting(true);
     try {
-      const eeAmt = parseFloat(pfManualForm.eeAmount) || 0;
-      const erAmt = parseFloat(pfManualForm.erAmount) || 0;
-      const epsAmt = erAmt - eeAmt; // EPS = ER - EE
-
       const res = await addManualPFTransaction(portfolioId, {
         date: pfManualForm.date,
         type: pfManualForm.type,
-        eeAmount: eeAmt,
-        erAmount: erAmt,
-        epsAmount: epsAmt > 0 ? epsAmt : 0,
+        amount: parseFloat(pfManualForm.amount),
         notes: (pfManualForm.notes || '').trim(),
       });
 
@@ -832,8 +845,7 @@ export default function AddInvestment() {
       setPfManualForm({
         date: new Date().toISOString().split('T')[0],
         type: 'DEPOSIT',
-        eeAmount: '',
-        erAmount: '',
+        amount: '',
         notes: '',
       });
       await refreshPortfolios();
@@ -951,11 +963,10 @@ export default function AddInvestment() {
       }
 
       if (txn.amount && parseFloat(txn.amount) > 0) {
-        const isPPF = assetType === 'PPF' || assetType === 'SSY' || assetType === 'PF';
         await addTransaction({
           investment_id: invId,
           portfolio_id: portfolioId || null,
-          transaction_type: isPPF ? 'DEPOSIT' : txn.transaction_type,
+          transaction_type: txn.transaction_type,
           transaction_date: txn.transaction_date,
           units: txn.units ? parseFloat(txn.units) : null,
           price_per_unit: txn.price_per_unit ? parseFloat(txn.price_per_unit) : null,
@@ -2820,6 +2831,19 @@ export default function AddInvestment() {
 
                   <Row className="g-3">
                     <Col md={6}>
+                      <Form.Label className="small">Type</Form.Label>
+                      <Form.Select
+                        size="sm"
+                        value={txn.transaction_type}
+                        onChange={(e) => updateTxn('transaction_type', e.target.value)}
+                      >
+                        <option value="DEPOSIT">Deposit</option>
+                        <option value="WITHDRAWAL">Withdrawal</option>
+                        <option value="INTEREST">Interest</option>
+                        <option value="RECONCILE">Reconcile</option>
+                      </Form.Select>
+                    </Col>
+                    <Col md={6}>
                       <Form.Label className="small">Date</Form.Label>
                       <Form.Control
                         size="sm"
@@ -2853,7 +2877,7 @@ export default function AddInvestment() {
 
                   <div className="mt-3 d-flex justify-content-center gap-3">
                     <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
-                      {submitting ? <><Spinner size="sm" className="me-1" /> Adding...</> : selectedPpfAccount ? `+ Add Deposit` : `+ Add ${assetType} Investment`}
+                      {submitting ? <><Spinner size="sm" className="me-1" /> Adding...</> : selectedPpfAccount ? `+ Add Transaction` : `+ Add ${assetType} Investment`}
                     </Button>
                     <Button variant="link" className="text-muted" onClick={() => navigate(-1)}>
                       Close
@@ -3052,7 +3076,7 @@ export default function AddInvestment() {
             <Collapse in={expandedSection === 'pf-manual'}>
               <div>
                 <Card.Body className="pt-2">
-                  <p className="small text-muted mb-3">Add a PF transaction manually. EPS will be calculated automatically as the difference between Employer and Employee contributions.</p>
+                  <p className="small text-muted mb-3">Add one PF row at a time. EPS is derived automatically from Employee and Employer contribution rows, so it is not entered here.</p>
 
                   {pfError && (
                     <Alert variant="danger" className="small py-2 d-flex align-items-center gap-2 mb-3">
@@ -3070,8 +3094,7 @@ export default function AddInvestment() {
                         setPfManualForm({
                           date: new Date().toISOString().split('T')[0],
                           type: 'DEPOSIT',
-                          eeAmount: '',
-                          erAmount: '',
+                              amount: '',
                           notes: '',
                         });
                       }}>Add another</button>
@@ -3097,30 +3120,20 @@ export default function AddInvestment() {
                             value={pfManualForm.type}
                             onChange={(e) => setPfManualForm({ ...pfManualForm, type: e.target.value })}
                           >
-                            <option value="DEPOSIT">Employee Contribution</option>
-                            <option value="EMPLOYER_CONTRIBUTION">Employer Contribution</option>
+                                {PF_MANUAL_TYPES.map((item) => (
+                                  <option key={item.value} value={item.value}>{item.label}</option>
+                                ))}
                           </Form.Select>
                         </Col>
                         <Col md={6}>
-                          <Form.Label className="small">Employee Contribution (₹)</Form.Label>
+                              <Form.Label className="small">{pfManualTypeMeta.amountLabel} (₹)</Form.Label>
                           <Form.Control
                             size="sm"
                             type="number"
                             step="0.01"
-                            value={pfManualForm.eeAmount}
-                            onChange={(e) => setPfManualForm({ ...pfManualForm, eeAmount: e.target.value })}
-                            placeholder="Employee amount"
-                          />
-                        </Col>
-                        <Col md={6}>
-                          <Form.Label className="small">Employer Contribution (₹)</Form.Label>
-                          <Form.Control
-                            size="sm"
-                            type="number"
-                            step="0.01"
-                            value={pfManualForm.erAmount}
-                            onChange={(e) => setPfManualForm({ ...pfManualForm, erAmount: e.target.value })}
-                            placeholder="Employer amount"
+                                value={pfManualForm.amount}
+                                onChange={(e) => setPfManualForm({ ...pfManualForm, amount: e.target.value })}
+                                placeholder={pfManualTypeMeta.amountLabel}
                           />
                         </Col>
                         <Col md={12}>
@@ -3133,16 +3146,9 @@ export default function AddInvestment() {
                             placeholder="Optional notes"
                           />
                         </Col>
-                        <Col md={12}>
-                          <Form.Label className="small text-info">EPS (Auto-calculated)</Form.Label>
-                          <Form.Control
-                            size="sm"
-                            type="text"
-                            disabled
-                            value={`₹ ${Math.max(0, (parseFloat(pfManualForm.erAmount) || 0) - (parseFloat(pfManualForm.eeAmount) || 0)).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`}
-                          />
-                          <div className="small text-muted mt-1">EPS = Employer - Employee contribution</div>
-                        </Col>
+                            <Col md={12}>
+                              <div className="small text-muted mt-1">This will create a single PF transaction row. Use the same date for related contribution rows if you want them grouped in the table.</div>
+                            </Col>
                       </Row>
 
                       <div className="mt-3 d-flex justify-content-center gap-3">

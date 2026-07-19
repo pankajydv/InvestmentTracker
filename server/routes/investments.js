@@ -7,7 +7,7 @@ const {
   XIRR_CASH_INFLOW_TYPES,
   INVESTED_AMOUNT_INFLOW_TYPES_SQL,
 } = require('../constants/transactionTypes');
-const { markScopeDirty } = require('../services/dirtyBackfillService');
+const { markScopeDirty, markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 const { getInvestmentSeries, getMarketSessionDates, getSeries } = require('../services/marketPriceCache');
 const { DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS } = require('../services/freshnessPolicy');
 

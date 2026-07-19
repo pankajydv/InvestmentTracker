@@ -21,7 +21,9 @@ const TYPE_LABELS = {
   EPS_CONTRIBUTION: 'EPS',
   INTEREST: 'Interest',
   RECONCILE: 'Reconcile',
-  WITHDRAWAL: 'Withdrawal'
+  WITHDRAWAL: 'Withdrawal',
+  TRANSFER_IN: 'Transfer In',
+  TRANSFER_OUT: 'Transfer Out',
 };
 
 const CASH_OUTFLOW_TYPES = new Set([
@@ -52,12 +54,19 @@ function isInternalXirrCashflow(assetType, transactionType) {
 function getTxnTypesForInvestment(investment) {
   if (!investment) return ['BUY', 'SELL', 'DIVIDEND'];
 
-  const isPPFType = investment.asset_type === 'PPF' || investment.asset_type === 'SSY' || investment.asset_type === 'PF';
+  const isPPFType = investment.asset_type === 'PPF' || investment.asset_type === 'SSY';
+  const isPFType = investment.asset_type === 'PF';
+  const isEpsInvestment = isPFType && /eps/i.test(String(investment.name || ''));
   const isBondType = investment.asset_type === 'BOND';
   const isSGBType = investment.asset_type === 'SGB';
   const isForeignUsdType = investment.asset_type === 'FOREIGN_STOCK' && investment.currency === 'USD';
 
   if (isPPFType) return ['DEPOSIT', 'WITHDRAWAL', 'INTEREST', 'RECONCILE'];
+  if (isPFType) {
+    return isEpsInvestment
+      ? ['EPS_CONTRIBUTION', 'INTEREST', 'WITHDRAWAL', 'RECONCILE']
+      : ['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'INTEREST', 'WITHDRAWAL', 'RECONCILE'];
+  }
   if (isBondType || isSGBType) return ['BUY', 'SELL', 'INTEREST'];
   if (isForeignUsdType) return ['VEST', 'ESPP_CONTRIBUTION', 'ESPP_PURCHASE', 'BUY', 'SELL', 'DIVIDEND'];
   return ['BUY', 'SELL', 'DIVIDEND'];
@@ -639,8 +648,8 @@ export default function InvestmentDetail() {
   const isSSY = data.asset_type === 'SSY';
   const isPPFOnly = data.asset_type === 'PPF';
   const isPFOnly = data.asset_type === 'PF';
+  const isEpsInvestment = isPFOnly && /eps/i.test(String(data.name || ''));
   const interestPreviewDecimals = isPPF ? 0 : 2;
-  const isEpsInvestment = isPPF && /eps/i.test(String(data.name || ''));
   const isBond = data.asset_type === 'BOND';
   const isSGB = data.asset_type === 'SGB';
   const isForeignUSD = data.asset_type === 'FOREIGN_STOCK' && data.currency === 'USD';
