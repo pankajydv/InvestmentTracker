@@ -15,6 +15,7 @@ const {
   getSeries,
   getNearestOnOrBefore,
   hydrateHistoricalPriceSeries,
+  getMarketSessionDates,
 } = require('./marketPriceCache');
 const {
   normalizeProviderDate,
@@ -24,7 +25,7 @@ const {
   formatIstDate,
   addDaysIso: addDaysIsoDate,
 } = require('./dateUtils');
-const { logAppWarn } = require('./appLogger');
+const { logAppWarn, logAppInfo } = require('./appLogger');
 
 function isoDate(date) {
   return formatIstDate(date);
@@ -1194,29 +1195,221 @@ async function fetchHistoricalOHLCRange(symbol, fromDate, toDate) {
  */
 async function fetchUSDToINR() {
   try {
-    // Try direct chart API first
-    const data = await fetchStockPriceDirect('USDINR=X');
-    return data.price || 83.5;
+    const today = new Date().toISOString().split('T')[0];
+    return await fetchHistoricalUSDToINR(today);
   } catch (e) {
-    try {
-      const yf = await getYahooFinance();
-      const quote = await yf.quote('USDINR=X');
-      return quote.regularMarketPrice || 83.5;
-    } catch (e2) {
-      console.error('Failed to fetch USD/INR rate:', e.message);
-      return 83.5; // fallback
+    console.error('Failed to fetch USD/INR rate:', e.message);
+    return 83.5; // fallback
+  }
+}
+
+const SBI_TT_BUY_CSV_URL = 'https://raw.githubusercontent.com/sahilgupta/sbi-fx-ratekeeper/main/csv_files/SBI_REFERENCE_RATES_USD.csv';
+const RBI_REFERENCE_ARCHIVE_URL = 'https://www.rbi.org.in/scripts/referenceratearchive.aspx';
+
+let sbiFxRatesByDateCache = null;
+let sbiFxRatesByDatePromise = null;
+
+function parseCsvDate(raw) {
+  const text = String(raw || '').trim();
+  const isoMatch = text.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (isoMatch) return isoMatch[1];
+  const dmyMatch = text.match(/\b(\d{2})[\/.-](\d{2})[\/.-](\d{4})\b/);
+  if (dmyMatch) return `${dmyMatch[3]}-${dmyMatch[2]}-${dmyMatch[1]}`;
+  return null;
+}
+
+async function loadSbiTTBuyRatesByDate() {
+  if (sbiFxRatesByDateCache) return sbiFxRatesByDateCache;
+  if (sbiFxRatesByDatePromise) return sbiFxRatesByDatePromise;
+
+  const promise = new Promise((resolve, reject) => {
+    https.get(SBI_TT_BUY_CSV_URL, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`SBI TT Buy CSV returned ${res.statusCode}`));
+        return;
+      }
+
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const byDate = new Map();
+          const lines = String(data || '').trim().split(/\r?\n/).slice(1);
+          for (const line of lines) {
+            const parts = line.split(',');
+            if (parts.length < 3) continue;
+            const parsedDate = parseCsvDate(parts[0]);
+            const rate = parseFloat(String(parts[2] || '').trim());
+            if (!parsedDate || !Number.isFinite(rate) || rate <= 0) continue;
+            byDate.set(parsedDate, rate);
+          }
+          resolve(byDate);
+        } catch (err) {
+          reject(err);
+        }
+      });
+      res.on('error', reject);
+    }).on('error', reject);
+  }).then((byDate) => {
+    sbiFxRatesByDateCache = byDate;
+    return byDate;
+  }).finally(() => {
+    sbiFxRatesByDatePromise = null;
+  });
+
+  sbiFxRatesByDatePromise = promise;
+  return promise;
+}
+
+function getNearestFxOnOrBefore(date) {
+  const normalizedDate = String(date || '').split('T')[0];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) return null;
+  const row = getNearestOnOrBefore('FX', 'USDINR=X', normalizedDate);
+  const rate = Number(row?.close);
+  if (!Number.isFinite(rate) || rate <= 0) return null;
+  return {
+    date: row.date,
+    close: rate,
+    source: String(row?.source || '').trim() || null,
+  };
+}
+
+function formatDateForRbi(dateIso) {
+  const iso = String(dateIso || '').split('T')[0];
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return `${m[3]}/${m[2]}/${m[1]}`;
+}
+
+function parseRbiDate(raw) {
+  const text = String(raw || '').trim();
+  const m = text.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return null;
+  return `${m[3]}-${m[2]}-${m[1]}`;
+}
+
+function extractAspNetHiddenValue(html, name) {
+  const pattern = new RegExp(`name=\\"${name}\\"[^>]*value=\\"([^\\"]*)\\"`, 'i');
+  const match = String(html || '').match(pattern);
+  return match?.[1] || '';
+}
+
+function httpRequestText(url, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  const headers = { 'User-Agent': 'Mozilla/5.0', ...(options.headers || {}) };
+  const body = options.body == null ? null : String(options.body);
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, { method, headers }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+          return;
+        }
+        resolve(data);
+      });
+    });
+
+    req.on('error', reject);
+    if (body != null) req.write(body);
+    req.end();
+  });
+}
+
+function parseRbiUsdRows(html) {
+  const byDate = new Map();
+  const rowRegex = /<tr>\s*<td[^>]*>\s*(\d{2}\/\d{2}\/\d{4})\s*<\/td>\s*<td[^>]*>\s*([0-9]+(?:\.[0-9]+)?)\s*<\/td>/gi;
+  let match;
+  while ((match = rowRegex.exec(String(html || ''))) !== null) {
+    const dateIso = parseRbiDate(match[1]);
+    const rate = Number(match[2]);
+    if (!dateIso || !Number.isFinite(rate) || rate <= 0) continue;
+    byDate.set(dateIso, rate);
+  }
+  return byDate;
+}
+
+async function fetchRbiReferenceUsdRatesByDate(fromDate, toDate) {
+  const fromRbi = formatDateForRbi(fromDate);
+  const toRbi = formatDateForRbi(toDate);
+  if (!fromRbi || !toRbi) {
+    throw new Error(`Invalid RBI range ${fromDate}..${toDate}`);
+  }
+
+  const initialHtml = await httpRequestText(RBI_REFERENCE_ARCHIVE_URL, { method: 'GET' });
+  const body = new URLSearchParams({
+    __EVENTTARGET: '',
+    __EVENTARGUMENT: '',
+    __VIEWSTATE: extractAspNetHiddenValue(initialHtml, '__VIEWSTATE'),
+    __VIEWSTATEGENERATOR: extractAspNetHiddenValue(initialHtml, '__VIEWSTATEGENERATOR'),
+    __EVENTVALIDATION: extractAspNetHiddenValue(initialHtml, '__EVENTVALIDATION'),
+    chkUSD: 'on',
+    txtFromDate: fromRbi,
+    txtToDate: toRbi,
+    btnSubmit: ' GO ',
+  }).toString();
+
+  const responseHtml = await httpRequestText(RBI_REFERENCE_ARCHIVE_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(body),
+    },
+    body,
+  });
+
+  return parseRbiUsdRows(responseHtml);
+}
+
+function getFxMissingWindows(rows, sessionDates) {
+  const rowMap = new Map(
+    (rows || [])
+      .filter((row) => row?.date && row?.close != null && Number.isFinite(Number(row.close)) && Number(row.close) > 0)
+      .map((row) => [row.date, row])
+  );
+
+  const windows = [];
+  let windowStart = null;
+  let previousDate = null;
+
+  for (const date of sessionDates) {
+    const covered = rowMap.has(date);
+    if (!covered) {
+      if (!windowStart) windowStart = date;
+      previousDate = date;
+      continue;
+    }
+    if (windowStart) {
+      windows.push({ from: windowStart, to: previousDate || windowStart });
+      windowStart = null;
+      previousDate = null;
     }
   }
+
+  if (windowStart) {
+    windows.push({ from: windowStart, to: previousDate || windowStart });
+  }
+
+  return windows;
+}
+
+function summarizeDecisionSamples(decisions, source) {
+  return decisions
+    .filter((d) => d.source === source)
+    .slice(0, 12)
+    .map((d) => ({ date: d.date, reason: d.reason, rate: d.rate, carryFromDate: d.carryFromDate || null, carryFromSource: d.carryFromSource || null }));
 }
 
 /**
  * Fetch historical USD/INR exchange rate for a specific date.
  *
  * Strategy:
- *   1. Try FBIL (Financial Benchmarks India Ltd) — publishes the official RBI
- *      reference rate. The public CSV endpoint returns the rate for a given date.
- *   2. Fall back to Yahoo Finance historical chart for USDINR=X.
- *   3. Fall back to the cached/live rate as a last resort.
+ *   1. Try SBI TT Buy first.
+ *   2. Fall back to RBI reference archive rate.
+ *   3. If both are unavailable for a session date, use last known rate and
+ *      persist as LOCF for traceable FX coverage.
  *
  * @param {string} date - ISO date string e.g. '2024-03-15'
  * @returns {Promise<number>} INR per USD
@@ -1224,125 +1417,34 @@ async function fetchUSDToINR() {
 async function fetchHistoricalUSDToINR(date) {
   if (!date) return fetchUSDToINR();
 
-  const exact = getSeries('FX', 'USDINR=X', date, date)
-    .find((row) => row?.date === date && row?.close != null);
+  const normalizedDate = String(date || '').split('T')[0];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedDate)) {
+    throw new Error(`Invalid FX date ${date}`);
+  }
+
+  const exact = getSeries('FX', 'USDINR=X', normalizedDate, normalizedDate)
+    .find((row) => row?.date === normalizedDate && row?.close != null);
   if (exact && exact.close != null) return Number(exact.close);
 
-  const nearestCached = getNearestOnOrBefore('FX', 'USDINR=X', date);
+  await fetchHistoricalUSDToINRRange(normalizedDate, normalizedDate);
 
-  // ── 1. FBIL reference rate ────────────────────────────────────────────────
-  try {
-    const rate = await _fetchFBILRate(date);
-    if (rate && rate > 0) {
-      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rate, source: 'FBIL' });
-      return rate;
-    }
-  } catch (e) {
-    console.error(`fetchHistoricalUSDToINR: FBIL fetch failed for ${date}:`, e.message);
-  }
+  const afterHydrate = getSeries('FX', 'USDINR=X', normalizedDate, normalizedDate)
+    .find((row) => row?.date === normalizedDate && row?.close != null);
+  if (afterHydrate && afterHydrate.close != null) return Number(afterHydrate.close);
 
-  // ── 2. Yahoo Finance historical USDINR=X ──────────────────────────────────
-  try {
-    const rate = await _fetchYahooHistoricalUSDINR(date);
-    if (rate && rate > 0) {
-      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rate, source: 'YAHOO' });
-      return rate;
-    }
-  } catch (e) {
-    console.error(`fetchHistoricalUSDToINR: Yahoo fetch failed for ${date}:`, e.message);
-  }
-
-  // ── 3. Current rate as fallback ───────────────────────────────────────────
+  const nearestCached = getNearestFxOnOrBefore(normalizedDate);
   if (nearestCached && nearestCached.close != null) {
-    const locfRate = Number(nearestCached.close);
-    if (Number.isFinite(locfRate) && locfRate > 0) {
-      // LOCF is not persisted to the FX cache; carry forward at read time only.
-      return locfRate;
-    }
+    logAppWarn('[FXRange] Using nearest cached FX fallback for unresolved date', {
+      date: normalizedDate,
+      fallbackDate: nearestCached.date,
+      fallbackRate: nearestCached.close,
+      fallbackSource: nearestCached.source,
+      reason: 'no_exact_row_after_hydration',
+    });
+    return Number(nearestCached.close);
   }
 
-  console.warn(`fetchHistoricalUSDToINR: could not get rate for ${date}, using current rate`);
-  const currentRate = await fetchUSDToINR();
-  if (Number.isFinite(Number(currentRate)) && Number(currentRate) > 0) {
-    // Last-resort spot rate is a proxy for a missing historical date; return it for this
-    // run but do NOT persist it (avoids anchoring today's rate onto a past date as a
-    // provider observation). Real provider data is fetched/cached on subsequent runs.
-    return Number(currentRate);
-  }
-
-  return currentRate;
-}
-
-const fbilMonthlyCache = new Map();
-
-function getYearMonth(dateIso) {
-  const [year, month] = String(dateIso).split('-');
-  return `${year}-${month}`;
-}
-
-function nextMonth(ym) {
-  const [yearStr, monthStr] = ym.split('-');
-  const year = Number(yearStr);
-  const month = Number(monthStr);
-  const d = new Date(Date.UTC(year, month - 1, 1));
-  d.setUTCMonth(d.getUTCMonth() + 1);
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-}
-
-function listYearMonths(fromDate, toDate) {
-  const out = [];
-  let ym = getYearMonth(fromDate);
-  const endYm = getYearMonth(toDate);
-  while (ym <= endYm) {
-    out.push(ym);
-    ym = nextMonth(ym);
-  }
-  return out;
-}
-
-function parseFBILMonthlyCsv(csvText) {
-  const byDate = new Map();
-  const lines = String(csvText || '').trim().split('\n').slice(1);
-  for (const line of lines) {
-    const parts = line.split(',');
-    if (parts.length < 2) continue;
-    const parsedDate = _parseFBILDate((parts[0] || '').trim());
-    const rate = parseFloat((parts[1] || '').trim());
-    if (!parsedDate || !Number.isFinite(rate) || rate <= 0) continue;
-    byDate.set(parsedDate, rate);
-  }
-  return byDate;
-}
-
-async function fetchFBILMonthlyRates(yearMonth) {
-  if (fbilMonthlyCache.has(yearMonth)) {
-    return fbilMonthlyCache.get(yearMonth);
-  }
-
-  const [year, month] = yearMonth.split('-');
-  const url = `https://fbil.org.in/FBIL_Data/upload/Historical_Data/FBIL-USD-INR-${year}-${month}.csv`;
-
-  const promise = new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`FBIL returned ${res.statusCode} for ${yearMonth}`));
-        return;
-      }
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          resolve(parseFBILMonthlyCsv(data));
-        } catch (e) {
-          reject(e);
-        }
-      });
-      res.on('error', reject);
-    }).on('error', reject);
-  });
-
-  fbilMonthlyCache.set(yearMonth, promise);
-  return promise;
+  throw new Error(`No FX rate available for ${normalizedDate}`);
 }
 
 async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
@@ -1354,204 +1456,156 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
   if (start > end) {
     throw new Error(`Invalid FX date range ordering ${start}..${end}`);
   }
-
-  const dates = [];
-  let d = start;
-  while (d <= end) {
-    dates.push(d);
-    d = addDaysIso(d, 1);
+  const today = isoDate(new Date());
+  const effectiveEnd = end > today ? today : end;
+  if (start > effectiveEnd) {
+    return {
+      attemptedDays: 0,
+      resolvedDays: 0,
+      unresolvedDays: 0,
+      sourceCounts: { SBI_TT_BUY: 0, RBI_REFERENCE: 0, LOCF: 0 },
+      providerCalls: 0,
+      reason: 'range_after_today',
+    };
   }
 
-  const monthRates = new Map();
-  const months = listYearMonths(start, end);
-  for (const ym of months) {
-    try {
-      const m = await fetchFBILMonthlyRates(ym);
-      monthRates.set(ym, m);
-    } catch (e) {
-      console.error(`fetchHistoricalUSDToINRRange: FBIL monthly fetch failed for ${ym}:`, e.message);
-    }
+  const sessionDates = getMarketSessionDates(start, effectiveEnd, 'FX');
+  const rows = getSeries('FX', 'USDINR=X', start, effectiveEnd);
+  const missingWindows = getFxMissingWindows(rows, sessionDates);
+
+  if (missingWindows.length === 0) {
+    return {
+      attemptedDays: sessionDates.length,
+      resolvedDays: sessionDates.length,
+      unresolvedDays: 0,
+      sourceCounts: { SBI_TT_BUY: 0, RBI_REFERENCE: 0, LOCF: 0 },
+      providerCalls: 0,
+      reason: 'no_missing_sessions',
+    };
   }
 
-  let successfulDays = 0;
-  let fallbackDays = 0;
+  const consolidatedFrom = missingWindows[0].from;
+  const consolidatedTo = missingWindows[missingWindows.length - 1].to > effectiveEnd
+    ? effectiveEnd
+    : missingWindows[missingWindows.length - 1].to;
 
-  for (const day of dates) {
-    const exact = getSeries('FX', 'USDINR=X', day, day)
-      .find((row) => row?.date === day && row?.close != null);
-    if (exact && exact.close != null) {
-      successfulDays += 1;
+  const providerRangeSessions = sessionDates.filter((d) => d >= consolidatedFrom && d <= consolidatedTo);
+  const coveredDates = new Set(
+    rows
+      .filter((row) => row?.date && row?.close != null && Number.isFinite(Number(row.close)) && Number(row.close) > 0)
+      .map((row) => row.date)
+  );
+  const pendingDates = providerRangeSessions.filter((d) => !coveredDates.has(d));
+
+  let sbiRatesByDate = new Map();
+  let rbiRatesByDate = new Map();
+  let sbiFetchError = null;
+  let rbiFetchError = null;
+
+  await Promise.all([
+    loadSbiTTBuyRatesByDate().then((map) => {
+      sbiRatesByDate = map || new Map();
+    }).catch((err) => {
+      sbiFetchError = err?.message || String(err);
+      logAppWarn('[FXRange] SBI TT Buy fetch failed for consolidated range', {
+        fromDate: consolidatedFrom,
+        toDate: consolidatedTo,
+        error: sbiFetchError,
+      });
+    }),
+    fetchRbiReferenceUsdRatesByDate(consolidatedFrom, consolidatedTo).then((map) => {
+      rbiRatesByDate = map || new Map();
+    }).catch((err) => {
+      rbiFetchError = err?.message || String(err);
+      logAppWarn('[FXRange] RBI reference archive fetch failed for consolidated range', {
+        fromDate: consolidatedFrom,
+        toDate: consolidatedTo,
+        error: rbiFetchError,
+      });
+    }),
+  ]);
+
+  const carrySeed = getNearestFxOnOrBefore(consolidatedFrom);
+  let carryRate = Number(carrySeed?.close);
+  let carryDate = carrySeed?.date || null;
+  let carrySource = carrySeed?.source || null;
+
+  const sourceCounts = { SBI_TT_BUY: 0, RBI_REFERENCE: 0, LOCF: 0 };
+  let unresolvedDays = 0;
+  const decisions = [];
+
+  for (const date of pendingDates) {
+    const sbiRate = Number(sbiRatesByDate.get(date));
+    if (Number.isFinite(sbiRate) && sbiRate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: sbiRate, source: 'SBI_TT_BUY' });
+      sourceCounts.SBI_TT_BUY += 1;
+      carryRate = sbiRate;
+      carryDate = date;
+      carrySource = 'SBI_TT_BUY';
+      decisions.push({ date, source: 'SBI_TT_BUY', reason: 'sbi_exact', rate: sbiRate });
       continue;
     }
 
-    const ym = getYearMonth(day);
-    const rates = monthRates.get(ym);
-    if (rates && rates.size > 0) {
-      let bestDate = null;
-      let bestRate = null;
-      for (const [rateDate, rate] of rates.entries()) {
-        if (rateDate <= day && (!bestDate || rateDate > bestDate)) {
-          bestDate = rateDate;
-          bestRate = rate;
-        }
-      }
-      if (bestRate && bestRate > 0) {
-        upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date: day, close: bestRate, source: 'FBIL' });
-        successfulDays += 1;
-        continue;
-      }
+    const rbiRate = Number(rbiRatesByDate.get(date));
+    if (Number.isFinite(rbiRate) && rbiRate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rbiRate, source: 'RBI_REFERENCE' });
+      sourceCounts.RBI_REFERENCE += 1;
+      carryRate = rbiRate;
+      carryDate = date;
+      carrySource = 'RBI_REFERENCE';
+      decisions.push({ date, source: 'RBI_REFERENCE', reason: 'sbi_missing_rbi_exact', rate: rbiRate });
+      continue;
     }
 
-    try {
-      await fetchHistoricalUSDToINR(day);
-      successfulDays += 1;
-      fallbackDays += 1;
-    } catch (e) {
-      console.error(`fetchHistoricalUSDToINRRange: fallback failed for ${day}:`, e.message);
+    if (Number.isFinite(carryRate) && carryRate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: carryRate, source: 'LOCF' });
+      sourceCounts.LOCF += 1;
+      decisions.push({
+        date,
+        source: 'LOCF',
+        reason: 'sbi_missing_rbi_missing_locf_from_previous',
+        rate: carryRate,
+        carryFromDate: carryDate,
+        carryFromSource: carrySource,
+      });
+      continue;
     }
+
+    unresolvedDays += 1;
+    decisions.push({ date, source: 'UNRESOLVED', reason: 'no_sbi_no_rbi_no_prior_rate', rate: null });
   }
+
+  logAppInfo('[FXRange] Consolidated provider resolution completed', {
+    requestedFrom: start,
+    requestedTo: end,
+    effectiveEnd,
+    missingWindows,
+    consolidatedWindow: { from: consolidatedFrom, to: consolidatedTo },
+    pendingSessionDays: pendingDates.length,
+    providerCalls: 2,
+    sourceCounts,
+    unresolvedDays,
+    providerErrors: {
+      sbi: sbiFetchError,
+      rbi: rbiFetchError,
+    },
+    samples: {
+      sbi: summarizeDecisionSamples(decisions, 'SBI_TT_BUY'),
+      rbi: summarizeDecisionSamples(decisions, 'RBI_REFERENCE'),
+      locf: summarizeDecisionSamples(decisions, 'LOCF'),
+      unresolved: decisions.filter((d) => d.source === 'UNRESOLVED').slice(0, 12),
+    },
+  });
 
   return {
-    attemptedDays: dates.length,
-    successfulDays,
-    fallbackDays,
-    monthCalls: months.length,
+    attemptedDays: sessionDates.length,
+    resolvedDays: sessionDates.length - unresolvedDays,
+    unresolvedDays,
+    sourceCounts,
+    providerCalls: 2,
+    missingWindows,
+    consolidatedWindow: { from: consolidatedFrom, to: consolidatedTo },
   };
-}
-
-/**
- * Fetch FBIL USD/INR reference rate for a given date.
- * FBIL publishes rates at: https://fbil.org.in/FBIL_Data/upload/ReferenceRatesFBIL.csv
- * The CSV format: Date,USD/INR,...
- * Date format in the file: DD-Mmm-YYYY (e.g. 15-Mar-2024)
- */
-function _fetchFBILRate(date) {
-  const targetDate = new Date(date);
-  // FBIL CSV: we fetch the "archive" endpoint which serves a monthly CSV
-  const year = targetDate.getFullYear();
-  const month = String(targetDate.getMonth() + 1).padStart(2, '0');
-  const url = `https://fbil.org.in/FBIL_Data/upload/Historical_Data/FBIL-USD-INR-${year}-${month}.csv`;
-
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`FBIL returned ${res.statusCode}`));
-        return;
-      }
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          // Lines: Date,USD/INR,... — skip header
-          const lines = data.trim().split('\n').slice(1);
-          const isoTarget = date.split('T')[0]; // YYYY-MM-DD
-
-          for (const line of lines) {
-            const parts = line.split(',');
-            if (parts.length < 2) continue;
-            // FBIL date format is DD-Mon-YYYY (e.g. 15-Mar-2024) or DD/MM/YYYY
-            const rawDate = parts[0].trim();
-            const parsed = _parseFBILDate(rawDate);
-            if (parsed === isoTarget) {
-              const rate = parseFloat(parts[1].trim());
-              if (!isNaN(rate) && rate > 0) {
-                resolve(rate);
-                return;
-              }
-            }
-          }
-          // If exact date not found (weekend/holiday), try nearest earlier date
-          const sortedRates = [];
-          for (const line of lines) {
-            const parts = line.split(',');
-            if (parts.length < 2) continue;
-            const parsed = _parseFBILDate(parts[0].trim());
-            const rate = parseFloat(parts[1].trim());
-            if (parsed && !isNaN(rate) && rate > 0 && parsed <= isoTarget) {
-              sortedRates.push({ date: parsed, rate });
-            }
-          }
-          if (sortedRates.length > 0) {
-            sortedRates.sort((a, b) => b.date.localeCompare(a.date));
-            resolve(sortedRates[0].rate);
-          } else {
-            reject(new Error('No matching rate in FBIL CSV'));
-          }
-        } catch (e) {
-          reject(e);
-        }
-      });
-      res.on('error', reject);
-    }).on('error', reject);
-  });
-}
-
-function _parseFBILDate(raw) {
-  // Try DD-Mon-YYYY (15-Mar-2024) → YYYY-MM-DD
-  const m1 = raw.match(/^(\d{2})-([A-Za-z]{3})-(\d{4})$/);
-  if (m1) {
-    const months = { Jan:'01', Feb:'02', Mar:'03', Apr:'04', May:'05', Jun:'06', Jul:'07', Aug:'08', Sep:'09', Oct:'10', Nov:'11', Dec:'12' };
-    const mon = months[m1[2]];
-    if (mon) return `${m1[3]}-${mon}-${m1[1]}`;
-  }
-  // Try DD/MM/YYYY
-  const m2 = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (m2) return `${m2[3]}-${m2[2]}-${m2[1]}`;
-  return null;
-}
-
-/**
- * Fetch historical USDINR rate from Yahoo Finance for a specific date.
- * Uses the v8 chart API with a narrow period around the target date.
- */
-async function _fetchYahooHistoricalUSDINR(date) {
-  const target = new Date(date);
-  // Fetch a ±5 day window to account for weekends/holidays
-  const from = new Date(target);
-  from.setDate(from.getDate() - 5);
-  const to = new Date(target);
-  to.setDate(to.getDate() + 1);
-
-  const p1 = Math.floor(from.getTime() / 1000);
-  const p2 = Math.floor(to.getTime() / 1000);
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X?period1=${p1}&period2=${p2}&interval=1d`;
-
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          const result = json.chart?.result?.[0];
-          if (!result) { reject(new Error('No Yahoo data')); return; }
-
-          const timestamps = result.timestamp || [];
-          const closes = result.indicators?.quote?.[0]?.close || [];
-          const isoTarget = date.split('T')[0];
-
-          // Find the closest date ≤ target
-          let bestRate = null;
-          let bestDate = null;
-          for (let i = 0; i < timestamps.length; i++) {
-            const d = istDateFromUnixSeconds(timestamps[i]);
-            if (!d) continue;
-            if (d <= isoTarget && closes[i] != null) {
-              if (!bestDate || d > bestDate) {
-                bestDate = d;
-                bestRate = closes[i];
-              }
-            }
-          }
-          if (bestRate) resolve(bestRate);
-          else reject(new Error('No rate found in Yahoo data'));
-        } catch (e) {
-          reject(e);
-        }
-      });
-      res.on('error', reject);
-    }).on('error', reject);
-  });
 }
 
 // ─── PPF/PF Calculation ───────────────────────────────────────────────────────

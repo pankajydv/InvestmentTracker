@@ -391,7 +391,7 @@ export default function AddInvestment() {
         notes: form.notes || '',
       });
 
-      // Auto-fetch exchange rate for the transaction date
+      // Auto-fetch the FX rate for the transaction date
       let exchangeRate = null;
       try {
         exchangeRate = await getUSDINRRate(manualStockTxn.transaction_date);

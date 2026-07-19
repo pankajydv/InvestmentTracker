@@ -189,7 +189,7 @@ export default function InvestmentDetail() {
 
   useEffect(() => { loadData(); }, [id, selectedId, selectedInterval]);
 
-  // Auto-fetch RBI rate when date or type changes for USD investments
+  // Auto-fetch the USD/INR FX rate when date or type changes for USD investments
   const fetchRBIRate = useCallback(async (date) => {
     if (!data || data.currency !== 'USD') return;
     if (!date) return;
@@ -1182,10 +1182,10 @@ export default function InvestmentDetail() {
                         {isForeignUSD && (
                           <Col md={4}>
                             <Form.Label className="small d-flex align-items-center gap-1">
-                              RBI Rate (₹/USD) {rateLoading && <Spinner animation="border" size="sm" />}
+                              FX Rate (₹/USD) {rateLoading && <Spinner animation="border" size="sm" />}
                             </Form.Label>
                             <Form.Control size="sm" type="number" step="0.0001" value={txnForm.exchange_rate_used}
-                              onChange={(e) => updateTxnField('exchange_rate_used', e.target.value)} placeholder="Auto-fetched from RBI" />
+                              onChange={(e) => updateTxnField('exchange_rate_used', e.target.value)} placeholder="Auto-fetched from FX sources" />
                           </Col>
                         )}
                       </>

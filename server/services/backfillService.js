@@ -3,6 +3,7 @@ const {
   fetchDividendEventsForRange,
   fetchHistoricalOHLC,
   fetchHistoricalUSDToINR,
+  fetchHistoricalUSDToINRRange,
   fetchMutualFundHistory,
   fetchMutualFundNAV,
   fetchStockPrice,
@@ -4105,47 +4106,22 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
     const fxStart = foreignFxWindows.reduce((m, w) => (w.startDate < m ? w.startDate : m), foreignFxWindows[0].startDate);
     const fxEnd = foreignFxWindows.reduce((m, w) => (w.endDate > m ? w.endDate : m), foreignFxWindows[0].endDate);
 
-    let fxFetchedRows = 0;
-    let fxParsedRows = 0;
     let fxHydrationError = null;
+    let fxHydrationStats = null;
 
-    await hydrateHistoricalPriceSeries({
-      instrumentType: 'FX',
-      symbol: 'USDINR=X',
-      fromDate: fxStart,
-      toDate: fxEnd,
-      freshnessSkipFromDate: runDate,
-      sourceLabel: 'YAHOO',
-      fetchRange: async (missingFrom, missingTo) => fetchStockSeriesFromSource('USDINR=X', missingFrom, missingTo),
-      mapFetchedRows: (rows) => {
-        const rawRows = Array.isArray(rows) ? rows : [];
-        fxFetchedRows += rawRows.length;
-        const parsedRows = rawRows.map((row) => {
-          const d = toIsoDate(row?.date);
-          const close = Number(row?.close);
-          if (!d || !Number.isFinite(close) || close <= 0) return null;
-          return { date: d, close, source: row?.source || 'YAHOO' };
-        }).filter(Boolean);
-        fxParsedRows += parsedRows.length;
-        return parsedRows;
-      },
-      onInfo: (message, meta) => logBackfillInfo(`[Backfill][FX] ${message}`, meta),
+    await fetchHistoricalUSDToINRRange(fxStart, fxEnd).then((stats) => {
+      fxHydrationStats = stats;
+      logBackfillInfo('[Backfill][FX] Authoritative FX hydration completed.', {
+        symbol: 'USDINR=X',
+        startDate: fxStart,
+        endDate: fxEnd,
+        ...(stats || {}),
+      });
     }).catch((err) => {
       fxHydrationError = err?.message || String(err);
       logBackfillError(`[Backfill][FX] Hydration failed for USDINR=X: ${err?.message || err}`);
-      return [];
+      return null;
     });
-
-    if (fxFetchedRows > fxParsedRows) {
-      logBackfillWarn('[Backfill][FXCache] Provider rows dropped during USDINR parse/validation', {
-        symbol: 'USDINR=X',
-        fetchedRows: fxFetchedRows,
-        parsedRows: fxParsedRows,
-        droppedRows: fxFetchedRows - fxParsedRows,
-        startDate: fxStart,
-        endDate: fxEnd,
-      });
-    }
 
     const fxExact = loadSeriesMapFromLocalCache('FX', 'USDINR=X', fxStart, fxEnd, (row) => row.close);
     const fxSessionDates = getMarketSessionDates(fxStart, fxEnd, 'FOREIGN_STOCK');
@@ -4202,6 +4178,7 @@ async function preloadStockHistoryForRun(db, invMap, scopeList, runDate, startBy
         startDate: fxStart,
         endDate: fxEnd,
         cachedPoints: cache.fx.size,
+        ...(fxHydrationStats || {}),
       });
     }
   }

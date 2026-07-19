@@ -202,8 +202,8 @@ function deriveVestActualization(db, txn, { fxRate = null } = {}) {
     });
   }
 
-  // Our cached USD/INR (Yahoo/FBIL reference) has been observed to differ from
-  // the rate the broker actually applies (SBI TT buying rate runs ~0.5% higher),
+  // Our cached USD/INR reference can differ from the rate the broker actually applies
+  // (SBI TT buying rate runs ~0.5% higher),
   // so FX is low-confidence: surface it for review rather than trusting silently.
   if (fxRate == null) {
     warnings.push({

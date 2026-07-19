@@ -128,7 +128,7 @@ function groupPfTransactions(rows) {
 }
 
 module.exports = function (db) {
-  // --- Get RBI USD/INR rate for a date (used by UI to auto-fill exchange_rate_used) ---
+  // --- Get FX USD/INR rate for a date (used by UI to auto-fill exchange_rate_used) ---
   router.get('/usd-inr-rate', async (req, res) => {
     try {
       const { date } = req.query;

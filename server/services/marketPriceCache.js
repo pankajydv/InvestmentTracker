@@ -1841,8 +1841,11 @@ async function hydrateHistoricalPriceSeries({
 
 function upsertPricePoint(point) {
   if (!point || !point.instrumentType || !point.symbol || !point.date) return;
-  // LOCF values are never persisted to cache tables; they are derived at read time.
-  if (String(point.source ?? '').toUpperCase() === 'LOCF') return;
+  // Persist LOCF only for FX; other instruments derive LOCF at read time.
+  if (
+    String(point.source ?? '').toUpperCase() === 'LOCF'
+    && !isFxInstrumentType(point.instrumentType)
+  ) return;
   const conn = getCacheDb();
   const normalizedDate = normalizeDate(point.date);
   if (!normalizedDate) return;
@@ -1936,9 +1939,10 @@ function upsertPricePoint(point) {
 function upsertPriceSeries(instrumentType, symbol, points, source = null, investmentId = null) {
   if (!instrumentType || !symbol || !Array.isArray(points) || points.length === 0) return;
   const conn = getCacheDb();
-  // LOCF values are never persisted to cache tables; they are derived at read time
-  // (nearest-on-or-before) when daily_values are computed. Drop any LOCF-sourced points.
-  const providerPoints = points.filter((p) => String(p?.source ?? source ?? '').toUpperCase() !== 'LOCF');
+  // Persist LOCF only for FX; other instruments keep LOCF as read-time behavior.
+  const providerPoints = isFxInstrumentType(instrumentType)
+    ? points
+    : points.filter((p) => String(p?.source ?? source ?? '').toUpperCase() !== 'LOCF');
   if (providerPoints.length === 0) return;
   const normalizedPoints = providerPoints.map(normalizeCachePoint).filter(Boolean);
   if (isFxInstrumentType(instrumentType)) {
@@ -2091,7 +2095,7 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
   const conn = getCacheDb();
   const investmentSymbol = String(providerSymbol || '').trim();
   if (!investmentSymbol) return;
-  // LOCF values are never persisted to cache tables; they are derived at read time.
+  // Investment-level series writes target market_price_cache; keep LOCF non-persistent.
   const providerPoints = points.filter((p) => String(p?.source ?? source ?? '').toUpperCase() !== 'LOCF');
   if (!providerPoints.length) return;
   const normalizedPoints = providerPoints.map(normalizeCachePoint).filter(Boolean);
