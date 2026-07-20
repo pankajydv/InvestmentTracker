@@ -85,7 +85,7 @@ function parseUsdInrCsv(csvText) {
     const rate = Number(String(match[2] || '').replace(/^"|"$/g, ''));
     if (!date || !Number.isFinite(rate) || rate <= 0) continue;
 
-    rows.push({ date, close: rate, source: 'NSE_RBI_REFERENCE' });
+    rows.push({ date, close: rate, source: 'RBI_REF' });
   }
 
   return rows;
@@ -161,7 +161,7 @@ async function getUsdInrNseHistoricalPrices(fromDate, toDate, onLog) {
     symbol: 'USDINR=X',
     fromDate,
     toDate,
-    sourceLabel: 'NSE_RBI_REFERENCE',
+    sourceLabel: 'RBI_REF',
     fetchRange: async (missingFrom, missingTo) => fetchUsdInrNseHistoricalRaw(missingFrom, missingTo, onLog),
     mapFetchedRows: (fetchedRows) => (Array.isArray(fetchedRows) ? fetchedRows : []),
   });

@@ -9,6 +9,7 @@
 
 const https = require('https');
 const http = require('http');
+const { fetchUsdInrNseHistoricalRaw } = require('./fxNseHistorical');
 const {
   upsertPricePoint,
   upsertPriceSeries,
@@ -1204,7 +1205,6 @@ async function fetchUSDToINR() {
 }
 
 const SBI_TT_BUY_CSV_URL = 'https://raw.githubusercontent.com/sahilgupta/sbi-fx-ratekeeper/main/csv_files/SBI_REFERENCE_RATES_USD.csv';
-const RBI_REFERENCE_ARCHIVE_URL = 'https://www.rbi.org.in/scripts/referenceratearchive.aspx';
 
 let sbiFxRatesByDateCache = null;
 let sbiFxRatesByDatePromise = null;
@@ -1274,93 +1274,19 @@ function getNearestFxOnOrBefore(date) {
   };
 }
 
-function formatDateForRbi(dateIso) {
-  const iso = String(dateIso || '').split('T')[0];
-  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  return `${m[3]}/${m[2]}/${m[1]}`;
-}
-
-function parseRbiDate(raw) {
-  const text = String(raw || '').trim();
-  const m = text.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (!m) return null;
-  return `${m[3]}-${m[2]}-${m[1]}`;
-}
-
-function extractAspNetHiddenValue(html, name) {
-  const pattern = new RegExp(`name=\\"${name}\\"[^>]*value=\\"([^\\"]*)\\"`, 'i');
-  const match = String(html || '').match(pattern);
-  return match?.[1] || '';
-}
-
-function httpRequestText(url, options = {}) {
-  const method = String(options.method || 'GET').toUpperCase();
-  const headers = { 'User-Agent': 'Mozilla/5.0', ...(options.headers || {}) };
-  const body = options.body == null ? null : String(options.body);
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(url, { method, headers }, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-          return;
-        }
-        resolve(data);
-      });
-    });
-
-    req.on('error', reject);
-    if (body != null) req.write(body);
-    req.end();
+async function fetchRbiReferenceUsdRatesByDate(fromDate, toDate) {
+  const rows = await fetchUsdInrNseHistoricalRaw(fromDate, toDate, (level, message, meta) => {
+    if (level === 'info') logAppInfo(message, meta);
+    else logAppWarn(message, meta);
   });
-}
-
-function parseRbiUsdRows(html) {
   const byDate = new Map();
-  const rowRegex = /<tr>\s*<td[^>]*>\s*(\d{2}\/\d{2}\/\d{4})\s*<\/td>\s*<td[^>]*>\s*([0-9]+(?:\.[0-9]+)?)\s*<\/td>/gi;
-  let match;
-  while ((match = rowRegex.exec(String(html || ''))) !== null) {
-    const dateIso = parseRbiDate(match[1]);
-    const rate = Number(match[2]);
-    if (!dateIso || !Number.isFinite(rate) || rate <= 0) continue;
+  for (const row of rows || []) {
+    const dateIso = String(row?.date || '').split('T')[0];
+    const rate = Number(row?.close);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso) || !Number.isFinite(rate) || rate <= 0) continue;
     byDate.set(dateIso, rate);
   }
   return byDate;
-}
-
-async function fetchRbiReferenceUsdRatesByDate(fromDate, toDate) {
-  const fromRbi = formatDateForRbi(fromDate);
-  const toRbi = formatDateForRbi(toDate);
-  if (!fromRbi || !toRbi) {
-    throw new Error(`Invalid RBI range ${fromDate}..${toDate}`);
-  }
-
-  const initialHtml = await httpRequestText(RBI_REFERENCE_ARCHIVE_URL, { method: 'GET' });
-  const body = new URLSearchParams({
-    __EVENTTARGET: '',
-    __EVENTARGUMENT: '',
-    __VIEWSTATE: extractAspNetHiddenValue(initialHtml, '__VIEWSTATE'),
-    __VIEWSTATEGENERATOR: extractAspNetHiddenValue(initialHtml, '__VIEWSTATEGENERATOR'),
-    __EVENTVALIDATION: extractAspNetHiddenValue(initialHtml, '__EVENTVALIDATION'),
-    chkUSD: 'on',
-    txtFromDate: fromRbi,
-    txtToDate: toRbi,
-    btnSubmit: ' GO ',
-  }).toString();
-
-  const responseHtml = await httpRequestText(RBI_REFERENCE_ARCHIVE_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Content-Length': Buffer.byteLength(body),
-    },
-    body,
-  });
-
-  return parseRbiUsdRows(responseHtml);
 }
 
 function getFxMissingWindows(rows, sessionDates) {
@@ -1402,12 +1328,203 @@ function summarizeDecisionSamples(decisions, source) {
     .map((d) => ({ date: d.date, reason: d.reason, rate: d.rate, carryFromDate: d.carryFromDate || null, carryFromSource: d.carryFromSource || null }));
 }
 
+const FX_SOURCE_PRIORITY = Object.freeze({
+  LOCF: 1,
+  RBI_REF: 2,
+  SBI_TTBR: 3,
+});
+
+function normalizeFxSource(source) {
+  const normalized = String(source || '').trim().toUpperCase();
+  if (!normalized) return null;
+  return normalized;
+}
+
+function getFxSourcePriority(source) {
+  const normalized = normalizeFxSource(source);
+  return FX_SOURCE_PRIORITY[normalized] || 0;
+}
+
+function buildRecentFxSessionWindow(runDate, minSessions, maxSessions) {
+  const normalizedRunDate = String(runDate || '').split('T')[0];
+  const maxWindowSessions = Math.max(Number(maxSessions || 0), Number(minSessions || 0), 1);
+  const seedStart = addDaysIso(normalizedRunDate, -(maxWindowSessions * 3 + 7));
+  const candidateSessions = getMarketSessionDates(seedStart, normalizedRunDate, 'FX');
+  if (!candidateSessions.length) return { sessions: [], fromDate: null, toDate: normalizedRunDate };
+
+  const recentSessions = candidateSessions.slice(-maxWindowSessions);
+  const recentStart = recentSessions[Math.max(recentSessions.length - Math.max(Number(minSessions || 0), 1), 0)] || recentSessions[0];
+
+  const recentRows = getSeries('FX', 'USDINR=X', recentSessions[0], normalizedRunDate);
+  const latestSbiDate = recentRows
+    .filter((row) => normalizeFxSource(row?.source) === 'SBI_TTBR')
+    .map((row) => String(row.date || '').split('T')[0])
+    .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
+    .sort()
+    .pop() || null;
+
+  let sinceLastSbiStart = recentSessions[0];
+  if (latestSbiDate) {
+    const nextSession = recentSessions.find((d) => d > latestSbiDate);
+    sinceLastSbiStart = nextSession || normalizedRunDate;
+  }
+
+  const fromDate = sinceLastSbiStart < recentStart ? sinceLastSbiStart : recentStart;
+  const sessions = recentSessions.filter((d) => d >= fromDate && d <= normalizedRunDate);
+  return {
+    sessions,
+    fromDate: sessions[0] || null,
+    toDate: normalizedRunDate,
+    latestSbiDate,
+    recentStart,
+    sinceLastSbiStart,
+  };
+}
+
+/**
+ * Upgrade recent fx_rate_cache rows with provider precedence without downgrades.
+ *
+ * Rules:
+ *   - LOCF -> RBI/SBI allowed
+ *   - RBI -> SBI allowed
+ *   - SBI never downgraded
+ *
+ * Dynamic window:
+ *   - all sessions since last SBI_TTBR OR last minSessions, whichever is wider,
+ *     bounded by maxSessions for safety.
+ */
+async function upgradeRecentFxRatesForProviderPrecedence(options = {}) {
+  const runDateRaw = String(options.runDate || isoDate(new Date())).split('T')[0];
+  const runDate = /^\d{4}-\d{2}-\d{2}$/.test(runDateRaw) ? runDateRaw : isoDate(new Date());
+  const minSessions = Math.max(Number(options.minSessions || 2), 1);
+  const maxSessions = Math.max(Number(options.maxSessions || 10), minSessions);
+
+  const window = buildRecentFxSessionWindow(runDate, minSessions, maxSessions);
+  if (!window.sessions.length || !window.fromDate) {
+    return {
+      runDate,
+      minSessions,
+      maxSessions,
+      sessionsScanned: 0,
+      providerCalls: 0,
+      skippedReason: 'no_sessions',
+      upgradedCount: 0,
+      earliestChangedDate: null,
+      transitions: { locfToRbi: 0, locfToSbi: 0, rbiToSbi: 0, otherUpgrades: 0 },
+    };
+  }
+
+  const existingRows = getSeries('FX', 'USDINR=X', window.fromDate, runDate)
+    .filter((row) => row?.date && row?.close != null)
+    .map((row) => ({
+      date: String(row.date || '').split('T')[0],
+      close: Number(row.close),
+      source: normalizeFxSource(row.source),
+    }))
+    .filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date));
+
+  const existingByDate = new Map(existingRows.map((row) => [row.date, row]));
+  const allWindowRowsAreSbi = window.sessions.every((date) => normalizeFxSource(existingByDate.get(date)?.source) === 'SBI_TTBR');
+  if (allWindowRowsAreSbi) {
+    return {
+      runDate,
+      minSessions,
+      maxSessions,
+      sessionsScanned: window.sessions.length,
+      providerCalls: 0,
+      skippedReason: 'all_window_rows_already_sbi',
+      upgradedCount: 0,
+      earliestChangedDate: null,
+      window,
+      transitions: { locfToRbi: 0, locfToSbi: 0, rbiToSbi: 0, otherUpgrades: 0 },
+    };
+  }
+
+  let sbiRatesByDate = new Map();
+  let rbiRatesByDate = new Map();
+  let sbiError = null;
+  let rbiError = null;
+
+  await Promise.all([
+    loadSbiTTBuyRatesByDate().then((map) => {
+      sbiRatesByDate = map || new Map();
+    }).catch((err) => {
+      sbiError = err?.message || String(err);
+      logAppWarn('[FXUpgradeSweep] SBI fetch failed', { runDate, fromDate: window.fromDate, toDate: runDate, error: sbiError });
+    }),
+    fetchRbiReferenceUsdRatesByDate(window.fromDate, runDate).then((map) => {
+      rbiRatesByDate = map || new Map();
+    }).catch((err) => {
+      rbiError = err?.message || String(err);
+      logAppWarn('[FXUpgradeSweep] RBI fetch failed', { runDate, fromDate: window.fromDate, toDate: runDate, error: rbiError });
+    }),
+  ]);
+
+  const transitions = { locfToRbi: 0, locfToSbi: 0, rbiToSbi: 0, otherUpgrades: 0 };
+  const upgradedDates = [];
+
+  for (const date of window.sessions) {
+    const existing = existingByDate.get(date) || null;
+    const existingSource = normalizeFxSource(existing?.source);
+    const existingPriority = getFxSourcePriority(existingSource);
+    if (existingPriority >= FX_SOURCE_PRIORITY.SBI_TTBR) continue;
+
+    const sbiRate = Number(sbiRatesByDate.get(date));
+    const rbiRate = Number(rbiRatesByDate.get(date));
+
+    let candidateSource = null;
+    let candidateRate = null;
+    if (Number.isFinite(sbiRate) && sbiRate > 0) {
+      candidateSource = 'SBI_TTBR';
+      candidateRate = sbiRate;
+    } else if (Number.isFinite(rbiRate) && rbiRate > 0) {
+      candidateSource = 'RBI_REF';
+      candidateRate = rbiRate;
+    }
+
+    if (!candidateSource || !(Number.isFinite(candidateRate) && candidateRate > 0)) continue;
+
+    const candidatePriority = getFxSourcePriority(candidateSource);
+    if (candidatePriority <= existingPriority) continue;
+
+    upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: candidateRate, source: candidateSource });
+    upgradedDates.push(date);
+
+    if (existingSource === 'LOCF' && candidateSource === 'RBI_REF') transitions.locfToRbi += 1;
+    else if (existingSource === 'LOCF' && candidateSource === 'SBI_TTBR') transitions.locfToSbi += 1;
+    else if (existingSource === 'RBI_REF' && candidateSource === 'SBI_TTBR') transitions.rbiToSbi += 1;
+    else transitions.otherUpgrades += 1;
+  }
+
+  const earliestChangedDate = upgradedDates.length ? upgradedDates.slice().sort()[0] : null;
+  const result = {
+    runDate,
+    minSessions,
+    maxSessions,
+    sessionsScanned: window.sessions.length,
+    providerCalls: 2,
+    skippedReason: null,
+    upgradedCount: upgradedDates.length,
+    earliestChangedDate,
+    upgradedDates,
+    window,
+    providerErrors: {
+      sbi: sbiError,
+      rbi: rbiError,
+    },
+    transitions,
+  };
+
+  logAppInfo('[FXUpgradeSweep] Completed', result);
+  return result;
+}
+
 /**
  * Fetch historical USD/INR exchange rate for a specific date.
  *
  * Strategy:
  *   1. Try SBI TT Buy first.
- *   2. Fall back to RBI reference archive rate.
+ *   2. Fall back to RBI reference rate.
  *   3. If both are unavailable for a session date, use last known rate and
  *      persist as LOCF for traceable FX coverage.
  *
@@ -1463,7 +1580,7 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
       attemptedDays: 0,
       resolvedDays: 0,
       unresolvedDays: 0,
-      sourceCounts: { SBI_TT_BUY: 0, RBI_REFERENCE: 0, LOCF: 0 },
+      sourceCounts: { SBI_TTBR: 0, RBI_REF: 0, LOCF: 0 },
       providerCalls: 0,
       reason: 'range_after_today',
     };
@@ -1478,7 +1595,7 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
       attemptedDays: sessionDates.length,
       resolvedDays: sessionDates.length,
       unresolvedDays: 0,
-      sourceCounts: { SBI_TT_BUY: 0, RBI_REFERENCE: 0, LOCF: 0 },
+      sourceCounts: { SBI_TTBR: 0, RBI_REF: 0, LOCF: 0 },
       providerCalls: 0,
       reason: 'no_missing_sessions',
     };
@@ -1530,30 +1647,30 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
   let carryDate = carrySeed?.date || null;
   let carrySource = carrySeed?.source || null;
 
-  const sourceCounts = { SBI_TT_BUY: 0, RBI_REFERENCE: 0, LOCF: 0 };
+  const sourceCounts = { SBI_TTBR: 0, RBI_REF: 0, LOCF: 0 };
   let unresolvedDays = 0;
   const decisions = [];
 
   for (const date of pendingDates) {
     const sbiRate = Number(sbiRatesByDate.get(date));
     if (Number.isFinite(sbiRate) && sbiRate > 0) {
-      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: sbiRate, source: 'SBI_TT_BUY' });
-      sourceCounts.SBI_TT_BUY += 1;
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: sbiRate, source: 'SBI_TTBR' });
+      sourceCounts.SBI_TTBR += 1;
       carryRate = sbiRate;
       carryDate = date;
-      carrySource = 'SBI_TT_BUY';
-      decisions.push({ date, source: 'SBI_TT_BUY', reason: 'sbi_exact', rate: sbiRate });
+      carrySource = 'SBI_TTBR';
+      decisions.push({ date, source: 'SBI_TTBR', reason: 'sbi_exact', rate: sbiRate });
       continue;
     }
 
     const rbiRate = Number(rbiRatesByDate.get(date));
     if (Number.isFinite(rbiRate) && rbiRate > 0) {
-      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rbiRate, source: 'RBI_REFERENCE' });
-      sourceCounts.RBI_REFERENCE += 1;
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: rbiRate, source: 'RBI_REF' });
+      sourceCounts.RBI_REF += 1;
       carryRate = rbiRate;
       carryDate = date;
-      carrySource = 'RBI_REFERENCE';
-      decisions.push({ date, source: 'RBI_REFERENCE', reason: 'sbi_missing_rbi_exact', rate: rbiRate });
+      carrySource = 'RBI_REF';
+      decisions.push({ date, source: 'RBI_REF', reason: 'sbi_missing_rbi_exact', rate: rbiRate });
       continue;
     }
 
@@ -1590,8 +1707,8 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
       rbi: rbiFetchError,
     },
     samples: {
-      sbi: summarizeDecisionSamples(decisions, 'SBI_TT_BUY'),
-      rbi: summarizeDecisionSamples(decisions, 'RBI_REFERENCE'),
+      sbi: summarizeDecisionSamples(decisions, 'SBI_TTBR'),
+      rbi: summarizeDecisionSamples(decisions, 'RBI_REF'),
       locf: summarizeDecisionSamples(decisions, 'LOCF'),
       unresolved: decisions.filter((d) => d.source === 'UNRESOLVED').slice(0, 12),
     },
@@ -2397,6 +2514,7 @@ module.exports = {
   fetchUSDToINR,
   fetchHistoricalUSDToINR,
   fetchHistoricalUSDToINRRange,
+  upgradeRecentFxRatesForProviderPrecedence,
   calculatePPFValue,
   toNSETicker,
   lookupTickerByISIN,

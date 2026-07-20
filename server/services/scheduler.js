@@ -10,11 +10,18 @@ applyEnvDefaults();
 
 const cron = require('node-cron');
 const { updateAllPrices } = require('./updater');
-const { runDirtyBackfillPreflight, markAllTrackedInvestmentsDirtyFromDate, markScopeDirty, runDailyBootstrapDirtyScopeEnqueue } = require('./dirtyBackfillService');
+const {
+  runDirtyBackfillPreflight,
+  markAllTrackedInvestmentsDirtyFromDate,
+  markScopeDirty,
+  runDailyBootstrapDirtyScopeEnqueue,
+  markActiveTrackedForeignScopesDirtyFromDate,
+} = require('./dirtyBackfillService');
 const {
   fetchMutualFundHistory,
   fetchHistoricalUSDToINR,
   fetchHistoricalUSDToINRRange,
+  upgradeRecentFxRatesForProviderPrecedence,
 } = require('./priceService');
 const { getSGBNseHistoricalPrices } = require('./sgbNseHistorical');
 const { hydrateStockSeriesForPhase2 } = require('./marketPriceCache');
@@ -48,6 +55,9 @@ const ENABLE_INTRADAY_COMPLIANCE = String(process.env.ENABLE_INTRADAY_COMPLIANCE
 const ENABLE_STARTUP_COMPLIANCE = String(process.env.ENABLE_STARTUP_COMPLIANCE || 'false').toLowerCase() === 'true';
 const ENABLE_STARTUP_PREFLIGHT = String(process.env.ENABLE_STARTUP_PREFLIGHT || 'false').toLowerCase() === 'true';
 const NIGHTLY_MARKET_CACHE_WARM_DAYS = parseNonNegativeIntEnv('NIGHTLY_MARKET_CACHE_WARM_DAYS', 5);
+const ENABLE_FX_UPGRADE_SWEEP = parseBooleanEnv('ENABLE_FX_UPGRADE_SWEEP', true);
+const FX_UPGRADE_SWEEP_SESSIONS = parsePositiveIntEnv('FX_UPGRADE_SWEEP_SESSIONS', 2);
+const FX_UPGRADE_SWEEP_MAX_SESSIONS = parsePositiveIntEnv('FX_UPGRADE_SWEEP_MAX_SESSIONS', 10);
 const ENABLE_FOREIGN_RECONCILE = parseBooleanEnv('ENABLE_FOREIGN_RECONCILE', true);
 const FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS = parsePositiveIntEnv('FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS', 10);
 const FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST = parseNonNegativeIntEnv('FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST', (4 * 60) + 25);
@@ -927,6 +937,42 @@ async function runSchedulerCycle(db, label, options = {}) {
     options,
   });
 
+  let fxUpgradeSweep = {
+    enabled: ENABLE_FX_UPGRADE_SWEEP,
+    skippedReason: ENABLE_FX_UPGRADE_SWEEP ? 'not_run' : 'disabled',
+    upgradedCount: 0,
+    earliestChangedDate: null,
+    dirtyScopesEnqueued: 0,
+  };
+
+  if (ENABLE_FX_UPGRADE_SWEEP) {
+    logAppInfo(`[Scheduler] ${label}: Step 3.5/6 FX upgrade sweep`, {
+      runDate: preflightRunDate,
+      minSessions: FX_UPGRADE_SWEEP_SESSIONS,
+      maxSessions: FX_UPGRADE_SWEEP_MAX_SESSIONS,
+    });
+    const sweep = await upgradeRecentFxRatesForProviderPrecedence({
+      runDate: preflightRunDate,
+      minSessions: FX_UPGRADE_SWEEP_SESSIONS,
+      maxSessions: FX_UPGRADE_SWEEP_MAX_SESSIONS,
+    });
+    let dirtyScopesEnqueued = 0;
+    if ((sweep?.upgradedCount || 0) > 0 && sweep?.earliestChangedDate) {
+      dirtyScopesEnqueued = markActiveTrackedForeignScopesDirtyFromDate(
+        db,
+        sweep.earliestChangedDate,
+        'fx-upgrade-sweep',
+        `fx-upgrade-sweep:${preflightRunDate}`
+      );
+    }
+    fxUpgradeSweep = {
+      ...sweep,
+      enabled: true,
+      dirtyScopesEnqueued,
+    };
+    logAppInfo(`[Scheduler] ${label}: Step 3.5/6 completed`, fxUpgradeSweep);
+  }
+
   // ── Step 4/6: Catch-up + dirty preflight ─────────────────────────────────
   logAppInfo(`[Scheduler] ${label}: Step 4/6 running catch-up + dirty preflight (Backfill Step-1 Cache-Warm -> Step-2 CA -> Step-3 Recompute -> Step-4 Aggregate Refresh)`, {
     preflightRunDate,
@@ -938,6 +984,7 @@ async function runSchedulerCycle(db, label, options = {}) {
     suppressRunDateWritesForMarketLinked: options.skipPriceUpdate !== true,
   });
   logAppInfo(`[Scheduler] ${label}: Step 4/6 completed (catch-up + backfill preflight)`, {
+    fxUpgradeSweep,
     catchUp,
     foreignReconcile,
     locfReconcile,
@@ -950,12 +997,13 @@ async function runSchedulerCycle(db, label, options = {}) {
       preflightRunDate,
       rollingFreshness,
       dailyBootstrap,
+      fxUpgradeSweep,
       catchUp,
       foreignReconcile,
       locfReconcile,
       preflight,
     });
-    return { preflightOnly: true, rollingFreshness, dailyBootstrap, catchUp, foreignReconcile, locfReconcile, preflight };
+    return { preflightOnly: true, rollingFreshness, dailyBootstrap, fxUpgradeSweep, catchUp, foreignReconcile, locfReconcile, preflight };
   }
 
   const warmRecentCacheDays = Number(options.warmRecentCacheDays || 0);
@@ -978,6 +1026,7 @@ async function runSchedulerCycle(db, label, options = {}) {
     preflightRunDate,
     rollingFreshness,
     dailyBootstrap,
+    fxUpgradeSweep,
     catchUp,
     foreignReconcile,
     locfReconcile,
@@ -1017,7 +1066,7 @@ async function runSchedulerCycle(db, label, options = {}) {
     logAppInfo(`[Scheduler] ${label}: Step 6/6 compliance scan skipped (no mode specified)`);
   }
 
-  return { rollingFreshness, dailyBootstrap, catchUp, foreignReconcile, locfReconcile, preflight, result, xirrCacheResult, complianceResult };
+  return { rollingFreshness, dailyBootstrap, fxUpgradeSweep, catchUp, foreignReconcile, locfReconcile, preflight, result, xirrCacheResult, complianceResult };
   } finally {
     isSchedulerCycleRunning = false;
   }
