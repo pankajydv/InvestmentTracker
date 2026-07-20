@@ -50,6 +50,23 @@ function downloadCSV(filename, rows) {
   URL.revokeObjectURL(url);
 }
 
+function buildCapitalGainsExportRows(rows) {
+  return (rows || []).map((row) => ({
+    asset_type: row.asset_type || '',
+    investment: row.investment || '',
+    lot_type: row.lot_type || '',
+    transaction_type: row.transaction_type || '',
+    acquisition_date: row.acquisition_date || '',
+    sale_date: row.sale_date || '',
+    units_sold: row.units_sold ?? '',
+    cost_inr: row.cost_inr ?? 0,
+    proceeds_inr: row.sale_proceeds_inr ?? 0,
+    expenditure_inr: row.transfer_expense_inr ?? 0,
+    gain_loss_inr: row.gain_loss_inr ?? 0,
+    gain_type: row.gain_type || '',
+  }));
+}
+
 function combineTaxReports(reports) {
   if (!Array.isArray(reports) || !reports.length) return null;
 
@@ -164,7 +181,7 @@ export default function TaxReport() {
 
           <Accordion defaultActiveKey="0" className="shadow-sm">
             <Accordion.Item eventKey="0">
-              <Accordion.Header>Schedule 1: Perquisite Income ({report.perquisite_income.length})</Accordion.Header>
+              <Accordion.Header>Schedule 1: Perquisite Income - Foreign Equity ({report.perquisite_income.length})</Accordion.Header>
               <Accordion.Body>
                 <div className="d-flex justify-content-end mb-2">
                   <Button size="sm" variant="outline-secondary" onClick={() => downloadCSV(`perquisite_${fy}.csv`, report.perquisite_income)}>
@@ -193,26 +210,29 @@ export default function TaxReport() {
             </Accordion.Item>
 
             <Accordion.Item eventKey="1">
-              <Accordion.Header>Schedule CG: Capital Gains ({report.capital_gains.length})</Accordion.Header>
+              <Accordion.Header>Schedule CG: Capital Gains - Supported Assets ({report.capital_gains.length})</Accordion.Header>
               <Accordion.Body>
                 <div className="d-flex justify-content-end mb-2">
-                  <Button size="sm" variant="outline-secondary" onClick={() => downloadCSV(`capital_gains_${fy}.csv`, report.capital_gains)}>
+                  <Button size="sm" variant="outline-secondary" onClick={() => downloadCSV(`capital_gains_${fy}.csv`, buildCapitalGainsExportRows(report.capital_gains))}>
                     <Download size={14} className="me-1" /> Export CSV
                   </Button>
                 </div>
                 <div className="table-responsive">
                   <Table size="sm" hover>
-                    <thead><tr><th>Investment</th><th>Lot Type</th><th>Acq Date</th><th>Sale Date</th><th>Units</th><th>Cost INR</th><th>Proceeds INR</th><th>Gain/Loss</th><th>Type</th></tr></thead>
+                    <thead><tr><th>Asset</th><th>Investment</th><th>Lot Type</th><th>Txn Type</th><th>Acq Date</th><th>Sale Date</th><th>Units</th><th>Cost INR</th><th>Proceeds INR</th><th>Expenditure INR</th><th>Gain/Loss</th><th>Type</th></tr></thead>
                     <tbody>
                       {report.capital_gains.map((r, idx) => (
                         <tr key={idx}>
+                          <td>{r.asset_type}{r.category ? ` / ${r.category}` : ''}</td>
                           <td>{r.investment}</td>
                           <td>{r.lot_type}</td>
+                          <td>{r.transaction_type || '-'}</td>
                           <td>{formatDate(r.acquisition_date)}</td>
                           <td>{formatDate(r.sale_date)}</td>
                           <td>{formatNumber(r.units_sold || 0, 4)}</td>
                           <td>{formatINR(r.cost_inr || 0)}</td>
                           <td>{formatINR(r.sale_proceeds_inr || 0)}</td>
+                          <td>{formatINR(r.transfer_expense_inr || 0)}</td>
                           <td className={profitColor(r.gain_loss_inr || 0)}>{formatINR(r.gain_loss_inr || 0)}</td>
                           <td><Badge bg={r.gain_type === 'LTCG' ? 'success' : 'warning'}>{r.gain_type}</Badge></td>
                         </tr>
