@@ -1190,15 +1190,20 @@ export default function AddInvestment() {
                           <th>Stock</th>
                           <th>Date</th>
                           <th style={{ width: 60 }}>Type</th>
-                          <th style={{ width: 70 }}>Shares</th>
-                          <th style={{ width: 90 }}>Price</th>
-                          <th style={{ width: 90 }}>Charges</th>
-                          <th style={{ width: 100 }}>Total</th>
+                          <th style={{ width: 70 }} className="text-end">Shares</th>
+                          <th style={{ width: 90 }} className="text-end">Price</th>
+                          <th style={{ width: 90 }} className="text-end">Charges</th>
+                          <th style={{ width: 120 }} className="text-end">STT</th>
+                          <th style={{ width: 100 }} className="text-end">Total</th>
+                          <th style={{ width: 70 }} className="text-center">Status</th>
                           <th style={{ width: 30 }}></th>
                         </tr>
                       </thead>
                       <tbody>
-                        {contractPreview.trades.map((trade, i) => (
+                        {contractPreview.trades
+                          .map((trade, i) => ({ trade, i }))
+                          .filter(({ trade }) => trade.status === 'new' || trade.status === 'update')
+                          .map(({ trade, i }) => (
                           <tr key={i}>
                             <td title={trade.isin || ''}>{trade.security}</td>
                             <td>{trade.tradeDate}</td>
@@ -1207,33 +1212,20 @@ export default function AddInvestment() {
                                 {trade.type}
                               </span>
                             </td>
-                            <td>
-                              <input
-                                type="number"
-                                className="form-control form-control-sm p-0 px-1"
-                                value={trade.quantity}
-                                onChange={(e) => updatePreviewTrade(i, 'quantity', parseFloat(e.target.value) || 0)}
-                              />
-                            </td>
-                            <td>
-                              <input
-                                type="number"
-                                step="0.01"
-                                className="form-control form-control-sm p-0 px-1"
-                                value={trade.rate}
-                                onChange={(e) => updatePreviewTrade(i, 'rate', parseFloat(e.target.value) || 0)}
-                              />
-                            </td>
-                            <td>
-                              <input
-                                type="number"
-                                step="0.01"
-                                className="form-control form-control-sm p-0 px-1"
-                                value={trade.brokerage}
-                                onChange={(e) => updatePreviewTrade(i, 'brokerage', parseFloat(e.target.value) || 0)}
-                              />
+                            <td className="text-end">{Number(trade.quantity).toLocaleString('en-IN', { maximumFractionDigits: 4 })}</td>
+                            <td className="text-end">₹{Number(trade.rate).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                            <td className="text-end">₹{Number(trade.brokerage || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                            <td className="text-end">
+                              {trade.status === 'update'
+                                ? <span className="text-primary">₹{Number(trade.existing_stt || 0).toFixed(2)} → ₹{Number(trade.new_stt || 0).toFixed(2)}</span>
+                                : `₹${Number(trade.stt || 0).toFixed(2)}`}
                             </td>
                             <td className="text-end">₹{trade.total?.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                            <td className="text-center">
+                              {trade.status === 'new'
+                                ? <span className="badge bg-success">New</span>
+                                : <span className="badge" style={{ backgroundColor: '#dbeafe', color: '#1d4ed8' }}>Update</span>}
+                            </td>
                             <td className="text-center">
                               <button
                                 className="btn btn-sm btn-link text-danger p-0"
@@ -1243,6 +1235,9 @@ export default function AddInvestment() {
                             </td>
                           </tr>
                         ))}
+                        {contractPreview.trades.filter(t => t.status === 'new' || t.status === 'update').length === 0 && (
+                          <tr><td colSpan={10} className="text-center text-muted py-3">No new or updated trades — everything in these contract notes is already in sync.</td></tr>
+                        )}
                       </tbody>
                     </table>
                   </div>
@@ -1290,9 +1285,9 @@ export default function AddInvestment() {
                       size="sm"
                       variant="success"
                       onClick={handleContractApprove}
-                      disabled={contractImporting || contractPreview.trades.length === 0}
+                      disabled={contractImporting || ((contractPreview.summary?.newTrades || 0) + (contractPreview.summary?.updateTrades || 0)) === 0}
                     >
-                      {contractImporting ? <><Spinner size="sm" className="me-1" /> Importing...</> : <><CheckCircle size={14} className="me-1" /> Approve & Import</>}
+                      {contractImporting ? <><Spinner size="sm" className="me-1" /> Importing...</> : <><CheckCircle size={14} className="me-1" /> Import {(contractPreview.summary?.newTrades || 0)} new · {(contractPreview.summary?.updateTrades || 0)} update{(contractPreview.summary?.updateTrades || 0) !== 1 ? 's' : ''}</>}
                     </Button>
                     <Button size="sm" variant="outline-secondary" onClick={handleContractCancel}>
                       Cancel
@@ -3594,8 +3589,16 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
         />
       </div>
 
-      {/* Scheme List */}
-      {preview.schemes.map((scheme, idx) => {
+      {/* Scheme List — only schemes with new or updated transactions */}
+      {preview.schemes.filter(schemeHasChanges).length === 0 && (
+        <div className="text-center text-muted small py-3 border rounded mb-2">
+          No new or updated transactions — everything in this statement is already in sync.
+        </div>
+      )}
+      {preview.schemes
+        .map((scheme, idx) => ({ scheme, idx }))
+        .filter(({ scheme }) => schemeHasChanges(scheme))
+        .map(({ scheme, idx }) => {
         const isExpanded = expandedScheme === idx;
         const isSelected = selectedSchemes.has(idx);
         const hasNew = scheme.newTransactionCount > 0;

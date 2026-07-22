@@ -8,6 +8,7 @@ import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDat
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil, Wallet, PiggyBank, BarChart3, TrendingUp, TrendingDown } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
+import CollapsibleSectionHeader from './CollapsibleSectionHeader';
 
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
 const UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
@@ -1269,22 +1270,14 @@ export default function InvestmentDetail() {
       {/* Transactions Table */}
       <Card className="shadow-sm transactions-card">
         <Card.Header className="bg-white px-3 py-2">
-          <div className="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2">
-            <div>
-              <h2 className="h6 fw-semibold mb-1">Transactions</h2>
-              <div className="small text-muted">All transaction rows for this investment.</div>
-            </div>
-            <div className="d-flex flex-wrap justify-content-md-end align-items-center gap-2 ms-md-auto">
-              <Button
-                size="sm"
-                variant="outline-secondary"
-                onClick={() => setTransactionsExpanded((prev) => !prev)}
-                aria-expanded={transactionsExpanded}
-              >
-                {transactionsExpanded ? 'Collapse Transactions' : 'Expand Transactions'}
-              </Button>
-
-              {!transactionsExpanded ? null : (
+          <CollapsibleSectionHeader
+            className="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-2"
+            rightClassName="d-flex flex-wrap justify-content-md-end align-items-center gap-2"
+            expanded={transactionsExpanded}
+            onToggle={() => setTransactionsExpanded((prev) => !prev)}
+            title="Transactions"
+            subtitle="All transaction rows for this investment."
+            right={!transactionsExpanded ? null : (
                 <>
               {isForeignUSD && (
                 <Dropdown autoClose="outside">
@@ -1387,8 +1380,7 @@ export default function InvestmentDetail() {
               )}
                 </>
               )}
-            </div>
-          </div>
+          />
         </Card.Header>
         <Collapse in={transactionsExpanded}>
           <div>
@@ -1558,25 +1550,17 @@ export default function InvestmentDetail() {
 
       <Card className="shadow-sm mt-4">
         <Card.Body>
-          <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
-            <div>
-              <h2 className="h6 fw-semibold mb-0">Daily Price & Value History</h2>
-            </div>
-            <Button
-              size="sm"
-              variant="outline-secondary"
-              onClick={() => {
-                const nextExpanded = !dailyValuesExpanded;
-                setDailyValuesExpanded(nextExpanded);
-                if (nextExpanded && !dailyValuesData && !dailyValuesLoading) {
-                  loadDailyValuesData();
-                }
-              }}
-              aria-expanded={dailyValuesExpanded}
-            >
-              {dailyValuesExpanded ? 'Collapse Daily Price & Value History' : 'Expand Daily Price & Value History'}
-            </Button>
-          </div>
+          <CollapsibleSectionHeader
+            expanded={dailyValuesExpanded}
+            onToggle={() => {
+              const nextExpanded = !dailyValuesExpanded;
+              setDailyValuesExpanded(nextExpanded);
+              if (nextExpanded && !dailyValuesData && !dailyValuesLoading) {
+                loadDailyValuesData();
+              }
+            }}
+            title="Daily Price & Value History"
+          />
 
           <Collapse in={dailyValuesExpanded}>
             <div>

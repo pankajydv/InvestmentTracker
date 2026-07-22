@@ -3,7 +3,7 @@ import { Card, Row, Col, Form, Button, Table, Badge, Spinner, Accordion } from '
 import { Download } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { getTaxReport, getTaxMeta } from '../services/api';
-import { formatINR, formatDate, formatNumber, profitColor } from '../utils/formatters';
+import { formatINRExact as formatINR, formatDate, formatNumber, profitColor } from '../utils/formatters';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 function fyLabel(startYear) {

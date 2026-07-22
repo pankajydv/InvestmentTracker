@@ -274,10 +274,51 @@ module.exports = function (db) {
       // Derive broker from parsed notes
       const broker = allParsed[0].broker || 'Unknown';
 
-      // Flatten all trades across all notes
+      // Flatten all trades across all notes, classifying each against existing
+      // DB transactions so the preview shows new / update / unchanged like MFs.
+      const findByIsinPrev = db.prepare('SELECT id FROM investments WHERE isin_code = ?');
+      const findByPrevIsinPrev = db.prepare("SELECT id FROM investments WHERE (',' || previous_isin_codes || ',') LIKE '%,' || ? || ',%'");
+      const findByNameOrTicker = db.prepare("SELECT id FROM investments WHERE asset_type = 'INDIAN_STOCK' AND (ticker_symbol = ? OR name = ?)");
+      const findExistingTxn = db.prepare(`
+        SELECT id, amount, fees, stt, locked FROM transactions
+        WHERE investment_id = ? AND transaction_type = ? AND transaction_date = ? AND units = ? AND price_per_unit = ?
+      `);
+
+      const classifyTrade = (trade) => {
+        const newAmount = trade.total || (trade.quantity * trade.rate);
+        const newFees = trade.brokerage || 0;
+        const newStt = trade.stt || 0;
+        let invId = null;
+        if (trade.isin) {
+          invId = findByIsinPrev.get(trade.isin)?.id || findByPrevIsinPrev.get(trade.isin)?.id || null;
+        }
+        if (!invId) invId = findByNameOrTicker.get(trade.security, trade.security)?.id || null;
+        if (!invId) return { status: 'new', new_stt: newStt, new_fees: newFees };
+        const ex = findExistingTxn.get(invId, trade.type, trade.tradeDate, trade.quantity, trade.rate);
+        if (!ex) return { status: 'new', new_stt: newStt, new_fees: newFees };
+        const amountDiff = Math.abs((ex.amount || 0) - newAmount) > 0.01;
+        const feesDiff = Math.abs((ex.fees || 0) - newFees) > 0.01;
+        // Treat a stored NULL stt as 0 (matches the import's `stt || 0`), so a
+        // genuine 0-STT row (e.g. an ETF buy) isn't flagged as a perpetual update.
+        const sttDiff = Math.abs((ex.stt || 0) - newStt) > 0.01;
+        if (amountDiff || feesDiff || sttDiff) {
+          return {
+            status: 'update',
+            existing_stt: ex.stt,
+            new_stt: newStt,
+            existing_fees: ex.fees,
+            new_fees: newFees,
+            existing_amount: ex.amount,
+            new_amount: newAmount,
+          };
+        }
+        return { status: 'unchanged' };
+      };
+
       const trades = [];
       for (const note of allParsed) {
         for (const trade of note.trades) {
+          const cls = classifyTrade(trade);
           trades.push({
             security: trade.security,
             isin: trade.isin || null,
@@ -288,9 +329,13 @@ module.exports = function (db) {
             total: trade.total,
             brokerage: trade.brokerage || 0,
             stt: trade.stt || 0,
+            ...cls,
           });
         }
       }
+
+      const newTradeCount = trades.filter(t => t.status === 'new').length;
+      const updateTradeCount = trades.filter(t => t.status === 'update').length;
 
       // Summary
       const buys = trades.filter(t => t.type === 'BUY');
@@ -320,6 +365,8 @@ module.exports = function (db) {
           totalSellValue: sells.reduce((s, t) => s + t.total, 0),
           totalSellShares: sells.reduce((s, t) => s + t.quantity, 0),
           totalBrokerage: totalCharges,
+          newTrades: newTradeCount,
+          updateTrades: updateTradeCount,
           chargesBreakdown,
         },
       });

@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { Row, Col, Card, Spinner } from 'react-bootstrap';
 import { getCorporateActionSuggestionCount, getInvestments } from '../services/api';
 import { ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_FILTER_ORDER } from '../utils/formatters';
-import { PlusCircle, RefreshCw, Percent } from 'lucide-react';
+import { RefreshCw, Percent } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 
@@ -107,9 +107,6 @@ export default function Investments() {
             {pendingSuggestionCount > 0 && (
               <span className="badge rounded-pill bg-danger">{pendingSuggestionCount}</span>
             )}
-          </Link>
-          <Link to="/investments/add" className="btn btn-primary btn-sm d-flex align-items-center gap-1">
-            <PlusCircle size={16} /> Add Investment
           </Link>
         </div>
       </div>

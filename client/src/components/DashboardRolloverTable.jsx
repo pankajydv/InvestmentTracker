@@ -4,6 +4,7 @@ import { getDashboardRollover } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { formatINR, formatINRExact, formatNumber, profitColor } from '../utils/formatters';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
+import CollapsibleSectionHeader from './CollapsibleSectionHeader';
 
 export default function DashboardRolloverTable({ title, description, assetType = null, showSource = true, compactCollapsed = false, defaultExpanded = false, wrapperClassName = 'shadow-sm mt-4' }) {
   usePrivacyMaskRefresh();
@@ -68,37 +69,29 @@ export default function DashboardRolloverTable({ title, description, assetType =
   return (
     <Card className={`${wrapperClassName} ${compactCollapsed && !expanded ? 'rollup-card-collapsed' : ''}`}>
       <Card.Body className={compactCollapsed && !expanded ? 'py-2 px-3' : undefined}>
-        <div className={`d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 ${expanded ? 'mb-2' : 'mb-0'}`}>
-          <div>
-            <h2 className="h6 fw-semibold mb-0">{title}</h2>
-          </div>
-          <div className="table-toolbar-actions">
-            {expanded && (
-              <Button
-                size="sm"
-                variant="link"
-                className="p-0 text-decoration-none table-compact-toggle"
-                onClick={() => setShowMore((prev) => !prev)}
-              >
-                {showMore ? 'Less fields' : 'More fields'}
-              </Button>
-            )}
+        <CollapsibleSectionHeader
+          className={`d-flex align-items-center gap-2 ${expanded ? 'mb-2' : 'mb-0'}`}
+          rightClassName="table-toolbar-actions"
+          expanded={expanded}
+          onToggle={() => {
+            const nextExpanded = !expanded;
+            setExpanded(nextExpanded);
+            if (nextExpanded && !data && !loading) {
+              loadData();
+            }
+          }}
+          title={title}
+          right={expanded ? (
             <Button
               size="sm"
-              variant="outline-secondary"
-              onClick={() => {
-                const nextExpanded = !expanded;
-                setExpanded(nextExpanded);
-                if (nextExpanded && !data && !loading) {
-                  loadData();
-                }
-              }}
-              aria-expanded={expanded}
+              variant="link"
+              className="p-0 text-decoration-none table-compact-toggle"
+              onClick={() => setShowMore((prev) => !prev)}
             >
-              {expanded ? 'Collapse' : 'Expand'}
+              {showMore ? 'Less fields' : 'More fields'}
             </Button>
-          </div>
-        </div>
+          ) : null}
+        />
 
         <Collapse in={expanded}>
           <div>

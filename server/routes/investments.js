@@ -1310,6 +1310,17 @@ module.exports = function (db) {
       if (display_name !== undefined) { sets.push('display_name = ?'); params.push(display_name || null); }
       if (isin_code !== undefined) { sets.push('isin_code = ?'); params.push(isin_code || null); }
       if (nps_fund_code !== undefined) { sets.push('nps_fund_code = ?'); params.push(nps_fund_code || null); }
+      if (req.body.previous_isin_codes !== undefined) {
+        const currentIsin = String(existing.isin_code || '').trim().toUpperCase();
+        const cleaned = [...new Set(
+          String(req.body.previous_isin_codes || '')
+            .split(',')
+            .map((s) => s.trim().toUpperCase())
+            .filter(Boolean)
+        )].filter((code) => code !== currentIsin);
+        sets.push('previous_isin_codes = ?');
+        params.push(cleaned.length ? cleaned.join(',') : null);
+      }
       if (req.body.is_active !== undefined) { sets.push('is_active = ?'); params.push(req.body.is_active ? 1 : 0); }
       if (req.body.exclude_from_tracking !== undefined) { sets.push('exclude_from_tracking = ?'); params.push(req.body.exclude_from_tracking ? 1 : 0); }
 

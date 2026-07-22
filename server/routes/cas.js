@@ -87,6 +87,28 @@ module.exports = function (db) {
     ].join('|');
   }
 
+  // Resolve a (possibly old/renamed) statement ISIN to the current investment's
+  // ISIN via previous_isin_codes — the same idea the stock import uses. Lets
+  // merged funds (e.g. Principal → Sundaram) dedup correctly instead of being
+  // flagged as new every import.
+  function buildIsinCanonicalMap() {
+    const rows = db.prepare("SELECT isin_code, previous_isin_codes FROM investments WHERE asset_type = 'MUTUAL_FUND' AND isin_code IS NOT NULL").all();
+    const map = new Map();
+    for (const r of rows) {
+      map.set(r.isin_code, r.isin_code);
+      if (r.previous_isin_codes) {
+        for (const prev of String(r.previous_isin_codes).split(',').map((s) => s.trim()).filter(Boolean)) {
+          if (!map.has(prev)) map.set(prev, r.isin_code);
+        }
+      }
+    }
+    return map;
+  }
+  function canonicalizeIsin(isin, canonMap) {
+    if (!isin) return isin;
+    return (canonMap && canonMap.get(isin)) || isin;
+  }
+
   /**
    * POST /api/cas/preview
    * Upload a CAS PDF and get a preview of detected holdings.
@@ -116,6 +138,7 @@ module.exports = function (db) {
       if (camsParsed && camsParsed.schemes && camsParsed.schemes.length > 0) {
         // ── CAMS/KFintech CAS (transaction history) ──
         const existingTxns = getExistingTransactionMap(portfolioId);
+        const isinCanon = buildIsinCanonicalMap();
 
         // Find existing investments by ISIN for matching
         const existingByIsin = {};
@@ -130,9 +153,9 @@ module.exports = function (db) {
         }
 
         const schemes = camsParsed.schemes.map(s => {
-          const existingInv = existingByIsin[s.isin] || null;
+          const existingInv = existingByIsin[canonicalizeIsin(s.isin, isinCanon)] || null;
           const transactions = s.transactions.map(t => {
-            const key = makeTxnKey(s.isin, t.date, t.type, t.amount, t.units, s.folio);
+            const key = makeTxnKey(canonicalizeIsin(s.isin, isinCanon), t.date, t.type, t.amount, t.units, s.folio);
             const newStt = t.stt || 0;
             const newFees = (t.stampDuty || 0) + (t.stt || 0);
             const existing = existingTxns.get(key);
@@ -327,6 +350,7 @@ module.exports = function (db) {
       if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
 
       const findByIsin = db.prepare('SELECT id, name FROM investments WHERE isin_code = ?');
+      const findByPreviousIsin = db.prepare("SELECT id, name FROM investments WHERE (',' || previous_isin_codes || ',') LIKE '%,' || ? || ',%'");
 
       const insertInvestment = db.prepare(`
         INSERT INTO investments (name, asset_type, ticker_symbol, isin_code, currency, notes)
@@ -342,6 +366,7 @@ module.exports = function (db) {
 
       // Build key → existing row map so re-import can correct STT on existing rows.
       const existingTxns = getExistingTransactionMap(portfolioId);
+      const isinCanon = buildIsinCanonicalMap();
 
       let importedCount = 0;
       let updatedCount = 0;
@@ -355,11 +380,16 @@ module.exports = function (db) {
           const folio = scheme.folio ? scheme.folio.replace(/\s/g, '') : null;
           const schemeName = scheme.schemeName;
 
-          // Find or create investment (match by ISIN only — folios are per-transaction)
+          // Find or create investment. Match current ISIN first, then a
+          // previous/renamed ISIN (merged funds), before creating a new one.
           let investmentId = null;
           if (isin) {
             const byIsin = findByIsin.get(isin);
             if (byIsin) investmentId = byIsin.id;
+            else {
+              const byPrev = findByPreviousIsin.get(isin);
+              if (byPrev) investmentId = byPrev.id;
+            }
           }
           if (!investmentId) {
             const inv = insertInvestment.run(
@@ -374,7 +404,7 @@ module.exports = function (db) {
 
           let schemeImported = 0;
           for (const t of (scheme.transactions || [])) {
-            const key = makeTxnKey(isin, t.date, t.type, t.amount, t.units, folio);
+            const key = makeTxnKey(canonicalizeIsin(isin, isinCanon), t.date, t.type, t.amount, t.units, folio);
             const newStt = t.stt || 0;
             const newFees = (t.stampDuty || 0) + (t.stt || 0);
             const feeNotes = [];

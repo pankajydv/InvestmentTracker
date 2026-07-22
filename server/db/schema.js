@@ -1345,7 +1345,7 @@ function initializeDb(db) {
       const knownCols = [
         'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
         'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
-        'locked', 'folio_number', 'stt', 'created_at',
+        'locked', 'folio_number', 'created_at',
       ];
       const colsToCopy = knownCols.filter(c => existingCols.includes(c));
       db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
@@ -1427,7 +1427,6 @@ function initializeDb(db) {
           fmv_per_unit REAL,
           gross_units REAL,
           tax_withheld_units REAL,
-          stt REAL,
           created_at TEXT DEFAULT (datetime('now')),
           FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
         )
@@ -1485,22 +1484,7 @@ function initializeDb(db) {
     console.log('Migrating: adding stt column to transactions...');
     const backupPath = createPreMigrationBackup(db, 'add-transactions-stt');
     if (backupPath) console.log(`Created migration backup: ${backupPath}`);
-    
-    try {
-      db.exec('ALTER TABLE transactions ADD COLUMN stt REAL');
-      // Checkpoint WAL mode to ensure changes are persisted
-      db.pragma('wal_checkpoint(TRUNCATE)');
-    } catch (err) {
-      console.error('STT migration ALTER TABLE failed:', err);
-      throw err;
-    }
-    
-    // Verify column was actually added
-    const txnColsAfter = db.prepare('PRAGMA table_info(transactions)').all().map((c) => c.name);
-    if (!txnColsAfter.includes('stt')) {
-      throw new Error(`Migration ${sttMigrationId}: stt column not found after ALTER TABLE`);
-    }
-    
+    db.exec('ALTER TABLE transactions ADD COLUMN stt REAL');
     recordMigration(db, sttMigrationId, 'applied');
     console.log('Migration complete: stt column added.');
   } else if (!hasMigrationRecord(db, sttMigrationId) && txnColsStt.includes('stt')) {

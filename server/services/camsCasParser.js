@@ -33,8 +33,11 @@ function parseNum(s) {
 /** Map CAS description to our DB transaction_type */
 function mapTransactionType(desc) {
   const d = desc.toLowerCase();
-  if (d.includes('lateral shift out') || d.includes('switch out'))  return 'SWITCH_OUT';
-  if (d.includes('lateral shift in')  || d.includes('switch in'))   return 'SWITCH_IN';
+  // CAMS uses variants like "Switch Out", "Switch Over Out", "Lateral Shift Out".
+  // Match the optional "over" wording; check OUT before IN so "Switch Over Out"
+  // isn't caught by a stray "in" elsewhere in the description.
+  if (/switch(\s+over)?\s+out/.test(d) || d.includes('lateral shift out')) return 'SWITCH_OUT';
+  if (/switch(\s+over)?\s+in/.test(d)  || d.includes('lateral shift in'))  return 'SWITCH_IN';
   if (d.includes('redemption'))                                      return 'SELL';
   if (d.includes('purchase') || d.includes('new purchase'))          return 'BUY';
   if (d.includes('dividend') && d.includes('reinvest'))              return 'BUY';

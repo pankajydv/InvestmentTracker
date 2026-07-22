@@ -14,6 +14,7 @@ import {
 } from '../services/api';
 import { ArrowLeft, Save } from 'lucide-react';
 import { ASSET_TYPE_LABELS, formatNumber } from '../utils/formatters';
+import CollapsibleSectionHeader from './CollapsibleSectionHeader';
 
 const MARKET_DRIVEN_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'BOND']);
 
@@ -118,6 +119,10 @@ export default function InvestmentSettings() {
   const [historySuccess, setHistorySuccess] = useState('');
   const [isAddingHistory, setIsAddingHistory] = useState(false);
   const [editingHistoryId, setEditingHistoryId] = useState(null);
+  const [newFormerIsin, setNewFormerIsin] = useState('');
+  const [formerIsinSaving, setFormerIsinSaving] = useState(false);
+  const [formerIsinError, setFormerIsinError] = useState('');
+  const [historyExpanded, setHistoryExpanded] = useState(false);
   const [priceHistoryFilters, setPriceHistoryFilters] = useState(() => historyDefaultFilters());
   const [priceHistoryLoading, setPriceHistoryLoading] = useState(false);
   const [priceHistoryError, setPriceHistoryError] = useState('');
@@ -336,6 +341,46 @@ export default function InvestmentSettings() {
     }
   };
 
+  const currentFormerIsins = () =>
+    String(data?.previous_isin_codes || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  const saveFormerIsins = async (nextList) => {
+    try {
+      setFormerIsinSaving(true);
+      setFormerIsinError('');
+      const value = nextList.join(',');
+      const updated = await updateInvestment(id, { previous_isin_codes: value });
+      setData((prev) => ({ ...prev, previous_isin_codes: updated?.previous_isin_codes ?? value }));
+    } catch (e) {
+      setFormerIsinError(e.message || 'Failed to update former ISINs');
+    } finally {
+      setFormerIsinSaving(false);
+    }
+  };
+
+  const handleAddFormerIsin = async () => {
+    const code = newFormerIsin.trim().toUpperCase();
+    if (!code) return;
+    if (code === String(data?.isin_code || '').toUpperCase()) {
+      setFormerIsinError('That is the current ISIN.');
+      return;
+    }
+    const existing = currentFormerIsins();
+    if (existing.includes(code)) {
+      setFormerIsinError('ISIN already listed.');
+      return;
+    }
+    await saveFormerIsins([...existing, code]);
+    setNewFormerIsin('');
+  };
+
+  const handleRemoveFormerIsin = async (code) => {
+    await saveFormerIsins(currentFormerIsins().filter((c) => c !== code));
+  };
+
   const handleSave = async (e) => {
     e.preventDefault();
     const confirmed = window.confirm('Save changes to this investment settings record?');
@@ -406,6 +451,10 @@ export default function InvestmentSettings() {
   const isMF = data.asset_type === 'MUTUAL_FUND';
   const isNPS = data.asset_type === 'NPS';
   const showSymbolHistory = data.asset_type === 'INDIAN_STOCK' || data.asset_type === 'MUTUAL_FUND';
+  const formerIsins = String(data.previous_isin_codes || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
   const isMarketDriven = MARKET_DRIVEN_ASSET_TYPES.has(String(data.asset_type || '').toUpperCase());
 
   return (
@@ -569,12 +618,21 @@ export default function InvestmentSettings() {
       {showSymbolHistory && (
         <Card className="shadow-sm mt-4">
           <Card.Body>
-            <div className="d-flex align-items-center justify-content-between mb-2">
-              <h2 className="h6 fw-bold mb-0">{isMF ? 'AMFI History' : 'Symbol History'}</h2>
-              <Button variant="outline-primary" size="sm" onClick={handleStartAddHistory} disabled={historySaving || isAddingHistory}>
-                Add
-              </Button>
-            </div>
+            <CollapsibleSectionHeader
+              className="d-flex align-items-center gap-2 mb-2"
+              expanded={historyExpanded}
+              onToggle={() => setHistoryExpanded((v) => !v)}
+              title={isMF ? 'AMFI History' : 'Symbol History'}
+              titleClassName="h6 fw-bold mb-0"
+              summary={`${historyRows.length} row${historyRows.length === 1 ? '' : 's'}${formerIsins.length ? ` · ${formerIsins.length} former ISIN${formerIsins.length === 1 ? '' : 's'}` : ''}`}
+              right={(
+                <Button variant="outline-primary" size="sm" onClick={() => { setHistoryExpanded(true); handleStartAddHistory(); }} disabled={historySaving || isAddingHistory}>
+                  Add
+                </Button>
+              )}
+            />
+            <Collapse in={historyExpanded}>
+              <div>
             <p className="text-muted small mb-3">
               {isMF
                 ? 'Track AMFI code changes over time so missing cache windows are fetched using the correct historical identifier.'
@@ -718,6 +776,49 @@ export default function InvestmentSettings() {
                 </Row>
               </Form>
             )}
+
+            <hr className="my-3" />
+            <div>
+              <span className="fw-semibold small">Former ISINs</span>
+              <div className="text-muted mb-2" style={{ fontSize: '0.75rem' }}>
+                Prior identifiers recorded after a merger/rename. Used to match imported transactions to this holding.
+              </div>
+              {formerIsins.length > 0 && (
+                <div className="d-flex flex-wrap gap-2 mb-2">
+                  {formerIsins.map((code) => (
+                    <span key={code} className="badge bg-light text-dark border d-inline-flex align-items-center">
+                      {code}
+                      <button
+                        type="button"
+                        className="btn-close btn-close-sm ms-2"
+                        style={{ fontSize: '0.55rem' }}
+                        aria-label={`Remove ${code}`}
+                        disabled={formerIsinSaving}
+                        onClick={() => handleRemoveFormerIsin(code)}
+                      />
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="d-flex align-items-center gap-2" style={{ maxWidth: 480 }}>
+                <Form.Control
+                  type="text"
+                  size="sm"
+                  className="flex-grow-1"
+                  value={newFormerIsin}
+                  onChange={(e) => { setNewFormerIsin(e.target.value); setFormerIsinError(''); }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddFormerIsin(); } }}
+                  placeholder="Add former ISIN (e.g. INF173K01155)"
+                  disabled={formerIsinSaving}
+                />
+                <Button variant="outline-secondary" size="sm" className="text-nowrap flex-shrink-0" onClick={handleAddFormerIsin} disabled={formerIsinSaving || !newFormerIsin.trim()}>
+                  Add ISIN
+                </Button>
+              </div>
+              {formerIsinError && <div className="text-danger small mt-2">{formerIsinError}</div>}
+            </div>
+              </div>
+            </Collapse>
           </Card.Body>
         </Card>
       )}
@@ -725,26 +826,18 @@ export default function InvestmentSettings() {
       {isMarketDriven && (
         <Card className="shadow-sm mt-4">
           <Card.Body>
-            <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
-              <div>
-                  <h2 className="h6 fw-semibold mb-1">Historical Prices</h2>
-                <div className="small text-muted">Cached market history for sparse-coverage troubleshooting.</div>
-              </div>
-              <Button
-                size="sm"
-                variant="outline-secondary"
-                onClick={() => {
-                  const nextExpanded = !priceHistoryExpanded;
-                  setPriceHistoryExpanded(nextExpanded);
-                  if (nextExpanded && !priceHistoryData && !priceHistoryLoading) {
-                    loadHistoricalPriceData();
-                  }
-                }}
-                aria-expanded={priceHistoryExpanded}
-              >
-                {priceHistoryExpanded ? 'Collapse Historical Prices' : 'Expand Historical Prices'}
-              </Button>
-            </div>
+            <CollapsibleSectionHeader
+              expanded={priceHistoryExpanded}
+              onToggle={() => {
+                const nextExpanded = !priceHistoryExpanded;
+                setPriceHistoryExpanded(nextExpanded);
+                if (nextExpanded && !priceHistoryData && !priceHistoryLoading) {
+                  loadHistoricalPriceData();
+                }
+              }}
+              title="Historical Prices"
+              subtitle="Cached market history for sparse-coverage troubleshooting."
+            />
 
             <Collapse in={priceHistoryExpanded}>
               <div>
@@ -940,26 +1033,18 @@ export default function InvestmentSettings() {
       {data?.asset_type === 'FOREIGN_STOCK' && (
         <Card className="shadow-sm mt-4">
           <Card.Body>
-            <div className="d-flex flex-column flex-lg-row justify-content-between align-items-start align-items-lg-center gap-2 mb-3">
-              <div>
-                <h2 className="h6 fw-semibold mb-1">FX Rate Cache (USD to INR)</h2>
-                <div className="small text-muted">Cached USD/INR exchange rates for foreign stock valuation.</div>
-              </div>
-              <Button
-                size="sm"
-                variant="outline-secondary"
-                onClick={() => {
-                  const nextExpanded = !fxRateCacheExpanded;
-                  setFxRateCacheExpanded(nextExpanded);
-                  if (nextExpanded && !fxRateCacheData && !fxRateCacheLoading) {
-                    loadFxRateCacheData();
-                  }
-                }}
-                aria-expanded={fxRateCacheExpanded}
-              >
-                {fxRateCacheExpanded ? 'Collapse FX Rates' : 'Expand FX Rates'}
-              </Button>
-            </div>
+            <CollapsibleSectionHeader
+              expanded={fxRateCacheExpanded}
+              onToggle={() => {
+                const nextExpanded = !fxRateCacheExpanded;
+                setFxRateCacheExpanded(nextExpanded);
+                if (nextExpanded && !fxRateCacheData && !fxRateCacheLoading) {
+                  loadFxRateCacheData();
+                }
+              }}
+              title="FX Rate Cache (USD to INR)"
+              subtitle="Cached USD/INR exchange rates for foreign stock valuation."
+            />
 
             <Collapse in={fxRateCacheExpanded}>
               <div>
