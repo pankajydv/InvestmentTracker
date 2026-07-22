@@ -9,6 +9,7 @@
 
 const https = require('https');
 const http = require('http');
+const { PDFParse } = require('pdf-parse');
 const { fetchUsdInrNseHistoricalRaw } = require('./fxNseHistorical');
 const {
   upsertPricePoint,
@@ -585,19 +586,41 @@ function parseForeignQuoteSession(symbol, quote) {
     && preMarketPrice > 0
     && Number.isFinite(preMarketTime)
     && preMarketTime > 0;
+  const hasPrePostMarketData = quote.hasPrePostMarketData === true;
 
-  let sessionPhase = 'regular';
-  let price = regularMarketPrice;
-  let providerTimestamp = regularMarketTime;
+  const candidates = [
+    { phase: 'regular', price: regularMarketPrice, timestamp: regularMarketTime },
+  ];
 
-  if (hasValidPre && marketState.startsWith('PRE')) {
+  // For quote payloads, use the freshest valid session timestamp when pre/post data exists.
+  // This avoids misclassifying stale regular rows as LOCF when newer post-market data is present.
+  if (hasPrePostMarketData) {
+    if (hasValidPre) {
+      candidates.push({ phase: 'pre', price: preMarketPrice, timestamp: preMarketTime });
+    }
+    if (hasValidPost) {
+      candidates.push({ phase: 'post', price: postMarketPrice, timestamp: postMarketTime });
+    }
+  }
+
+  let selected = candidates[0];
+  for (const candidate of candidates) {
+    if (!candidate || !Number.isFinite(candidate.timestamp) || candidate.timestamp <= 0) continue;
+    if (!selected || candidate.timestamp > selected.timestamp) {
+      selected = candidate;
+    }
+  }
+
+  let sessionPhase = selected.phase;
+  let price = selected.price;
+  let providerTimestamp = selected.timestamp;
+
+  // Keep explicit market-state hint for PRE when pre timestamp equals selected timestamp.
+  // This helps during ambiguous quote windows where provider reports PRE state.
+  if (hasPrePostMarketData && hasValidPre && marketState.startsWith('PRE') && preMarketTime === providerTimestamp) {
     sessionPhase = 'pre';
     price = preMarketPrice;
     providerTimestamp = preMarketTime;
-  } else if (hasValidPost && (marketState.startsWith('POST') || marketState === 'CLOSED')) {
-    sessionPhase = 'post';
-    price = postMarketPrice;
-    providerTimestamp = postMarketTime;
   }
 
   if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(providerTimestamp) || providerTimestamp <= 0) {
@@ -1205,9 +1228,13 @@ async function fetchUSDToINR() {
 }
 
 const SBI_TT_BUY_CSV_URL = 'https://raw.githubusercontent.com/sahilgupta/sbi-fx-ratekeeper/main/csv_files/SBI_REFERENCE_RATES_USD.csv';
+const SBI_FOREX_CARD_PDF_URL = 'https://sbi.bank.in/documents/16012/1400784/FOREX_CARD_RATES.pdf';
+const SBI_FOREX_PDF_CACHE_MS = 10 * 60 * 1000;
 
 let sbiFxRatesByDateCache = null;
 let sbiFxRatesByDatePromise = null;
+let sbiForexPdfSnapshotCache = null;
+let sbiForexPdfSnapshotPromise = null;
 
 function parseCsvDate(raw) {
   const text = String(raw || '').trim();
@@ -1216,6 +1243,90 @@ function parseCsvDate(raw) {
   const dmyMatch = text.match(/\b(\d{2})[\/.-](\d{2})[\/.-](\d{4})\b/);
   if (dmyMatch) return `${dmyMatch[3]}-${dmyMatch[2]}-${dmyMatch[1]}`;
   return null;
+}
+
+function dmyToIso(raw) {
+  const text = String(raw || '').trim();
+  const m = text.match(/^(\d{2})[-\/](\d{2})[-\/](\d{4})$/);
+  if (!m) return null;
+  return `${m[3]}-${m[2]}-${m[1]}`;
+}
+
+function parseSbiForexPdfSnapshot(text) {
+  const normalizedText = String(text || '');
+  if (!normalizedText.trim()) return null;
+
+  const dateMatches = normalizedText.match(/\b\d{2}[-\/]\d{2}[-\/]\d{4}\b/g) || [];
+  const reportDateIso = dateMatches
+    .map((d) => dmyToIso(d))
+    .find((d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''))) || null;
+  if (!reportDateIso) return null;
+
+  const lines = normalizedText
+    .split(/\r?\n/)
+    .map((line) => String(line || '').trim())
+    .filter(Boolean);
+
+  const usdIndex = lines.findIndex((line) => /UNITED\s+STATES\s+DOLLAR/i.test(line) && /USD\s*\/\s*INR/i.test(line));
+  let usdLine = usdIndex >= 0 ? lines[usdIndex] : null;
+
+  if (!usdLine) {
+    const rowMatch = normalizedText.match(/UNITED\s+STATES\s+DOLLAR[\s\S]{0,120}USD\s*\/\s*INR[\s\S]{0,120}/i);
+    usdLine = rowMatch ? String(rowMatch[0]).replace(/\s+/g, ' ') : null;
+  }
+  if (!usdLine) return null;
+
+  const usdLineTail = String(usdLine).replace(/^.*?USD\s*\/\s*INR\s*/i, '');
+  const numbers = usdLineTail.match(/\d+(?:\.\d+)?/g) || [];
+  const ttBuy = Number(numbers[0]);
+  if (!Number.isFinite(ttBuy) || ttBuy <= 0) return null;
+
+  return {
+    date: reportDateIso,
+    ttBuyRate: ttBuy,
+  };
+}
+
+async function fetchSbiForexCardPdfSnapshot() {
+  const now = Date.now();
+  if (
+    sbiForexPdfSnapshotCache
+    && Number.isFinite(Number(sbiForexPdfSnapshotCache.fetchedAtMs || 0))
+    && now - Number(sbiForexPdfSnapshotCache.fetchedAtMs) < SBI_FOREX_PDF_CACHE_MS
+  ) {
+    return sbiForexPdfSnapshotCache.data;
+  }
+
+  if (sbiForexPdfSnapshotPromise) return sbiForexPdfSnapshotPromise;
+
+  sbiForexPdfSnapshotPromise = (async () => {
+    const parser = new PDFParse({ url: SBI_FOREX_CARD_PDF_URL });
+    try {
+      const result = await parser.getText();
+      const snapshot = parseSbiForexPdfSnapshot(result?.text || '');
+      if (!snapshot) {
+        throw new Error('Unable to parse date and USD/INR TT Buy from SBI FOREX PDF');
+      }
+
+      sbiForexPdfSnapshotCache = {
+        fetchedAtMs: Date.now(),
+        data: snapshot,
+      };
+
+      logAppInfo('[FXRange] Parsed SBI FOREX PDF snapshot', {
+        url: SBI_FOREX_CARD_PDF_URL,
+        date: snapshot.date,
+        ttBuyRate: snapshot.ttBuyRate,
+      });
+
+      return snapshot;
+    } finally {
+      try { await parser.destroy(); } catch (_) {}
+      sbiForexPdfSnapshotPromise = null;
+    }
+  })();
+
+  return sbiForexPdfSnapshotPromise;
 }
 
 async function loadSbiTTBuyRatesByDate() {
@@ -1442,10 +1553,25 @@ async function upgradeRecentFxRatesForProviderPrecedence(options = {}) {
 
   let sbiRatesByDate = new Map();
   let rbiRatesByDate = new Map();
+  let pdfSnapshot = null;
   let sbiError = null;
   let rbiError = null;
+  let pdfError = null;
+  const providerCalls = 3;
 
   await Promise.all([
+    fetchSbiForexCardPdfSnapshot().then((snapshot) => {
+      pdfSnapshot = snapshot || null;
+    }).catch((err) => {
+      pdfError = err?.message || String(err);
+      logAppWarn('[FXUpgradeSweep] SBI FOREX PDF fetch failed', {
+        runDate,
+        fromDate: window.fromDate,
+        toDate: runDate,
+        url: SBI_FOREX_CARD_PDF_URL,
+        error: pdfError,
+      });
+    }),
     loadSbiTTBuyRatesByDate().then((map) => {
       sbiRatesByDate = map || new Map();
     }).catch((err) => {
@@ -1469,12 +1595,16 @@ async function upgradeRecentFxRatesForProviderPrecedence(options = {}) {
     const existingPriority = getFxSourcePriority(existingSource);
     if (existingPriority >= FX_SOURCE_PRIORITY.SBI_TTBR) continue;
 
+    const pdfRate = Number(pdfSnapshot?.date === date ? pdfSnapshot.ttBuyRate : NaN);
     const sbiRate = Number(sbiRatesByDate.get(date));
     const rbiRate = Number(rbiRatesByDate.get(date));
 
     let candidateSource = null;
     let candidateRate = null;
-    if (Number.isFinite(sbiRate) && sbiRate > 0) {
+    if (Number.isFinite(pdfRate) && pdfRate > 0) {
+      candidateSource = 'SBI_TTBR';
+      candidateRate = pdfRate;
+    } else if (Number.isFinite(sbiRate) && sbiRate > 0) {
       candidateSource = 'SBI_TTBR';
       candidateRate = sbiRate;
     } else if (Number.isFinite(rbiRate) && rbiRate > 0) {
@@ -1502,13 +1632,14 @@ async function upgradeRecentFxRatesForProviderPrecedence(options = {}) {
     minSessions,
     maxSessions,
     sessionsScanned: window.sessions.length,
-    providerCalls: 2,
+    providerCalls,
     skippedReason: null,
     upgradedCount: upgradedDates.length,
     earliestChangedDate,
     upgradedDates,
     window,
     providerErrors: {
+      pdf: pdfError,
       sbi: sbiError,
       rbi: rbiError,
     },
@@ -1616,10 +1747,24 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
 
   let sbiRatesByDate = new Map();
   let rbiRatesByDate = new Map();
+  let pdfSnapshot = null;
   let sbiFetchError = null;
   let rbiFetchError = null;
+  let pdfFetchError = null;
+  const providerCalls = 3;
 
   await Promise.all([
+    fetchSbiForexCardPdfSnapshot().then((snapshot) => {
+      pdfSnapshot = snapshot || null;
+    }).catch((err) => {
+      pdfFetchError = err?.message || String(err);
+      logAppWarn('[FXRange] SBI FOREX PDF fetch failed for consolidated range', {
+        fromDate: consolidatedFrom,
+        toDate: consolidatedTo,
+        url: SBI_FOREX_CARD_PDF_URL,
+        error: pdfFetchError,
+      });
+    }),
     loadSbiTTBuyRatesByDate().then((map) => {
       sbiRatesByDate = map || new Map();
     }).catch((err) => {
@@ -1652,6 +1797,17 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
   const decisions = [];
 
   for (const date of pendingDates) {
+    const pdfRate = Number(pdfSnapshot?.date === date ? pdfSnapshot.ttBuyRate : NaN);
+    if (Number.isFinite(pdfRate) && pdfRate > 0) {
+      upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: pdfRate, source: 'SBI_TTBR' });
+      sourceCounts.SBI_TTBR += 1;
+      carryRate = pdfRate;
+      carryDate = date;
+      carrySource = 'SBI_TTBR';
+      decisions.push({ date, source: 'SBI_TTBR', reason: 'sbi_pdf_exact', rate: pdfRate });
+      continue;
+    }
+
     const sbiRate = Number(sbiRatesByDate.get(date));
     if (Number.isFinite(sbiRate) && sbiRate > 0) {
       upsertPricePoint({ instrumentType: 'FX', symbol: 'USDINR=X', date, close: sbiRate, source: 'SBI_TTBR' });
@@ -1699,10 +1855,11 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
     missingWindows,
     consolidatedWindow: { from: consolidatedFrom, to: consolidatedTo },
     pendingSessionDays: pendingDates.length,
-    providerCalls: 2,
+    providerCalls,
     sourceCounts,
     unresolvedDays,
     providerErrors: {
+      pdf: pdfFetchError,
       sbi: sbiFetchError,
       rbi: rbiFetchError,
     },
@@ -1719,7 +1876,7 @@ async function fetchHistoricalUSDToINRRange(fromDate, toDate) {
     resolvedDays: sessionDates.length - unresolvedDays,
     unresolvedDays,
     sourceCounts,
-    providerCalls: 2,
+    providerCalls,
     missingWindows,
     consolidatedWindow: { from: consolidatedFrom, to: consolidatedTo },
   };

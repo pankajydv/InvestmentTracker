@@ -1414,6 +1414,7 @@ export default function InvestmentDetail() {
                       {!isPPF && <th className="px-3 text-end">Price</th>}
                       <th className="px-3 text-end">Amt</th>
                       {!isPPF && <th className="px-3 text-end">Fees</th>}
+                      {!isPPF && <th className="px-3 text-end">STT</th>}
                       {isPPF && <th className="px-3 text-end">Balance</th>}
                       {!isPPF && <th className="px-3 text-end">Hold</th>}
                       {hasFolioColumn && <th className="px-3">Folio</th>}
@@ -1518,6 +1519,7 @@ export default function InvestmentDetail() {
                           ) : null}
                         </td>
                         {!isPPF && <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
+                        {!isPPF && <td className="px-3 text-end text-muted">{txn.stt != null ? `₹${formatNumber(txn.stt, 2)}` : '-'}</td>}
                         {isPPF && <td className="px-3 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>}
                         {!isPPF && <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
                         {!isPPF && hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}

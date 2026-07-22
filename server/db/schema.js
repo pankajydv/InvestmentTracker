@@ -1334,6 +1334,7 @@ function initializeDb(db) {
           fmv_per_unit REAL,
           gross_units REAL,
           tax_withheld_units REAL,
+          stt REAL,
           created_at TEXT DEFAULT (datetime('now')),
           FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
         )
@@ -1344,7 +1345,7 @@ function initializeDb(db) {
       const knownCols = [
         'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
         'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
-        'locked', 'folio_number', 'created_at',
+        'locked', 'folio_number', 'stt', 'created_at',
       ];
       const colsToCopy = knownCols.filter(c => existingCols.includes(c));
       db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
@@ -1426,6 +1427,7 @@ function initializeDb(db) {
           fmv_per_unit REAL,
           gross_units REAL,
           tax_withheld_units REAL,
+          stt REAL,
           created_at TEXT DEFAULT (datetime('now')),
           FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
         )
@@ -1436,7 +1438,7 @@ function initializeDb(db) {
         'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
         'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
         'locked', 'folio_number', 'exchange_rate_used', 'usd_amount', 'fmv_per_unit',
-        'gross_units', 'tax_withheld_units', 'created_at',
+        'gross_units', 'tax_withheld_units', 'stt', 'created_at',
       ];
       const colsToCopy = knownCols.filter((c) => existingCols.includes(c));
       db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
@@ -1468,6 +1470,41 @@ function initializeDb(db) {
     }
   } else if (!hasMigrationRecord(db, vestWithholdingMigrationId) && hasGrossUnits && hasTaxWithheldUnits) {
     recordMigration(db, vestWithholdingMigrationId, 'skipped', 'vesting withholding columns already present');
+  }
+
+  // ── Migration: add stt column on transactions ──────────────────────────────
+  // Securities Transaction Tax portion of `fees` (bundled charge). Stored
+  // separately because STT is NOT a deductible cost/transfer expense for
+  // capital-gains computation. `fees` remains the full total for back-compat.
+  const txnColsStt = db.prepare('PRAGMA table_info(transactions)').all().map((c) => c.name);
+  const sttMigrationId = '20260720-add-transactions-stt';
+  if (!txnColsStt.includes('stt') && !hasMigrationRecord(db, sttMigrationId)) {
+    if (!migrationsEnabled) {
+      throw new Error(`Pending migration ${sttMigrationId} detected but migrations are disabled. Set ALLOW_DB_MIGRATIONS=true and restart.`);
+    }
+    console.log('Migrating: adding stt column to transactions...');
+    const backupPath = createPreMigrationBackup(db, 'add-transactions-stt');
+    if (backupPath) console.log(`Created migration backup: ${backupPath}`);
+    
+    try {
+      db.exec('ALTER TABLE transactions ADD COLUMN stt REAL');
+      // Checkpoint WAL mode to ensure changes are persisted
+      db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch (err) {
+      console.error('STT migration ALTER TABLE failed:', err);
+      throw err;
+    }
+    
+    // Verify column was actually added
+    const txnColsAfter = db.prepare('PRAGMA table_info(transactions)').all().map((c) => c.name);
+    if (!txnColsAfter.includes('stt')) {
+      throw new Error(`Migration ${sttMigrationId}: stt column not found after ALTER TABLE`);
+    }
+    
+    recordMigration(db, sttMigrationId, 'applied');
+    console.log('Migration complete: stt column added.');
+  } else if (!hasMigrationRecord(db, sttMigrationId) && txnColsStt.includes('stt')) {
+    recordMigration(db, sttMigrationId, 'skipped', 'stt column already present');
   }
 
   // ── Migration: add ESPP_CONTRIBUTION transaction type ────────────────
@@ -1516,6 +1553,7 @@ function initializeDb(db) {
           fmv_per_unit REAL,
           gross_units REAL,
           tax_withheld_units REAL,
+          stt REAL,
           created_at TEXT DEFAULT (datetime('now')),
           FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
         )
@@ -1526,7 +1564,7 @@ function initializeDb(db) {
         'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
         'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
         'locked', 'folio_number', 'exchange_rate_used', 'usd_amount', 'fmv_per_unit',
-        'gross_units', 'tax_withheld_units', 'created_at',
+        'gross_units', 'tax_withheld_units', 'stt', 'created_at',
       ];
       const colsToCopy = knownCols.filter((c) => existingCols.includes(c));
       db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
@@ -1606,6 +1644,7 @@ function initializeDb(db) {
           fmv_per_unit REAL,
           gross_units REAL,
           tax_withheld_units REAL,
+          stt REAL,
           created_at TEXT DEFAULT (datetime('now')),
           FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
         )
@@ -1616,7 +1655,7 @@ function initializeDb(db) {
         'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
         'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
         'locked', 'folio_number', 'exchange_rate_used', 'usd_amount', 'fmv_per_unit',
-        'gross_units', 'tax_withheld_units', 'created_at',
+        'gross_units', 'tax_withheld_units', 'stt', 'created_at',
       ];
       const colsToCopy = knownCols.filter((c) => existingCols.includes(c));
       db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);
@@ -1725,6 +1764,7 @@ function initializeDb(db) {
           fmv_per_unit REAL,
           gross_units REAL,
           tax_withheld_units REAL,
+          stt REAL,
           created_at TEXT DEFAULT (datetime('now')),
           FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
         )
@@ -1735,7 +1775,7 @@ function initializeDb(db) {
         'id', 'investment_id', 'portfolio_id', 'transaction_type', 'transaction_date',
         'units', 'price_per_unit', 'amount', 'fees', 'broker', 'notes',
         'locked', 'folio_number', 'exchange_rate_used', 'usd_amount', 'fmv_per_unit',
-        'gross_units', 'tax_withheld_units', 'created_at',
+        'gross_units', 'tax_withheld_units', 'stt', 'created_at',
       ];
       const colsToCopy = knownCols.filter((c) => existingCols.includes(c));
       db.exec(`INSERT INTO transactions_new (${colsToCopy.join(', ')}) SELECT ${colsToCopy.join(', ')} FROM transactions`);

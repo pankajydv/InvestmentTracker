@@ -231,6 +231,13 @@ export const getTaxReport = (fy, portfolioId) => {
   return fetchJSON(`/tax/us-stocks?${params.toString()}`);
 };
 
+export const getTaxMeta = (portfolioId) => {
+  const params = new URLSearchParams();
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  const qs = params.toString();
+  return fetchJSON(`/tax/meta${qs ? `?${qs}` : ''}`);
+};
+
 // Utils
 export const searchMutualFunds = (q) => fetchJSON(`/utils/search-mf?q=${encodeURIComponent(q)}`);
 export const searchStockByName = (q, market) =>

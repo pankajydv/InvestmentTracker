@@ -51,6 +51,80 @@ function gainTypeForInvestment(investment, acquisitionDate, saleDate) {
   return holdingDays > 730 ? 'LTCG' : 'STCG';
 }
 
+// ── Tax classification (equity-oriented vs non-equity) ───────────────────────
+// Primary signal: STT charged on the disposal. STT on MF redemption/switch is
+// levied ONLY on equity-oriented funds, so its presence is the most reliable
+// real-world indicator (more reliable than SEBI's scheme-category label, which
+// can mark an equity FoF as "Other Scheme"). Falls back to category/name.
+const DEBT_NAME_RE = /debt|liquid|gilt|\bbond\b|money market|overnight|ultra short|low duration|floater|corporate bond|banking\s*&?\s*psu|credit risk|dynamic bond|short duration|medium duration/i;
+
+function resolveEquityOriented(inv, hasSttOnDisposal) {
+  if (inv.asset_type === 'FOREIGN_STOCK') return false; // outside the Indian STT/111A/112A regime
+  if (inv.asset_type === 'INDIAN_STOCK') return true;   // listed equity / equity ETF, STT paid
+  if (inv.asset_type === 'MUTUAL_FUND') {
+    if (hasSttOnDisposal) return true; // STT on redemption ⇒ equity-oriented
+    const cat = String(inv.category || '').toLowerCase();
+    if (cat.includes('equity')) return true;
+    if (DEBT_NAME_RE.test(cat)) return false;
+    const name = String(inv.display_name || inv.name || '');
+    if (DEBT_NAME_RE.test(name)) return false;
+    return true; // default: most Indian MFs are equity-oriented
+  }
+  return false;
+}
+
+function thresholdDaysFor(inv, equityOriented) {
+  if (inv.asset_type === 'FOREIGN_STOCK') return 730;
+  return equityOriented ? 365 : 730;
+}
+
+// Asset class + ITR section for a disposal row.
+function classifyForTax(inv, gainType, equityOriented) {
+  let assetClass;
+  if (inv.asset_type === 'FOREIGN_STOCK') assetClass = 'Foreign';
+  else if (equityOriented) assetClass = 'Equity';
+  else assetClass = 'Debt';
+
+  let taxSection;
+  if (assetClass === 'Equity') taxSection = gainType === 'LTCG' ? '112A' : '111A';
+  else taxSection = gainType === 'LTCG' ? '112' : 'SLAB'; // Foreign + Debt
+
+  return { assetClass, taxSection };
+}
+
+// ── ITR quarter buckets (for Section 234C advance-tax interest) ──────────────
+const FY_QUARTERS = [
+  { key: 'Q1', label: 'Up to 15 Jun' },
+  { key: 'Q2', label: '16 Jun – 15 Sep' },
+  { key: 'Q3', label: '16 Sep – 15 Dec' },
+  { key: 'Q4', label: '16 Dec – 15 Mar' },
+  { key: 'Q5', label: '16 Mar – 31 Mar' },
+];
+
+const CG_SECTION_DEFS = [
+  { key: '111A', title: 'STCG – Equity (Section 111A, STT paid)' },
+  { key: '112A', title: 'LTCG – Equity (Section 112A, STT paid)' },
+  { key: '112', title: 'LTCG – Foreign / Other (Section 112)' },
+  { key: 'SLAB', title: 'STCG – Foreign / Other (Slab rate)' },
+];
+
+const LTCG_112A_EXEMPTION = 125000;
+
+// Map a sale date (YYYY-MM-DD) to its ITR financial-year quarter bucket.
+function fyQuarterForDate(dateStr) {
+  const parts = String(dateStr || '').split('-').map(Number);
+  const m = parts[1];
+  const d = parts[2];
+  if (!m || !d) return 'Q4';
+  const md = m * 100 + d;
+  if (md >= 401 && md <= 615) return 'Q1';
+  if (md >= 616 && md <= 915) return 'Q2';
+  if (md >= 916 && md <= 1215) return 'Q3';
+  if ((md >= 1216 && md <= 1231) || (md >= 101 && md <= 315)) return 'Q4';
+  if (md >= 316 && md <= 331) return 'Q5';
+  return 'Q4';
+}
+
 function roundCurrency(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
@@ -114,6 +188,20 @@ function buildTaxReport(db, fy, portfolioId) {
 
   const allTxns = db.prepare(txnSql).all(...txnParams);
 
+  // Fund-level equity-oriented resolution: if ANY disposal of an investment
+  // carried STT (fees on an MF redemption/switch are STT), treat it as
+  // equity-oriented. This corrects SEBI-label edge cases like equity FoFs.
+  const invHasSttOnDisposal = {};
+  for (const t of allTxns) {
+    if (LOT_DISPOSAL_TYPES.has(t.transaction_type) && Number(t.fees) > 0) {
+      invHasSttOnDisposal[t.investment_id] = true;
+    }
+  }
+  const equityOrientedByInv = {};
+  for (const inv of investments) {
+    equityOrientedByInv[inv.id] = resolveEquityOriented(inv, !!invHasSttOnDisposal[inv.id]);
+  }
+
   const lotPool = {};
   for (const inv of investments) lotPool[inv.id] = [];
 
@@ -149,6 +237,7 @@ function buildTaxReport(db, fy, portfolioId) {
           units_remaining: units,
           cost_per_unit_inr: costPerUnitINR,
           buy_fee_per_unit_inr: buyFeePerUnitINR,
+          buy_stt_per_unit_inr: 0,
           fmv_per_unit: pricePerUnit,
           exchange_rate: rate,
           txn_id: txn.id,
@@ -186,6 +275,7 @@ function buildTaxReport(db, fy, portfolioId) {
           units_remaining: units,
           cost_per_unit_inr: costPerUnitINR,
           buy_fee_per_unit_inr: buyFeePerUnitINR,
+          buy_stt_per_unit_inr: 0,
           fmv_per_unit: fmvPerUnit,
           exchange_rate: rate,
           txn_id: txn.id,
@@ -222,6 +312,7 @@ function buildTaxReport(db, fy, portfolioId) {
           units_remaining: units,
           cost_per_unit_inr: units > 0 ? grossCostINR / units : 0,
           buy_fee_per_unit_inr: units > 0 ? feesINR / units : 0,
+          buy_stt_per_unit_inr: units > 0 ? (Number(txn.stt) || 0) / units : 0,
           fmv_per_unit: inv.currency === 'USD' ? fmvPerUnit : pricePerUnit,
           exchange_rate: rate,
           txn_id: txn.id,
@@ -245,12 +336,25 @@ function buildTaxReport(db, fy, portfolioId) {
             ? (soldFromLot / units) * feesINR
             : 0;
           const buySideExpenseINR = (Number(lot.buy_fee_per_unit_inr) || 0) * soldFromLot;
-          const totalExpenseINR = buySideExpenseINR + saleSideExpenseINR;
+          const saleSideSttINR = units > 0 ? (soldFromLot / units) * (Number(txn.stt) || 0) : 0;
+          const buySideSttINR = (Number(lot.buy_stt_per_unit_inr) || 0) * soldFromLot;
+          const totalSttINR = buySideSttINR + saleSideSttINR;
+          const grossExpenseINR = buySideExpenseINR + saleSideExpenseINR;
+          // STT is not a deductible cost/transfer expense for capital gains.
+          const deductibleExpenseINR = Math.max(0, grossExpenseINR - totalSttINR);
           const costINR = lot.cost_per_unit_inr * soldFromLot;
-          const gainINR = saleProceedsINR - costINR - totalExpenseINR;
+          const gainINR = saleProceedsINR - costINR - deductibleExpenseINR;
+
+          const equityOriented = !!equityOrientedByInv[invId];
+          const thresholdDays = thresholdDaysFor(inv, equityOriented);
+          const gt = daysBetween(lot.acquisition_date, txnDate) > thresholdDays ? 'LTCG' : 'STCG';
+          const { assetClass, taxSection } = classifyForTax(inv, gt, equityOriented);
 
           capitalGainsRows.push({
             asset_type: inv.asset_type,
+            asset_class: assetClass,
+            tax_section: taxSection,
+            equity_oriented: equityOriented,
             category: inv.category || null,
             investment: name,
             ticker,
@@ -265,11 +369,13 @@ function buildTaxReport(db, fy, portfolioId) {
             sale_exchange_rate: rate,
             buy_side_fees_inr: roundCurrency(buySideExpenseINR),
             sale_side_fees_inr: roundCurrency(saleSideExpenseINR),
-            transfer_expense_inr: roundCurrency(totalExpenseINR),
+            stt_inr: roundCurrency(totalSttINR),
+            transfer_expense_inr: roundCurrency(deductibleExpenseINR),
             cost_inr: roundCurrency(costINR),
             sale_proceeds_inr: roundCurrency(saleProceedsINR),
             gain_loss_inr: roundCurrency(gainINR),
-            gain_type: gainTypeForInvestment(inv, lot.acquisition_date, txnDate),
+            gain_type: gt,
+            quarter: fyQuarterForDate(txnDate),
             notes: txn.notes || null,
           });
         }
@@ -337,12 +443,60 @@ function buildTaxReport(db, fy, portfolioId) {
   const totalLTCGINR = ltcgRows.reduce((s, r) => s + (r.gain_loss_inr || 0), 0);
   const totalDividendINR = dividendRows.reduce((s, r) => s + (r.amount_inr || 0), 0);
 
+  // ── Schedule CG sub-sections by ITR section ──────────────────────────────
+  const sumBy = (rows, field) => rows.reduce((s, r) => s + (Number(r[field]) || 0), 0);
+  const cgSections = CG_SECTION_DEFS.map((def) => {
+    const rows = capitalGainsRows.filter((r) => r.tax_section === def.key);
+    return {
+      key: def.key,
+      title: def.title,
+      section: def.key,
+      rows,
+      subtotal: {
+        rows: rows.length,
+        cost_inr: roundCurrency(sumBy(rows, 'cost_inr')),
+        proceeds_inr: roundCurrency(sumBy(rows, 'sale_proceeds_inr')),
+        expenditure_inr: roundCurrency(sumBy(rows, 'transfer_expense_inr')),
+        stt_inr: roundCurrency(sumBy(rows, 'stt_inr')),
+        gain_inr: roundCurrency(sumBy(rows, 'gain_loss_inr')),
+      },
+    };
+  });
+
+  // ── Quarter-wise breakup (gross gains net of fees) per section ────────────
+  const cgQuarterly = FY_QUARTERS.map((q) => {
+    const entry = { quarter: q.key, label: q.label };
+    for (const def of CG_SECTION_DEFS) {
+      const g = capitalGainsRows
+        .filter((r) => r.tax_section === def.key && r.quarter === q.key)
+        .reduce((s, r) => s + (r.gain_loss_inr || 0), 0);
+      entry[def.key] = roundCurrency(g);
+    }
+    entry.total = roundCurrency(CG_SECTION_DEFS.reduce((s, def) => s + entry[def.key], 0));
+    return entry;
+  });
+
+  // ── CG headline summary (with 112A ₹1.25L exemption) ─────────────────────
+  const gainForSection = (key) => roundCurrency(
+    sumBy(capitalGainsRows.filter((r) => r.tax_section === key), 'gain_loss_inr'),
+  );
+  const stcg111a = gainForSection('111A');
+  const ltcg112aGross = gainForSection('112A');
+  const ltcg112 = gainForSection('112');
+  const stcgSlab = gainForSection('SLAB');
+  const ltcg112aExemptionUsed = roundCurrency(Math.min(Math.max(ltcg112aGross, 0), LTCG_112A_EXEMPTION));
+  const ltcg112aTaxable = roundCurrency(Math.max(0, ltcg112aGross - LTCG_112A_EXEMPTION));
+
   return {
     fy,
     fy_start: fyStartStr,
     fy_end: fyEndStr,
     perquisite_income: perquisiteRows,
     capital_gains: capitalGainsRows,
+    cg_sections: cgSections,
+    cg_quarterly: cgQuarterly,
+    cg_quarter_labels: FY_QUARTERS,
+    cg_section_defs: CG_SECTION_DEFS,
     dividend_income: dividendRows,
     schedule_fa: scheduleFA,
     summary: {
@@ -352,7 +506,14 @@ function buildTaxReport(db, fy, portfolioId) {
       total_dividend_inr: roundCurrency(totalDividendINR),
       stcg_lots: stcgRows.length,
       ltcg_lots: ltcgRows.length,
-      tax_note: 'Capital gains include supported foreign stock, Indian stock, and mutual fund disposals. Foreign-stock LTCG uses a 24-month threshold; listed Indian equity and equity-like funds use 12 months; debt-like mutual funds use 24 months.',
+      cg_stcg_111a: stcg111a,
+      cg_ltcg_112a_gross: ltcg112aGross,
+      cg_ltcg_112a_exemption: ltcg112aExemptionUsed,
+      cg_ltcg_112a_taxable: ltcg112aTaxable,
+      cg_ltcg_112: ltcg112,
+      cg_stcg_slab: stcgSlab,
+      ltcg_112a_exemption_limit: LTCG_112A_EXEMPTION,
+      tax_note: 'Equity (STT-paid) → 111A STCG / 112A LTCG with 12-month threshold and ₹1.25L LTCG exemption. Foreign & non-equity → slab STCG / 112 LTCG with 24-month threshold. Equity classification uses STT charged on disposal as the primary signal.',
     },
   };
 }
@@ -403,6 +564,35 @@ module.exports = function (db) {
       res.json(buildTaxReport(db, fy, portfolio_id));
     } catch (e) {
       console.error('Tax report error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  /**
+   * GET /api/tax/meta?portfolio_id=1
+   *
+   * Returns lightweight metadata used to build the FY selector without hardcoding:
+   *   - earliest_transaction_date : oldest transaction date across supported asset types
+   */
+  router.get('/meta', (req, res) => {
+    try {
+      const { portfolio_id } = req.query;
+      const assetPlaceholders = [...SUPPORTED_TAX_ASSET_TYPES].map(() => '?').join(',');
+      let sql = `
+        SELECT MIN(DATE(t.transaction_date)) AS earliest_transaction_date
+        FROM transactions t
+        JOIN investments i ON i.id = t.investment_id
+        WHERE i.asset_type IN (${assetPlaceholders})
+      `;
+      const params = [...SUPPORTED_TAX_ASSET_TYPES];
+      if (portfolio_id) {
+        sql += ' AND t.portfolio_id = ?';
+        params.push(portfolio_id);
+      }
+      const row = db.prepare(sql).get(...params);
+      res.json({ earliest_transaction_date: row?.earliest_transaction_date || null });
+    } catch (e) {
+      console.error('Tax meta error:', e);
       res.status(500).json({ error: e.message });
     }
   });

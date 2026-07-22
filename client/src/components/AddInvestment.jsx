@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse, Table } from 'react-bootstrap';
-import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, triggerPriceUpdate, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction, previewRsuGrantDocuments, importRsuGrantSchedule, getUSDINRRate } from '../services/api';
+import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction, previewRsuGrantDocuments, importRsuGrantSchedule, getUSDINRRate } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp, Plus } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -508,10 +508,10 @@ export default function AddInvestment() {
       const result = await uploadCASPreview(casFile, portfolioId, casPassword || undefined);
       setCasPreview(result);
       if (result.casType === 'cams') {
-        // CAMS CAS — select schemes that have new transactions by default
+        // CAMS CAS — select schemes that have new OR updatable (STT/fees) transactions
         setCasSelectedSchemes(new Set(
           result.schemes
-            .map((s, i) => s.newTransactionCount > 0 ? i : null)
+            .map((s, i) => ((s.newTransactionCount > 0 || s.updateTransactionCount > 0) ? i : null))
             .filter(i => i !== null)
         ));
       } else {
@@ -528,27 +528,26 @@ export default function AddInvestment() {
   const handleCASImport = async () => {
     setCasError('');
     if (casPreview?.casType === 'cams') {
-      // CAMS CAS — import selected schemes' new transactions
+      // CAMS CAS — send ALL transactions for selected schemes so the server can
+      // insert new ones AND correct STT/fees on already-existing transactions.
       const schemes = [];
       casSelectedSchemes.forEach(idx => {
         const s = casPreview.schemes[idx];
         if (!s) return;
-        const newTxns = s.transactions.filter(t => t.isNew);
-        if (newTxns.length > 0) {
+        if (s.transactions && s.transactions.length > 0) {
           schemes.push({
             isin: s.isin,
             schemeName: s.schemeName,
             folio: s.folio,
             amc: s.amc,
-            transactions: newTxns,
+            transactions: s.transactions,
           });
         }
       });
-      if (schemes.length === 0) return setCasError('No new transactions to import in selected schemes');
+      if (schemes.length === 0) return setCasError('No transactions to import in selected schemes');
       setCasImporting(true);
       try {
         const result = await importCAMSCASTransactions(portfolioId, schemes);
-        try { await triggerPriceUpdate(); } catch (_) { /* */ }
         await refreshPortfolios();
         setCasResult(result);
         setCasPreview(null);
@@ -567,7 +566,6 @@ export default function AddInvestment() {
     setCasImporting(true);
     try {
       const result = await importCASHoldings(portfolioId, holdings);
-      try { await triggerPriceUpdate(); } catch (_) { /* non-critical */ }
       await refreshPortfolios();
       setCasResult(result);
       setCasPreview(null);
@@ -2232,6 +2230,7 @@ export default function AddInvestment() {
                     <Alert variant="success" className="small py-2">
                       <CheckCircle size={14} className="me-1" />
                       Successfully imported {casResult.imported} {casResult.schemes ? 'transaction' : 'investment'}{casResult.imported !== 1 ? 's' : ''} from CAS.
+                      {casResult.updated > 0 && <span className="text-muted ms-1">({casResult.updated} updated)</span>}
                       {casResult.skipped > 0 && <span className="text-muted ms-1">({casResult.skipped} duplicates skipped)</span>}
                       <button className="btn btn-link btn-sm p-0 ms-2" onClick={handleCASReset}>
                         Upload another
@@ -3553,15 +3552,18 @@ function CASHoldingTable({ title, emoji, items, selected, setSelected, open, tog
 
 /* ─── CAMS/KFintech CAS Preview (transaction-level delta) ─── */
 function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expandedScheme, setExpandedScheme, onImport, onCancel, importing, formatCurrency }) {
-  const totalNewTxns = preview.schemes.reduce((s, sc) => s + sc.newTransactionCount, 0);
+  const schemeHasChanges = (sc) => (sc.newTransactionCount > 0 || sc.updateTransactionCount > 0);
   const selectedNewTxns = preview.schemes
     .filter((_, i) => selectedSchemes.has(i))
     .reduce((s, sc) => s + sc.newTransactionCount, 0);
+  const selectedUpdateTxns = preview.schemes
+    .filter((_, i) => selectedSchemes.has(i))
+    .reduce((s, sc) => s + (sc.updateTransactionCount || 0), 0);
 
-  const allWithNew = preview.schemes
-    .map((s, i) => s.newTransactionCount > 0 ? i : null)
+  const allWithChanges = preview.schemes
+    .map((s, i) => (schemeHasChanges(s) ? i : null))
     .filter(i => i !== null);
-  const allSelected = allWithNew.length > 0 && allWithNew.every(i => selectedSchemes.has(i));
+  const allSelected = allWithChanges.length > 0 && allWithChanges.every(i => selectedSchemes.has(i));
 
   return (
     <div className="mt-3">
@@ -3574,6 +3576,7 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
         )}
         <span className="small text-muted ms-auto">
           {preview.summary.totalSchemes} schemes · <span className="text-success fw-medium">{preview.summary.newTransactions} new</span>
+          {preview.summary.updateTransactions > 0 && <> · <span className="text-primary fw-medium">{preview.summary.updateTransactions} updates</span></>}
           {preview.summary.existingTransactions > 0 && <> · {preview.summary.existingTransactions} in DB</>}
         </span>
       </div>
@@ -3585,9 +3588,9 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
           checked={allSelected}
           onChange={() => {
             if (allSelected) setSelectedSchemes(new Set());
-            else setSelectedSchemes(new Set(allWithNew));
+            else setSelectedSchemes(new Set(allWithChanges));
           }}
-          label={<span className="small text-muted">Select all schemes with new transactions</span>}
+          label={<span className="small text-muted">Select all schemes with new or updated transactions</span>}
         />
       </div>
 
@@ -3596,16 +3599,19 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
         const isExpanded = expandedScheme === idx;
         const isSelected = selectedSchemes.has(idx);
         const hasNew = scheme.newTransactionCount > 0;
-        const newTxns = scheme.transactions.filter(t => t.isNew);
+        const hasUpdates = (scheme.updateTransactionCount || 0) > 0;
+        const hasChanges = hasNew || hasUpdates;
+        // Only show rows that will actually change the DB (new or update); hide unchanged.
+        const visibleTxns = scheme.transactions.filter(t => t.status === 'new' || t.status === 'update');
 
         return (
-          <div key={idx} className="border rounded mb-2 overflow-hidden" style={{ opacity: hasNew ? 1 : 0.6 }}>
+          <div key={idx} className="border rounded mb-2 overflow-hidden" style={{ opacity: hasChanges ? 1 : 0.6 }}>
             {/* Scheme Header */}
             <div className="d-flex align-items-center px-3 py-2" style={{ backgroundColor: isSelected ? '#eff6ff' : 'transparent' }}>
               <Form.Check
                 type="checkbox"
                 checked={isSelected}
-                disabled={!hasNew}
+                disabled={!hasChanges}
                 onChange={() => {
                   const next = new Set(selectedSchemes);
                   if (next.has(idx)) next.delete(idx);
@@ -3628,18 +3634,19 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
                   </div>
                 </div>
                 <div className="d-flex align-items-center gap-2 ms-2">
-                  {hasNew ? (
+                  {hasNew && (
                     <span className="badge" style={{ fontSize: '0.65rem', backgroundColor: '#dcfce7', color: '#15803d' }}>
                       {scheme.newTransactionCount} new
                     </span>
-                  ) : (
-                    <span className="badge bg-light text-muted" style={{ fontSize: '0.65rem' }}>
-                      all in DB
+                  )}
+                  {hasUpdates && (
+                    <span className="badge" style={{ fontSize: '0.65rem', backgroundColor: '#dbeafe', color: '#1d4ed8' }}>
+                      {scheme.updateTransactionCount} update{scheme.updateTransactionCount !== 1 ? 's' : ''}
                     </span>
                   )}
-                  {scheme.existingTransactionCount > 0 && (
+                  {!hasChanges && (
                     <span className="badge bg-light text-muted" style={{ fontSize: '0.65rem' }}>
-                      {scheme.existingTransactionCount} existing
+                      all in DB
                     </span>
                   )}
                   {scheme.closingBalance > 0 && (
@@ -3667,13 +3674,16 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
                         <th className="px-2 py-1 text-end">Amount</th>
                         <th className="px-2 py-1 text-end">Units</th>
                         <th className="px-2 py-1 text-end">Price</th>
+                        <th className="px-2 py-1 text-end">STT</th>
                         <th className="px-2 py-1">Description</th>
                         <th className="px-2 py-1">Status</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {scheme.transactions.map((t, ti) => (
-                        <tr key={ti} style={{ opacity: t.isNew ? 1 : 0.5 }}>
+                      {visibleTxns.length === 0 ? (
+                        <tr><td colSpan={8} className="px-2 py-2 text-center text-muted">Nothing to import — all transactions already in DB.</td></tr>
+                      ) : visibleTxns.map((t, ti) => (
+                        <tr key={ti}>
                           <td className="px-2 py-1 text-nowrap">{t.date}</td>
                           <td className="px-2 py-1">
                             <span className={`badge ${t.type === 'BUY' ? 'bg-success' : t.type === 'SELL' ? 'bg-danger' : 'bg-secondary'}`}
@@ -3684,12 +3694,17 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
                           <td className="px-2 py-1 text-end">{formatCurrency(t.amount)}</td>
                           <td className="px-2 py-1 text-end">{Math.abs(t.units || 0).toLocaleString('en-IN', { maximumFractionDigits: 4 })}</td>
                           <td className="px-2 py-1 text-end">{formatCurrency(t.price)}</td>
+                          <td className="px-2 py-1 text-end">
+                            {t.status === 'update'
+                              ? <span className="text-primary">{formatCurrency(t.existing_stt || 0)} → {formatCurrency(t.new_stt || 0)}</span>
+                              : formatCurrency(t.new_stt || 0)}
+                          </td>
                           <td className="px-2 py-1 text-muted text-truncate" style={{ maxWidth: 180 }}>{t.description}</td>
                           <td className="px-2 py-1">
-                            {t.isNew ? (
+                            {t.status === 'new' ? (
                               <span className="badge" style={{ fontSize: '0.6rem', backgroundColor: '#dcfce7', color: '#15803d' }}>New</span>
                             ) : (
-                              <span className="badge bg-light text-muted" style={{ fontSize: '0.6rem' }}>In DB</span>
+                              <span className="badge" style={{ fontSize: '0.6rem', backgroundColor: '#dbeafe', color: '#1d4ed8' }}>Update</span>
                             )}
                           </td>
                         </tr>
@@ -3711,7 +3726,7 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
       {/* Import Bar */}
       <div className="bg-light border rounded p-2 mt-3 d-flex align-items-center justify-content-between">
         <div className="small text-muted">
-          <strong>{selectedNewTxns}</strong> new transactions in <strong>{selectedSchemes.size}</strong> scheme{selectedSchemes.size !== 1 ? 's' : ''} selected
+          <strong>{selectedNewTxns}</strong> new · <strong>{selectedUpdateTxns}</strong> update{selectedUpdateTxns !== 1 ? 's' : ''} in <strong>{selectedSchemes.size}</strong> scheme{selectedSchemes.size !== 1 ? 's' : ''} selected
         </div>
         <div className="d-flex gap-2">
           <Button size="sm" variant="outline-secondary" onClick={onCancel}>
@@ -3720,12 +3735,12 @@ function CAMSCASPreview({ preview, selectedSchemes, setSelectedSchemes, expanded
           <Button
             size="sm" variant="success"
             onClick={onImport}
-            disabled={importing || selectedNewTxns === 0}
+            disabled={importing || (selectedNewTxns === 0 && selectedUpdateTxns === 0)}
           >
             {importing ? (
               <><Spinner size="sm" className="me-1" /> Importing...</>
             ) : (
-              <><CheckCircle size={14} className="me-1" /> Import {selectedNewTxns} Transactions</>
+              <><CheckCircle size={14} className="me-1" /> Import {selectedNewTxns + selectedUpdateTxns} Transactions</>
             )}
           </Button>
         </div>

@@ -774,10 +774,11 @@ async function updateAllPrices(db, options = {}) {
       const existingSource = String(existingRow?.price_source || '').toUpperCase();
       const isSessionSource = ['PRE', 'POST', 'LIVE'].includes(existingSource);
       const attemptedDowngrade = isSessionSource && String(resolvedPriceSource || '').toUpperCase() === 'LOCF';
+      const attemptedLiveToPre = existingSource === 'LIVE' && String(resolvedPriceSource || '').toUpperCase() === 'PRE';
       
-      if (attemptedDowngrade) {
+      if (attemptedDowngrade || attemptedLiveToPre) {
         effectivePriceSource = existingRow.price_source;
-        logAppWarn('[UpdatePrices][SourceGuard] Prevented session source downgrade to LOCF', {
+        logAppWarn('[UpdatePrices][SourceGuard] Prevented session source downgrade', {
           investmentId: inv.id,
           investmentName: inv.name,
           portfolioId: pid,

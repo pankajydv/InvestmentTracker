@@ -267,9 +267,18 @@ function parseSharekhanHTM(text, fileName) {
     }
   }
 
-  // Clean up: remove stt from individual trades (now merged into brokerage)
-  for (const trade of trades) {
-    delete trade.stt;
+  // Clean up: keep per-trade STT allocated by trade value (STT is not a
+  // deductible cost, so downstream tax logic needs it separately). `brokerage`
+  // still carries the full charge (incl STT) so `fees` stays the total.
+  if (totalSTT > 0 && trades.length > 0) {
+    const totalTradeValue = trades.reduce((s, t) => s + t.total, 0);
+    for (const trade of trades) {
+      trade.stt = totalTradeValue > 0
+        ? parseFloat(((trade.total / totalTradeValue) * totalSTT).toFixed(2))
+        : parseFloat((totalSTT / trades.length).toFixed(2));
+    }
+  } else {
+    for (const trade of trades) trade.stt = 0;
   }
 
   return {
@@ -425,7 +434,12 @@ function parseGrowwPDF(text, fileName) {
     }
   }
 
-  for (const trade of trades) delete trade.stt;
+  const totalTradeValueForStt = trades.reduce((s, t) => s + t.total, 0);
+  for (const trade of trades) {
+    trade.stt = (stt > 0 && totalTradeValueForStt > 0)
+      ? parseFloat(((trade.total / totalTradeValueForStt) * stt).toFixed(2))
+      : 0;
+  }
 
   return {
     broker: 'Groww', clientCode, panNumber, tradeDate,

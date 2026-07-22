@@ -287,6 +287,7 @@ module.exports = function (db) {
             rate: trade.rate,
             total: trade.total,
             brokerage: trade.brokerage || 0,
+            stt: trade.stt || 0,
           });
         }
       }
@@ -369,15 +370,15 @@ module.exports = function (db) {
       `);
       // Idempotent: find existing transaction by key fields
       const findTransaction = db.prepare(`
-        SELECT id, amount, fees FROM transactions
+        SELECT id, amount, fees, stt FROM transactions
         WHERE investment_id = ? AND transaction_type = ? AND transaction_date = ? AND units = ? AND price_per_unit = ?
       `);
       const insertTransaction = db.prepare(`
-        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, stt, broker, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const updateTransaction = db.prepare(`
-        UPDATE transactions SET amount = ?, fees = ?, notes = ? WHERE id = ?
+        UPDATE transactions SET amount = ?, fees = ?, stt = ?, notes = ? WHERE id = ?
       `);
 
       let investmentsCreated = 0;
@@ -444,6 +445,7 @@ module.exports = function (db) {
           for (const trade of stock.trades) {
             const amount = trade.total || trade.quantity * trade.rate;
             const fees = trade.brokerage || 0;
+            const stt = trade.stt || 0;
             const notes = `${broker || 'Broker'} contract note`;
 
             // Idempotent check
@@ -453,8 +455,8 @@ module.exports = function (db) {
 
             if (existingTxn) {
               // Check if anything changed
-              if (Math.abs(existingTxn.amount - amount) > 0.01 || Math.abs(existingTxn.fees - fees) > 0.01) {
-                updateTransaction.run(amount, fees, notes, existingTxn.id);
+              if (Math.abs(existingTxn.amount - amount) > 0.01 || Math.abs(existingTxn.fees - fees) > 0.01 || Math.abs((existingTxn.stt || 0) - stt) > 0.01) {
+                updateTransaction.run(amount, fees, stt, notes, existingTxn.id);
                 transactionsUpdated++;
               } else {
                 transactionsSkipped++;
@@ -462,7 +464,7 @@ module.exports = function (db) {
             } else {
               insertTransaction.run(
                 investmentId, portfolioId, trade.type, trade.tradeDate, trade.quantity,
-                trade.rate, amount, fees, broker || 'Unknown', notes
+                trade.rate, amount, fees, stt, broker || 'Unknown', notes
               );
               dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: trade.tradeDate });
               transactionsCreated++;

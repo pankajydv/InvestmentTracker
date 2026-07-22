@@ -41,6 +41,31 @@ module.exports = function (db) {
     return keys;
   }
 
+  // Like getExistingTransactionKeys but returns key → { id, fees, stt, locked }
+  // so an import can UPDATE STT/fees on already-present transactions.
+  function getExistingTransactionMap(portfolioId) {
+    const rows = db.prepare(`
+      SELECT t.id, i.isin_code, t.transaction_date, t.transaction_type, t.amount, t.units, t.folio_number, t.fees, t.stt, t.locked
+      FROM transactions t
+      JOIN investments i ON i.id = t.investment_id
+      WHERE t.portfolio_id = ? AND i.asset_type = 'MUTUAL_FUND'
+    `).all(portfolioId);
+    const map = new Map();
+    for (const r of rows) {
+      if (!r.isin_code) continue;
+      const key = [
+        r.isin_code,
+        r.transaction_date,
+        normalizeTxnType(r.transaction_type),
+        Math.round(Math.abs(r.amount || 0) * 100),
+        Math.round(Math.abs(r.units || 0) * 1000),
+        (r.folio_number || '').replace(/\s/g, ''),
+      ].join('|');
+      map.set(key, { id: r.id, fees: r.fees, stt: r.stt, locked: r.locked });
+    }
+    return map;
+  }
+
   /**
    * Normalize transaction type for duplicate comparison.
    * SWITCH_IN and BUY are equivalent, SWITCH_OUT and SELL are equivalent.
@@ -90,7 +115,7 @@ module.exports = function (db) {
 
       if (camsParsed && camsParsed.schemes && camsParsed.schemes.length > 0) {
         // ── CAMS/KFintech CAS (transaction history) ──
-        const existingKeys = getExistingTransactionKeys(portfolioId);
+        const existingTxns = getExistingTransactionMap(portfolioId);
 
         // Find existing investments by ISIN for matching
         const existingByIsin = {};
@@ -108,9 +133,29 @@ module.exports = function (db) {
           const existingInv = existingByIsin[s.isin] || null;
           const transactions = s.transactions.map(t => {
             const key = makeTxnKey(s.isin, t.date, t.type, t.amount, t.units, s.folio);
-            return { ...t, isNew: !existingKeys.has(key) };
+            const newStt = t.stt || 0;
+            const newFees = (t.stampDuty || 0) + (t.stt || 0);
+            const existing = existingTxns.get(key);
+            if (!existing) {
+              return { ...t, status: 'new', isNew: true, new_stt: newStt, new_fees: newFees };
+            }
+            const sttDiff = existing.stt == null || Math.abs((existing.stt || 0) - newStt) > 0.005;
+            const feesDiff = Math.abs((existing.fees || 0) - newFees) > 0.005;
+            if (!existing.locked && (sttDiff || feesDiff)) {
+              return {
+                ...t,
+                status: 'update',
+                isNew: false,
+                existing_stt: existing.stt,
+                new_stt: newStt,
+                existing_fees: existing.fees,
+                new_fees: newFees,
+              };
+            }
+            return { ...t, status: 'unchanged', isNew: false };
           });
-          const newTxns = transactions.filter(t => t.isNew);
+          const newCount = transactions.filter(t => t.status === 'new').length;
+          const updateCount = transactions.filter(t => t.status === 'update').length;
           return {
             amc: s.amc,
             schemeCode: s.schemeCode,
@@ -127,13 +172,15 @@ module.exports = function (db) {
             existingName: existingInv?.name || null,
             isNew: !existingInv,
             transactions,
-            newTransactionCount: newTxns.length,
-            existingTransactionCount: transactions.length - newTxns.length,
+            newTransactionCount: newCount,
+            updateTransactionCount: updateCount,
+            existingTransactionCount: transactions.length - newCount,
           };
         });
 
         const totalTxns = schemes.reduce((s, sc) => s + sc.transactions.length, 0);
         const newTxns = schemes.reduce((s, sc) => s + sc.newTransactionCount, 0);
+        const updateTxns = schemes.reduce((s, sc) => s + sc.updateTransactionCount, 0);
 
         return res.json({
           casType: 'cams',
@@ -146,6 +193,7 @@ module.exports = function (db) {
             closedSchemes: schemes.filter(s => s.closingBalance === 0).length,
             totalTransactions: totalTxns,
             newTransactions: newTxns,
+            updateTransactions: updateTxns,
             existingTransactions: totalTxns - newTxns,
           },
         });
@@ -286,14 +334,17 @@ module.exports = function (db) {
       `);
 
       const insertTransaction = db.prepare(`
-        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, folio_number)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, stt, broker, notes, folio_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
+      // Update STT/fees on an already-present transaction (idempotent re-import).
+      const updateTransactionStt = db.prepare('UPDATE transactions SET stt = ?, fees = ? WHERE id = ?');
 
-      // Build existing keys to skip duplicates (double safety — preview already filtered)
-      const existingKeys = getExistingTransactionKeys(portfolioId);
+      // Build key → existing row map so re-import can correct STT on existing rows.
+      const existingTxns = getExistingTransactionMap(portfolioId);
 
       let importedCount = 0;
+      let updatedCount = 0;
       let skippedCount = 0;
       const results = [];
       const dirtyCandidates = [];
@@ -323,24 +374,36 @@ module.exports = function (db) {
 
           let schemeImported = 0;
           for (const t of (scheme.transactions || [])) {
-            // Skip non-new transactions
             const key = makeTxnKey(isin, t.date, t.type, t.amount, t.units, folio);
-            if (existingKeys.has(key)) { skippedCount++; continue; }
-
-            const fees = (t.stampDuty || 0) + (t.stt || 0);
+            const newStt = t.stt || 0;
+            const newFees = (t.stampDuty || 0) + (t.stt || 0);
             const feeNotes = [];
             if (t.stampDuty > 0) feeNotes.push(`Stamp Duty: ₹${t.stampDuty}`);
             if (t.stt > 0) feeNotes.push(`STT: ₹${t.stt}`);
             const notes = [t.description || '', ...feeNotes].filter(Boolean).join('; ');
 
-            insertTransaction.run(
+            // Existing transaction: correct STT/fees if they differ (skip locked rows).
+            const existing = existingTxns.get(key);
+            if (existing) {
+              const sttDiff = existing.stt == null || Math.abs((existing.stt || 0) - newStt) > 0.005;
+              const feesDiff = Math.abs((existing.fees || 0) - newFees) > 0.005;
+              if (!existing.locked && (sttDiff || feesDiff)) {
+                updateTransactionStt.run(newStt, newFees, existing.id);
+                updatedCount++;
+              } else {
+                skippedCount++;
+              }
+              continue;
+            }
+
+            const info = insertTransaction.run(
               investmentId, portfolioId,
               t.type, t.date,
               Math.abs(t.units || 0), t.price || 0, Math.abs(t.amount || 0),
-              fees, 'CAMS CAS', notes, folio
+              newFees, newStt, 'CAMS CAS', notes, folio
             );
             dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: t.date });
-            existingKeys.add(key); // prevent duplicates within same import
+            existingTxns.set(key, { id: info.lastInsertRowid, fees: newFees, stt: newStt, locked: 0 });
             importedCount++;
             schemeImported++;
           }
@@ -359,12 +422,14 @@ module.exports = function (db) {
         portfolio_id: portfolioId,
         schemes: results.length,
         imported: importedCount,
+        updated: updatedCount,
         skipped: skippedCount,
       });
 
       res.json({
         success: true,
         imported: importedCount,
+        updated: updatedCount,
         skipped: skippedCount,
         schemes: results,
       });
@@ -464,6 +529,10 @@ module.exports = function (db) {
       });
 
       importTxn();
+
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'cas-holdings-import', `portfolio:${portfolio_id}`);
+      }
 
       logAppInfo('[CAS] Holdings import completed', {
         portfolio_id: Number(portfolio_id),
