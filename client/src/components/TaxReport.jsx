@@ -185,12 +185,14 @@ function combineTaxReports(reports) {
     perquisite_income: [],
     capital_gains: [],
     dividend_income: [],
+    form_67: [],
     schedule_fa: [],
     summary: {
       total_perquisite_inr: 0,
       total_stcg_inr: 0,
       total_ltcg_inr: 0,
       total_dividend_inr: 0,
+      total_ftc_inr: 0,
       tax_note: reports[0]?.summary?.tax_note || '',
     },
   };
@@ -199,12 +201,14 @@ function combineTaxReports(reports) {
     combined.perquisite_income.push(...(report?.perquisite_income || []));
     combined.capital_gains.push(...(report?.capital_gains || []));
     combined.dividend_income.push(...(report?.dividend_income || []));
+    combined.form_67.push(...(report?.form_67 || []));
     combined.schedule_fa.push(...(report?.schedule_fa || []));
 
     combined.summary.total_perquisite_inr += Number(report?.summary?.total_perquisite_inr) || 0;
     combined.summary.total_stcg_inr += Number(report?.summary?.total_stcg_inr) || 0;
     combined.summary.total_ltcg_inr += Number(report?.summary?.total_ltcg_inr) || 0;
     combined.summary.total_dividend_inr += Number(report?.summary?.total_dividend_inr) || 0;
+    combined.summary.total_ftc_inr += Number(report?.summary?.total_ftc_inr) || 0;
   }
 
   return combined;
@@ -402,12 +406,81 @@ export default function TaxReport() {
                         </tr>
                       ))}
                     </tbody>
+                    <tfoot className="table-light fw-semibold">
+                      <tr>
+                        <td colSpan={4}>Total</td>
+                        <td>{formatINR(summary.total_dividend_inr || 0)}</td>
+                      </tr>
+                    </tfoot>
                   </Table>
                 </div>
+                {report.dividend_quarterly && (
+                  <div className="mt-4">
+                    <div className="fw-semibold mb-2">Quarter-wise breakup (for Section 234C)</div>
+                    <div className="table-responsive">
+                      <Table size="sm" bordered className="small">
+                        <thead className="table-light">
+                          <tr><th>Quarter</th><th className="text-end">Indian</th><th className="text-end">Foreign</th><th className="text-end">Total</th></tr>
+                        </thead>
+                        <tbody>
+                          {report.dividend_quarterly.map((q) => (
+                            <tr key={q.quarter}>
+                              <td className="text-nowrap">{q.quarter} · {q.label}</td>
+                              <td className="text-end">{formatINR(q.indian)}</td>
+                              <td className="text-end">{formatINR(q.foreign)}</td>
+                              <td className="text-end fw-semibold">{formatINR(q.total)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </Table>
+                    </div>
+                  </div>
+                )}
               </Accordion.Body>
             </Accordion.Item>
 
             <Accordion.Item eventKey="3">
+              <Accordion.Header>Form 67: Foreign Tax Credit ({report.form_67.length} dividends · FTC {formatINR(summary.total_ftc_inr || 0)})</Accordion.Header>
+              <Accordion.Body>
+                <div className="d-flex justify-content-end mb-2">
+                  <Button size="sm" variant="outline-secondary" onClick={() => downloadCSV(`form67_${fy}.csv`, report.form_67)}>
+                    <Download size={14} className="me-1" /> Export CSV
+                  </Button>
+                </div>
+                <div className="table-responsive">
+                  <Table size="sm" hover>
+                    <thead><tr><th>Date</th><th>Investment</th><th>Country</th><th>Gross USD</th><th>Tax USD</th><th>Net USD</th><th>Rate</th><th>Gross INR</th><th>Tax Withheld INR</th><th>Net INR</th></tr></thead>
+                    <tbody>
+                      {report.form_67.map((r, idx) => (
+                        <tr key={idx}>
+                          <td>{formatDate(r.date)}</td>
+                          <td>{r.investment}</td>
+                          <td>{r.country_code}</td>
+                          <td>${formatNumber(r.gross_dividend_usd, 2)}</td>
+                          <td>${formatNumber(r.tax_withheld_usd, 2)}</td>
+                          <td>${formatNumber(r.net_dividend_usd, 2)}</td>
+                          <td>{r.exchange_rate || '-'}</td>
+                          <td>{formatINR(r.gross_dividend_inr)}</td>
+                          <td>{formatINR(r.tax_withheld_inr)}</td>
+                          <td>{formatINR(r.net_dividend_inr)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot className="table-light fw-semibold">
+                      <tr>
+                        <td colSpan={7}>Total</td>
+                        <td>{formatINR(report.form_67.reduce((s, r) => s + r.gross_dividend_inr, 0))}</td>
+                        <td>{formatINR(summary.total_ftc_inr || 0)}</td>
+                        <td>{formatINR(summary.total_dividend_inr || 0)}</td>
+                      </tr>
+                    </tfoot>
+                  </Table>
+                </div>
+                <div className="small text-muted">US federal withholding at 25%. Gross = Net ÷ 0.75. File Form 67 before the due date to claim FTC under Section 90/91.</div>
+              </Accordion.Body>
+            </Accordion.Item>
+
+            <Accordion.Item eventKey="4">
               <Accordion.Header>Schedule FA: Foreign Asset Disclosure ({report.schedule_fa.length})</Accordion.Header>
               <Accordion.Body>
                 <div className="d-flex justify-content-end mb-2">

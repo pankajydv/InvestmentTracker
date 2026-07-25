@@ -156,6 +156,7 @@ function buildTaxReport(db, fy, portfolioId) {
       perquisite_income: [],
       capital_gains: [],
       dividend_income: [],
+      form_67: [],
       schedule_fa: [],
       summary: {
         total_perquisite_inr: 0,
@@ -391,6 +392,7 @@ function buildTaxReport(db, fy, portfolioId) {
       dividendRows.push({
         asset_type: inv.asset_type,
         date: txnDate,
+        quarter: fyQuarterForDate(txnDate),
         investment: name,
         ticker,
         amount_inr: roundCurrency(amtINR),
@@ -442,6 +444,46 @@ function buildTaxReport(db, fy, portfolioId) {
   const totalSTCGINR = stcgRows.reduce((s, r) => s + (r.gain_loss_inr || 0), 0);
   const totalLTCGINR = ltcgRows.reduce((s, r) => s + (r.gain_loss_inr || 0), 0);
   const totalDividendINR = dividendRows.reduce((s, r) => s + (r.amount_inr || 0), 0);
+
+  // ── Dividend quarter-wise breakup (for Section 234C advance-tax interest) ──
+  const dividendQuarterly = FY_QUARTERS.map((q) => {
+    const indian = roundCurrency(dividendRows
+      .filter((r) => r.quarter === q.key && r.asset_type !== 'FOREIGN_STOCK')
+      .reduce((s, r) => s + (r.amount_inr || 0), 0));
+    const foreign = roundCurrency(dividendRows
+      .filter((r) => r.quarter === q.key && r.asset_type === 'FOREIGN_STOCK')
+      .reduce((s, r) => s + (r.amount_inr || 0), 0));
+    return { quarter: q.key, label: q.label, indian, foreign, total: roundCurrency(indian + foreign) };
+  });
+
+  // ── Form 67: Foreign Tax Credit on dividends ─────────────────────────────
+  // DB stores GROSS dividends (declared_rate × shares) in usd_amount/amount.
+  // US federal withholding is 25% for Indian residents (DTAA Article 10).
+  // Form 67 requires: country, TIN, gross income, tax paid (all in INR).
+  const US_WITHHOLDING_RATE = 0.25;
+  const form67Rows = [];
+  for (const d of dividendRows) {
+    if (d.asset_type !== 'FOREIGN_STOCK' || !d.usd_amount) continue;
+    const grossUSD = roundCurrency(d.usd_amount);
+    const taxUSD = roundCurrency(d.usd_amount * US_WITHHOLDING_RATE);
+    const netUSD = roundCurrency(d.usd_amount * (1 - US_WITHHOLDING_RATE));
+    const rate = d.exchange_rate || 1;
+    form67Rows.push({
+      date: d.date,
+      investment: d.investment,
+      ticker: d.ticker || null,
+      country: 'United States',
+      country_code: 'US',
+      gross_dividend_usd: grossUSD,
+      tax_withheld_usd: taxUSD,
+      net_dividend_usd: netUSD,
+      exchange_rate: rate,
+      gross_dividend_inr: d.amount_inr,
+      tax_withheld_inr: roundCurrency(taxUSD * rate),
+      net_dividend_inr: roundCurrency(netUSD * rate),
+    });
+  }
+  const totalFTCINR = form67Rows.reduce((s, r) => s + r.tax_withheld_inr, 0);
 
   // ── Schedule CG sub-sections by ITR section ──────────────────────────────
   const sumBy = (rows, field) => rows.reduce((s, r) => s + (Number(r[field]) || 0), 0);
@@ -498,12 +540,15 @@ function buildTaxReport(db, fy, portfolioId) {
     cg_quarter_labels: FY_QUARTERS,
     cg_section_defs: CG_SECTION_DEFS,
     dividend_income: dividendRows,
+    dividend_quarterly: dividendQuarterly,
+    form_67: form67Rows,
     schedule_fa: scheduleFA,
     summary: {
       total_perquisite_inr: roundCurrency(totalPerquisiteINR),
       total_stcg_inr: roundCurrency(totalSTCGINR),
       total_ltcg_inr: roundCurrency(totalLTCGINR),
       total_dividend_inr: roundCurrency(totalDividendINR),
+      total_ftc_inr: roundCurrency(totalFTCINR),
       stcg_lots: stcgRows.length,
       ltcg_lots: ltcgRows.length,
       cg_stcg_111a: stcg111a,
