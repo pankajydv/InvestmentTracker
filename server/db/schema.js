@@ -341,6 +341,34 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_portfolio_expenses_portfolio ON portfolio_expenses(portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_portfolio_expenses_date ON portfolio_expenses(expense_date);
 
+    -- Tax: manual other income entries (savings interest, TD interest, etc.)
+    CREATE TABLE IF NOT EXISTS tax_other_income (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fy TEXT NOT NULL,
+      portfolio_id INTEGER,
+      category TEXT NOT NULL CHECK(category IN ('SAVINGS_INTEREST','TD_INTEREST','NCD_INTEREST','PF_INTEREST','NPS_80CCD2','OTHER')),
+      source_name TEXT NOT NULL,
+      account_number TEXT,
+      amount REAL NOT NULL DEFAULT 0,
+      tds REAL NOT NULL DEFAULT 0,
+      notes TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tax_other_income_fy ON tax_other_income(fy, portfolio_id);
+
+    -- Tax: parsed AIS data (salary, TDS/TCS credits, etc.)
+    CREATE TABLE IF NOT EXISTS tax_ais_data (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fy TEXT NOT NULL,
+      portfolio_id INTEGER,
+      pan TEXT,
+      data_json TEXT NOT NULL,
+      uploaded_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tax_ais_data_fy ON tax_ais_data(fy, portfolio_id);
+
     -- Dashboard performance optimization indexes
     CREATE INDEX IF NOT EXISTS idx_transactions_investment_portfolio ON transactions(investment_id, portfolio_id, transaction_date);
     CREATE INDEX IF NOT EXISTS idx_transactions_price_lookup ON transactions(investment_id, price_per_unit DESC, transaction_date DESC);

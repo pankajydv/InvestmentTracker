@@ -238,6 +238,46 @@ export const getTaxMeta = (portfolioId) => {
   return fetchJSON(`/tax/meta${qs ? `?${qs}` : ''}`);
 };
 
+// Tax: AIS
+export const uploadAIS = async (file, fy, portfolioId) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('fy', fy);
+  if (portfolioId) formData.append('portfolio_id', portfolioId);
+  const res = await fetch(`${API_BASE}/tax/ais`, { method: 'POST', body: formData, credentials: 'include' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Upload failed');
+  }
+  return res.json();
+};
+
+export const getAISData = (fy, portfolioId) => {
+  const params = new URLSearchParams({ fy });
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/tax/ais?${params}`);
+};
+
+// Tax: Other Income
+export const getOtherIncome = (fy, portfolioId) => {
+  const params = new URLSearchParams({ fy });
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/tax/other-income?${params}`);
+};
+export const addOtherIncome = (data) =>
+  fetchJSON('/tax/other-income', { method: 'POST', body: JSON.stringify(data) });
+export const updateOtherIncome = (id, data) =>
+  fetchJSON(`/tax/other-income/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+export const deleteOtherIncome = (id) =>
+  fetchJSON(`/tax/other-income/${id}`, { method: 'DELETE' });
+
+// Tax: Computation
+export const getTaxComputation = (fy, portfolioId) => {
+  const params = new URLSearchParams({ fy });
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/tax/computation?${params.toString()}`);
+};
+
 // Utils
 export const searchMutualFunds = (q) => fetchJSON(`/utils/search-mf?q=${encodeURIComponent(q)}`);
 export const searchStockByName = (q, market) =>

@@ -24,6 +24,10 @@
 
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const { parseAIS } = require('../services/aisParser');
+
+const aisUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 const SUPPORTED_TAX_ASSET_TYPES = new Set(['FOREIGN_STOCK', 'INDIAN_STOCK', 'MUTUAL_FUND']);
 const FOREIGN_TAX_ASSET_TYPES = new Set(['FOREIGN_STOCK']);
@@ -577,6 +581,214 @@ function parseFY(fy) {
   return { start, end, label: fy };
 }
 
+// ── New Regime Tax Computation ─────────────────────────────────────────────
+
+const STANDARD_DEDUCTION = 75000;
+const NEW_REGIME_SLABS = [
+  { upto: 400000, rate: 0 },
+  { upto: 800000, rate: 0.05 },
+  { upto: 1200000, rate: 0.10 },
+  { upto: 1600000, rate: 0.15 },
+  { upto: 2000000, rate: 0.20 },
+  { upto: 2400000, rate: 0.25 },
+  { upto: Infinity, rate: 0.30 },
+];
+
+function computeSlabTax(taxableIncome) {
+  let tax = 0;
+  let prev = 0;
+  for (const slab of NEW_REGIME_SLABS) {
+    const chunk = Math.min(taxableIncome, slab.upto) - prev;
+    if (chunk <= 0) break;
+    tax += chunk * slab.rate;
+    prev = slab.upto;
+  }
+  return Math.round(tax);
+}
+
+function computeSurcharge(totalIncome, baseTax) {
+  if (totalIncome <= 5000000) return 0;
+  if (totalIncome <= 10000000) return Math.round(baseTax * 0.10);
+  if (totalIncome <= 20000000) return Math.round(baseTax * 0.15);
+  return Math.round(baseTax * 0.25);
+}
+
+function buildTaxComputation(db, fy, portfolioId) {
+  // 1. Investment report (CG, dividends, perquisites)
+  const investmentReport = buildTaxReport(db, fy, portfolioId);
+
+  // 2. AIS data
+  const aisRow = portfolioId
+    ? db.prepare('SELECT data_json FROM tax_ais_data WHERE fy = ? AND portfolio_id = ?').get(fy, portfolioId)
+    : db.prepare('SELECT data_json FROM tax_ais_data WHERE fy = ? AND portfolio_id IS NULL').get(fy);
+  const ais = aisRow ? JSON.parse(aisRow.data_json) : null;
+
+  // 3. Other income entries
+  const otherIncome = portfolioId
+    ? db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id = ? ORDER BY category, id').all(fy, portfolioId)
+    : db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id IS NULL ORDER BY category, id').all(fy);
+
+  // ── Head 1: Salary ──
+  const salaryEntries = ais?.salary || [];
+  const grossSalary = salaryEntries.reduce((s, e) => s + (e.gross || 0), 0);
+  const salaryTDS = salaryEntries.reduce((s, e) => s + (e.tds_total || 0), 0);
+  const netSalary = Math.max(0, grossSalary - STANDARD_DEDUCTION);
+
+  // ── Head 4: Capital Gains (taxed separately at special rates) ──
+  const cg = investmentReport.summary || {};
+  const stcg111a = cg.cg_stcg_111a || 0;
+  const ltcg112aGross = cg.cg_ltcg_112a_gross || 0;
+  const ltcg112aExemption = cg.cg_ltcg_112a_exemption || 0;
+  const ltcg112aTaxable = cg.cg_ltcg_112a_taxable || 0;
+  const ltcg112 = cg.cg_ltcg_112 || 0;
+  const stcgSlab = cg.cg_stcg_slab || 0;
+  const totalCG = stcg111a + ltcg112aTaxable + ltcg112 + stcgSlab;
+
+  // ── Head 5: Other Sources ──
+  const dividendINR = cg.total_dividend_inr || 0;
+  const savingsInterest = otherIncome.filter((r) => r.category === 'SAVINGS_INTEREST').reduce((s, r) => s + r.amount, 0);
+  const tdInterest = otherIncome.filter((r) => r.category === 'TD_INTEREST').reduce((s, r) => s + r.amount, 0);
+  const ncdInterest = otherIncome.filter((r) => r.category === 'NCD_INTEREST').reduce((s, r) => s + r.amount, 0);
+  const pfInterest = otherIncome.filter((r) => r.category === 'PF_INTEREST').reduce((s, r) => s + r.amount, 0);
+  const otherOS = otherIncome.filter((r) => r.category === 'OTHER').reduce((s, r) => s + r.amount, 0);
+  const totalOS = dividendINR + savingsInterest + tdInterest + ncdInterest + pfInterest + otherOS;
+  const otherIncomeTDS = otherIncome.reduce((s, r) => s + (r.tds || 0), 0);
+
+  // ── Gross Total Income ──
+  const grossTotalIncome = netSalary + totalCG + totalOS;
+
+  // ── Deductions (New Regime: only 80CCD(2) employer NPS) ──
+  const { start: fyStart, end: fyEnd } = parseFY(fy);
+  const fyStartStr = fyStart.toISOString().split('T')[0];
+  const fyEndStr = fyEnd.toISOString().split('T')[0];
+  let npsQuery = `
+    SELECT COALESCE(SUM(t.amount), 0) as total
+    FROM transactions t
+    JOIN investments i ON i.id = t.investment_id
+    WHERE i.asset_type = 'NPS'
+      AND t.transaction_type = 'EMPLOYER_CONTRIBUTION'
+      AND t.transaction_date >= ? AND t.transaction_date <= ?
+      AND i.name LIKE '%TIER I%'
+  `;
+  const npsParams = [fyStartStr, fyEndStr];
+  if (portfolioId) {
+    npsQuery += ' AND t.portfolio_id = ?';
+    npsParams.push(portfolioId);
+  }
+  const npsEmployerContribution = Math.round(db.prepare(npsQuery).get(...npsParams).total);
+  // Check for user override (persisted in tax_other_income as NPS_80CCD2)
+  const npsOverrideRow = portfolioId
+    ? db.prepare('SELECT amount FROM tax_other_income WHERE fy = ? AND portfolio_id = ? AND category = ?').get(fy, portfolioId, 'NPS_80CCD2')
+    : db.prepare('SELECT amount FROM tax_other_income WHERE fy = ? AND portfolio_id IS NULL AND category = ?').get(fy, 'NPS_80CCD2');
+  const deduction80CCD2 = npsOverrideRow ? Math.round(npsOverrideRow.amount) : npsEmployerContribution;
+  const nps80CCD2Computed = npsEmployerContribution;
+  const totalDeductions = deduction80CCD2;
+  const totalTaxableIncome = Math.max(0, grossTotalIncome - totalDeductions);
+
+  // ── Income grouping by tax rate (applied to taxable income after deductions) ──
+  // Slab-rate income: Salary + Other Sources + STCG at slab (foreign STCG) minus deduction
+  const slabIncome = Math.max(0, netSalary - deduction80CCD2) + totalOS + stcgSlab;
+  // Special-rate CG: taxed at flat rates, not slab
+  const specialRateCG = stcg111a + ltcg112aTaxable + ltcg112;
+
+  // ── Tax computation ──
+  const taxOnSlabIncome = computeSlabTax(slabIncome);
+  const taxOnSTCG111A = Math.round(Math.max(0, stcg111a) * 0.20); // 20% post Budget 2024
+  const taxOnLTCG112A = Math.round(Math.max(0, ltcg112aTaxable) * 0.125); // 12.5%
+  const taxOnLTCG112 = Math.round(Math.max(0, ltcg112) * 0.125); // 12.5% (foreign/other)
+
+  // ── Total tax before surcharge/cess ──
+  const totalTaxBeforeSurcharge = taxOnSlabIncome + taxOnSTCG111A + taxOnLTCG112A + taxOnLTCG112;
+
+  // ── Section 87A rebate (income up to ₹7L under new regime → zero tax) ──
+  let rebate87A = 0;
+  if (totalTaxableIncome <= 700000) {
+    rebate87A = Math.min(taxOnSlabIncome, 25000);
+  }
+  const taxAfterRebate = Math.max(0, totalTaxBeforeSurcharge - rebate87A);
+
+  // ── Surcharge ──
+  const surcharge = computeSurcharge(totalTaxableIncome, taxAfterRebate);
+
+  // ── Cess ──
+  const cess = Math.round((taxAfterRebate + surcharge) * 0.04);
+
+  // ── Total tax liability ──
+  const totalTaxLiability = taxAfterRebate + surcharge + cess;
+
+  // ── Credits ──
+  const ftcINR = cg.total_ftc_inr || 0;
+  const lrsTCS = ais?.lrs_tcs?.reduce((s, r) => s + (r.tcs || 0), 0) || 0;
+  const pfTDS = otherIncome.filter((r) => r.category === 'PF_INTEREST').reduce((s, r) => s + (r.tds || 0), 0);
+  const totalTDS = salaryTDS + otherIncomeTDS;
+  const totalCredits = totalTDS + lrsTCS + ftcINR;
+
+  // ── Net payable / refund ──
+  const netPayable = totalTaxLiability - totalCredits;
+
+  return {
+    fy,
+    heads: {
+      salary: {
+        entries: salaryEntries,
+        gross: grossSalary,
+        standard_deduction: grossSalary > 0 ? STANDARD_DEDUCTION : 0,
+        net: netSalary,
+        tds: salaryTDS,
+      },
+      capital_gains: {
+        stcg_111a: stcg111a,
+        ltcg_112a_gross: ltcg112aGross,
+        ltcg_112a_exemption: ltcg112aExemption,
+        ltcg_112a_taxable: ltcg112aTaxable,
+        ltcg_112: ltcg112,
+        stcg_slab: stcgSlab,
+        total: totalCG,
+      },
+      other_sources: {
+        dividends: dividendINR,
+        savings_interest: savingsInterest,
+        td_interest: tdInterest,
+        ncd_interest: ncdInterest,
+        pf_interest: pfInterest,
+        other: otherOS,
+        total: totalOS,
+        tds: otherIncomeTDS,
+      },
+    },
+    slab_income: slabIncome,
+    special_rate_cg: specialRateCG,
+    gross_total_income: grossTotalIncome,
+    deductions: {
+      nps_employer_80ccd2: deduction80CCD2,
+      nps_employer_80ccd2_computed: nps80CCD2Computed,
+      total: totalDeductions,
+    },
+    total_taxable_income: totalTaxableIncome,
+    tax: {
+      on_slab_income: taxOnSlabIncome,
+      on_stcg_111a: taxOnSTCG111A,
+      on_ltcg_112a: taxOnLTCG112A,
+      on_ltcg_112: taxOnLTCG112,
+      total_before_surcharge: totalTaxBeforeSurcharge,
+      rebate_87a: rebate87A,
+      after_rebate: taxAfterRebate,
+      surcharge,
+      cess,
+      total_liability: totalTaxLiability,
+    },
+    credits: {
+      salary_tds: salaryTDS,
+      other_tds: otherIncomeTDS - pfTDS,
+      pf_tds: pfTDS,
+      lrs_tcs: lrsTCS,
+      ftc: ftcINR,
+      total: totalCredits,
+    },
+    net_payable: netPayable,
+  };
+}
+
 /**
  * Determine if a lot is LTCG (held > 24 months) or STCG.
  */
@@ -664,6 +876,131 @@ module.exports = function (db) {
       // This endpoint exists as a placeholder for future server-side CSV generation.
       res.status(501).json({ error: 'Use the /api/tax/us-stocks endpoint and the client CSV export button.' });
     } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── AIS Upload ──────────────────────────────────────────────────────────────
+  router.post('/ais', aisUpload.single('file'), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
+      const fy = req.body.fy;
+      const portfolioId = req.body.portfolio_id || null;
+      if (!fy) return res.status(400).json({ error: 'fy is required' });
+
+      const parsed = await parseAIS(req.file.buffer);
+
+      // Store parsed data
+      db.prepare(`
+        INSERT OR REPLACE INTO tax_ais_data (fy, portfolio_id, pan, data_json, uploaded_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+      `).run(fy, portfolioId, parsed.pan, JSON.stringify(parsed));
+
+      // Auto-create other_income rows from AIS (savings + TD interest) if none exist
+      const existingCount = db.prepare('SELECT COUNT(*) as c FROM tax_other_income WHERE fy = ? AND (portfolio_id = ? OR (portfolio_id IS NULL AND ? IS NULL))').get(fy, portfolioId, portfolioId).c;
+      if (existingCount === 0) {
+        const ins = db.prepare(`
+          INSERT INTO tax_other_income (fy, portfolio_id, category, source_name, account_number, amount, tds, notes)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        for (const s of parsed.savings_interest) {
+          ins.run(fy, portfolioId, 'SAVINGS_INTEREST', s.source, s.account_number, s.amount, 0, 'From AIS');
+        }
+        for (const t of parsed.td_interest) {
+          ins.run(fy, portfolioId, 'TD_INTEREST', t.source, t.account_number, t.amount, 0, 'From AIS');
+        }
+        for (const n of parsed.interest_on_securities) {
+          ins.run(fy, portfolioId, 'NCD_INTEREST', n.source, null, n.amount, n.tds, 'From AIS');
+        }
+        for (const p of parsed.pf_taxable_interest) {
+          ins.run(fy, portfolioId, 'PF_INTEREST', p.source, null, p.amount, p.tds, 'From AIS');
+        }
+      }
+
+      res.json(parsed);
+    } catch (e) {
+      console.error('AIS parse error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── AIS Data (previously uploaded) ─────────────────────────────────────────
+  router.get('/ais', (req, res) => {
+    try {
+      const { fy, portfolio_id } = req.query;
+      if (!fy) return res.status(400).json({ error: 'fy is required' });
+      const row = portfolio_id
+        ? db.prepare('SELECT data_json, uploaded_at FROM tax_ais_data WHERE fy = ? AND portfolio_id = ?').get(fy, portfolio_id)
+        : db.prepare('SELECT data_json, uploaded_at FROM tax_ais_data WHERE fy = ? AND portfolio_id IS NULL').get(fy);
+      if (!row) return res.json(null);
+      res.json({ ...JSON.parse(row.data_json), uploaded_at: row.uploaded_at });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Other Income CRUD ──────────────────────────────────────────────────────
+  router.get('/other-income', (req, res) => {
+    try {
+      const { fy, portfolio_id } = req.query;
+      if (!fy) return res.status(400).json({ error: 'fy is required' });
+      const rows = portfolio_id
+        ? db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id = ? ORDER BY category, id').all(fy, portfolio_id)
+        : db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id IS NULL ORDER BY category, id').all(fy);
+      res.json(rows);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.post('/other-income', (req, res) => {
+    try {
+      const { fy, portfolio_id, category, source_name, account_number, amount, tds, notes } = req.body;
+      if (!fy || !category || !source_name) {
+        return res.status(400).json({ error: 'fy, category, and source_name are required' });
+      }
+      const result = db.prepare(`
+        INSERT INTO tax_other_income (fy, portfolio_id, category, source_name, account_number, amount, tds, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(fy, portfolio_id || null, category, source_name, account_number || null, Number(amount) || 0, Number(tds) || 0, notes || null);
+      const row = db.prepare('SELECT * FROM tax_other_income WHERE id = ?').get(result.lastInsertRowid);
+      res.json(row);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.put('/other-income/:id', (req, res) => {
+    try {
+      const { source_name, account_number, amount, tds, notes } = req.body;
+      db.prepare(`
+        UPDATE tax_other_income SET source_name = ?, account_number = ?, amount = ?, tds = ?, notes = ?
+        WHERE id = ?
+      `).run(source_name, account_number || null, Number(amount) || 0, Number(tds) || 0, notes || null, req.params.id);
+      const row = db.prepare('SELECT * FROM tax_other_income WHERE id = ?').get(req.params.id);
+      res.json(row);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.delete('/other-income/:id', (req, res) => {
+    try {
+      db.prepare('DELETE FROM tax_other_income WHERE id = ?').run(req.params.id);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Tax Computation (New Regime) ───────────────────────────────────────────
+  router.get('/computation', (req, res) => {
+    try {
+      const { fy, portfolio_id } = req.query;
+      if (!fy) return res.status(400).json({ error: 'fy is required' });
+      res.json(buildTaxComputation(db, fy, portfolio_id));
+    } catch (e) {
+      console.error('Tax computation error:', e);
       res.status(500).json({ error: e.message });
     }
   });
