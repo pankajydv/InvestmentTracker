@@ -226,21 +226,27 @@ function buildCgView(capitalGains) {
     return entry;
   });
 
-  // ITR-ready quarterly: absorb losses from earlier quarters into later quarters per section
-  // (ITR Section F doesn't accept negative values)
+  // ITR-ready quarterly: no negative values, column totals must match annual net gain per section
+  // Logic: show positive quarters at face value, absorb losses by reducing the largest gain quarter
   const quarterlyITR = FY_QUARTERS.map((q) => ({ quarter: q.key, label: q.label }));
   for (const def of CG_SECTIONS) {
-    let carryLoss = 0;
-    for (const qEntry of quarterlyITR) {
-      const rawQ = quarterly.find((q) => q.quarter === qEntry.quarter);
-      const rawVal = rawQ ? rawQ[def.key] : 0;
-      const adjusted = rawVal + carryLoss; // carryLoss is negative or zero
-      if (adjusted < 0) {
-        qEntry[def.key] = 0;
-        carryLoss = adjusted; // carry the remaining loss forward
+    const rawVals = quarterly.map((q) => q[def.key] || 0);
+    const annualNet = rawVals.reduce((s, v) => s + v, 0);
+
+    if (annualNet <= 0) {
+      // Net loss or zero: all quarters show 0
+      for (let i = 0; i < quarterlyITR.length; i++) quarterlyITR[i][def.key] = 0;
+    } else {
+      // Distribute: start with positive values only, then scale down to match annual net
+      const positives = rawVals.map((v) => Math.max(0, v));
+      const positiveSum = positives.reduce((s, v) => s + v, 0);
+      if (positiveSum > 0) {
+        // Scale each positive quarter proportionally so they sum to annualNet
+        for (let i = 0; i < quarterlyITR.length; i++) {
+          quarterlyITR[i][def.key] = round2((positives[i] / positiveSum) * annualNet);
+        }
       } else {
-        qEntry[def.key] = round2(adjusted);
-        carryLoss = 0;
+        for (let i = 0; i < quarterlyITR.length; i++) quarterlyITR[i][def.key] = 0;
       }
     }
   }
