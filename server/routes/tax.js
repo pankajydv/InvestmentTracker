@@ -137,6 +137,36 @@ function roundUnits(value) {
   return Math.round((Number(value) || 0) * 10000) / 10000;
 }
 
+function toNumberLoose(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (value == null) return 0;
+  const cleaned = String(value).replace(/,/g, '').trim();
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function hasPropertySalesInAis(aisData) {
+  if (!aisData) return false;
+  const sales = aisData.property_sales || aisData.propertySales;
+  if (!sales) return false;
+  if (Array.isArray(sales)) return sales.length > 0;
+  const rows = Array.isArray(sales.rows) ? sales.rows : [];
+  if (rows.length > 0) return true;
+  if (toNumberLoose(sales.count) > 0) return true;
+  if (toNumberLoose(sales.total_amount) > 0) return true;
+  if (toNumberLoose(sales.totalAmount) > 0) return true;
+  return false;
+}
+
+function hasLegacyAisWithoutPropertyFields(aisData) {
+  if (!aisData || typeof aisData !== 'object') return false;
+  const hasSalesKey = Object.prototype.hasOwnProperty.call(aisData, 'property_sales')
+    || Object.prototype.hasOwnProperty.call(aisData, 'propertySales');
+  const hasPurchaseKey = Object.prototype.hasOwnProperty.call(aisData, 'property_purchases')
+    || Object.prototype.hasOwnProperty.call(aisData, 'propertyPurchases');
+  return !hasSalesKey && !hasPurchaseKey;
+}
+
 function buildTaxReport(db, fy, portfolioId) {
   if (!fy) throw new Error('fy is required (e.g. 2025-26)');
 
@@ -622,11 +652,19 @@ function buildTaxComputation(db, fy, portfolioId) {
     ? db.prepare('SELECT data_json FROM tax_ais_data WHERE fy = ? AND portfolio_id = ?').get(fy, portfolioId)
     : db.prepare('SELECT data_json FROM tax_ais_data WHERE fy = ? AND portfolio_id IS NULL').get(fy);
   const ais = aisRow ? JSON.parse(aisRow.data_json) : null;
+  const hasAisPropertySale = hasPropertySalesInAis(ais);
 
   // 3. Other income entries
   const otherIncome = portfolioId
     ? db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id = ? ORDER BY category, id').all(fy, portfolioId)
     : db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id IS NULL ORDER BY category, id').all(fy);
+
+  // 3b. Persisted property capital gains helper rows
+  const propertyItems = portfolioId
+    ? db.prepare('SELECT * FROM tax_property_items WHERE fy = ? AND portfolio_id = ? ORDER BY property_side, id').all(fy, portfolioId)
+    : db.prepare('SELECT * FROM tax_property_items WHERE fy = ? AND portfolio_id IS NULL ORDER BY property_side, id').all(fy);
+  const legacyPropertyUnknown = hasLegacyAisWithoutPropertyFields(ais);
+  const effectivePropertyItems = (hasAisPropertySale || (legacyPropertyUnknown && propertyItems.length > 0)) ? propertyItems : [];
 
   // ── Head 1: Salary ──
   const salaryEntries = ais?.salary || [];
@@ -651,11 +689,44 @@ function buildTaxComputation(db, fy, portfolioId) {
   const ncdInterest = otherIncome.filter((r) => r.category === 'NCD_INTEREST').reduce((s, r) => s + r.amount, 0);
   const pfInterest = otherIncome.filter((r) => r.category === 'PF_INTEREST').reduce((s, r) => s + r.amount, 0);
   const otherOS = otherIncome.filter((r) => r.category === 'OTHER').reduce((s, r) => s + r.amount, 0);
-  const totalOS = dividendINR + savingsInterest + tdInterest + ncdInterest + pfInterest + otherOS;
-  const otherIncomeTDS = otherIncome.reduce((s, r) => s + (r.tds || 0), 0);
+  const osTransferExpense = otherIncome.filter((r) => r.category === 'OS_TRANSFER_EXPENSE').reduce((s, r) => s + r.amount, 0);
+  const cgTransferExpense = otherIncome.filter((r) => r.category === 'CG_TRANSFER_EXPENSE').reduce((s, r) => s + r.amount, 0);
+  const totalOS = Math.max(0, dividendINR + savingsInterest + tdInterest + ncdInterest + pfInterest + otherOS - osTransferExpense);
+  const otherIncomeTDS = otherIncome.filter((r) => !['CG_TRANSFER_EXPENSE', 'OS_TRANSFER_EXPENSE', 'NPS_80CCD2'].includes(r.category)).reduce((s, r) => s + (r.tds || 0), 0);
+
+  // ── Adjust LTCG 112 for transfer expenses (Section 48) ──
+  const ltcg112AfterTransfer = Math.max(0, ltcg112 - cgTransferExpense);
+
+  // ── Property Capital Gains helper (manual rows) ──
+  // OLD side: one sale row + multiple cost rows (land/construction/stamp/etc.)
+  const oldSale = effectivePropertyItems
+    .filter((r) => r.property_side === 'OLD' && r.item_type === 'SALE_CONSIDERATION')
+    .reduce((s, r) => s + (Number(r.amount) || 0), 0);
+  const oldCost = effectivePropertyItems
+    .filter((r) => r.property_side === 'OLD' && r.item_type !== 'SALE_CONSIDERATION')
+    .reduce((s, r) => s + (Number(r.amount) || 0), 0);
+  const oldPropertyGainLoss = Math.round((oldSale - oldCost) * 100) / 100;
+  const oldPropertyLTCGBefore54 = Math.max(0, oldPropertyGainLoss);
+  const oldPropertyLTCL = Math.max(0, -oldPropertyGainLoss);
+
+  // Section 54 helper: exemption against old-property LTCG based on new-house
+  // investment captured in NEW-side rows.
+  const newPropertyEligibleInvestment = effectivePropertyItems
+    .filter((r) => r.property_side === 'NEW')
+    .reduce((s, r) => s + (Number(r.amount) || 0), 0);
+  const section54ExemptionUsed = Math.min(oldPropertyLTCGBefore54, Math.max(0, newPropertyEligibleInvestment));
+  const oldPropertyLTCGAfter54 = Math.max(0, oldPropertyLTCGBefore54 - section54ExemptionUsed);
+
+  // Apply property gain/loss on LTCG-112 bucket.
+  const ltcg112WithPropertyGain = ltcg112AfterTransfer + oldPropertyLTCGAfter54;
+  const propertyLtclSetoffUsed = Math.min(ltcg112WithPropertyGain, oldPropertyLTCL);
+  const propertyLtclCarryForward = Math.max(0, oldPropertyLTCL - propertyLtclSetoffUsed);
+  const ltcg112Adjusted = Math.max(0, ltcg112WithPropertyGain - propertyLtclSetoffUsed);
+
+  const totalCGAdjusted = stcg111a + ltcg112aTaxable + ltcg112Adjusted + stcgSlab;
 
   // ── Gross Total Income ──
-  const grossTotalIncome = netSalary + totalCG + totalOS;
+  const grossTotalIncome = netSalary + totalCGAdjusted + totalOS;
 
   // ── Deductions (New Regime: only 80CCD(2) employer NPS) ──
   const { start: fyStart, end: fyEnd } = parseFY(fy);
@@ -686,16 +757,16 @@ function buildTaxComputation(db, fy, portfolioId) {
   const totalTaxableIncome = Math.max(0, grossTotalIncome - totalDeductions);
 
   // ── Income grouping by tax rate (applied to taxable income after deductions) ──
-  // Slab-rate income: Salary + Other Sources + STCG at slab (foreign STCG) minus deduction
-  const slabIncome = Math.max(0, netSalary - deduction80CCD2) + totalOS + stcgSlab;
+  // Slab-rate income: Salary + Other Sources + STCG at slab (foreign STCG)
+  const slabIncome = netSalary + totalOS + stcgSlab;
   // Special-rate CG: taxed at flat rates, not slab
-  const specialRateCG = stcg111a + ltcg112aTaxable + ltcg112;
+  const specialRateCG = stcg111a + ltcg112aTaxable + ltcg112Adjusted;
 
   // ── Tax computation ──
-  const taxOnSlabIncome = computeSlabTax(slabIncome);
+  const taxOnSlabIncome = computeSlabTax(Math.max(0, slabIncome - deduction80CCD2));
   const taxOnSTCG111A = Math.round(Math.max(0, stcg111a) * 0.20); // 20% post Budget 2024
   const taxOnLTCG112A = Math.round(Math.max(0, ltcg112aTaxable) * 0.125); // 12.5%
-  const taxOnLTCG112 = Math.round(Math.max(0, ltcg112) * 0.125); // 12.5% (foreign/other)
+  const taxOnLTCG112 = Math.round(Math.max(0, ltcg112Adjusted) * 0.125); // 12.5% (foreign/other)
 
   // ── Total tax before surcharge/cess ──
   const totalTaxBeforeSurcharge = taxOnSlabIncome + taxOnSTCG111A + taxOnLTCG112A + taxOnLTCG112;
@@ -742,8 +813,16 @@ function buildTaxComputation(db, fy, portfolioId) {
         ltcg_112a_exemption: ltcg112aExemption,
         ltcg_112a_taxable: ltcg112aTaxable,
         ltcg_112: ltcg112,
+        ltcg_112_after_transfer: ltcg112AfterTransfer,
+        property_ltcg_before_54: oldPropertyLTCGBefore54,
+        property_section_54_exemption: section54ExemptionUsed,
+        property_ltcg_added: oldPropertyLTCGAfter54,
+        property_ltcl_setoff_used: propertyLtclSetoffUsed,
+        property_ltcl_carry_forward: propertyLtclCarryForward,
+        ltcg_112_adjusted: ltcg112Adjusted,
+        ltcg_112_transfer_expense: cgTransferExpense,
         stcg_slab: stcgSlab,
-        total: totalCG,
+        total: totalCGAdjusted,
       },
       other_sources: {
         dividends: dividendINR,
@@ -752,17 +831,34 @@ function buildTaxComputation(db, fy, portfolioId) {
         ncd_interest: ncdInterest,
         pf_interest: pfInterest,
         other: otherOS,
+        transfer_expense: osTransferExpense,
         total: totalOS,
         tds: otherIncomeTDS,
       },
     },
     slab_income: slabIncome,
+    taxable_slab_income: Math.max(0, slabIncome - deduction80CCD2),
     special_rate_cg: specialRateCG,
     gross_total_income: grossTotalIncome,
     deductions: {
       nps_employer_80ccd2: deduction80CCD2,
       nps_employer_80ccd2_computed: nps80CCD2Computed,
       total: totalDeductions,
+    },
+    property_capital_gains: {
+      enabled: hasAisPropertySale || legacyPropertyUnknown,
+      source_unknown: legacyPropertyUnknown,
+      rows_count: effectivePropertyItems.length,
+      old_sale: oldSale,
+      old_cost: oldCost,
+      old_gain_loss: oldPropertyGainLoss,
+      old_ltcg_before_54: oldPropertyLTCGBefore54,
+      section_54_exemption_used: section54ExemptionUsed,
+      old_ltcg_added: oldPropertyLTCGAfter54,
+      old_ltcl_available: oldPropertyLTCL,
+      old_ltcl_setoff_used: propertyLtclSetoffUsed,
+      old_ltcl_carry_forward: propertyLtclCarryForward,
+      new_property_eligible_investment: newPropertyEligibleInvestment,
     },
     total_taxable_income: totalTaxableIncome,
     tax: {
@@ -818,6 +914,7 @@ module.exports = function (db) {
   router.get('/us-stocks', (req, res) => {
     try {
       const { fy, portfolio_id } = req.query;
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
       res.json(buildTaxReport(db, fy, portfolio_id));
     } catch (e) {
       console.error('Tax report error:', e);
@@ -887,6 +984,7 @@ module.exports = function (db) {
       const fy = req.body.fy;
       const portfolioId = req.body.portfolio_id || null;
       if (!fy) return res.status(400).json({ error: 'fy is required' });
+      if (!portfolioId) return res.status(400).json({ error: 'portfolio_id is required' });
 
       const parsed = await parseAIS(req.file.buffer);
 
@@ -929,9 +1027,8 @@ module.exports = function (db) {
     try {
       const { fy, portfolio_id } = req.query;
       if (!fy) return res.status(400).json({ error: 'fy is required' });
-      const row = portfolio_id
-        ? db.prepare('SELECT data_json, uploaded_at FROM tax_ais_data WHERE fy = ? AND portfolio_id = ?').get(fy, portfolio_id)
-        : db.prepare('SELECT data_json, uploaded_at FROM tax_ais_data WHERE fy = ? AND portfolio_id IS NULL').get(fy);
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
+      const row = db.prepare('SELECT data_json, uploaded_at FROM tax_ais_data WHERE fy = ? AND portfolio_id = ?').get(fy, portfolio_id);
       if (!row) return res.json(null);
       res.json({ ...JSON.parse(row.data_json), uploaded_at: row.uploaded_at });
     } catch (e) {
@@ -944,9 +1041,8 @@ module.exports = function (db) {
     try {
       const { fy, portfolio_id } = req.query;
       if (!fy) return res.status(400).json({ error: 'fy is required' });
-      const rows = portfolio_id
-        ? db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id = ? ORDER BY category, id').all(fy, portfolio_id)
-        : db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id IS NULL ORDER BY category, id').all(fy);
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
+      const rows = db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id = ? ORDER BY category, id').all(fy, portfolio_id);
       res.json(rows);
     } catch (e) {
       res.status(500).json({ error: e.message });
@@ -959,6 +1055,7 @@ module.exports = function (db) {
       if (!fy || !category || !source_name) {
         return res.status(400).json({ error: 'fy, category, and source_name are required' });
       }
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
       const result = db.prepare(`
         INSERT INTO tax_other_income (fy, portfolio_id, category, source_name, account_number, amount, tds, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -993,11 +1090,124 @@ module.exports = function (db) {
     }
   });
 
+  // ── Property Capital Gains Items CRUD ─────────────────────────────────────
+  router.get('/property-items', (req, res) => {
+    try {
+      const { fy, portfolio_id } = req.query;
+      if (!fy) return res.status(400).json({ error: 'fy is required' });
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
+      const rows = db.prepare('SELECT * FROM tax_property_items WHERE fy = ? AND portfolio_id = ? ORDER BY property_side, id').all(fy, portfolio_id);
+      res.json(rows);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.post('/property-items', (req, res) => {
+    try {
+      const { fy, portfolio_id, property_side, item_type, label, amount, txn_date, notes } = req.body;
+      if (!fy || !property_side || !item_type || !label) {
+        return res.status(400).json({ error: 'fy, property_side, item_type, and label are required' });
+      }
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
+      const result = db.prepare(`
+        INSERT INTO tax_property_items (fy, portfolio_id, property_side, item_type, label, amount, txn_date, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        fy,
+        portfolio_id || null,
+        property_side,
+        item_type,
+        label,
+        Number(amount) || 0,
+        txn_date || null,
+        notes || null,
+      );
+      const row = db.prepare('SELECT * FROM tax_property_items WHERE id = ?').get(result.lastInsertRowid);
+      res.json(row);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.put('/property-items/bulk', (req, res) => {
+    try {
+      const { fy, portfolio_id, rows } = req.body;
+      if (!fy) return res.status(400).json({ error: 'fy is required' });
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
+      if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows must be an array' });
+
+      const replaceRows = db.transaction((fyValue, portfolioValue, inputRows) => {
+        db.prepare('DELETE FROM tax_property_items WHERE fy = ? AND portfolio_id = ?').run(fyValue, portfolioValue);
+        const insert = db.prepare(`
+          INSERT INTO tax_property_items (fy, portfolio_id, property_side, item_type, label, amount, txn_date, notes)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        for (const row of inputRows) {
+          const itemType = row.item_type || 'CUSTOM';
+          const label = itemType === 'CUSTOM'
+            ? (row.label || 'Custom Cost')
+            : (row.label || itemType);
+          insert.run(
+            fyValue,
+            portfolioValue,
+            row.property_side,
+            itemType,
+            label,
+            Number(row.amount) || 0,
+            row.txn_date || null,
+            row.notes || null,
+          );
+        }
+        return db.prepare('SELECT * FROM tax_property_items WHERE fy = ? AND portfolio_id = ? ORDER BY property_side, id').all(fyValue, portfolioValue);
+      });
+
+      res.json(replaceRows(fy, portfolio_id, rows));
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.put('/property-items/:id', (req, res) => {
+    try {
+      const { property_side, item_type, label, amount, txn_date, notes } = req.body;
+      const current = db.prepare('SELECT * FROM tax_property_items WHERE id = ?').get(req.params.id);
+      if (!current) return res.status(404).json({ error: 'Row not found' });
+      db.prepare(`
+        UPDATE tax_property_items
+        SET property_side = ?, item_type = ?, label = ?, amount = ?, txn_date = ?, notes = ?
+        WHERE id = ?
+      `).run(
+        property_side || current.property_side,
+        item_type || current.item_type,
+        label || current.label,
+        amount == null ? current.amount : (Number(amount) || 0),
+        txn_date || null,
+        notes || null,
+        req.params.id,
+      );
+      const row = db.prepare('SELECT * FROM tax_property_items WHERE id = ?').get(req.params.id);
+      res.json(row);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.delete('/property-items/:id', (req, res) => {
+    try {
+      db.prepare('DELETE FROM tax_property_items WHERE id = ?').run(req.params.id);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ── Tax Computation (New Regime) ───────────────────────────────────────────
   router.get('/computation', (req, res) => {
     try {
       const { fy, portfolio_id } = req.query;
       if (!fy) return res.status(400).json({ error: 'fy is required' });
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
       res.json(buildTaxComputation(db, fy, portfolio_id));
     } catch (e) {
       console.error('Tax computation error:', e);

@@ -346,7 +346,7 @@ function initializeDb(db) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       fy TEXT NOT NULL,
       portfolio_id INTEGER,
-      category TEXT NOT NULL CHECK(category IN ('SAVINGS_INTEREST','TD_INTEREST','NCD_INTEREST','PF_INTEREST','NPS_80CCD2','OTHER')),
+      category TEXT NOT NULL CHECK(category IN ('SAVINGS_INTEREST','TD_INTEREST','NCD_INTEREST','PF_INTEREST','NPS_80CCD2','CG_TRANSFER_EXPENSE','OS_TRANSFER_EXPENSE','OTHER')),
       source_name TEXT NOT NULL,
       account_number TEXT,
       amount REAL NOT NULL DEFAULT 0,
@@ -368,6 +368,33 @@ function initializeDb(db) {
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tax_ais_data_fy ON tax_ais_data(fy, portfolio_id);
+
+    -- Tax: property capital gains inputs (old/new property amounts and custom costs)
+    CREATE TABLE IF NOT EXISTS tax_property_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fy TEXT NOT NULL,
+      portfolio_id INTEGER,
+      property_side TEXT NOT NULL CHECK(property_side IN ('OLD', 'NEW')),
+      item_type TEXT NOT NULL CHECK(item_type IN (
+        'SALE_CONSIDERATION',
+        'PURCHASE_CONSIDERATION',
+        'LAND_COST',
+        'CONSTRUCTION_COST',
+        'STAMP_DUTY',
+        'BROKERAGE',
+        'TRANSFER_EXPENSE',
+        'IMPROVEMENT_COST',
+        'OTHER_COST',
+        'CUSTOM'
+      )),
+      label TEXT NOT NULL,
+      amount REAL NOT NULL DEFAULT 0,
+      txn_date TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tax_property_items_fy ON tax_property_items(fy, portfolio_id);
 
     -- Dashboard performance optimization indexes
     CREATE INDEX IF NOT EXISTS idx_transactions_investment_portfolio ON transactions(investment_id, portfolio_id, transaction_date);

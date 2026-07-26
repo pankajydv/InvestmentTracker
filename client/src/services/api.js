@@ -238,6 +238,12 @@ export const getTaxMeta = (portfolioId) => {
   return fetchJSON(`/tax/meta${qs ? `?${qs}` : ''}`);
 };
 
+export const savePropertyItems = (fy, portfolioId, rows) =>
+  fetchJSON('/tax/property-items/bulk', {
+    method: 'PUT',
+    body: JSON.stringify({ fy, portfolio_id: portfolioId, rows }),
+  });
+
 // Tax: AIS
 export const uploadAIS = async (file, fy, portfolioId) => {
   const formData = new FormData();
@@ -270,6 +276,19 @@ export const updateOtherIncome = (id, data) =>
   fetchJSON(`/tax/other-income/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const deleteOtherIncome = (id) =>
   fetchJSON(`/tax/other-income/${id}`, { method: 'DELETE' });
+
+// Tax: Property Capital Gains Items
+export const getPropertyItems = (fy, portfolioId) => {
+  const params = new URLSearchParams({ fy });
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/tax/property-items?${params}`);
+};
+export const addPropertyItem = (data) =>
+  fetchJSON('/tax/property-items', { method: 'POST', body: JSON.stringify(data) });
+export const updatePropertyItem = (id, data) =>
+  fetchJSON(`/tax/property-items/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+export const deletePropertyItem = (id) =>
+  fetchJSON(`/tax/property-items/${id}`, { method: 'DELETE' });
 
 // Tax: Computation
 export const getTaxComputation = (fy, portfolioId) => {

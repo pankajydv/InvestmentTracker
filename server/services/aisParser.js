@@ -29,6 +29,8 @@ async function parseAIS(pdfBuffer) {
   const tdInterest = extractTDInterest(text);
   const dividendsSFT = extractDividendsSFT(text);
   const taxPayments = extractTaxPayments(text);
+  const propertyPurchases = extractImmovablePurchases(text);
+  const propertySales = extractImmovableSales(text);
 
   // Merge salary with annexure breakup (17(1)/17(2)/17(3))
   for (const s of salary) {
@@ -52,6 +54,8 @@ async function parseAIS(pdfBuffer) {
     td_interest: tdInterest,
     dividends_sft: dividendsSFT,
     tax_payments: taxPayments,
+    property_purchases: propertyPurchases,
+    property_sales: propertySales,
   };
 }
 
@@ -66,6 +70,11 @@ function parseAmount(raw) {
   const cleaned = String(raw).replace(/[,\s]/g, '');
   const val = parseFloat(cleaned);
   return Number.isFinite(val) ? val : 0;
+}
+
+function findRegexIndex(text, re) {
+  const m = text.match(re);
+  return m && typeof m.index === 'number' ? m.index : -1;
 }
 
 function extractPAN(text) {
@@ -299,6 +308,80 @@ function extractTaxPayments(text) {
     });
   }
   return results;
+}
+
+/**
+ * Extract immovable property purchase rows from TDS-194IA(P).
+ */
+function extractImmovablePurchases(text) {
+  const results = [];
+  const start = findRegexIndex(text, /purchase\s+of\s+immovable\s+property/i);
+  if (start < 0) return { count: 0, total_amount: 0, rows: [] };
+  const endCandidates = [
+    findRegexIndex(text.slice(start), /part\s*b2\s*-?\s*information\s+relating\s+to\s+specified\s+financial\s+transaction/i),
+    findRegexIndex(text.slice(start), /sale\s+of\s+land\s+or\s+building/i),
+  ].filter((i) => i >= 0);
+  const adjustedEnds = endCandidates.map((i) => i + start).filter((i) => i > start);
+  const end = adjustedEnds.length ? Math.min(...adjustedEnds) : Math.min(text.length, start + 14000);
+  const section = text.slice(start, end);
+
+  const headerMatch = section.match(/TDS-194IA\(P\)[\s\S]{0,1200}?\s(\d+)\s+([\d,]+)/i);
+  const totalCount = headerMatch ? parseInt(headerMatch[1], 10) : 0;
+  const totalAmount = headerMatch ? parseAmount(headerMatch[2]) : 0;
+
+  const rowRe = /(\d{2}\/\d{2}\/\d{4})\s+([\d,]+)\s+([\d,]+)\s+Active/g;
+  let m;
+  while ((m = rowRe.exec(section)) !== null) {
+    results.push({
+      date: m[1],
+      amount_paid: parseAmount(m[2]),
+      tds_deposited: parseAmount(m[3]),
+    });
+  }
+
+  return {
+    count: totalCount || results.length,
+    total_amount: totalAmount || results.reduce((s, r) => s + (r.amount_paid || 0), 0),
+    rows: results,
+  };
+}
+
+/**
+ * Extract immovable property sale rows from SFT-012.
+ */
+function extractImmovableSales(text) {
+  const results = [];
+  const start = findRegexIndex(text, /sale\s+of\s+land\s+or\s+building/i);
+  if (start < 0) return { count: 0, total_amount: 0, rows: [] };
+  const endCandidates = [
+    findRegexIndex(text.slice(start), /sale\s+of\s+securities\s+and\s+units\s+of\s+mutual\s+fund/i),
+    findRegexIndex(text.slice(start), /purchase\s+of\s+securities\s+and\s+units\s+of\s+mutual\s+funds?/i),
+  ].filter((i) => i >= 0);
+  const adjustedEnds = endCandidates.map((i) => i + start).filter((i) => i > start);
+  const end = adjustedEnds.length ? Math.min(...adjustedEnds) : Math.min(text.length, start + 14000);
+  const section = text.slice(start, end);
+
+  const headerMatch = section.match(/SFT-012[\s\S]{0,1200}?\s(\d+)\s+([\d,]+)/i);
+  const totalCount = headerMatch ? parseInt(headerMatch[1], 10) : 0;
+  const totalAmount = headerMatch ? parseAmount(headerMatch[2]) : 0;
+
+  const rowRe = /Sale\s+(\d{2}\/\d{2}\/\d{4})\s+([\d,]+)\s+([\d,]+)\s+(\d+)\s+([\d,]+)\s+Active/g;
+  let m;
+  while ((m = rowRe.exec(section)) !== null) {
+    results.push({
+      transaction_date: m[1],
+      transaction_amount: parseAmount(m[2]),
+      stamp_value: parseAmount(m[3]),
+      party_count: Number(m[4]) || 0,
+      assigned_amount: parseAmount(m[5]),
+    });
+  }
+
+  return {
+    count: totalCount || results.length,
+    total_amount: totalAmount || results.reduce((s, r) => s + (r.assigned_amount || r.transaction_amount || 0), 0),
+    rows: results,
+  };
 }
 
 module.exports = { parseAIS };

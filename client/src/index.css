@@ -263,6 +263,244 @@ tr:hover .row-actions {
   pointer-events: auto;
 }
 
+/* Tax page consistency pass */
+.tax-modern-page .accordion-item {
+  border: 1px solid #d8e2f1;
+  border-radius: 0.75rem;
+  overflow: hidden;
+}
+
+.tax-modern-page .accordion-button {
+  background: linear-gradient(180deg, #eaf3ff 0%, #dfeeff 100%);
+  color: #153a6b;
+  font-weight: 500;
+  padding-top: 0.7rem;
+  padding-bottom: 0.7rem;
+}
+
+.tax-modern-page .accordion-button:not(.collapsed) {
+  box-shadow: none;
+}
+
+.tax-modern-page .accordion-body {
+  background: #fbfdff;
+}
+
+.tax-modern-page {
+  color: #1f2937;
+  font-size: 0.95rem;
+  line-height: 1.35;
+}
+
+.tax-modern-page .card {
+  border-color: #dbe5f3;
+  border-radius: 0.6rem;
+}
+
+.tax-modern-page .card-header {
+  background: #f4f8ff;
+  border-bottom: 1px solid #dbe5f3;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.tax-modern-page .table,
+.tax-modern-page .btn,
+.tax-modern-page .form-control,
+.tax-modern-page .form-select,
+.tax-modern-page .badge {
+  font-size: 0.95rem;
+}
+
+.tax-modern-page .small {
+  font-size: 0.84rem !important;
+  line-height: 1.3;
+}
+
+.tax-modern-page .h6,
+.tax-modern-page h6 {
+  font-size: 1.02rem;
+  font-weight: 600;
+}
+
+.tax-modern-page .table thead th {
+  font-size: 0.94rem;
+  font-weight: 600;
+  border-bottom: 1px solid #dbe5f3;
+  color: #1f3b63;
+}
+
+.tax-modern-page .table tbody td,
+.tax-modern-page .table tfoot td,
+.tax-modern-page .table tbody th,
+.tax-modern-page .table tfoot th {
+  font-size: 0.95rem;
+  vertical-align: middle;
+}
+
+.tax-modern-page .table > :not(caption) > * > * {
+  border-bottom: 0;
+}
+
+.tax-modern-page .table tbody tr:not(:last-child) > * {
+  border-bottom: 1px solid rgba(148, 163, 184, 0.22);
+}
+
+.tax-modern-page .table.table-borderless tbody tr:not(:last-child) > * {
+  border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.tax-modern-page .table tfoot td,
+.tax-modern-page .table tfoot th {
+  border-top: 1px solid #dbe5f3;
+}
+
+.tax-modern-page .table-light > * > * {
+  box-shadow: inset 0 1px 0 #e6edf8;
+}
+
+.tax-modern-page .tax-subsection {
+  background: transparent;
+  border: 0 !important;
+  box-shadow: none;
+  border-left-width: 0 !important;
+  padding: 0 !important;
+  margin: 0 0 0.55rem 0;
+}
+
+.tax-modern-page .tax-subsection .table {
+  margin-bottom: 0;
+}
+
+.tax-modern-page .tax-subsection-header {
+  background: #eef4ff;
+  border: 1px solid #dce8fb;
+  border-radius: 0.55rem;
+  padding: 0.26rem 0.52rem;
+}
+
+.tax-modern-page .tax-subsection-header .btn.btn-link {
+  min-height: 1.45rem;
+  line-height: 1.15;
+}
+
+.tax-modern-page .tax-subsection-header .text-muted.small {
+  margin-top: 0;
+}
+
+.tax-modern-page .tax-subsection > .table-responsive,
+.tax-modern-page .tax-subsection > .mt-2,
+.tax-modern-page .tax-subsection > .small.text-muted,
+.tax-modern-page .tax-subsection > .alert {
+  margin-top: 0.4rem !important;
+}
+
+.tax-modern-page .tax-subsection .btn-link {
+  color: #4b627f;
+}
+
+.tax-modern-page .bg-light.border.rounded,
+.tax-modern-page .my-2.p-2.border.rounded.bg-light {
+  background: #f8fbff !important;
+  border-color: #dbe5f3 !important;
+  border-radius: 0.55rem !important;
+}
+
+.tax-modern-page .form-control,
+.tax-modern-page .form-select {
+  border-color: #d7e2f2;
+}
+
+.tax-modern-page .tax-summary-label {
+  color: #6b7280;
+  font-size: 0.75rem;
+}
+
+.tax-modern-page .tax-summary-sub {
+  color: #6b7280;
+  font-size: 0.69rem;
+  line-height: 1.25;
+}
+
+.tax-modern-page .tax-cell-meta {
+  color: #6b7280;
+  font-size: 0.76rem;
+}
+
+.tax-modern-page .property-summary-title {
+  color: #3f5879;
+  font-size: 0.82rem;
+  font-weight: 600;
+  border-bottom: 1px solid #dbe5f3;
+  padding-bottom: 0.2rem;
+}
+
+.tax-modern-page .property-summary-line {
+  line-height: 1.2;
+}
+
+.tax-modern-page .property-summary-label {
+  color: #5f6b7a;
+}
+
+.tax-modern-page .property-summary-value {
+  color: #1f2937;
+}
+
+.tax-modern-page .property-delete-btn {
+  min-width: 1.1rem;
+  min-height: 1.1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tax-modern-page .property-action-btn {
+  min-width: 1.1rem;
+  min-height: 1.1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #2563eb;
+}
+
+.tax-modern-page .property-rows-table th {
+  font-size: 0.84rem;
+  color: #334e74;
+}
+
+.tax-modern-page .property-rows-table td {
+  vertical-align: middle;
+}
+
+.tax-modern-page .property-main-section {
+  border-color: #cfe0f7;
+}
+
+.tax-modern-page .property-main-header {
+  background: #dcebff;
+  border: 1px solid #cfe0f7;
+  border-radius: 0.55rem;
+  padding: 0.42rem 0.65rem;
+}
+
+.tax-modern-page .property-main-section .card-body {
+  border-top: 1px solid #dbe5f3;
+}
+
+.tax-modern-page .property-embedded-section {
+  border: 0;
+  box-shadow: none !important;
+  margin-bottom: 0 !important;
+}
+
+.tax-modern-page .property-embedded-section .card-body {
+  border-top: 0;
+  padding-left: 0;
+  padding-right: 0;
+  padding-bottom: 0;
+}
+
 .asset-allocation-donut {
   width: 100%;
   height: 100%;

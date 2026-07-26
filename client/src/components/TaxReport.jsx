@@ -3,10 +3,11 @@ import { Card, Row, Col, Form, Button, Table, Badge, Spinner, Accordion } from '
 import { Download, Plus, Trash2 } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import CollapsibleSectionHeader from './CollapsibleSectionHeader';
-import { getTaxReport, getTaxMeta, uploadAIS, getAISData, getOtherIncome, addOtherIncome, updateOtherIncome, deleteOtherIncome } from '../services/api';
+import { getTaxReport, getTaxMeta, getTaxComputation, uploadAIS, getAISData, getOtherIncome, addOtherIncome, updateOtherIncome, deleteOtherIncome } from '../services/api';
 import { formatINRExact as formatINR, formatDate, formatNumber, profitColor } from '../utils/formatters';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 import TaxComputation from './TaxComputation';
+import PropertyCapitalGains from './PropertyCapitalGains';
 
 function fyLabel(startYear) {
   return `${startYear}-${String(startYear + 1).slice(-2)}`;
@@ -118,6 +119,64 @@ const LTCG_112A_EXEMPTION = 125000;
 function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 function sumField(rows, field) { return round2((rows || []).reduce((s, r) => s + (Number(r[field]) || 0), 0)); }
 
+function toNumberLoose(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (value == null) return 0;
+  const cleaned = String(value).replace(/,/g, '').trim();
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function hasPropertySalesInAis(aisData) {
+  if (!aisData) return false;
+  const sales = aisData.property_sales ?? aisData.propertySales ?? null;
+  if (!sales) return false;
+  if (Array.isArray(sales)) return sales.length > 0;
+  const rows = Array.isArray(sales.rows) ? sales.rows : [];
+  if (rows.length > 0) return true;
+  if (toNumberLoose(sales.count) > 0) return true;
+  if (toNumberLoose(sales.total_amount) > 0) return true;
+  if (toNumberLoose(sales.totalAmount) > 0) return true;
+  return false;
+}
+
+function hasLegacyAisWithoutPropertyFields(aisData) {
+  if (!aisData || typeof aisData !== 'object') return false;
+  const hasSalesKey = Object.prototype.hasOwnProperty.call(aisData, 'property_sales')
+    || Object.prototype.hasOwnProperty.call(aisData, 'propertySales');
+  const hasPurchaseKey = Object.prototype.hasOwnProperty.call(aisData, 'property_purchases')
+    || Object.prototype.hasOwnProperty.call(aisData, 'propertyPurchases');
+  return !hasSalesKey && !hasPurchaseKey;
+}
+
+function computeSlabTaxLocal(taxableIncome) {
+  const slabs = [
+    { upto: 400000, rate: 0 },
+    { upto: 800000, rate: 0.05 },
+    { upto: 1200000, rate: 0.10 },
+    { upto: 1600000, rate: 0.15 },
+    { upto: 2000000, rate: 0.20 },
+    { upto: 2400000, rate: 0.25 },
+    { upto: Infinity, rate: 0.30 },
+  ];
+  let tax = 0;
+  let prev = 0;
+  for (const slab of slabs) {
+    const chunk = Math.min(taxableIncome, slab.upto) - prev;
+    if (chunk <= 0) break;
+    tax += chunk * slab.rate;
+    prev = slab.upto;
+  }
+  return Math.round(tax);
+}
+
+function computeSurchargeLocal(totalIncome, baseTax) {
+  if (totalIncome <= 5000000) return 0;
+  if (totalIncome <= 10000000) return Math.round(baseTax * 0.10);
+  if (totalIncome <= 20000000) return Math.round(baseTax * 0.15);
+  return Math.round(baseTax * 0.25);
+}
+
 function fyQuarterForDate(dateStr) {
   const parts = String(dateStr || '').split('-').map(Number);
   const m = parts[1];
@@ -225,17 +284,20 @@ export default function TaxReport() {
   const portfolioId = selectedIds.length === 1 ? String(selectedIds[0]) : '';
   const [loading, setLoading] = useState(false);
   const [report, setReport] = useState(null);
+  const [computation, setComputation] = useState(null);
   const [error, setError] = useState('');
   const [perquisiteExpanded, setPerquisiteExpanded] = useState(false);
   const [cgQuarterExpanded, setCgQuarterExpanded] = useState(false);
   const [dividendExpanded, setDividendExpanded] = useState(false);
   const [divQuarterExpanded, setDivQuarterExpanded] = useState(false);
   const [interestExpanded, setInterestExpanded] = useState(false);
-  const [form67Expanded, setForm67Expanded] = useState(false);
-  const [faExpanded, setFaExpanded] = useState(false);
   const [ais, setAis] = useState(null);
   const [aisLoading, setAisLoading] = useState(false);
   const [otherIncome, setOtherIncome] = useState([]);
+  const [taxRefreshNonce, setTaxRefreshNonce] = useState(0);
+  const hasSinglePortfolio = selectedIds.length === 1;
+  const hasAisPropertySale = useMemo(() => hasPropertySalesInAis(ais), [ais]);
+  const hasLegacyPropertyUnknown = useMemo(() => hasLegacyAisWithoutPropertyFields(ais), [ais]);
 
   // Fetch the earliest transaction date so the FY list reflects real data range.
   useEffect(() => {
@@ -254,6 +316,12 @@ export default function TaxReport() {
   }, [options]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const load = async () => {
+    if (!hasSinglePortfolio) {
+      setError('Select exactly one portfolio to generate tax computation.');
+      setReport(null);
+      setComputation(null);
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -274,27 +342,92 @@ export default function TaxReport() {
     } finally {
       setLoading(false);
     }
+    // Auto-compute tax after report generation.
+    await refreshTaxComputation();
   };
 
   const summary = report?.summary || {};
   const cgView = useMemo(() => buildCgView(report?.capital_gains), [report]);
+  const form67RowsWithIndianTax = useMemo(() => {
+    const rows = report?.form_67 || [];
+    if (!rows.length || !computation) return rows;
+
+    const foreignDividendINR = rows.reduce((s, r) => s + (Number(r.gross_dividend_inr) || 0), 0);
+    if (foreignDividendINR <= 0) {
+      return rows.map((r) => ({ ...r, indian_tax_payable_normal_inr: 0 }));
+    }
+
+    const t = computation.tax || {};
+    const taxableSlab = Number(computation.taxable_slab_income) || 0;
+    const totalTaxableIncome = Number(computation.total_taxable_income) || 0;
+    const specialTaxTotal = (Number(t.on_stcg_111a) || 0) + (Number(t.on_ltcg_112a) || 0) + (Number(t.on_ltcg_112) || 0);
+
+    const reducedTaxableSlab = Math.max(0, taxableSlab - foreignDividendINR);
+    const reducedTotalTaxableIncome = Math.max(0, totalTaxableIncome - foreignDividendINR);
+    const reducedTaxOnSlab = computeSlabTaxLocal(reducedTaxableSlab);
+    const reducedTotalBeforeSurcharge = reducedTaxOnSlab + specialTaxTotal;
+    const reducedRebate87A = reducedTotalTaxableIncome <= 700000 ? Math.min(reducedTaxOnSlab, 25000) : 0;
+    const reducedAfterRebate = Math.max(0, reducedTotalBeforeSurcharge - reducedRebate87A);
+    const reducedSurcharge = computeSurchargeLocal(reducedTotalTaxableIncome, reducedAfterRebate);
+    const reducedCess = Math.round((reducedAfterRebate + reducedSurcharge) * 0.04);
+    const reducedTotalLiability = reducedAfterRebate + reducedSurcharge + reducedCess;
+
+    const currentTotalLiability = Number(t.total_liability) || 0;
+    const indianTaxOnForeignDividend = Math.max(0, currentTotalLiability - reducedTotalLiability);
+
+    return rows.map((r) => {
+      const rowShare = (Number(r.gross_dividend_inr) || 0) / foreignDividendINR;
+      return {
+        ...r,
+        indian_tax_payable_normal_inr: round2(indianTaxOnForeignDividend * rowShare),
+      };
+    });
+  }, [report, computation]);
+  const form67NeedsSetup = !ais || !computation;
+  const form67MissingSteps = [
+    !ais ? 'Upload AIS' : null,
+    !computation ? 'Generate Report' : null,
+  ].filter(Boolean);
+  const compactHeaderClass = 'd-flex align-items-center gap-2 mb-0 tax-subsection-header';
+  const compactTitleClass = 'h6 fw-semibold mb-0';
+
+  const refreshTaxComputation = async () => {
+    try {
+      const comp = await getTaxComputation(fy, portfolioId);
+      setComputation(comp);
+    } catch (e) {
+      setComputation(null);
+    } finally {
+      setTaxRefreshNonce((n) => n + 1);
+    }
+  };
 
   // ── AIS & Other Income ──
   useEffect(() => {
-    if (!fy) return;
-    getAISData(fy, portfolioId || undefined).then(setAis).catch(() => setAis(null));
-    getOtherIncome(fy, portfolioId || undefined).then(setOtherIncome).catch(() => setOtherIncome([]));
-  }, [fy, portfolioId]);
+    if (!fy || !hasSinglePortfolio) {
+      setAis(null);
+      setOtherIncome([]);
+      return;
+    }
+    getAISData(fy, portfolioId).then(setAis).catch(() => setAis(null));
+    getOtherIncome(fy, portfolioId).then(setOtherIncome).catch(() => setOtherIncome([]));
+  }, [fy, hasSinglePortfolio, portfolioId]);
 
   const handleAISUpload = async (e) => {
+    if (!hasSinglePortfolio) {
+      setError('Select exactly one portfolio before uploading AIS.');
+      e.target.value = '';
+      return;
+    }
     const file = e.target.files?.[0];
     if (!file) return;
     setAisLoading(true);
     try {
-      const parsed = await uploadAIS(file, fy, portfolioId || undefined);
+      const parsed = await uploadAIS(file, fy, portfolioId);
       setAis(parsed);
-      const oi = await getOtherIncome(fy, portfolioId || undefined);
+      const oi = await getOtherIncome(fy, portfolioId);
       setOtherIncome(oi);
+      await refreshTaxComputation();
     } catch (err) {
       setError(err.message || 'AIS parse failed');
     } finally {
@@ -304,22 +437,33 @@ export default function TaxReport() {
   };
 
   const handleAddOI = async (category) => {
-    const row = await addOtherIncome({ fy, portfolio_id: portfolioId || null, category, source_name: '', amount: 0, tds: 0 });
+    if (!hasSinglePortfolio) {
+      setError('Select exactly one portfolio before editing tax data.');
+      return;
+    }
+    const defaultNames = {
+      SAVINGS_INTEREST: 'Bank', TD_INTEREST: 'Bank FD', NCD_INTEREST: 'NCD',
+      PF_INTEREST: 'EPFO', CG_TRANSFER_EXPENSE: 'Wire transfer', OS_TRANSFER_EXPENSE: 'Remittance', OTHER: 'Other',
+    };
+    const row = await addOtherIncome({ fy, portfolio_id: portfolioId, category, source_name: defaultNames[category] || 'Other', amount: 0, tds: 0 });
     setOtherIncome((prev) => [...prev, row]);
+    await refreshTaxComputation();
   };
   const handleUpdateOI = async (id, field, value) => {
     const row = otherIncome.find((r) => r.id === id);
     if (!row) return;
     await updateOtherIncome(id, { ...row, [field]: value });
     setOtherIncome((prev) => prev.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
+    await refreshTaxComputation();
   };
   const handleDeleteOI = async (id) => {
     await deleteOtherIncome(id);
     setOtherIncome((prev) => prev.filter((r) => r.id !== id));
+    await refreshTaxComputation();
   };
 
   return (
-    <div className="d-flex flex-column gap-3">
+    <div className="d-flex flex-column gap-3 tax-modern-page">
       <Card className="shadow-sm">
         <Card.Body>
           <div className="d-flex flex-wrap align-items-end gap-2">
@@ -329,13 +473,13 @@ export default function TaxReport() {
                 {options.map((o) => <option key={o} value={o}>{o}</option>)}
               </Form.Select>
             </div>
-            <Button size="sm" onClick={load} disabled={loading}>
+            <Button size="sm" onClick={load} disabled={loading || !hasSinglePortfolio}>
               {loading ? <Spinner animation="border" size="sm" /> : 'Generate Report'}
             </Button>
             {ais ? (
               <span className="d-flex align-items-center gap-1">
                 <Badge bg="success">AIS ✓</Badge>
-                <label className="btn btn-sm btn-link text-muted p-0 mb-0" style={{ fontSize: '0.75rem', cursor: 'pointer' }}>
+                <label className="btn btn-sm btn-link text-muted p-0 mb-0 tax-summary-label" style={{ cursor: 'pointer' }}>
                   {aisLoading ? <Spinner animation="border" size="sm" /> : 'change'}
                   <input type="file" accept=".pdf" hidden onChange={handleAISUpload} />
                 </label>
@@ -347,6 +491,11 @@ export default function TaxReport() {
               </label>
             )}
           </div>
+          {!hasSinglePortfolio && (
+            <div className="text-danger small mt-2">
+              Select exactly one portfolio to compute tax. Current selection must not be All or multiple portfolios.
+            </div>
+          )}
           {error && <div className="text-danger small mt-2">{error}</div>}
         </Card.Body>
       </Card>
@@ -354,16 +503,46 @@ export default function TaxReport() {
       {report && (
         <>
           <Row className="g-3">
-            <Col xs={6} md={2}><SummaryCard label="Perquisite (Sch 1)" value={formatINR(summary.total_perquisite_inr || 0)} /></Col>
-            <Col xs={6} md={2}><SummaryCard label="STCG 111A (Equity)" value={formatINR(cgView.summary.stcg111a)} color={profitColor(cgView.summary.stcg111a)} /></Col>
-            <Col xs={6} md={2}><SummaryCard label="LTCG 112A taxable" value={formatINR(cgView.summary.ltcg112aTaxable)} color={profitColor(cgView.summary.ltcg112aTaxable)} sub={`Gross ${formatINR(cgView.summary.ltcg112aGross)} · exempt ${formatINR(cgView.summary.ltcg112aExemption)}`} /></Col>
-            <Col xs={6} md={2}><SummaryCard label="LTCG 112 (Foreign)" value={formatINR(cgView.summary.ltcg112)} color={profitColor(cgView.summary.ltcg112)} /></Col>
-            <Col xs={6} md={2}><SummaryCard label="STCG Slab" value={formatINR(cgView.summary.stcgSlab)} color={profitColor(cgView.summary.stcgSlab)} /></Col>
-            <Col xs={6} md={2}><SummaryCard label="Dividend (Sch OS)" value={formatINR(summary.total_dividend_inr || 0)} /></Col>
+            {computation ? (
+              <>
+                <Col xs={6} md={2}><SummaryCard label="Net Salary" value={formatINR(computation.heads?.salary?.net || 0)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="STCG (111A + Slab)" value={formatINR((computation.heads?.capital_gains?.stcg_111a || 0) + (computation.heads?.capital_gains?.stcg_slab || 0))} color={profitColor((computation.heads?.capital_gains?.stcg_111a || 0) + (computation.heads?.capital_gains?.stcg_slab || 0))} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="LTCG 112A (Equity)" value={formatINR(computation.heads?.capital_gains?.ltcg_112a_taxable || 0)} color={profitColor(computation.heads?.capital_gains?.ltcg_112a_taxable)} sub={`Gross ${formatINR(computation.heads?.capital_gains?.ltcg_112a_gross || 0)}`} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="LTCG 112 (Foreign)" value={formatINR((computation.heads?.capital_gains?.ltcg_112_adjusted ?? computation.heads?.capital_gains?.ltcg_112) || 0)} color={profitColor(computation.heads?.capital_gains?.ltcg_112 || 0)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="Other Sources" value={formatINR(computation.heads?.other_sources?.total || 0)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="Tax Liability" value={formatINR(computation.tax?.total_liability || 0)} color="text-danger" /></Col>
+              </>
+            ) : (
+              <>
+                <Col xs={6} md={2}><SummaryCard label="Perquisite (Sch 1)" value={formatINR(summary.total_perquisite_inr || 0)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="STCG 111A (Equity)" value={formatINR(cgView.summary.stcg111a)} color={profitColor(cgView.summary.stcg111a)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="LTCG 112A taxable" value={formatINR(cgView.summary.ltcg112aTaxable)} color={profitColor(cgView.summary.ltcg112aTaxable)} sub={`Gross ${formatINR(cgView.summary.ltcg112aGross)} · exempt ${formatINR(cgView.summary.ltcg112aExemption)}`} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="LTCG 112 (Foreign)" value={formatINR(cgView.summary.ltcg112)} color={profitColor(cgView.summary.ltcg112)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="STCG Slab" value={formatINR(cgView.summary.stcgSlab)} color={profitColor(cgView.summary.stcgSlab)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="Dividend (Sch OS)" value={formatINR(summary.total_dividend_inr || 0)} /></Col>
+              </>
+            )}
           </Row>
 
           <Accordion alwaysOpen className="shadow-sm">
-            <Accordion.Item eventKey="0">
+            {(hasAisPropertySale || hasLegacyPropertyUnknown) && (
+              <Accordion.Item eventKey="0">
+                <Accordion.Header>Property Capital Gains</Accordion.Header>
+                <Accordion.Body>
+                  <PropertyCapitalGains
+                    fy={fy}
+                    portfolioId={portfolioId}
+                    ais={ais}
+                    showHeader={false}
+                    propertySignalUnknown={hasLegacyPropertyUnknown && !hasAisPropertySale}
+                    ltcg112={(computation?.heads?.capital_gains?.ltcg_112_after_transfer ?? computation?.heads?.capital_gains?.ltcg_112 ?? cgView.summary.ltcg112) || 0}
+                    onSaved={load}
+                  />
+                </Accordion.Body>
+              </Accordion.Item>
+            )}
+
+            <Accordion.Item eventKey="1">
               <Accordion.Header>Schedule 1: Salary & Perquisite Income ({report.perquisite_income.length} vests{ais?.salary?.length ? ` · Gross ${formatINR(ais.salary.reduce((s, e) => s + (e.gross || 0), 0))}` : ''})</Accordion.Header>
               <Accordion.Body>
                 {ais?.salary?.length > 0 && (
@@ -394,50 +573,53 @@ export default function TaxReport() {
                         </tr>
                       </tfoot>
                     </Table>
-                    <hr />
                   </div>
                 )}
-                <CollapsibleSectionHeader
-                  expanded={perquisiteExpanded}
-                  onToggle={() => setPerquisiteExpanded((v) => !v)}
-                  title="Foreign Equity Perquisites (RSU/ESPP detail)"
-                  summary={`${report.perquisite_income.length} entries · Total ${formatINR(summary.total_perquisite_inr || 0)}`}
-                  right={perquisiteExpanded ? (
-                    <Button size="sm" variant="outline-secondary" onClick={(e) => { e.stopPropagation(); downloadCSV(`perquisite_${fy}.csv`, report.perquisite_income); }}>
-                      <Download size={14} className="me-1" /> Export CSV
-                    </Button>
-                  ) : null}
-                />
-                {perquisiteExpanded && (
-                <div className="table-responsive">
-                  <Table size="sm" hover>
-                    <thead><tr><th>Date</th><th>Type</th><th>Investment</th><th>Units</th><th>FMV USD</th><th>Rate</th><th>Perquisite INR</th></tr></thead>
-                    <tbody>
-                      {report.perquisite_income.map((r, idx) => (
-                        <tr key={idx}>
-                          <td>{formatDate(r.date)}</td>
-                          <td>{r.type}</td>
-                          <td>{r.investment}</td>
-                          <td>{formatNumber(r.units || 0, 4)}</td>
-                          <td>{r.fmv_per_share_usd != null ? `$${formatNumber(r.fmv_per_share_usd, 2)}` : '-'}</td>
-                          <td>{r.exchange_rate || '-'}</td>
-                          <td>{formatINR(r.perquisite_inr || 0)}</td>
+                <SubSectionShell accent="info">
+                  <CollapsibleSectionHeader
+                    expanded={perquisiteExpanded}
+                    onToggle={() => setPerquisiteExpanded((v) => !v)}
+                    title="Foreign Equity Perquisites (RSU/ESPP detail)"
+                    className={compactHeaderClass}
+                    titleClassName={compactTitleClass}
+                    summary={`${report.perquisite_income.length} entries · Total ${formatINR(summary.total_perquisite_inr || 0)}`}
+                    right={perquisiteExpanded ? (
+                      <Button size="sm" variant="outline-secondary" onClick={(e) => { e.stopPropagation(); downloadCSV(`perquisite_${fy}.csv`, report.perquisite_income); }}>
+                        <Download size={14} className="me-1" /> Export CSV
+                      </Button>
+                    ) : null}
+                  />
+                  {perquisiteExpanded && (
+                  <div className="table-responsive">
+                    <Table size="sm" hover>
+                      <thead><tr><th>Date</th><th>Type</th><th>Investment</th><th>Units</th><th>FMV USD</th><th>Rate</th><th>Perquisite INR</th></tr></thead>
+                      <tbody>
+                        {report.perquisite_income.map((r, idx) => (
+                          <tr key={idx}>
+                            <td>{formatDate(r.date)}</td>
+                            <td>{r.type}</td>
+                            <td>{r.investment}</td>
+                            <td>{formatNumber(r.units || 0, 4)}</td>
+                            <td>{r.fmv_per_share_usd != null ? `$${formatNumber(r.fmv_per_share_usd, 2)}` : '-'}</td>
+                            <td>{r.exchange_rate || '-'}</td>
+                            <td>{formatINR(r.perquisite_inr || 0)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                      <tfoot className="table-light fw-semibold">
+                        <tr>
+                          <td colSpan={6}>Total</td>
+                          <td>{formatINR(summary.total_perquisite_inr || 0)}</td>
                         </tr>
-                      ))}
-                    </tbody>
-                    <tfoot className="table-light fw-semibold">
-                      <tr>
-                        <td colSpan={6}>Total</td>
-                        <td>{formatINR(summary.total_perquisite_inr || 0)}</td>
-                      </tr>
-                    </tfoot>
-                  </Table>
-                </div>
-                )}
+                      </tfoot>
+                    </Table>
+                  </div>
+                  )}
+                </SubSectionShell>
               </Accordion.Body>
             </Accordion.Item>
 
-            <Accordion.Item eventKey="1">
+            <Accordion.Item eventKey="2">
               <Accordion.Header>Schedule CG: Capital Gains ({report.capital_gains.length} lots across {cgView.sections.filter((s) => s.rows.length).length} categories)</Accordion.Header>
               <Accordion.Body>
                 <div className="d-flex justify-content-end mb-2">
@@ -446,13 +628,28 @@ export default function TaxReport() {
                   </Button>
                 </div>
                 {cgView.sections.map((sec) => (
-                  <CGSection key={sec.key} section={sec} fy={fy} />
+                  <SubSectionShell key={sec.key} accent="secondary" className="mb-2">
+                    <CGSection section={sec} fy={fy} />
+                  </SubSectionShell>
                 ))}
-                <div className="mt-3">
+                {/* Transfer expense for foreign CG */}
+                <TransferExpenseInput
+                  label="Cost of Transfer — Wire/Remittance Charges (Section 48)"
+                  category="CG_TRANSFER_EXPENSE"
+                  rows={otherIncome}
+                  fy={fy}
+                  portfolioId={portfolioId}
+                  onAdd={handleAddOI}
+                  onUpdate={handleUpdateOI}
+                  onDelete={handleDeleteOI}
+                />
+                <SubSectionShell accent="secondary" className="mt-3">
                   <CollapsibleSectionHeader
                     expanded={cgQuarterExpanded}
                     onToggle={() => setCgQuarterExpanded((v) => !v)}
                     title="Quarter-wise breakup (for Section 234C)"
+                    className={compactHeaderClass}
+                    titleClassName={compactTitleClass}
                   />
                   {cgQuarterExpanded && (
                   <div className="table-responsive mt-2">
@@ -478,53 +675,59 @@ export default function TaxReport() {
                     </Table>
                   </div>
                   )}
-                </div>
+                </SubSectionShell>
               </Accordion.Body>
             </Accordion.Item>
 
-            <Accordion.Item eventKey="2">
+            <Accordion.Item eventKey="3">
               <Accordion.Header>Schedule OS: Other Sources (Dividends {report.dividend_income.length} + Interest {otherIncome.length} entries)</Accordion.Header>
               <Accordion.Body>
                 {/* Dividends */}
-                <CollapsibleSectionHeader
-                  expanded={dividendExpanded}
-                  onToggle={() => setDividendExpanded((v) => !v)}
-                  title="Dividend Income"
-                  summary={`${report.dividend_income.length} entries · Total ${formatINR(summary.total_dividend_inr || 0)}`}
-                  right={dividendExpanded ? (
-                    <Button size="sm" variant="outline-secondary" onClick={(e) => { e.stopPropagation(); downloadCSV(`dividend_${fy}.csv`, report.dividend_income); }}>
-                      <Download size={14} className="me-1" /> Export CSV
-                    </Button>
-                  ) : null}
-                />
-                {dividendExpanded && (
-                <div className="table-responsive mb-3">
-                  <Table size="sm" hover>
-                    <thead><tr><th>Date</th><th>Investment</th><th>USD</th><th>Rate</th><th>INR</th></tr></thead>
-                    <tbody>
-                      {report.dividend_income.map((r, idx) => (
-                        <tr key={idx}>
-                          <td>{formatDate(r.date)}</td>
-                          <td>{r.investment}</td>
-                          <td>{r.usd_amount != null ? `$${formatNumber(r.usd_amount, 2)}` : '-'}</td>
-                          <td>{r.exchange_rate || '-'}</td>
-                          <td>{formatINR(r.amount_inr || 0)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                    <tfoot className="table-light fw-semibold">
-                      <tr><td colSpan={4}>Total Dividends</td><td>{formatINR(summary.total_dividend_inr || 0)}</td></tr>
-                    </tfoot>
-                  </Table>
-                </div>
-                )}
+                <SubSectionShell accent="primary">
+                  <CollapsibleSectionHeader
+                    expanded={dividendExpanded}
+                    onToggle={() => setDividendExpanded((v) => !v)}
+                    title="Dividend Income"
+                    className={compactHeaderClass}
+                    titleClassName={compactTitleClass}
+                    summary={`${report.dividend_income.length} entries · Total ${formatINR(summary.total_dividend_inr || 0)}`}
+                    right={dividendExpanded ? (
+                      <Button size="sm" variant="outline-secondary" onClick={(e) => { e.stopPropagation(); downloadCSV(`dividend_${fy}.csv`, report.dividend_income); }}>
+                        <Download size={14} className="me-1" /> Export CSV
+                      </Button>
+                    ) : null}
+                  />
+                  {dividendExpanded && (
+                  <div className="table-responsive mb-1">
+                    <Table size="sm" hover>
+                      <thead><tr><th>Date</th><th>Investment</th><th>USD</th><th>Rate</th><th>INR</th></tr></thead>
+                      <tbody>
+                        {report.dividend_income.map((r, idx) => (
+                          <tr key={idx}>
+                            <td>{formatDate(r.date)}</td>
+                            <td>{r.investment}</td>
+                            <td>{r.usd_amount != null ? `$${formatNumber(r.usd_amount, 2)}` : '-'}</td>
+                            <td>{r.exchange_rate || '-'}</td>
+                            <td>{formatINR(r.amount_inr || 0)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                      <tfoot className="table-light fw-semibold">
+                        <tr><td colSpan={4}>Total Dividends</td><td>{formatINR(summary.total_dividend_inr || 0)}</td></tr>
+                      </tfoot>
+                    </Table>
+                  </div>
+                  )}
+                </SubSectionShell>
 
                 {report.dividend_quarterly && (
-                  <>
+                  <SubSectionShell accent="secondary">
                     <CollapsibleSectionHeader
                       expanded={divQuarterExpanded}
                       onToggle={() => setDivQuarterExpanded((v) => !v)}
                       title="Dividend quarter-wise breakup"
+                      className={compactHeaderClass}
+                      titleClassName={compactTitleClass}
                     />
                     {divQuarterExpanded && (
                     <div className="table-responsive mt-2 mb-3">
@@ -545,21 +748,35 @@ export default function TaxReport() {
                       </Table>
                     </div>
                     )}
-                  </>
+                  </SubSectionShell>
                 )}
 
                 {/* Interest & Other */}
-                <CollapsibleSectionHeader
-                  expanded={interestExpanded}
-                  onToggle={() => setInterestExpanded((v) => !v)}
-                  title="Interest & Other Income"
-                  summary={`${otherIncome.length} entries · Total ${formatINR(otherIncome.reduce((s, r) => s + (r.amount || 0), 0))}`}
+                <TransferExpenseInput
+                  label="Deduction u/s 57 — Dividend Remittance Charges"
+                  category="OS_TRANSFER_EXPENSE"
+                  rows={otherIncome}
+                  fy={fy}
+                  portfolioId={portfolioId}
+                  onAdd={handleAddOI}
+                  onUpdate={handleUpdateOI}
+                  onDelete={handleDeleteOI}
                 />
-                {interestExpanded && (
-                  <div className="mt-2">
-                    <OtherIncomeEditor rows={otherIncome} onAdd={handleAddOI} onUpdate={handleUpdateOI} onDelete={handleDeleteOI} />
-                  </div>
-                )}
+                <SubSectionShell accent="warning">
+                  <CollapsibleSectionHeader
+                    expanded={interestExpanded}
+                    onToggle={() => setInterestExpanded((v) => !v)}
+                    title="Interest & Other Income"
+                    className={compactHeaderClass}
+                    titleClassName={compactTitleClass}
+                    summary={`${otherIncome.length} entries · Total ${formatINR(otherIncome.reduce((s, r) => s + (r.amount || 0), 0))}`}
+                  />
+                  {interestExpanded && (
+                    <div className="mt-2">
+                      <OtherIncomeEditor rows={otherIncome} onAdd={handleAddOI} onUpdate={handleUpdateOI} onDelete={handleDeleteOI} />
+                    </div>
+                  )}
+                </SubSectionShell>
 
                 {/* Schedule OS Total */}
                 <div className="mt-3 p-2 bg-light border rounded d-flex justify-content-between fw-bold">
@@ -569,26 +786,27 @@ export default function TaxReport() {
               </Accordion.Body>
             </Accordion.Item>
 
-            <Accordion.Item eventKey="3">
+            <Accordion.Item eventKey="4">
               <Accordion.Header>Form 67: Foreign Tax Credit ({report.form_67.length} dividends · FTC {formatINR(summary.total_ftc_inr || 0)})</Accordion.Header>
               <Accordion.Body>
-                <CollapsibleSectionHeader
-                  expanded={form67Expanded}
-                  onToggle={() => setForm67Expanded((v) => !v)}
-                  title="FTC Detail"
-                  summary={`${report.form_67.length} entries · Tax withheld ${formatINR(summary.total_ftc_inr || 0)}`}
-                  right={form67Expanded ? (
-                    <Button size="sm" variant="outline-secondary" onClick={(e) => { e.stopPropagation(); downloadCSV(`form67_${fy}.csv`, report.form_67); }}>
+                <SubSectionShell accent="info">
+                  {form67NeedsSetup && (
+                    <div className="alert alert-warning small py-2 mb-2" role="alert">
+                      <strong>Tip:</strong> For complete Form-67 fields (including tax payable on such income under normal provisions in India),
+                      please finish: {form67MissingSteps.join(' and ')}.
+                    </div>
+                  )}
+                  <div className="d-flex align-items-center justify-content-between mb-2">
+                    <div className="h6 fw-semibold mb-0">FTC Detail <span className="text-muted small fw-normal">{report.form_67.length} entries · Tax withheld {formatINR(summary.total_ftc_inr || 0)}</span></div>
+                    <Button size="sm" variant="outline-secondary" onClick={() => downloadCSV(`form67_${fy}.csv`, report.form_67)}>
                       <Download size={14} className="me-1" /> Export CSV
                     </Button>
-                  ) : null}
-                />
-                {form67Expanded && (
-                <div className="table-responsive mt-2">
-                  <Table size="sm" hover>
+                  </div>
+                  <div className="table-responsive mt-2">
+                    <Table size="sm" hover>
                     <thead><tr><th>Date</th><th>Investment</th><th>Country</th><th>Gross USD</th><th>Tax USD</th><th>Net USD</th><th>Rate</th><th>Gross INR</th><th>Tax Withheld INR</th><th>Net INR</th></tr></thead>
                     <tbody>
-                      {report.form_67.map((r, idx) => (
+                      {form67RowsWithIndianTax.map((r, idx) => (
                         <tr key={idx}>
                           <td>{formatDate(r.date)}</td>
                           <td>{r.investment}</td>
@@ -606,35 +824,34 @@ export default function TaxReport() {
                     <tfoot className="table-light fw-semibold">
                       <tr>
                         <td colSpan={7}>Total</td>
-                        <td>{formatINR(report.form_67.reduce((s, r) => s + r.gross_dividend_inr, 0))}</td>
-                        <td>{formatINR(summary.total_ftc_inr || 0)}</td>
-                        <td>{formatINR(summary.total_dividend_inr || 0)}</td>
+                        <td>{formatINR(form67RowsWithIndianTax.reduce((s, r) => s + (r.gross_dividend_inr || 0), 0))}</td>
+                        <td>{formatINR(form67RowsWithIndianTax.reduce((s, r) => s + (r.tax_withheld_inr || 0), 0))}</td>
+                        <td>{formatINR(form67RowsWithIndianTax.reduce((s, r) => s + (r.net_dividend_inr || 0), 0))}</td>
                       </tr>
                     </tfoot>
-                  </Table>
-                </div>
-                )}
-                <div className="small text-muted mt-2">US federal withholding at 25%. Gross = Net ÷ 0.75. File Form 67 before the due date to claim FTC under Section 90/91.</div>
+                    </Table>
+                  </div>
+                  <div className="mt-2 p-2 bg-light border rounded d-flex justify-content-between small">
+                    <span className="fw-semibold">Tax payable on such income under normal provisions in India</span>
+                    <span className="fw-bold">{formatINR(form67RowsWithIndianTax.reduce((s, r) => s + (r.indian_tax_payable_normal_inr || 0), 0))}</span>
+                  </div>
+                  <div className="small text-muted mt-2">US federal withholding at 25%. Gross = Net ÷ 0.75. Tax payable in India is computed using a tax-delta method from current computation (with vs without foreign dividend income). File Form 67 before the due date to claim FTC under Section 90/91.</div>
+                </SubSectionShell>
               </Accordion.Body>
             </Accordion.Item>
 
-            <Accordion.Item eventKey="4">
+            <Accordion.Item eventKey="5">
               <Accordion.Header>Schedule FA: Foreign Asset Disclosure ({report.schedule_fa.length})</Accordion.Header>
               <Accordion.Body>
-                <CollapsibleSectionHeader
-                  expanded={faExpanded}
-                  onToggle={() => setFaExpanded((v) => !v)}
-                  title="Foreign Assets"
-                  summary={`${report.schedule_fa.length} holdings`}
-                  right={faExpanded ? (
-                    <Button size="sm" variant="outline-secondary" onClick={(e) => { e.stopPropagation(); downloadCSV(`schedule_fa_${fy}.csv`, report.schedule_fa); }}>
+                <SubSectionShell accent="secondary">
+                  <div className="d-flex align-items-center justify-content-between mb-2">
+                    <div className="h6 fw-semibold mb-0">Foreign Assets <span className="text-muted small fw-normal">{report.schedule_fa.length} holdings</span></div>
+                    <Button size="sm" variant="outline-secondary" onClick={() => downloadCSV(`schedule_fa_${fy}.csv`, report.schedule_fa)}>
                       <Download size={14} className="me-1" /> Export CSV
                     </Button>
-                  ) : null}
-                />
-                {faExpanded && (
-                <div className="table-responsive">
-                  <Table size="sm" hover>
+                  </div>
+                  <div className="table-responsive">
+                    <Table size="sm" hover>
                     <thead><tr><th>Investment</th><th>Ticker</th><th>Units Held</th><th>Acq Cost USD</th><th>Acq Cost INR</th><th>Year-End Value INR</th><th>Peak Value INR</th></tr></thead>
                     <tbody>
                       {report.schedule_fa.map((r, idx) => (
@@ -649,13 +866,18 @@ export default function TaxReport() {
                         </tr>
                       ))}
                     </tbody>
-                  </Table>
-                </div>
-                )}
+                    </Table>
+                  </div>
+                </SubSectionShell>
               </Accordion.Body>
             </Accordion.Item>
 
-            <TaxComputation fy={fy} portfolioId={portfolioId} />
+            <TaxComputation
+              fy={fy}
+              portfolioId={portfolioId}
+              refreshNonce={taxRefreshNonce}
+              onRecomputed={refreshTaxComputation}
+            />
           </Accordion>
 
           <div className="small text-muted">{summary.tax_note}</div>
@@ -669,11 +891,22 @@ function SummaryCard({ label, value, color = '', sub = '' }) {
   return (
     <Card className="shadow-sm h-100">
       <Card.Body className="py-3">
-        <div className="text-muted" style={{ fontSize: '0.75rem' }}>{label}</div>
+        <div className="tax-summary-label">{label}</div>
         <div className={`fs-6 fw-bold ${color}`}>{value}</div>
-        {sub ? <div className="text-muted" style={{ fontSize: '0.65rem' }}>{sub}</div> : null}
+        {sub ? <div className="tax-summary-sub">{sub}</div> : null}
       </Card.Body>
     </Card>
+  );
+}
+
+function SubSectionShell({ children, accent = 'primary', className = '' }) {
+  return (
+    <div
+      className={`tax-subsection ${className}`.trim()}
+      style={{ borderLeft: `4px solid var(--bs-${accent})` }}
+    >
+      {children}
+    </div>
   );
 }
 
@@ -698,7 +931,7 @@ function CgDataRow({ r, showLot }) {
   return (
     <tr>
       <td>{r.investment}</td>
-      <td className="text-muted" style={{ fontSize: '0.75rem' }}>{r.isin || '-'}</td>
+      <td className="tax-cell-meta">{r.isin || '-'}</td>
       <td><Badge bg={r.asset_class === 'Equity' ? 'primary' : r.asset_class === 'Foreign' ? 'info' : 'secondary'}>{r.asset_class}</Badge></td>
       {showLot && <td>{r.lot_type}</td>}
       <td className="text-nowrap">{formatDate(r.acquisition_date)}</td>
@@ -743,11 +976,13 @@ function CGSection({ section, fy }) {
     : [{ label: null, rows: section.rows }];
 
   return (
-    <div className="mb-3">
+    <div className="mb-0">
       <CollapsibleSectionHeader
         expanded={expanded}
         onToggle={() => setExpanded((v) => !v)}
         title={section.title}
+        className="d-flex align-items-center gap-2 mb-0 tax-subsection-header"
+        titleClassName="h6 fw-semibold mb-0"
         summary={hasRows ? `${section.rows.length} lots · Gain/Loss ${formatINR(section.subtotal.gain)}` : 'No disposals'}
         right={expanded && hasRows ? (
           <Button size="sm" variant="outline-secondary" onClick={(e) => { e.stopPropagation(); downloadCSV(`cg_${section.key}_${fy}.csv`, buildCapitalGainsExportRows(section.rows)); }}>
@@ -798,6 +1033,40 @@ function CGSection({ section, fy }) {
   );
 }
 
+// ── Inline transfer expense input (for CG Section 48 and OS Section 57) ──
+function TransferExpenseInput({ label, category, rows, fy, portfolioId, onAdd, onUpdate, onDelete }) {
+  const existing = rows.find((r) => r.category === category);
+  const [localVal, setLocalVal] = useState('');
+  const [editing, setEditing] = useState(false);
+
+  return (
+    <div className="my-2 p-2 border rounded bg-light">
+      <div className="d-flex align-items-center justify-content-between">
+        <span className="small fw-semibold">{label}</span>
+        {!existing ? (
+          <span className="d-flex align-items-center gap-2">
+            <span className="small text-muted">Not set</span>
+            <Button size="sm" variant="outline-primary" className="py-0 px-2" onClick={() => onAdd(category)}>Set</Button>
+          </span>
+        ) : (
+          <span className="d-flex align-items-center gap-2">
+            <Form.Control size="sm" type="number"
+              value={editing ? localVal : (existing.amount || '')}
+              style={{ width: 130 }}
+              onFocus={() => { setLocalVal(String(existing.amount || '')); setEditing(true); }}
+              onChange={(e) => setLocalVal(e.target.value)}
+              onBlur={() => { onUpdate(existing.id, 'amount', Number(localVal) || 0); setEditing(false); }} />
+            <span className="small text-muted">= {formatINR(existing.amount || 0)}</span>
+            <Button size="sm" variant="link" className="text-danger p-0" onClick={() => onDelete(existing.id)}>
+              <Trash2 size={14} />
+            </Button>
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Inline Other Income Editor for unified Schedule OS ──
 const OI_CATEGORIES = [
   { key: 'SAVINGS_INTEREST', label: 'Savings Bank Interest', showTDS: false },
@@ -828,14 +1097,7 @@ function OtherIncomeEditor({ rows, onAdd, onUpdate, onDelete }) {
                   <tr><th>Source</th><th style={{ width: 130 }}>Amount</th>{showTDS && <th style={{ width: 100 }}>TDS</th>}<th style={{ width: 36 }}></th></tr>
                 </thead>
                 <tbody>
-                  {catRows.map((r) => (
-                    <tr key={r.id}>
-                      <td className="text-muted">{r.source_name || '—'}</td>
-                      <td><Form.Control size="sm" type="number" value={r.amount || ''} onChange={(e) => onUpdate(r.id, 'amount', Number(e.target.value) || 0)} /></td>
-                      {showTDS && <td><Form.Control size="sm" type="number" value={r.tds || ''} onChange={(e) => onUpdate(r.id, 'tds', Number(e.target.value) || 0)} /></td>}
-                      <td><Button size="sm" variant="link" className="text-danger p-0" onClick={() => onDelete(r.id)}><Trash2 size={14} /></Button></td>
-                    </tr>
-                  ))}
+                  {catRows.map((r) => <OIRow key={r.id} row={r} showTDS={showTDS} onUpdate={onUpdate} onDelete={onDelete} />)}
                 </tbody>
                 <tfoot className="table-light fw-semibold">
                   <tr><td>Total</td><td>{formatINR(total)}</td>{showTDS && <td>{formatINR(totalTDS)}</td>}<td></td></tr>
@@ -847,5 +1109,29 @@ function OtherIncomeEditor({ rows, onAdd, onUpdate, onDelete }) {
         );
       })}
     </div>
+  );
+}
+
+function OIRow({ row, showTDS, onUpdate, onDelete }) {
+  const [amt, setAmt] = useState(String(row.amount || ''));
+  const [tds, setTds] = useState(String(row.tds || ''));
+
+  return (
+    <tr>
+      <td className="text-muted">{row.source_name || '—'}</td>
+      <td>
+        <Form.Control size="sm" type="number" value={amt}
+          onChange={(e) => setAmt(e.target.value)}
+          onBlur={() => onUpdate(row.id, 'amount', Number(amt) || 0)} />
+      </td>
+      {showTDS && (
+        <td>
+          <Form.Control size="sm" type="number" value={tds}
+            onChange={(e) => setTds(e.target.value)}
+            onBlur={() => onUpdate(row.id, 'tds', Number(tds) || 0)} />
+        </td>
+      )}
+      <td><Button size="sm" variant="link" className="text-danger p-0" onClick={() => onDelete(row.id)}><Trash2 size={14} /></Button></td>
+    </tr>
   );
 }
