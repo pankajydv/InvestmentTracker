@@ -226,6 +226,28 @@ function buildCgView(capitalGains) {
     return entry;
   });
 
+  // ITR-ready quarterly: absorb losses from earlier quarters into later quarters per section
+  // (ITR Section F doesn't accept negative values)
+  const quarterlyITR = FY_QUARTERS.map((q) => ({ quarter: q.key, label: q.label }));
+  for (const def of CG_SECTIONS) {
+    let carryLoss = 0;
+    for (const qEntry of quarterlyITR) {
+      const rawQ = quarterly.find((q) => q.quarter === qEntry.quarter);
+      const rawVal = rawQ ? rawQ[def.key] : 0;
+      const adjusted = rawVal + carryLoss; // carryLoss is negative or zero
+      if (adjusted < 0) {
+        qEntry[def.key] = 0;
+        carryLoss = adjusted; // carry the remaining loss forward
+      } else {
+        qEntry[def.key] = round2(adjusted);
+        carryLoss = 0;
+      }
+    }
+  }
+  for (const qEntry of quarterlyITR) {
+    qEntry.total = round2(CG_SECTIONS.reduce((s, d) => s + (qEntry[d.key] || 0), 0));
+  }
+
   const ltcg112aGross = sumField(rows.filter((r) => r.tax_section === '112A'), 'gain_loss_inr');
   const summary = {
     stcg111a: sumField(rows.filter((r) => r.tax_section === '111A'), 'gain_loss_inr'),
@@ -236,7 +258,7 @@ function buildCgView(capitalGains) {
     stcgSlab: sumField(rows.filter((r) => r.tax_section === 'SLAB'), 'gain_loss_inr'),
   };
 
-  return { sections, quarterly, summary };
+  return { sections, quarterly, quarterlyITR, summary };
 }
 
 function combineTaxReports(reports) {
@@ -662,7 +684,7 @@ export default function TaxReport() {
                         </tr>
                       </thead>
                       <tbody>
-                        {cgView.quarterly.map((q) => (
+                        {cgView.quarterlyITR.map((q) => (
                           <tr key={q.quarter}>
                             <td className="text-nowrap">{q.quarter} · {q.label}</td>
                             {CG_SECTIONS.map((d) => (
@@ -672,6 +694,18 @@ export default function TaxReport() {
                           </tr>
                         ))}
                       </tbody>
+                      <tfoot className="table-light fw-semibold">
+                        <tr>
+                          <td>Annual Total</td>
+                          {CG_SECTIONS.map((d) => {
+                            const colTotal = cgView.quarterlyITR.reduce((s, q) => s + (q[d.key] || 0), 0);
+                            return <td key={d.key} className={`text-end ${profitColor(colTotal)}`}>{formatINR(colTotal)}</td>;
+                          })}
+                          <td className={`text-end ${profitColor(cgView.quarterlyITR.reduce((s, q) => s + (q.total || 0), 0))}`}>
+                            {formatINR(cgView.quarterlyITR.reduce((s, q) => s + (q.total || 0), 0))}
+                          </td>
+                        </tr>
+                      </tfoot>
                     </Table>
                   </div>
                   )}
