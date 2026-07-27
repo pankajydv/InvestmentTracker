@@ -26,8 +26,10 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const { parseAIS } = require('../services/aisParser');
+const { parseForm16 } = require('../services/form16Parser');
 
 const aisUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+const form16Upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 const SUPPORTED_TAX_ASSET_TYPES = new Set(['FOREIGN_STOCK', 'INDIAN_STOCK', 'MUTUAL_FUND']);
 const FOREIGN_TAX_ASSET_TYPES = new Set(['FOREIGN_STOCK']);
@@ -137,6 +139,12 @@ function roundUnits(value) {
   return Math.round((Number(value) || 0) * 10000) / 10000;
 }
 
+function normalizeDateOnly(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  return s.split(/[ T]/)[0] || '';
+}
+
 function toNumberLoose(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
   if (value == null) return 0;
@@ -165,6 +173,368 @@ function hasLegacyAisWithoutPropertyFields(aisData) {
   const hasPurchaseKey = Object.prototype.hasOwnProperty.call(aisData, 'property_purchases')
     || Object.prototype.hasOwnProperty.call(aisData, 'propertyPurchases');
   return !hasSalesKey && !hasPurchaseKey;
+}
+
+function calendarYearWindow(calendarYear) {
+  const y = Number(calendarYear);
+  if (!Number.isFinite(y) || y < 1900 || y > 2500) {
+    throw new Error('Invalid calendar year');
+  }
+  return {
+    year: y,
+    start: `${y}-01-01`,
+    end: `${y}-12-31`,
+  };
+}
+
+function buildScheduleFaA3Rows(db, { portfolioId, calendarYear }) {
+  if (!portfolioId) throw new Error('portfolio_id is required');
+  const { year, start, end } = calendarYearWindow(calendarYear);
+
+  const investments = db.prepare(`
+    SELECT DISTINCT i.id, COALESCE(i.display_name, i.name) AS investment, i.ticker_symbol AS ticker
+    FROM investments i
+    JOIN transactions t ON t.investment_id = i.id
+    WHERE i.asset_type = 'FOREIGN_STOCK' AND t.portfolio_id = ?
+  `).all(portfolioId);
+
+  const investmentIds = investments.map((r) => Number(r.id)).filter((id) => Number.isFinite(id));
+  if (!investmentIds.length) {
+    return {
+      calendar_year: year,
+      start_date: start,
+      end_date: end,
+      rows: [],
+      summary: {
+        rows: 0,
+        surviving_rows: 0,
+        unresolved_peak_rows: 0,
+        unresolved_closing_rows: 0,
+      },
+    };
+  }
+
+  const invMap = new Map(investments.map((r) => [Number(r.id), r]));
+  const idPlaceholders = investmentIds.map(() => '?').join(',');
+
+  const dailyValueSeries = db.prepare(`
+    SELECT DATE(dv.date) AS date, SUM(COALESCE(dv.current_value, 0)) AS total_current_value
+    FROM daily_values dv
+    WHERE dv.portfolio_id = ?
+      AND dv.investment_id IN (${idPlaceholders})
+      AND DATE(dv.date) >= ? AND DATE(dv.date) <= ?
+    GROUP BY DATE(dv.date)
+    ORDER BY DATE(dv.date) ASC
+  `).all(portfolioId, ...investmentIds, start, end);
+
+  let a2PeakBalanceInr = 0;
+  let a2ClosingBalanceInr = 0;
+  let a2ClosingDate = null;
+  for (const row of dailyValueSeries) {
+    const v = Number(row.total_current_value) || 0;
+    if (v > a2PeakBalanceInr) a2PeakBalanceInr = v;
+    a2ClosingBalanceInr = v;
+    a2ClosingDate = normalizeDateOnly(row.date) || a2ClosingDate;
+  }
+
+  const divRow = db.prepare(`
+    SELECT COALESCE(SUM(COALESCE(t.amount, 0)), 0) AS total_dividends
+    FROM transactions t
+    WHERE t.portfolio_id = ?
+      AND t.investment_id IN (${idPlaceholders})
+      AND t.transaction_type = 'DIVIDEND'
+      AND DATE(t.transaction_date) >= ? AND DATE(t.transaction_date) <= ?
+  `).get(portfolioId, ...investmentIds, start, end);
+  const a2GrossPaidCreditedInr = Number(divRow?.total_dividends) || 0;
+
+  const txns = db.prepare(`
+    SELECT t.*, i.currency
+    FROM transactions t
+    JOIN investments i ON i.id = t.investment_id
+    WHERE t.portfolio_id = ?
+      AND t.investment_id IN (${idPlaceholders})
+      AND DATE(t.transaction_date) <= ?
+    ORDER BY DATE(t.transaction_date) ASC, t.id ASC
+  `).all(portfolioId, ...investmentIds, end);
+
+  const priceRows = db.prepare(`
+    SELECT investment_id, date, close, adj_close
+    FROM market_price_cache
+    WHERE investment_id IN (${idPlaceholders})
+      AND date >= ? AND date <= ?
+    ORDER BY date ASC
+  `).all(...investmentIds, start, end);
+
+  const fxRows = db.prepare(`
+    SELECT date, rate
+    FROM fx_rate_cache
+    WHERE date <= ?
+    ORDER BY date ASC
+  `).all(end);
+
+  const fxByDate = new Map();
+  for (const row of fxRows) {
+    const d = normalizeDateOnly(row.date);
+    const r = Number(row.rate) || 0;
+    if (d && r > 0) fxByDate.set(d, r);
+  }
+
+  const fxNearestOnOrBefore = (dateIso) => {
+    if (fxByDate.has(dateIso)) return fxByDate.get(dateIso);
+    const keys = [...fxByDate.keys()];
+    let nearest = null;
+    for (const d of keys) {
+      if (d <= dateIso) nearest = d;
+      else break;
+    }
+    return nearest ? fxByDate.get(nearest) : null;
+  };
+
+  const pricesByInv = new Map();
+  for (const row of priceRows) {
+    const invId = Number(row.investment_id);
+    const date = normalizeDateOnly(row.date);
+    const closeUsd = Number(row.close) || Number(row.adj_close) || 0;
+    if (!Number.isFinite(invId) || !date || closeUsd <= 0) continue;
+    const fx = fxNearestOnOrBefore(date);
+    if (!fx || fx <= 0) continue;
+    const inrPerUnit = closeUsd * fx;
+    if (!pricesByInv.has(invId)) pricesByInv.set(invId, []);
+    pricesByInv.get(invId).push({ date, inrPerUnit });
+  }
+
+  const lotPoolByInv = new Map();
+  const allLotsByInv = new Map();
+  let windowActivated = false;
+
+  const ensurePool = (invId) => {
+    if (!lotPoolByInv.has(invId)) lotPoolByInv.set(invId, []);
+    return lotPoolByInv.get(invId);
+  };
+
+  const registerLot = (invId, lot) => {
+    ensurePool(invId).push(lot);
+    if (!allLotsByInv.has(invId)) allLotsByInv.set(invId, []);
+    allLotsByInv.get(invId).push(lot);
+  };
+
+  const markExistingLotsAsHeldInWindow = () => {
+    for (const lots of allLotsByInv.values()) {
+      for (const lot of lots) {
+        if ((Number(lot.units_remaining) || 0) > 1e-9) lot.held_in_window = true;
+      }
+    }
+  };
+
+  const unitsAliveAtDate = (lot, dateIso) => {
+    if (!lot || !dateIso) return 0;
+    if (lot.acquisition_date > dateIso) return 0;
+    let soldTillDate = 0;
+    for (const ev of lot.sale_events || []) {
+      if (ev.date <= dateIso) soldTillDate += Number(ev.units) || 0;
+    }
+    return Math.max(0, (Number(lot.units_original) || 0) - soldTillDate);
+  };
+
+  for (const txn of txns) {
+    const invId = Number(txn.investment_id);
+    if (!Number.isFinite(invId)) continue;
+    const txnDate = normalizeDateOnly(txn.transaction_date);
+    if (!txnDate || txnDate > end) continue;
+    const txnType = String(txn.transaction_type || '').trim();
+
+    if (!windowActivated && txnDate >= start) {
+      markExistingLotsAsHeldInWindow();
+      windowActivated = true;
+    }
+
+    const units = Number(txn.units) || 0;
+    const grossUnits = Number(txn.gross_units) || units;
+    const pricePerUnit = Number(txn.price_per_unit) || 0;
+    const fmvPerUnit = Number(txn.fmv_per_unit) || pricePerUnit;
+    const rate = Number(txn.exchange_rate_used) || null;
+    const amountINR = Number(txn.amount) || 0;
+    const feesINR = Number(txn.fees) || 0;
+
+    if (txnType === 'VEST' && FOREIGN_TAX_ASSET_TYPES.has('FOREIGN_STOCK')) {
+      const costPerUnitINR = units > 0
+        ? (rate ? pricePerUnit * grossUnits * rate : amountINR) / units
+        : 0;
+      const buyFeePerUnitINR = units > 0 ? feesINR / units : 0;
+      if (units > 0) {
+        registerLot(invId, {
+          acquisition_date: txnDate,
+          units_original: units,
+          units_remaining: units,
+          cost_per_unit_inr: costPerUnitINR,
+          buy_fee_per_unit_inr: buyFeePerUnitINR,
+          sale_events: [],
+          sale_proceeds_in_year: 0,
+          dividends_in_year: 0,
+          held_in_window: txnDate >= start && txnDate <= end,
+        });
+      }
+      continue;
+    }
+
+    if (txnType === 'ESPP_PURCHASE' && FOREIGN_TAX_ASSET_TYPES.has('FOREIGN_STOCK')) {
+      const costPerUnitINR = units > 0
+        ? (rate ? fmvPerUnit * units * rate : amountINR) / units
+        : 0;
+      const buyFeePerUnitINR = units > 0 ? feesINR / units : 0;
+      if (units > 0) {
+        registerLot(invId, {
+          acquisition_date: txnDate,
+          units_original: units,
+          units_remaining: units,
+          cost_per_unit_inr: costPerUnitINR,
+          buy_fee_per_unit_inr: buyFeePerUnitINR,
+          sale_events: [],
+          sale_proceeds_in_year: 0,
+          dividends_in_year: 0,
+          held_in_window: txnDate >= start && txnDate <= end,
+        });
+      }
+      continue;
+    }
+
+    if (LOT_CREATING_TYPES.has(txnType)) {
+      if (units > 0) {
+        const grossCostINR = rate && String(txn.currency || '').toUpperCase() === 'USD'
+          ? (pricePerUnit * units * rate)
+          : amountINR;
+        registerLot(invId, {
+          acquisition_date: txnDate,
+          units_original: units,
+          units_remaining: units,
+          cost_per_unit_inr: units > 0 ? grossCostINR / units : 0,
+          buy_fee_per_unit_inr: units > 0 ? feesINR / units : 0,
+          sale_events: [],
+          sale_proceeds_in_year: 0,
+          dividends_in_year: 0,
+          held_in_window: txnDate >= start && txnDate <= end,
+        });
+      }
+      continue;
+    }
+
+    if (LOT_DISPOSAL_TYPES.has(txnType)) {
+      let remainingToSell = units;
+      const pool = ensurePool(invId);
+      while (remainingToSell > 1e-9 && pool.length > 0) {
+        const lot = pool[0];
+        const soldFromLot = Math.min(lot.units_remaining, remainingToSell);
+        if (soldFromLot > 0) {
+          lot.sale_events.push({ date: txnDate, units: soldFromLot });
+          if (txnDate >= start && txnDate <= end && TAXABLE_DISPOSAL_TYPES.has(txnType) && units > 0) {
+            lot.sale_proceeds_in_year = roundCurrency((Number(lot.sale_proceeds_in_year) || 0) + ((soldFromLot / units) * amountINR));
+          }
+        }
+        lot.units_remaining -= soldFromLot;
+        remainingToSell -= soldFromLot;
+        if (lot.units_remaining < 1e-9) pool.shift();
+      }
+      continue;
+    }
+
+    if (txnType === 'DIVIDEND' && txnDate >= start && txnDate <= end) {
+      const lots = allLotsByInv.get(invId) || [];
+      const aliveLots = lots.filter((l) => unitsAliveAtDate(l, txnDate) > 1e-9);
+      const aliveUnits = aliveLots.reduce((s, l) => s + unitsAliveAtDate(l, txnDate), 0);
+      if (aliveUnits > 1e-9) {
+        for (const lot of aliveLots) {
+          const lotUnits = unitsAliveAtDate(lot, txnDate);
+          const share = lotUnits / aliveUnits;
+          lot.dividends_in_year = roundCurrency((Number(lot.dividends_in_year) || 0) + (amountINR * share));
+        }
+      }
+    }
+  }
+
+  if (!windowActivated) markExistingLotsAsHeldInWindow();
+
+  const rows = [];
+  let unresolvedPeakRows = 0;
+  let unresolvedClosingRows = 0;
+  let survivingRows = 0;
+
+  for (const [invId, allLots] of allLotsByInv.entries()) {
+    const heldLots = (allLots || []).filter((l) => l.held_in_window);
+    if (!heldLots.length) continue;
+    const invMeta = invMap.get(invId) || { investment: '', ticker: '' };
+    const priceTimeline = pricesByInv.get(invId) || [];
+    const closingPoint = priceTimeline.length > 0 ? priceTimeline[priceTimeline.length - 1] : null;
+
+    for (const lot of heldLots) {
+      const unitsRemaining = Number(lot.units_remaining) || 0;
+      if (unitsRemaining > 1e-9) survivingRows += 1;
+
+      const initialValue = roundCurrency((Number(lot.units_original) || 0) * (Number(lot.cost_per_unit_inr) || 0));
+
+      let peakValue = null;
+      for (const p of priceTimeline) {
+        if (p.date < lot.acquisition_date) continue;
+        const unitsOnDate = unitsAliveAtDate(lot, p.date);
+        if (unitsOnDate <= 1e-9) continue;
+        const valueOnDate = roundCurrency(unitsOnDate * (Number(p.inrPerUnit) || 0));
+        if (peakValue == null || valueOnDate > peakValue) peakValue = valueOnDate;
+      }
+      if (peakValue == null) unresolvedPeakRows += 1;
+
+      let closingValue = null;
+      if (unitsRemaining <= 1e-9) {
+        closingValue = 0;
+      } else if (closingPoint && Number(closingPoint.inrPerUnit) > 0) {
+        closingValue = roundCurrency(unitsRemaining * Number(closingPoint.inrPerUnit));
+      } else {
+        unresolvedClosingRows += 1;
+      }
+
+      rows.push({
+        investment_id: invId,
+        investment: invMeta.investment,
+        ticker: invMeta.ticker || '',
+        acquisitionDate: lot.acquisition_date,
+        acquiredValue: initialValue,
+        peakValue,
+        closingValue,
+        dividends: roundCurrency(Number(lot.dividends_in_year) || 0),
+        sale: roundCurrency(Number(lot.sale_proceeds_in_year) || 0),
+      });
+    }
+  }
+
+  rows.sort((a, b) => {
+    const ia = String(a.investment || '').toLowerCase();
+    const ib = String(b.investment || '').toLowerCase();
+    if (ia < ib) return -1;
+    if (ia > ib) return 1;
+    const da = normalizeDateOnly(a.acquisitionDate);
+    const dbb = normalizeDateOnly(b.acquisitionDate);
+    if (da < dbb) return -1;
+    if (da > dbb) return 1;
+    return 0;
+  });
+
+  return {
+    calendar_year: year,
+    start_date: start,
+    end_date: end,
+    rows,
+    a2_summary: {
+      peak_balance_inr: roundCurrency(a2PeakBalanceInr),
+      closing_balance_inr: roundCurrency(a2ClosingBalanceInr),
+      gross_paid_credited_inr: roundCurrency(a2GrossPaidCreditedInr),
+      closing_balance_date: a2ClosingDate,
+      source: 'daily_values',
+    },
+    summary: {
+      rows: rows.length,
+      surviving_rows: survivingRows,
+      unresolved_peak_rows: unresolvedPeakRows,
+      unresolved_closing_rows: unresolvedClosingRows,
+    },
+  };
 }
 
 function buildTaxReport(db, fy, portfolioId) {
@@ -654,6 +1024,11 @@ function buildTaxComputation(db, fy, portfolioId) {
   const ais = aisRow ? JSON.parse(aisRow.data_json) : null;
   const hasAisPropertySale = hasPropertySalesInAis(ais);
 
+  const form16Row = portfolioId
+    ? db.prepare('SELECT data_json FROM tax_form16_data WHERE fy = ? AND portfolio_id = ?').get(fy, portfolioId)
+    : db.prepare('SELECT data_json FROM tax_form16_data WHERE fy = ? AND portfolio_id IS NULL').get(fy);
+  const form16 = form16Row ? JSON.parse(form16Row.data_json) : null;
+
   // 3. Other income entries
   const otherIncome = portfolioId
     ? db.prepare('SELECT * FROM tax_other_income WHERE fy = ? AND portfolio_id = ? ORDER BY category, id').all(fy, portfolioId)
@@ -747,12 +1122,12 @@ function buildTaxComputation(db, fy, portfolioId) {
     npsParams.push(portfolioId);
   }
   const npsEmployerContribution = Math.round(db.prepare(npsQuery).get(...npsParams).total);
-  // Check for user override (persisted in tax_other_income as NPS_80CCD2)
-  const npsOverrideRow = portfolioId
-    ? db.prepare('SELECT amount FROM tax_other_income WHERE fy = ? AND portfolio_id = ? AND category = ?').get(fy, portfolioId, 'NPS_80CCD2')
-    : db.prepare('SELECT amount FROM tax_other_income WHERE fy = ? AND portfolio_id IS NULL AND category = ?').get(fy, 'NPS_80CCD2');
-  const deduction80CCD2 = npsOverrideRow ? Math.round(npsOverrideRow.amount) : npsEmployerContribution;
+  const form16Nps80ccd2 = Number(form16?.nps_employer_80ccd2);
+  const deduction80CCD2 = Number.isFinite(form16Nps80ccd2) && form16Nps80ccd2 > 0
+    ? Math.max(0, Math.round(form16Nps80ccd2))
+    : npsEmployerContribution;
   const nps80CCD2Computed = npsEmployerContribution;
+  const nps80CCD2Source = Number.isFinite(form16Nps80ccd2) && form16Nps80ccd2 > 0 ? 'FORM16' : 'NPS_TRANSACTIONS';
   const totalDeductions = deduction80CCD2;
   const totalTaxableIncome = Math.max(0, grossTotalIncome - totalDeductions);
 
@@ -843,6 +1218,7 @@ function buildTaxComputation(db, fy, portfolioId) {
     deductions: {
       nps_employer_80ccd2: deduction80CCD2,
       nps_employer_80ccd2_computed: nps80CCD2Computed,
+      nps_employer_80ccd2_source: nps80CCD2Source,
       total: totalDeductions,
     },
     property_capital_gains: {
@@ -977,6 +1353,22 @@ module.exports = function (db) {
     }
   });
 
+  // ── Schedule FA A3 lot-wise valuation (calendar-year based) ───────────────
+  router.get('/schedule-fa-a3', (req, res) => {
+    try {
+      const { portfolio_id, calendar_year } = req.query;
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
+      if (!calendar_year) return res.status(400).json({ error: 'calendar_year is required' });
+      const result = buildScheduleFaA3Rows(db, {
+        portfolioId: Number(portfolio_id),
+        calendarYear: Number(calendar_year),
+      });
+      res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ── AIS Upload ──────────────────────────────────────────────────────────────
   router.post('/ais', aisUpload.single('file'), async (req, res) => {
     try {
@@ -1029,6 +1421,42 @@ module.exports = function (db) {
       if (!fy) return res.status(400).json({ error: 'fy is required' });
       if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
       const row = db.prepare('SELECT data_json, uploaded_at FROM tax_ais_data WHERE fy = ? AND portfolio_id = ?').get(fy, portfolio_id);
+      if (!row) return res.json(null);
+      res.json({ ...JSON.parse(row.data_json), uploaded_at: row.uploaded_at });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Form-16 Upload (optional, used for 80CCD(2) authority) ───────────────
+  router.post('/form16', form16Upload.single('file'), async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: 'No PDF file uploaded' });
+      const fy = req.body.fy;
+      const portfolioId = req.body.portfolio_id || null;
+      if (!fy) return res.status(400).json({ error: 'fy is required' });
+      if (!portfolioId) return res.status(400).json({ error: 'portfolio_id is required' });
+
+      const parsed = await parseForm16(req.file.buffer);
+
+      db.prepare(`
+        INSERT OR REPLACE INTO tax_form16_data (fy, portfolio_id, pan, data_json, uploaded_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+      `).run(fy, portfolioId, parsed.pan, JSON.stringify(parsed));
+
+      res.json(parsed);
+    } catch (e) {
+      console.error('Form-16 parse error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.get('/form16', (req, res) => {
+    try {
+      const { fy, portfolio_id } = req.query;
+      if (!fy) return res.status(400).json({ error: 'fy is required' });
+      if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
+      const row = db.prepare('SELECT data_json, uploaded_at FROM tax_form16_data WHERE fy = ? AND portfolio_id = ?').get(fy, portfolio_id);
       if (!row) return res.json(null);
       res.json({ ...JSON.parse(row.data_json), uploaded_at: row.uploaded_at });
     } catch (e) {

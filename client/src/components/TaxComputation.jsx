@@ -1,50 +1,23 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Accordion, Button, Card, Form, Spinner, Table } from 'react-bootstrap';
-import { getTaxComputation, addOtherIncome, updateOtherIncome, getOtherIncome } from '../services/api';
+import { Accordion, Card, Spinner, Table } from 'react-bootstrap';
+import { getTaxComputation } from '../services/api';
 import { formatINRExact as formatINR } from '../utils/formatters';
 
 export default function TaxComputation({ fy, portfolioId, refreshNonce = 0, onRecomputed }) {
   const [computation, setComputation] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [npsEditing, setNpsEditing] = useState(false);
-  const [npsValue, setNpsValue] = useState('');
-  const [npsRowId, setNpsRowId] = useState(null);
 
   const loadComputation = useCallback(async () => {
     setLoading(true);
     try {
       const data = await getTaxComputation(fy, portfolioId || undefined);
       setComputation(data);
-      // Check if there's an existing NPS override row
-      const oi = await getOtherIncome(fy, portfolioId || undefined);
-      const npsRow = oi.find((r) => r.category === 'NPS_80CCD2');
-      if (npsRow) setNpsRowId(npsRow.id);
     } catch (err) {
       setComputation(null);
     } finally {
       setLoading(false);
     }
   }, [fy, portfolioId]);
-
-  const handleNpsSave = useCallback(async () => {
-    const val = Number(npsValue);
-    if (!val && val !== 0) return;
-    try {
-      if (npsRowId) {
-        await updateOtherIncome(npsRowId, { source_name: 'Employer NPS (Form 16)', amount: val, tds: 0 });
-      } else {
-        const row = await addOtherIncome({ fy, portfolio_id: portfolioId || null, category: 'NPS_80CCD2', source_name: 'Employer NPS (Form 16)', amount: val, tds: 0 });
-        setNpsRowId(row.id);
-      }
-      setNpsEditing(false);
-      // Reload computation with the override
-      const data = await getTaxComputation(fy, portfolioId || undefined);
-      setComputation(data);
-      await onRecomputed?.();
-    } catch (err) {
-      // ignore
-    }
-  }, [fy, portfolioId, npsValue, npsRowId, onRecomputed]);
 
   useEffect(() => {
     loadComputation();
@@ -59,20 +32,19 @@ export default function TaxComputation({ fy, portfolioId, refreshNonce = 0, onRe
             <Spinner animation="border" size="sm" className="me-2" />Computing tax...
           </div>
         )}
-        {computation && <TaxComputationView data={computation} npsEditing={npsEditing} npsValue={npsValue}
-          onNpsEdit={() => { setNpsValue(String(computation.deductions?.nps_employer_80ccd2 || '')); setNpsEditing(true); }}
-          onNpsChange={setNpsValue} onNpsSave={handleNpsSave} onNpsCancel={() => setNpsEditing(false)} />}
+        {computation && <TaxComputationView data={computation} />}
       </Accordion.Body>
     </Accordion.Item>
   );
 }
 
-function TaxComputationView({ data, npsEditing, npsValue, onNpsEdit, onNpsChange, onNpsSave, onNpsCancel }) {
+function TaxComputationView({ data }) {
   const { heads, tax, credits } = data;
   const h = heads;
   const d = data.deductions || {};
   const p = data.property_capital_gains || {};
-  const isOverridden = d.nps_employer_80ccd2 !== d.nps_employer_80ccd2_computed;
+  const npsSource = String(d.nps_employer_80ccd2_source || '').toUpperCase();
+  const npsSourceLabel = npsSource === 'FORM16' ? 'Form-16' : 'computed';
 
   const formatImpact = (amount) => {
     const n = Number(amount) || 0;
@@ -106,21 +78,12 @@ function TaxComputationView({ data, npsEditing, npsValue, onNpsEdit, onNpsChange
               <td></td>
               <td>
                 Less: 80CCD(2) Employer NPS
-                {isOverridden && <span className="text-muted ms-1 tax-summary-sub">(computed: {formatINR(d.nps_employer_80ccd2_computed)})</span>}
-                {!npsEditing && (
-                  <Button size="sm" variant="link" className="p-0 ms-2 tax-summary-sub" onClick={onNpsEdit}>edit</Button>
-                )}
+                {npsSource === 'FORM16'
+                  ? <span className="text-muted ms-1 tax-summary-sub">(source: Form-16 · computed: {formatINR(d.nps_employer_80ccd2_computed)})</span>
+                  : <span className="text-muted ms-1 tax-summary-sub">(source: {npsSourceLabel})</span>}
               </td>
               <td className="text-end">
-                {npsEditing ? (
-                  <span className="d-flex align-items-center justify-content-end gap-1">
-                    <Form.Control size="sm" type="number" value={npsValue} onChange={(e) => onNpsChange(e.target.value)} style={{ width: 120 }} />
-                    <Button size="sm" variant="primary" className="py-0 px-1" onClick={onNpsSave}>Save</Button>
-                    <Button size="sm" variant="link" className="py-0 px-1 text-muted" onClick={onNpsCancel}>✕</Button>
-                  </span>
-                ) : (
-                  <span className="text-success">{formatImpact(-d.nps_employer_80ccd2)}</span>
-                )}
+                <span className="text-success">{formatImpact(-d.nps_employer_80ccd2)}</span>
               </td>
             </tr>
           )}

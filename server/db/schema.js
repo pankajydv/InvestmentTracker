@@ -369,6 +369,18 @@ function initializeDb(db) {
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tax_ais_data_fy ON tax_ais_data(fy, portfolio_id);
 
+    -- Tax: parsed Form-16 data (salary/TDS/NPS extraction)
+    CREATE TABLE IF NOT EXISTS tax_form16_data (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fy TEXT NOT NULL,
+      portfolio_id INTEGER,
+      pan TEXT,
+      data_json TEXT NOT NULL,
+      uploaded_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tax_form16_data_fy ON tax_form16_data(fy, portfolio_id);
+
     -- Tax: property capital gains inputs (old/new property amounts and custom costs)
     CREATE TABLE IF NOT EXISTS tax_property_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

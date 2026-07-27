@@ -238,6 +238,13 @@ export const getTaxMeta = (portfolioId) => {
   return fetchJSON(`/tax/meta${qs ? `?${qs}` : ''}`);
 };
 
+export const getScheduleFaA3 = (portfolioId, calendarYear) => {
+  const params = new URLSearchParams();
+  if (portfolioId) params.set('portfolio_id', String(portfolioId));
+  if (calendarYear) params.set('calendar_year', String(calendarYear));
+  return fetchJSON(`/tax/schedule-fa-a3?${params.toString()}`);
+};
+
 export const savePropertyItems = (fy, portfolioId, rows) =>
   fetchJSON('/tax/property-items/bulk', {
     method: 'PUT',
@@ -262,6 +269,25 @@ export const getAISData = (fy, portfolioId) => {
   const params = new URLSearchParams({ fy });
   if (portfolioId) params.set('portfolio_id', portfolioId);
   return fetchJSON(`/tax/ais?${params}`);
+};
+
+export const uploadForm16 = async (file, fy, portfolioId) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('fy', fy);
+  if (portfolioId) formData.append('portfolio_id', portfolioId);
+  const res = await fetch(`${API_BASE}/tax/form16`, { method: 'POST', body: formData, credentials: 'include' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Upload failed');
+  }
+  return res.json();
+};
+
+export const getForm16Data = (fy, portfolioId) => {
+  const params = new URLSearchParams({ fy });
+  if (portfolioId) params.set('portfolio_id', portfolioId);
+  return fetchJSON(`/tax/form16?${params}`);
 };
 
 // Tax: Other Income

@@ -3,7 +3,7 @@ import { Card, Row, Col, Form, Button, Table, Badge, Spinner, Accordion } from '
 import { Download, Plus, Trash2 } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import CollapsibleSectionHeader from './CollapsibleSectionHeader';
-import { getTaxReport, getTaxMeta, getTaxComputation, uploadAIS, getAISData, getOtherIncome, addOtherIncome, updateOtherIncome, deleteOtherIncome } from '../services/api';
+import { getTaxReport, getTaxMeta, getTaxComputation, uploadAIS, getAISData, uploadForm16, getForm16Data, getOtherIncome, addOtherIncome, updateOtherIncome, deleteOtherIncome, getScheduleFaA3 } from '../services/api';
 import { formatINRExact as formatINR, formatDate, formatNumber, profitColor } from '../utils/formatters';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 import TaxComputation from './TaxComputation';
@@ -77,6 +77,38 @@ function downloadCSV(filename, rows) {
   URL.revokeObjectURL(url);
 }
 
+function downloadCSVWithHeaders(filename, headers, rows) {
+  const escapeCell = (v) => {
+    if (v == null) return '';
+    const s = String(v);
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+      return `"${s.replace(/"/g, '""')}"`;
+    }
+    return s;
+  };
+
+  const safeHeaders = Array.isArray(headers) ? headers : [];
+  const lines = [safeHeaders.join(',')];
+  for (const row of rows || []) {
+    lines.push(safeHeaders.map((h) => escapeCell(row[h])).join(','));
+  }
+
+  const csv = lines.join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function templateStorageKey(fy, portfolioId) {
+  return `schedule_fa_a3_template::${String(fy || '')}::${String(portfolioId || '')}`;
+}
+
 function buildCapitalGainsExportRows(rows) {
   return (rows || []).map((row) => ({
     asset_class: row.asset_class || '',
@@ -96,6 +128,554 @@ function buildCapitalGainsExportRows(rows) {
     stt_inr: row.stt_inr ?? 0,
     gain_loss_inr: row.gain_loss_inr ?? 0,
   }));
+}
+
+function normalizeHeader(header) {
+  return String(header || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function isA3DividendHeader(header) {
+  const key = normalizeHeader(header);
+  return key === 'totalgrossamountpaidcreditedwithrespecttoholding'
+    || key === 'dividends'
+    || key === 'dividend'
+    || (key.includes('paid') && key.includes('credited') && key.includes('holding'));
+}
+
+function isA3SaleHeader(header) {
+  const key = normalizeHeader(header);
+  return key === 'totalgrossproceedsfromsaleorredemptionofinvestment'
+    || key === 'sale'
+    || key === 'salevalue'
+    || (key.includes('gross') && key.includes('proceeds') && key.includes('sale'))
+    || (key.includes('sale') && key.includes('redemption') && key.includes('investment'));
+}
+
+function isA3ClosingHeader(header) {
+  const key = normalizeHeader(header);
+  return key === 'closingbalance'
+    || key === 'closingvalue'
+    || (key.includes('closing') && key.includes('balance'))
+    || (key.includes('closing') && key.includes('value'));
+}
+
+function isA3PeakHeader(header) {
+  const key = normalizeHeader(header);
+  return key === 'peakvalueofinvestmentduringtheperiod'
+    || key === 'peakvalueofinvestment'
+    || key === 'peakvalue'
+    || (key.includes('peak') && key.includes('value'));
+}
+
+function placeholderForHeader(header) {
+  const base = String(header || 'FIELD')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return `<<${base || 'FIELD'}>>`;
+}
+
+function parseA3TemplateColumns(templateCsvText) {
+  const text = String(templateCsvText || '');
+  if (!text.trim()) return [];
+  const lines = text.split(/\r?\n/);
+  const markerIdx = lines.findIndex((line) => {
+    const s = String(line || '').toLowerCase();
+    return /schedule\s*fa\s*:\s*table\s*a3/i.test(s)
+      || s.includes('details of foreign equity and debt interest held')
+      || s.includes('beneficial interest')
+      || s.includes('calendar year ending as on 31st december');
+  });
+  const start = markerIdx >= 0 ? markerIdx + 1 : 0;
+
+  for (let i = start; i < lines.length; i += 1) {
+    const line = String(lines[i] || '').trim();
+    if (!line || !line.includes(',')) continue;
+    const cols = line.split(',').map((c) => c.trim()).filter(Boolean);
+    if (cols.length >= 4) return cols;
+  }
+  return [];
+}
+
+function parseA3TemplateCalendarYear(templateCsvText) {
+  const text = String(templateCsvText || '');
+  if (!text.trim()) return null;
+
+  const explicitYearMatch = text.match(/calendar\s+year\s+ending\s+as\s+on\s+31(?:st)?\s+dec(?:ember)?\s*,?\s*(\d{4})/i);
+  if (explicitYearMatch) return Number(explicitYearMatch[1]);
+
+  const dec31YearMatch = text.match(/31(?:st)?\s+dec(?:ember)?\s*,?\s*(\d{4})/i);
+  if (dec31YearMatch) return Number(dec31YearMatch[1]);
+
+  return null;
+}
+
+function calendarYearFromFy(fy) {
+  const m = String(fy || '').match(/^(\d{4})-/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  return Number.isFinite(y) ? y : null;
+}
+
+const SCHEDULE_FA_A3_FIXED_HEADERS = [
+  'Country/Region name',
+  'Country Name and Code',
+  'Name of entity',
+  'Address of entity',
+  'ZIP Code',
+  'Nature of entity',
+  'Date of acquiring the interest',
+  'Initial value of the investment',
+  'Peak value of investment during the Period',
+  'Closing balance',
+  'Total gross amount paid/credited with respect to the holding during the period',
+  'Total gross proceeds from sale or redemption of investment during the period',
+];
+
+const SCHEDULE_FA_A3_EXPORT_FILENAME = 'Table-A3.csv';
+
+function formatA3Date(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return s;
+  const slash = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (slash) return `${slash[3]}-${slash[2]}-${slash[1]}`;
+  return s;
+}
+
+function formatA3Amount(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n);
+}
+
+const FA_A3_DEFAULTS = {
+  countryRegionName: 'UNITED STATES',
+  countryNameAndCode: '2',
+  address: 'One Microsoft Way Redmond Washington',
+  postalCode: '98052',
+  natureOfEntity: 'Listed Company',
+};
+
+function buildScheduleFaA3LotRows(scheduleFaRows, report) {
+  const byInvestmentDividends = new Map();
+  const byInvestmentSales = new Map();
+  const byInvestmentLots = new Map();
+
+  for (const row of report?.dividend_income || []) {
+    const key = String(row.investment || '').trim();
+    byInvestmentDividends.set(key, round2((byInvestmentDividends.get(key) || 0) + (Number(row.amount_inr) || 0)));
+  }
+
+  for (const row of report?.capital_gains || []) {
+    const key = String(row.investment || '').trim();
+    byInvestmentSales.set(key, round2((byInvestmentSales.get(key) || 0) + (Number(row.sale_proceeds_inr) || 0)));
+  }
+
+  for (const row of report?.perquisite_income || []) {
+    const key = String(row.investment || '').trim();
+    if (!key) continue;
+    if (!byInvestmentLots.has(key)) byInvestmentLots.set(key, []);
+    byInvestmentLots.get(key).push({
+      acquisition_date: row.date || '',
+      acquired_value_inr: round2(Number(row.perquisite_inr) || 0),
+    });
+  }
+
+  // For investments where perquisite lots are unavailable, infer acquisition lots
+  // from tax lots seen in capital-gain rows (use unique acquisition date + lot type).
+  const inferredLotSeen = new Set();
+  for (const row of report?.capital_gains || []) {
+    const key = String(row.investment || '').trim();
+    if (!key || (byInvestmentLots.get(key)?.length || 0) > 0) continue;
+    const acqDate = String(row.acquisition_date || '').trim();
+    if (!acqDate) continue;
+    const lotType = String(row.lot_type || '').trim();
+    const seenKey = `${key}__${acqDate}__${lotType}`;
+    if (inferredLotSeen.has(seenKey)) continue;
+    inferredLotSeen.add(seenKey);
+
+    if (!byInvestmentLots.has(key)) byInvestmentLots.set(key, []);
+    byInvestmentLots.get(key).push({
+      acquisition_date: acqDate,
+      acquired_value_inr: round2(Number(row.cost_inr) || 0),
+    });
+  }
+
+  const lotRows = [];
+
+  for (const holding of scheduleFaRows || []) {
+    const inv = String(holding.investment || '').trim();
+    const lots = byInvestmentLots.get(inv) || [
+      {
+        acquisition_date: holding.year_end_date || '',
+        acquired_value_inr: round2(Number(holding.acquisition_cost_inr) || 0),
+      },
+    ];
+
+    const totalAcq = lots.reduce((s, l) => s + (Number(l.acquired_value_inr) || 0), 0);
+    const totalPeak = round2(Number(holding.peak_value_inr) || 0);
+    const totalClosing = round2(Number(holding.year_end_value_inr) || 0);
+    const totalDiv = round2(byInvestmentDividends.get(inv) || 0);
+    const totalSale = round2(byInvestmentSales.get(inv) || 0);
+
+    lots.forEach((lot, idx) => {
+      const shareBase = totalAcq > 0 ? (Number(lot.acquired_value_inr) || 0) / totalAcq : 1 / Math.max(1, lots.length);
+      lotRows.push({
+        slNo: lotRows.length + 1,
+        investment: inv,
+        acquisitionDate: lot.acquisition_date || '',
+        acquiredValue: round2(Number(lot.acquired_value_inr) || 0),
+        peakValue: round2(totalPeak * shareBase),
+        closingValue: round2(totalClosing * shareBase),
+        dividends: round2(totalDiv * shareBase),
+        sale: round2(totalSale * shareBase),
+        _lotIndex: idx,
+      });
+    });
+  }
+
+  return lotRows;
+}
+
+const A3_LOT_CREATING_TYPES = new Set(['BUY', 'IPO', 'VEST', 'ESPP_PURCHASE', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN']);
+const A3_LOT_DISPOSAL_TYPES = new Set(['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL']);
+const A3_TAXABLE_DISPOSAL_TYPES = new Set(['SELL', 'REDEMPTION', 'SWITCH_OUT', 'WITHDRAWAL']);
+
+function normalizeDateOnly(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  return s.split(/[ T]/)[0] || '';
+}
+
+function buildScheduleFaA3SurvivingLotRows(transactions, dailyValuesByInvestment, calendarYear) {
+  const year = Number(calendarYear);
+  if (!Number.isFinite(year)) return [];
+
+  const startDate = `${year}-01-01`;
+  const cutoffDate = `${year}-12-31`;
+  const sorted = [...(transactions || [])].sort((a, b) => {
+    const da = normalizeDateOnly(a.transaction_date);
+    const db = normalizeDateOnly(b.transaction_date);
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return (Number(a.id) || 0) - (Number(b.id) || 0);
+  });
+
+  const lotPoolByInvestment = new Map();
+  const invMetaById = new Map();
+  const allLotsByInvestment = new Map();
+  let windowActivated = false;
+
+  const ensurePool = (invId) => {
+    if (!lotPoolByInvestment.has(invId)) lotPoolByInvestment.set(invId, []);
+    return lotPoolByInvestment.get(invId);
+  };
+
+  const registerLot = (invId, lot) => {
+    ensurePool(invId).push(lot);
+    if (!allLotsByInvestment.has(invId)) allLotsByInvestment.set(invId, []);
+    allLotsByInvestment.get(invId).push(lot);
+  };
+
+  const unitsAliveAtDate = (lot, dateIso) => {
+    if (!lot || !dateIso) return 0;
+    if (lot.acquisition_date > dateIso) return 0;
+    let soldTillDate = 0;
+    for (const ev of lot.saleEvents || []) {
+      if (ev.date <= dateIso) soldTillDate += Number(ev.units) || 0;
+    }
+    return Math.max(0, (Number(lot.units_original) || 0) - soldTillDate);
+  };
+
+  const dvPricePerUnit = (dv) => {
+    const cv = Number(dv?.current_value) || 0;
+    const tu = Number(dv?.total_units) || 0;
+    if (tu > 0 && cv > 0) return cv / tu;
+
+    const p = Number(dv?.price_per_unit) || 0;
+    if (p > 0) return p;
+    return 0;
+  };
+
+  const markExistingLotsAsHeldInWindow = () => {
+    for (const lots of allLotsByInvestment.values()) {
+      for (const lot of lots) {
+        if (Number(lot.units_remaining) > 1e-9) lot.held_in_window = true;
+      }
+    }
+  };
+
+  for (const txn of sorted) {
+    const invId = Number(txn.investment_id);
+    if (!Number.isFinite(invId)) continue;
+
+    const txnDate = normalizeDateOnly(txn.transaction_date);
+    if (!txnDate || txnDate > cutoffDate) continue;
+    const txnType = String(txn.transaction_type || '').trim();
+
+    if (!windowActivated && txnDate >= startDate) {
+      markExistingLotsAsHeldInWindow();
+      windowActivated = true;
+    }
+
+    invMetaById.set(invId, {
+      investment: String(txn.investment_name || '').trim(),
+      ticker: String(txn.ticker_symbol || '').trim(),
+    });
+
+    const units = Number(txn.units) || 0;
+    const grossUnits = Number(txn.gross_units) || units;
+    const pricePerUnit = Number(txn.price_per_unit) || 0;
+    const fmvPerUnit = Number(txn.fmv_per_unit) || pricePerUnit;
+    const rate = Number(txn.exchange_rate_used) || null;
+    const amountINR = Number(txn.amount) || 0;
+    const feesINR = Number(txn.fees) || 0;
+
+    if (txnType === 'VEST') {
+      const costPerUnitINR = units > 0
+        ? (rate ? pricePerUnit * grossUnits * rate : amountINR) / units
+        : 0;
+      const buyFeePerUnitINR = units > 0 ? feesINR / units : 0;
+      if (units > 0) {
+        registerLot(invId, {
+          investment_id: invId,
+          acquisition_date: txnDate,
+          units_original: units,
+          units_remaining: units,
+          cost_per_unit_inr: costPerUnitINR,
+          buy_fee_per_unit_inr: buyFeePerUnitINR,
+          saleEvents: [],
+          saleProceedsInYear: 0,
+          dividendsInYear: 0,
+          held_in_window: txnDate >= startDate && txnDate <= cutoffDate,
+        });
+      }
+      continue;
+    }
+
+    if (txnType === 'ESPP_PURCHASE') {
+      const costPerUnitINR = units > 0
+        ? (rate ? fmvPerUnit * units * rate : amountINR) / units
+        : 0;
+      const buyFeePerUnitINR = units > 0 ? feesINR / units : 0;
+      if (units > 0) {
+        registerLot(invId, {
+          investment_id: invId,
+          acquisition_date: txnDate,
+          units_original: units,
+          units_remaining: units,
+          cost_per_unit_inr: costPerUnitINR,
+          buy_fee_per_unit_inr: buyFeePerUnitINR,
+          saleEvents: [],
+          saleProceedsInYear: 0,
+          dividendsInYear: 0,
+          held_in_window: txnDate >= startDate && txnDate <= cutoffDate,
+        });
+      }
+      continue;
+    }
+
+    if (A3_LOT_CREATING_TYPES.has(txnType)) {
+      if (units > 0) {
+        const fxCost = rate ? pricePerUnit * units * rate : 0;
+        const grossCostINR = fxCost > 0 ? fxCost : amountINR;
+        registerLot(invId, {
+          investment_id: invId,
+          acquisition_date: txnDate,
+          units_original: units,
+          units_remaining: units,
+          cost_per_unit_inr: units > 0 ? grossCostINR / units : 0,
+          buy_fee_per_unit_inr: units > 0 ? feesINR / units : 0,
+          saleEvents: [],
+          saleProceedsInYear: 0,
+          dividendsInYear: 0,
+          held_in_window: txnDate >= startDate && txnDate <= cutoffDate,
+        });
+      }
+      continue;
+    }
+
+    if (A3_LOT_DISPOSAL_TYPES.has(txnType)) {
+      let remainingToSell = units;
+      const pool = ensurePool(invId);
+      while (remainingToSell > 1e-9 && pool.length > 0) {
+        const lot = pool[0];
+        const soldFromLot = Math.min(lot.units_remaining, remainingToSell);
+        if (soldFromLot > 0) {
+          lot.saleEvents.push({ date: txnDate, units: soldFromLot });
+        }
+
+        if (txnDate >= startDate && txnDate <= cutoffDate && A3_TAXABLE_DISPOSAL_TYPES.has(txnType) && units > 0) {
+          lot.saleProceedsInYear = round2((Number(lot.saleProceedsInYear) || 0) + ((soldFromLot / units) * amountINR));
+        }
+
+        lot.units_remaining -= soldFromLot;
+        remainingToSell -= soldFromLot;
+        if (lot.units_remaining < 1e-9) pool.shift();
+      }
+      continue;
+    }
+
+    if (txnType === 'DIVIDEND' && txnDate >= startDate && txnDate <= cutoffDate) {
+      const lots = allLotsByInvestment.get(invId) || [];
+      const aliveLots = lots.filter((l) => unitsAliveAtDate(l, txnDate) > 1e-9);
+      const aliveUnits = aliveLots.reduce((s, l) => s + unitsAliveAtDate(l, txnDate), 0);
+      if (aliveUnits > 1e-9) {
+        for (const lot of aliveLots) {
+          const lotUnits = unitsAliveAtDate(lot, txnDate);
+          const share = lotUnits / aliveUnits;
+          lot.dividendsInYear = round2((Number(lot.dividendsInYear) || 0) + (amountINR * share));
+        }
+      }
+    }
+  }
+
+  if (!windowActivated) {
+    // No transaction occurred on/after year start; carry-forward lots still alive
+    // at cutoff are deemed held during the calendar year.
+    markExistingLotsAsHeldInWindow();
+  }
+
+  const lotRows = [];
+  for (const [invId, allLots] of allLotsByInvestment.entries()) {
+    const heldInWindowLots = (allLots || []).filter((l) => l.held_in_window);
+    if (!heldInWindowLots.length) continue;
+
+    const meta = invMetaById.get(invId) || { investment: '', ticker: '' };
+
+    const dvRows = (Array.isArray(dailyValuesByInvestment?.[invId]) ? dailyValuesByInvestment[invId] : [])
+      .filter((dv) => {
+        const d = normalizeDateOnly(dv?.date);
+        return !!d && d >= startDate && d <= cutoffDate;
+      })
+      .sort((a, b) => {
+        const da = normalizeDateOnly(a.date);
+        const db = normalizeDateOnly(b.date);
+        if (da < db) return -1;
+        if (da > db) return 1;
+        return 0;
+      });
+
+    let closingPricePerUnit = 0;
+    let latestDate = '';
+    for (const dv of dvRows) {
+      const d = normalizeDateOnly(dv.date);
+      const ppu = dvPricePerUnit(dv);
+      if (!(ppu > 0)) continue;
+      if (!latestDate || d > latestDate) {
+        latestDate = d;
+        closingPricePerUnit = ppu;
+      }
+    }
+
+    for (const lot of heldInWindowLots) {
+      const lotAcqCost = (Number(lot.units_original) || 0) * (Number(lot.cost_per_unit_inr) || 0);
+      const hasClosingPrice = closingPricePerUnit > 0;
+      const unitsRemaining = Number(lot.units_remaining) || 0;
+      const lotClosingValue = hasClosingPrice
+        ? round2(unitsRemaining * closingPricePerUnit)
+        : (unitsRemaining <= 1e-9 ? 0 : null);
+
+      let lotPeakValue = 0;
+      for (const dv of dvRows) {
+        const d = normalizeDateOnly(dv.date);
+        if (!d || d < lot.acquisition_date) continue;
+        const ppu = dvPricePerUnit(dv);
+        if (!(ppu > 0)) continue;
+        const unitsOnDate = unitsAliveAtDate(lot, d);
+        const lotValueOnDate = unitsOnDate * ppu;
+        if (lotValueOnDate > lotPeakValue) lotPeakValue = lotValueOnDate;
+      }
+
+      const resolvedPeakValue = lotPeakValue > 0 ? round2(lotPeakValue) : null;
+
+      lotRows.push({
+        investment_id: invId,
+        investment: meta.investment,
+        ticker: meta.ticker,
+        acquisitionDate: lot.acquisition_date || '',
+        acquiredValue: round2(lotAcqCost),
+        peakValue: resolvedPeakValue,
+        closingValue: lotClosingValue,
+        dividends: round2(Number(lot.dividendsInYear) || 0),
+        sale: round2(Number(lot.saleProceedsInYear) || 0),
+      });
+    }
+  }
+
+  lotRows.sort((a, b) => {
+    const ia = String(a.investment || '').toLowerCase();
+    const ib = String(b.investment || '').toLowerCase();
+    if (ia < ib) return -1;
+    if (ia > ib) return 1;
+    const da = normalizeDateOnly(a.acquisitionDate);
+    const db = normalizeDateOnly(b.acquisitionDate);
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+  });
+
+  return lotRows;
+}
+
+function buildScheduleFaA3TemplateRows(scheduleFaRows, report, templateHeaders) {
+  const headers = Array.isArray(templateHeaders) ? templateHeaders : [];
+  const lots = buildScheduleFaA3LotRows(scheduleFaRows, report);
+
+  return lots.map((lot, idx) => {
+    const mapped = {};
+    for (const header of headers) {
+      const key = normalizeHeader(header);
+      const hasAll = (...parts) => parts.every((p) => key.includes(p));
+      if (key === 'slno') mapped[header] = idx + 1;
+      else if (key === 'countryregionname' || (hasAll('country', 'region', 'name')) || key === 'countryname') mapped[header] = FA_A3_DEFAULTS.countryRegionName;
+      else if (key === 'countrynameandcode' || hasAll('country', 'name', 'code')) mapped[header] = FA_A3_DEFAULTS.countryNameAndCode;
+      else if (key === 'nameofentity' || key === 'entityname' || key === 'investmentname' || hasAll('name', 'entity')) mapped[header] = lot.investment || '';
+      else if (key === 'addressofentity' || key === 'address' || hasAll('address', 'entity')) mapped[header] = FA_A3_DEFAULTS.address;
+      else if (key === 'zipcode' || key === 'postalcode' || key === 'pincode' || hasAll('zip', 'code')) mapped[header] = FA_A3_DEFAULTS.postalCode;
+      else if (key === 'natureofentity' || key === 'entitytype' || hasAll('nature', 'entity')) mapped[header] = FA_A3_DEFAULTS.natureOfEntity;
+      else if (key === 'dateofacquiringinterest' || key === 'dateofacquiringtheinterest' || hasAll('date', 'acquiring', 'interest') || key === 'dateofacquiring' || key === 'date') mapped[header] = formatA3Date(lot.acquisitionDate) || '<<DATE_OF_ACQUIRING_INTEREST>>';
+      else if (key === 'initialvalueofinvestment' || key === 'initialvalueoftheinvestment' || hasAll('initial', 'value', 'investment') || key === 'acquiredvalue') mapped[header] = formatA3Amount(lot.acquiredValue);
+      else if (key === 'peakvalueofinvestment' || key === 'peakvalueoftheinvestment' || hasAll('peak', 'value', 'investment') || (key.includes('peak') && key.includes('value'))) mapped[header] = formatA3Amount(lot.peakValue);
+      else if (key === 'closingbalance' || key === 'closingvalue' || hasAll('closing', 'balance') || hasAll('closing', 'value')) mapped[header] = formatA3Amount(lot.closingValue);
+      else if (key === 'totalgrossamountpaidcreditedwithrespecttoholding' || hasAll('paid', 'credited', 'holding') || key === 'dividends' || key === 'dividend') mapped[header] = formatA3Amount(lot.dividends);
+      else if (key === 'totalgrossproceedsfromsaleorredemptionofinvestment' || hasAll('sale', 'redemption', 'investment') || hasAll('gross', 'proceeds', 'sale') || key === 'sale' || key === 'salevalue') mapped[header] = formatA3Amount(lot.sale);
+      else if (key === 'ticker' || key === 'symbol') mapped[header] = '<<TICKER>>';
+      else mapped[header] = placeholderForHeader(header);
+    }
+    return mapped;
+  });
+}
+
+function mapScheduleFaA3TemplateRowsFromLots(lots, templateHeaders) {
+  const headers = Array.isArray(templateHeaders) ? templateHeaders : [];
+  return (lots || []).map((lot, idx) => {
+    const mapped = {};
+    const inferredNatureOfIncome = Number(lot.dividends || 0) > 0 ? 'Dividend' : '';
+    for (const header of headers) {
+      const key = normalizeHeader(header);
+      const hasAll = (...parts) => parts.every((p) => key.includes(p));
+      if (key === 'slno') mapped[header] = idx + 1;
+      else if (key === 'countryregionname' || (hasAll('country', 'region', 'name')) || key === 'countryname') mapped[header] = FA_A3_DEFAULTS.countryRegionName;
+      else if (key === 'countrynameandcode' || hasAll('country', 'name', 'code')) mapped[header] = FA_A3_DEFAULTS.countryNameAndCode;
+      else if (key === 'nameofentity' || key === 'entityname' || key === 'investmentname' || hasAll('name', 'entity')) mapped[header] = lot.investment || '';
+      else if (key === 'addressofentity' || key === 'address' || hasAll('address', 'entity')) mapped[header] = FA_A3_DEFAULTS.address;
+      else if (key === 'zipcode' || key === 'postalcode' || key === 'pincode' || hasAll('zip', 'code')) mapped[header] = FA_A3_DEFAULTS.postalCode;
+      else if (key === 'natureofentity' || key === 'entitytype' || hasAll('nature', 'entity')) mapped[header] = FA_A3_DEFAULTS.natureOfEntity;
+      else if (key === 'dateofacquiringinterest' || key === 'dateofacquiringtheinterest' || hasAll('date', 'acquiring', 'interest') || key === 'dateofacquiring' || key === 'date') mapped[header] = formatA3Date(lot.acquisitionDate) || '<<DATE_OF_ACQUIRING_INTEREST>>';
+      else if (key === 'initialvalueofinvestment' || key === 'initialvalueoftheinvestment' || hasAll('initial', 'value', 'investment') || key === 'acquiredvalue') mapped[header] = formatA3Amount(lot.acquiredValue);
+      else if (key === 'peakvalueofinvestment' || key === 'peakvalueoftheinvestment' || hasAll('peak', 'value', 'investment') || (key.includes('peak') && key.includes('value'))) mapped[header] = formatA3Amount(lot.peakValue);
+      else if (key === 'closingbalance' || key === 'closingvalue' || hasAll('closing', 'balance') || hasAll('closing', 'value')) mapped[header] = formatA3Amount(lot.closingValue);
+      else if (key === 'totalgrossamountpaidcreditedwithrespecttoholding' || hasAll('paid', 'credited', 'holding') || key === 'dividends' || key === 'dividend') mapped[header] = formatA3Amount(lot.dividends);
+      else if (key === 'natureofincome' || (hasAll('nature', 'income')) || key === 'incomehead') mapped[header] = inferredNatureOfIncome;
+      else if (key === 'totalgrossproceedsfromsaleorredemptionofinvestment' || hasAll('sale', 'redemption', 'investment') || hasAll('gross', 'proceeds', 'sale') || key === 'sale' || key === 'salevalue') mapped[header] = formatA3Amount(lot.sale);
+      else if (key === 'ticker' || key === 'symbol') mapped[header] = lot.ticker || '<<TICKER>>';
+      else mapped[header] = placeholderForHeader(header);
+    }
+    return mapped;
+  });
 }
 
 // ── Schedule CG structure (mirrors the backend classification) ───────────────
@@ -319,10 +899,21 @@ export default function TaxReport() {
   const [dividendExpanded, setDividendExpanded] = useState(false);
   const [divQuarterExpanded, setDivQuarterExpanded] = useState(false);
   const [interestExpanded, setInterestExpanded] = useState(false);
+  const [scheduleFaA3Expanded, setScheduleFaA3Expanded] = useState(true);
   const [ais, setAis] = useState(null);
   const [aisLoading, setAisLoading] = useState(false);
+  const [form16, setForm16] = useState(null);
+  const [form16Loading, setForm16Loading] = useState(false);
   const [otherIncome, setOtherIncome] = useState([]);
   const [taxRefreshNonce, setTaxRefreshNonce] = useState(0);
+  const [scheduleFaA3TemplateHeaders, setScheduleFaA3TemplateHeaders] = useState(SCHEDULE_FA_A3_FIXED_HEADERS);
+  const [scheduleFaA3TemplateName, setScheduleFaA3TemplateName] = useState(SCHEDULE_FA_A3_EXPORT_FILENAME);
+  const [scheduleFaA3CalendarYear, setScheduleFaA3CalendarYear] = useState(null);
+  const [scheduleFaA3TemplateYearHint, setScheduleFaA3TemplateYearHint] = useState(null);
+  const [scheduleFaTemplateLoadedFromMemory, setScheduleFaTemplateLoadedFromMemory] = useState(false);
+  const [scheduleFaA3Rows, setScheduleFaA3Rows] = useState([]);
+  const [scheduleFaA3Loading, setScheduleFaA3Loading] = useState(false);
+  const [scheduleFaA2Summary, setScheduleFaA2Summary] = useState(null);
   const hasSinglePortfolio = selectedIds.length === 1;
   const hasAisPropertySale = useMemo(() => hasPropertySalesInAis(ais), [ais]);
   const hasLegacyPropertyUnknown = useMemo(() => hasLegacyAisWithoutPropertyFields(ais), [ais]);
@@ -418,6 +1009,120 @@ export default function TaxReport() {
   ].filter(Boolean);
   const compactHeaderClass = 'd-flex align-items-center gap-2 mb-0 tax-subsection-header';
   const compactTitleClass = 'h6 fw-semibold mb-0';
+  const scheduleFaA3Totals = useMemo(() => {
+    const headers = Array.isArray(scheduleFaA3TemplateHeaders) ? scheduleFaA3TemplateHeaders : [];
+    const dividendHeader = headers.find((h) => isA3DividendHeader(h)) || null;
+    const saleHeader = headers.find((h) => isA3SaleHeader(h)) || null;
+    const closingHeader = headers.find((h) => isA3ClosingHeader(h)) || null;
+    const peakHeader = headers.find((h) => isA3PeakHeader(h)) || null;
+
+    let peakTotal = 0;
+    let closingTotal = 0;
+    let dividendsTotal = 0;
+    let saleTotal = 0;
+    for (const row of scheduleFaA3Rows || []) {
+      if (peakHeader) peakTotal += Number(row?.[peakHeader]) || 0;
+      if (closingHeader) closingTotal += Number(row?.[closingHeader]) || 0;
+      if (dividendHeader) dividendsTotal += Number(row?.[dividendHeader]) || 0;
+      if (saleHeader) saleTotal += Number(row?.[saleHeader]) || 0;
+    }
+
+    return {
+      peakHeader,
+      closingHeader,
+      dividendHeader,
+      saleHeader,
+      peakTotal: formatA3Amount(peakTotal),
+      closingTotal: formatA3Amount(closingTotal),
+      dividendsTotal: formatA3Amount(dividendsTotal),
+      saleTotal: formatA3Amount(saleTotal),
+    };
+  }, [scheduleFaA3Rows, scheduleFaA3TemplateHeaders]);
+
+  const scheduleFaA3FooterRow = useMemo(() => {
+    if (!scheduleFaA3TemplateHeaders.length) return null;
+    const firstHeader = scheduleFaA3TemplateHeaders[0];
+    const footer = {};
+    for (const header of scheduleFaA3TemplateHeaders) {
+      if (header === firstHeader) {
+        footer[header] = 'TOTAL';
+        continue;
+      }
+      if (scheduleFaA3Totals.dividendHeader && header === scheduleFaA3Totals.dividendHeader) {
+        footer[header] = scheduleFaA3Totals.dividendsTotal;
+        continue;
+      }
+      if (scheduleFaA3Totals.peakHeader && header === scheduleFaA3Totals.peakHeader) {
+        footer[header] = scheduleFaA3Totals.peakTotal;
+        continue;
+      }
+      if (scheduleFaA3Totals.closingHeader && header === scheduleFaA3Totals.closingHeader) {
+        footer[header] = scheduleFaA3Totals.closingTotal;
+        continue;
+      }
+      if (scheduleFaA3Totals.saleHeader && header === scheduleFaA3Totals.saleHeader) {
+        footer[header] = scheduleFaA3Totals.saleTotal;
+        continue;
+      }
+      footer[header] = '';
+    }
+    return footer;
+  }, [scheduleFaA3TemplateHeaders, scheduleFaA3Totals]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const run = async () => {
+      if (!hasSinglePortfolio || !portfolioId || !report || scheduleFaA3TemplateHeaders.length === 0) {
+        setScheduleFaA3Rows([]);
+        setScheduleFaA2Summary(null);
+        return;
+      }
+
+      const year = calendarYearFromFy(fy);
+      if (!Number.isFinite(year)) {
+        setScheduleFaA3Rows(buildScheduleFaA3TemplateRows(report?.schedule_fa, report, scheduleFaA3TemplateHeaders));
+        setScheduleFaA2Summary(null);
+        return;
+      }
+
+      const startDate = `${year}-01-01`;
+      const cutoffDate = `${year}-12-31`;
+
+      setScheduleFaA3Loading(true);
+      try {
+        const payload = await getScheduleFaA3(portfolioId, year);
+        const lotRows = Array.isArray(payload?.rows) ? payload.rows : [];
+        const mapped = mapScheduleFaA3TemplateRowsFromLots(lotRows, scheduleFaA3TemplateHeaders);
+        if (!cancelled) {
+          setScheduleFaA3Rows(mapped);
+          const a2 = payload?.a2_summary;
+          if (a2 && typeof a2 === 'object') {
+            setScheduleFaA2Summary({
+              peakBalanceInr: formatA3Amount(a2.peak_balance_inr),
+              closingBalanceInr: formatA3Amount(a2.closing_balance_inr),
+              grossPaidCreditedInr: formatA3Amount(a2.gross_paid_credited_inr),
+              closingBalanceDate: String(a2.closing_balance_date || ''),
+              source: String(a2.source || ''),
+            });
+          } else {
+            setScheduleFaA2Summary(null);
+          }
+        }
+      } catch {
+        if (!cancelled) {
+          setScheduleFaA3Rows([]);
+          setScheduleFaA2Summary(null);
+          setError('Schedule FA A3 compliance mode: unable to build calendar-year rows from transaction history.');
+        }
+      } finally {
+        if (!cancelled) setScheduleFaA3Loading(false);
+      }
+    };
+
+    run();
+    return () => { cancelled = true; };
+  }, [hasSinglePortfolio, portfolioId, report, scheduleFaA3TemplateHeaders, scheduleFaA3CalendarYear, fy]);
 
   const refreshTaxComputation = async () => {
     try {
@@ -430,16 +1135,37 @@ export default function TaxReport() {
     }
   };
 
+  const scheduleFaA2Display = useMemo(() => {
+    if (scheduleFaA2Summary) return scheduleFaA2Summary;
+    return {
+      peakBalanceInr: scheduleFaA3Totals.peakTotal,
+      closingBalanceInr: scheduleFaA3Totals.closingTotal,
+      grossPaidCreditedInr: scheduleFaA3Totals.dividendsTotal,
+      closingBalanceDate: '',
+      source: 'a3_lot_rollup',
+    };
+  }, [scheduleFaA2Summary, scheduleFaA3Totals]);
+
   // ── AIS & Other Income ──
   useEffect(() => {
     if (!fy || !hasSinglePortfolio) {
       setAis(null);
+      setForm16(null);
       setOtherIncome([]);
       return;
     }
     getAISData(fy, portfolioId).then(setAis).catch(() => setAis(null));
+    getForm16Data(fy, portfolioId).then(setForm16).catch(() => setForm16(null));
     getOtherIncome(fy, portfolioId).then(setOtherIncome).catch(() => setOtherIncome([]));
   }, [fy, hasSinglePortfolio, portfolioId]);
+
+  useEffect(() => {
+    if (!fy || !portfolioId) return;
+    setScheduleFaA3TemplateHeaders(SCHEDULE_FA_A3_FIXED_HEADERS);
+    setScheduleFaA3TemplateName(SCHEDULE_FA_A3_EXPORT_FILENAME);
+    setScheduleFaA3CalendarYear(calendarYearFromFy(fy));
+    setScheduleFaTemplateLoadedFromMemory(false);
+  }, [fy, portfolioId]);
 
   const handleAISUpload = async (e) => {
     if (!hasSinglePortfolio) {
@@ -460,6 +1186,28 @@ export default function TaxReport() {
       setError(err.message || 'AIS parse failed');
     } finally {
       setAisLoading(false);
+      e.target.value = '';
+    }
+  };
+
+  const handleForm16Upload = async (e) => {
+    if (!hasSinglePortfolio) {
+      setError('Select exactly one portfolio before uploading Form-16.');
+      e.target.value = '';
+      return;
+    }
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setForm16Loading(true);
+    try {
+      const parsed = await uploadForm16(file, fy, portfolioId);
+      setForm16(parsed);
+      await refreshTaxComputation();
+      setError('');
+    } catch (err) {
+      setError(err.message || 'Form-16 parse failed');
+    } finally {
+      setForm16Loading(false);
       e.target.value = '';
     }
   };
@@ -490,6 +1238,32 @@ export default function TaxReport() {
     await refreshTaxComputation();
   };
 
+  const handleLoadScheduleFaA3Template = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsedCalendarYear = parseA3TemplateCalendarYear(text);
+      const resolvedCalendarYear = calendarYearFromFy(fy);
+      setScheduleFaA3TemplateHeaders(SCHEDULE_FA_A3_FIXED_HEADERS);
+      setScheduleFaA3TemplateName(SCHEDULE_FA_A3_EXPORT_FILENAME);
+      setScheduleFaA3CalendarYear(resolvedCalendarYear);
+      setScheduleFaA3TemplateYearHint(Number(parsedCalendarYear) || null);
+      if (fy && portfolioId) {
+        const key = templateStorageKey(fy, portfolioId);
+        localStorage.setItem(key, JSON.stringify({
+          headers: SCHEDULE_FA_A3_FIXED_HEADERS,
+          name: SCHEDULE_FA_A3_EXPORT_FILENAME,
+          calendarYear: resolvedCalendarYear,
+          templateYearHint: Number(parsedCalendarYear) || null,
+        }));
+        setScheduleFaTemplateLoadedFromMemory(false);
+      }
+      setError('');
+    } catch (e) {
+      setError('Failed to read selected Schedule FA A3 template file.');
+    }
+  };
+
   return (
     <div className="d-flex flex-column gap-3 tax-modern-page">
       <Card className="shadow-sm">
@@ -516,6 +1290,20 @@ export default function TaxReport() {
               <label className="btn btn-sm btn-outline-secondary mb-0">
                 {aisLoading ? <Spinner animation="border" size="sm" /> : 'Upload AIS'}
                 <input type="file" accept=".pdf" hidden onChange={handleAISUpload} />
+              </label>
+            )}
+            {form16 ? (
+              <span className="d-flex align-items-center gap-1">
+                <Badge bg="success">Form-16 ✓</Badge>
+                <label className="btn btn-sm btn-link text-muted p-0 mb-0 tax-summary-label" style={{ cursor: 'pointer' }}>
+                  {form16Loading ? <Spinner animation="border" size="sm" /> : 'change'}
+                  <input type="file" accept=".pdf" hidden onChange={handleForm16Upload} />
+                </label>
+              </span>
+            ) : (
+              <label className="btn btn-sm btn-outline-secondary mb-0">
+                {form16Loading ? <Spinner animation="border" size="sm" /> : 'Upload Form-16'}
+                <input type="file" accept=".pdf" hidden onChange={handleForm16Upload} />
               </label>
             )}
           </div>
@@ -884,30 +1672,129 @@ export default function TaxReport() {
               <Accordion.Header>Schedule FA: Foreign Asset Disclosure ({report.schedule_fa.length})</Accordion.Header>
               <Accordion.Body>
                 <SubSectionShell accent="secondary">
-                  <div className="d-flex align-items-center justify-content-between mb-2">
-                    <div className="h6 fw-semibold mb-0">Foreign Assets <span className="text-muted small fw-normal">{report.schedule_fa.length} holdings</span></div>
-                    <Button size="sm" variant="outline-secondary" onClick={() => downloadCSV(`schedule_fa_${fy}.csv`, report.schedule_fa)}>
-                      <Download size={14} className="me-1" /> Export CSV
-                    </Button>
-                  </div>
-                  <div className="table-responsive">
-                    <Table size="sm" hover>
-                    <thead><tr><th>Investment</th><th>Ticker</th><th>Units Held</th><th>Acq Cost USD</th><th>Acq Cost INR</th><th>Year-End Value INR</th><th>Peak Value INR</th></tr></thead>
-                    <tbody>
-                      {report.schedule_fa.map((r, idx) => (
-                        <tr key={idx}>
-                          <td>{r.investment}</td>
-                          <td>{r.ticker || '-'}</td>
-                          <td>{formatNumber(r.units_held || 0, 4)}</td>
-                          <td>${formatNumber(r.acquisition_cost_usd || 0, 2)}</td>
-                          <td>{formatINR(r.acquisition_cost_inr || 0)}</td>
-                          <td>{r.year_end_value_inr != null ? formatINR(r.year_end_value_inr) : '-'}</td>
-                          <td>{r.peak_value_inr != null ? formatINR(r.peak_value_inr) : '-'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                    </Table>
-                  </div>
+                  {scheduleFaA3TemplateHeaders.length > 0 && !scheduleFaA3Loading && (
+                    <div className="mb-2">
+                      <div className="h6 fw-semibold mb-2">Schedule FA A2 (CY Summary)</div>
+                      <div className="border rounded">
+                        <Table size="sm" className="mb-0">
+                          <tbody>
+                            <tr>
+                              <td className="fw-semibold">Peak balance during period</td>
+                              <td className="text-end">{formatINR(scheduleFaA2Display.peakBalanceInr)}</td>
+                            </tr>
+                            <tr>
+                              <td className="fw-semibold">Closing balance</td>
+                              <td className="text-end">{formatINR(scheduleFaA2Display.closingBalanceInr)}</td>
+                            </tr>
+                            <tr>
+                              <td className="fw-semibold">Gross amount paid/credited (Dividend)</td>
+                              <td className="text-end">{formatINR(scheduleFaA2Display.grossPaidCreditedInr)}</td>
+                            </tr>
+                          </tbody>
+                        </Table>
+                      </div>
+                      <div className="small text-muted mt-1">
+                        CY basis{scheduleFaA2Display.closingBalanceDate ? ` · closing as of ${scheduleFaA2Display.closingBalanceDate}` : ''}
+                      </div>
+                    </div>
+                  )}
+
+                  <hr className="my-3" />
+
+                  <CollapsibleSectionHeader
+                    expanded={scheduleFaA3Expanded}
+                    onToggle={() => setScheduleFaA3Expanded((v) => !v)}
+                    title="Schedule FA A3"
+                    className={compactHeaderClass}
+                    titleClassName={compactTitleClass}
+                    summary={`${scheduleFaA3Rows.length} rows${Number.isFinite(Number(scheduleFaA3CalendarYear)) ? ` · CY end 31 Dec ${scheduleFaA3CalendarYear}` : ''}`}
+                    right={scheduleFaA3Expanded ? (
+                      <div className="d-flex align-items-center gap-2">
+                        <label className="btn btn-sm btn-outline-secondary mb-0">
+                          Load Schedule FA A3 Template
+                          <input
+                            type="file"
+                            accept=".csv,text/csv"
+                            hidden
+                            onChange={(e) => {
+                              handleLoadScheduleFaA3Template(e.target.files?.[0]);
+                              e.target.value = '';
+                            }}
+                          />
+                        </label>
+                        <Button
+                          size="sm"
+                          variant="outline-secondary"
+                          disabled={!scheduleFaA3TemplateHeaders.length}
+                          onClick={() => downloadCSVWithHeaders(SCHEDULE_FA_A3_EXPORT_FILENAME, scheduleFaA3TemplateHeaders, scheduleFaA3Rows)}
+                        >
+                          <Download size={14} className="me-1" /> Download A3 CSV
+                        </Button>
+                      </div>
+                    ) : null}
+                  />
+
+                  {scheduleFaA3Expanded && (
+                    <>
+                      {!scheduleFaA3TemplateHeaders.length && (
+                        <div className="small text-muted mb-2">Schedule FA A3 export uses the fixed Table-A3 format.</div>
+                      )}
+                      {scheduleFaA3Loading && (
+                        <div className="small text-muted mb-2">Preparing A3 rows from transaction history for holdings held at any time during the selected calendar year...</div>
+                      )}
+                      <div className="table-responsive">
+                        <Table size="sm" hover>
+                        <thead>
+                          <tr>
+                            {(scheduleFaA3TemplateHeaders.length ? scheduleFaA3TemplateHeaders : ['Load Schedule FA A3 Template to preview']).map((header) => (
+                              <th key={header}>{header}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {scheduleFaA3TemplateHeaders.length > 0 && scheduleFaA3Rows.map((r, idx) => (
+                            <tr key={idx}>
+                              {scheduleFaA3TemplateHeaders.map((header) => {
+                                const val = r[header];
+                                const numeric = typeof val === 'number' && Number.isFinite(val);
+                                return (
+                                  <td key={`${idx}-${header}`} className={numeric ? 'text-end' : ''}>
+                                    {numeric ? formatINR(val) : String(val ?? '')}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))}
+                          {scheduleFaA3TemplateHeaders.length > 0 && !scheduleFaA3Loading && scheduleFaA3Rows.length === 0 && (
+                            <tr>
+                              <td colSpan={scheduleFaA3TemplateHeaders.length} className="text-muted">No foreign holdings were held during the selected calendar year for this portfolio.</td>
+                            </tr>
+                          )}
+                          {scheduleFaA3TemplateHeaders.length === 0 && (
+                            <tr>
+                              <td className="text-muted">Use the file picker above to load Schedule FA A3 template CSV.</td>
+                            </tr>
+                          )}
+                        </tbody>
+                        {scheduleFaA3TemplateHeaders.length > 0 && scheduleFaA3FooterRow && (
+                          <tfoot className="table-light fw-semibold">
+                            <tr>
+                              {scheduleFaA3TemplateHeaders.map((header) => {
+                                const val = scheduleFaA3FooterRow[header];
+                                const numeric = typeof val === 'number' && Number.isFinite(val);
+                                return (
+                                  <td key={`footer-${header}`} className={numeric ? 'text-end' : ''}>
+                                    {numeric ? formatINR(val) : String(val ?? '')}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          </tfoot>
+                        )}
+                        </Table>
+                      </div>
+                    </>
+                  )}
                 </SubSectionShell>
               </Accordion.Body>
             </Accordion.Item>
