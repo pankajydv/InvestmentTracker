@@ -32,13 +32,13 @@ export default function TaxComputation({ fy, portfolioId, refreshNonce = 0, onRe
             <Spinner animation="border" size="sm" className="me-2" />Computing tax...
           </div>
         )}
-        {computation && <TaxComputationView data={computation} />}
+        {computation && <TaxComputationView data={computation} fy={fy} />}
       </Accordion.Body>
     </Accordion.Item>
   );
 }
 
-function TaxComputationView({ data }) {
+function TaxComputationView({ data, fy }) {
   const { heads, tax, credits } = data;
   const h = heads;
   const d = data.deductions || {};

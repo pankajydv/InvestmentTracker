@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Card, Row, Col, Form, Button, Table, Badge, Spinner, Accordion } from 'react-bootstrap';
-import { Download, Plus, Trash2 } from 'lucide-react';
+import { Download, Plus, Trash2, Info } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import CollapsibleSectionHeader from './CollapsibleSectionHeader';
 import { getTaxReport, getTaxMeta, getTaxComputation, uploadAIS, getAISData, uploadForm16, getForm16Data, getOtherIncome, addOtherIncome, updateOtherIncome, deleteOtherIncome, getScheduleFaA3 } from '../services/api';
@@ -8,6 +8,7 @@ import { formatINRExact as formatINR, formatDate, formatNumber, profitColor } fr
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 import TaxComputation from './TaxComputation';
 import PropertyCapitalGains from './PropertyCapitalGains';
+import TaxationRulesReference from './TaxationRulesReference';
 
 function fyLabel(startYear) {
   return `${startYear}-${String(startYear + 1).slice(-2)}`;
@@ -1806,6 +1807,10 @@ export default function TaxReport() {
               onRecomputed={refreshTaxComputation}
             />
           </Accordion>
+
+          {computation?.taxation_rules && (
+            <TaxationRulesReference rules={computation.taxation_rules} fy={fy} />
+          )}
 
           <div className="small text-muted">{summary.tax_note}</div>
         </>

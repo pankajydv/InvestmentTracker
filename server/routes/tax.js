@@ -27,6 +27,7 @@ const router = express.Router();
 const multer = require('multer');
 const { parseAIS } = require('../services/aisParser');
 const { parseForm16 } = require('../services/form16Parser');
+const { getTaxationRules, getTaxationRulesSummary } = require('../config/taxationRules');
 
 const aisUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const form16Upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -113,8 +114,6 @@ const CG_SECTION_DEFS = [
   { key: '112', title: 'LTCG – Foreign / Other (Section 112)' },
   { key: 'SLAB', title: 'STCG – Foreign / Other (Slab rate)' },
 ];
-
-const LTCG_112A_EXEMPTION = 125000;
 
 // Map a sale date (YYYY-MM-DD) to its ITR financial-year quarter bucket.
 function fyQuarterForDate(dateStr) {
@@ -537,7 +536,7 @@ function buildScheduleFaA3Rows(db, { portfolioId, calendarYear }) {
   };
 }
 
-function buildTaxReport(db, fy, portfolioId) {
+function buildTaxReport(db, fy, portfolioId, ltcgEquityExemption = 125000) {
   if (!fy) throw new Error('fy is required (e.g. 2025-26)');
 
   const { start: fyStart, end: fyEnd } = parseFY(fy);
@@ -930,8 +929,8 @@ function buildTaxReport(db, fy, portfolioId) {
   const ltcg112aGross = gainForSection('112A');
   const ltcg112 = gainForSection('112');
   const stcgSlab = gainForSection('SLAB');
-  const ltcg112aExemptionUsed = roundCurrency(Math.min(Math.max(ltcg112aGross, 0), LTCG_112A_EXEMPTION));
-  const ltcg112aTaxable = roundCurrency(Math.max(0, ltcg112aGross - LTCG_112A_EXEMPTION));
+  const ltcg112aExemptionUsed = roundCurrency(Math.min(Math.max(ltcg112aGross, 0), ltcgEquityExemption));
+  const ltcg112aTaxable = roundCurrency(Math.max(0, ltcg112aGross - ltcgEquityExemption));
 
   return {
     fy,
@@ -961,7 +960,7 @@ function buildTaxReport(db, fy, portfolioId) {
       cg_ltcg_112a_taxable: ltcg112aTaxable,
       cg_ltcg_112: ltcg112,
       cg_stcg_slab: stcgSlab,
-      ltcg_112a_exemption_limit: LTCG_112A_EXEMPTION,
+      ltcg_112a_exemption_limit: ltcgEquityExemption,
       tax_note: 'Equity (STT-paid) → 111A STCG / 112A LTCG with 12-month threshold and ₹1.25L LTCG exemption. Foreign & non-equity → slab STCG / 112 LTCG with 24-month threshold. Equity classification uses STT charged on disposal as the primary signal.',
     },
   };
@@ -981,23 +980,18 @@ function parseFY(fy) {
   return { start, end, label: fy };
 }
 
-// ── New Regime Tax Computation ─────────────────────────────────────────────
+// ── New Regime Tax Computation (Dynamic, rule-based) ───────────────────────
 
-const STANDARD_DEDUCTION = 75000;
-const NEW_REGIME_SLABS = [
-  { upto: 400000, rate: 0 },
-  { upto: 800000, rate: 0.05 },
-  { upto: 1200000, rate: 0.10 },
-  { upto: 1600000, rate: 0.15 },
-  { upto: 2000000, rate: 0.20 },
-  { upto: 2400000, rate: 0.25 },
-  { upto: Infinity, rate: 0.30 },
-];
-
-function computeSlabTax(taxableIncome) {
+/**
+ * Compute tax on income using slab structure from taxation rules.
+ * @param {number} taxableIncome - Income to be taxed
+ * @param {Array} slabs - Slab array from taxation rules (must include upto & rate)
+ * @returns {number} Tax amount rounded to nearest rupee
+ */
+function computeSlabTax(taxableIncome, slabs) {
   let tax = 0;
   let prev = 0;
-  for (const slab of NEW_REGIME_SLABS) {
+  for (const slab of slabs) {
     const chunk = Math.min(taxableIncome, slab.upto) - prev;
     if (chunk <= 0) break;
     tax += chunk * slab.rate;
@@ -1006,16 +1000,43 @@ function computeSlabTax(taxableIncome) {
   return Math.round(tax);
 }
 
-function computeSurcharge(totalIncome, baseTax) {
-  if (totalIncome <= 5000000) return 0;
-  if (totalIncome <= 10000000) return Math.round(baseTax * 0.10);
-  if (totalIncome <= 20000000) return Math.round(baseTax * 0.15);
-  return Math.round(baseTax * 0.25);
+/**
+ * Compute surcharge based on total income and surcharge slabs from taxation rules.
+ * @param {number} totalIncome - Total taxable income
+ * @param {number} baseTax - Tax before surcharge
+ * @param {Array} surchargeSlabs - Surcharge slab array from taxation rules
+ * @returns {number} Surcharge amount rounded to nearest rupee
+ */
+function computeSurcharge(totalIncome, baseTax, surchargeSlabs) {
+  for (const slab of surchargeSlabs) {
+    if (totalIncome <= slab.upto) {
+      return Math.round(baseTax * slab.rate);
+    }
+  }
+  // If income exceeds all slabs, use the highest rate
+  const lastSlab = surchargeSlabs[surchargeSlabs.length - 1];
+  return Math.round(baseTax * lastSlab.rate);
 }
 
 function buildTaxComputation(db, fy, portfolioId) {
+  // ── Fetch taxation rules for this financial year ──
+  const taxRules = getTaxationRules(fy, 'newRegime');
+  if (!taxRules || taxRules.status === 'not_supported') {
+    throw new Error(`Tax computation not supported for FY ${fy} in New Regime`);
+  }
+
+  const standardDeduction = taxRules.standardDeduction;
+  const slabs = taxRules.slabs;
+  const surchargeSlabs = taxRules.surcharge;
+  const stcgRate = taxRules.capitalGains.stcg.rate;
+  const ltcgRate = taxRules.capitalGains.ltcgEquity.rate;
+  const ltcgEquityExemption = taxRules.capitalGains.ltcgEquity.exemption;
+  const rebate87ALimit = taxRules.rebate87A.limit;
+  const rebate87AAmount = taxRules.rebate87A.amount;
+  const cessRate = taxRules.cess.rate;
+
   // 1. Investment report (CG, dividends, perquisites)
-  const investmentReport = buildTaxReport(db, fy, portfolioId);
+  const investmentReport = buildTaxReport(db, fy, portfolioId, ltcgEquityExemption);
 
   // 2. AIS data
   const aisRow = portfolioId
@@ -1045,7 +1066,7 @@ function buildTaxComputation(db, fy, portfolioId) {
   const salaryEntries = ais?.salary || [];
   const grossSalary = salaryEntries.reduce((s, e) => s + (e.gross || 0), 0);
   const salaryTDS = salaryEntries.reduce((s, e) => s + (e.tds_total || 0), 0);
-  const netSalary = Math.max(0, grossSalary - STANDARD_DEDUCTION);
+  const netSalary = Math.max(0, grossSalary - standardDeduction);
 
   // ── Head 4: Capital Gains (taxed separately at special rates) ──
   const cg = investmentReport.summary || {};
@@ -1138,26 +1159,26 @@ function buildTaxComputation(db, fy, portfolioId) {
   const specialRateCG = stcg111a + ltcg112aTaxable + ltcg112Adjusted;
 
   // ── Tax computation ──
-  const taxOnSlabIncome = computeSlabTax(Math.max(0, slabIncome - deduction80CCD2));
-  const taxOnSTCG111A = Math.round(Math.max(0, stcg111a) * 0.20); // 20% post Budget 2024
-  const taxOnLTCG112A = Math.round(Math.max(0, ltcg112aTaxable) * 0.125); // 12.5%
-  const taxOnLTCG112 = Math.round(Math.max(0, ltcg112Adjusted) * 0.125); // 12.5% (foreign/other)
+  const taxOnSlabIncome = computeSlabTax(Math.max(0, slabIncome - deduction80CCD2), slabs);
+  const taxOnSTCG111A = Math.round(Math.max(0, stcg111a) * stcgRate);
+  const taxOnLTCG112A = Math.round(Math.max(0, ltcg112aTaxable) * ltcgRate);
+  const taxOnLTCG112 = Math.round(Math.max(0, ltcg112Adjusted) * ltcgRate);
 
   // ── Total tax before surcharge/cess ──
   const totalTaxBeforeSurcharge = taxOnSlabIncome + taxOnSTCG111A + taxOnLTCG112A + taxOnLTCG112;
 
-  // ── Section 87A rebate (income up to ₹7L under new regime → zero tax) ──
+  // ── Section 87A rebate ──
   let rebate87A = 0;
-  if (totalTaxableIncome <= 700000) {
-    rebate87A = Math.min(taxOnSlabIncome, 25000);
+  if (totalTaxableIncome <= rebate87ALimit) {
+    rebate87A = Math.min(taxOnSlabIncome, rebate87AAmount);
   }
   const taxAfterRebate = Math.max(0, totalTaxBeforeSurcharge - rebate87A);
 
   // ── Surcharge ──
-  const surcharge = computeSurcharge(totalTaxableIncome, taxAfterRebate);
+  const surcharge = computeSurcharge(totalTaxableIncome, taxAfterRebate, surchargeSlabs);
 
   // ── Cess ──
-  const cess = Math.round((taxAfterRebate + surcharge) * 0.04);
+  const cess = Math.round((taxAfterRebate + surcharge) * cessRate);
 
   // ── Total tax liability ──
   const totalTaxLiability = taxAfterRebate + surcharge + cess;
@@ -1178,7 +1199,7 @@ function buildTaxComputation(db, fy, portfolioId) {
       salary: {
         entries: salaryEntries,
         gross: grossSalary,
-        standard_deduction: grossSalary > 0 ? STANDARD_DEDUCTION : 0,
+        standard_deduction: grossSalary > 0 ? standardDeduction : 0,
         net: netSalary,
         tds: salaryTDS,
       },
@@ -1258,6 +1279,20 @@ function buildTaxComputation(db, fy, portfolioId) {
       total: totalCredits,
     },
     net_payable: netPayable,
+    taxation_rules: {
+      fy,
+      regime: 'newRegime',
+      standard_deduction: standardDeduction,
+      slabs: slabs.map((s) => ({ upto: s.upto, rate: s.rate, label: s.label })),
+      capital_gains: {
+        stcg: { rate: stcgRate, section: taxRules.capitalGains.stcg.section, description: taxRules.capitalGains.stcg.description },
+        ltcg_equity: { rate: ltcgRate, section: taxRules.capitalGains.ltcgEquity.section, exemption: ltcgEquityExemption, description: taxRules.capitalGains.ltcgEquity.description },
+        ltcg_foreign: { rate: ltcgRate, section: taxRules.capitalGains.ltcgForeign.section, description: taxRules.capitalGains.ltcgForeign.description },
+      },
+      rebate_87a: { limit: rebate87ALimit, amount: rebate87AAmount, description: taxRules.rebate87A.description },
+      surcharge: surchargeSlabs.map((s) => ({ upto: s.upto, rate: s.rate, label: s.label })),
+      cess: { rate: cessRate, description: taxRules.cess.description },
+    },
   };
 }
 

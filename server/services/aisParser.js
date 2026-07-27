@@ -100,17 +100,20 @@ function extractFY(text) {
 /**
  * Extract salary entries from TDS-192 sections.
  * Each entry: { source, source_pan, gross, tds_total, count }
+ * 
+ * Handles company names with embedded parentheses and newlines before PAN code.
  */
 function extractSalary(text) {
   const results = [];
   // Match TDS-192 blocks: code, description, source with PAN, count, amount
-  const blockRe = /TDS-192\s+Salary\s+received\s+\(Section\s+192\)\s+(.*?)\s+\((\w+)\)\s+(\d+)\s+([\d,]+)/g;
+  // PAN format: [A-Z0-9]{10} (e.g., HYDM00984E or similar entity identifiers)
+  // Use [\s\S]*? to handle newlines between company name and PAN
+  const blockRe = /TDS-192\s+Salary\s+received\s+\(Section\s+192\)[\s\S]*?\(([A-Z0-9]{10})\)\s+(\d+)\s+([\d,]+)/g;
   let m;
   while ((m = blockRe.exec(text)) !== null) {
-    const source = cleanText(m[1]);
-    const sourcePan = m[2];
-    const count = parseInt(m[3]);
-    const gross = parseAmount(m[4]);
+    const sourcePan = m[1];
+    const count = parseInt(m[2]);
+    const gross = parseAmount(m[3]);
 
     // Sum TDS from quarterly rows that follow
     let tdsTotal = 0;
@@ -123,6 +126,12 @@ function extractSalary(text) {
       rowCount++;
     }
 
+    // Extract source name from the match by looking back in the text
+    // Find text between "Section 192)" and the PAN
+    const beforePanText = text.substring(m.index, m.index + m[0].length);
+    const sourceMatch = beforePanText.match(/Section\s+192\)\s*([\s\S]*?)\s*\(([A-Z0-9]{10})\)/);
+    const source = sourceMatch ? cleanText(sourceMatch[1]) : 'Unknown Source';
+
     results.push({ source, source_pan: sourcePan, gross, tds_total: tdsTotal, count });
   }
   return results;
@@ -130,13 +139,16 @@ function extractSalary(text) {
 
 /**
  * Extract salary annexure II breakup (17(1), 17(2), 17(3)).
+ * Handles newlines between company name and PAN.
  */
 function extractSalaryAnnexure(text) {
   const results = [];
-  const blockRe = /TDS-\s*Ann\.II-\s*SAL\s+Salary\s+\(TDS\s+Annexure\s+II\)\s+(.*?)\s+\((\w+)\)\s+\d+\s+([\d,]+)/g;
+  // PAN format: [A-Z0-9]{10} (e.g., HYDM00984E or similar entity identifiers)
+  // Use [\s\S]*? to handle newlines
+  const blockRe = /TDS-\s*Ann\.II-\s*SAL\s+Salary\s+\(TDS\s+Annexure\s+II\)[\s\S]*?\(([A-Z0-9]{10})\)\s+\d+\s+([\d,]+)/g;
   let m;
   while ((m = blockRe.exec(text)) !== null) {
-    const sourcePan = m[2];
+    const sourcePan = m[1];
     const afterBlock = text.substring(m.index + m[0].length, m.index + m[0].length + 1500);
     // Look for: GROSS SALARY U/S 17(1) | VALUE OF PERQUISITES U/S 17(2) | PROFITS IN LIEU 17(3) | GROSS SALARY
     const rowRe = /([\d,]+)\s+([\d,]+)\s+([\d,]+)\s+([\d,]+)\s+Active/;
@@ -155,15 +167,17 @@ function extractSalaryAnnexure(text) {
 
 /**
  * Extract interest on securities (TDS-193, NCD/bond interest).
+ * Handles newlines between company name and PAN.
  */
 function extractInterestOnSecurities(text) {
   const results = [];
-  const blockRe = /TDS-193\s+Interest\s+received\s+on\s+securities\s+\(Section\s+193\)\s+(.*?)\s+\((\w+)\)\s+(\d+)\s+([\d,]+)/g;
+  // PAN format: [A-Z0-9]{10} (e.g., HYDM00984E or similar entity identifiers)
+  // Use [\s\S]*? to handle newlines
+  const blockRe = /TDS-193\s+Interest\s+received\s+on\s+securities\s+\(Section\s+193\)[\s\S]*?\(([A-Z0-9]{10})\)\s+(\d+)\s+([\d,]+)/g;
   let m;
   while ((m = blockRe.exec(text)) !== null) {
-    const source = cleanText(m[1]);
-    const amount = parseAmount(m[4]);
-    const count = parseInt(m[3]);
+    const amount = parseAmount(m[3]);
+    const count = parseInt(m[2]);
     // Sum TDS
     let tds = 0;
     const afterBlock = text.substring(m.index + m[0].length, m.index + m[0].length + 3000);
@@ -174,6 +188,12 @@ function extractInterestOnSecurities(text) {
       tds += parseAmount(tm[2]);
       rowCount++;
     }
+    
+    // Extract source name from the match by looking back in the text
+    const beforePanText = text.substring(m.index, m.index + m[0].length);
+    const sourceMatch = beforePanText.match(/Section\s+193\)[\s\S]*?([A-Z][\s\w]*)\s*\(([A-Z0-9]{10})\)/);
+    const source = sourceMatch ? cleanText(sourceMatch[1]) : 'Unknown Source';
+
     results.push({ source, amount, tds });
   }
   return results;
@@ -201,15 +221,17 @@ function extractPFTaxableInterest(text) {
 
 /**
  * Extract LRS TCS (TCS-206CQ).
+ * Handles newlines between company name and PAN.
  */
 function extractLRSTCS(text) {
   const results = [];
-  const blockRe = /TCS-206CQ\s+Remittance\s+under\s+LRS.*?\s+(.*?)\s+\((\w+)\)\s+(\d+)\s+([\d,]+)/g;
+  // PAN format: [A-Z0-9]{10} (e.g., HYDM00984E or similar entity identifiers)
+  // Use [\s\S]*? to handle newlines
+  const blockRe = /TCS-206CQ\s+Remittance\s+under\s+LRS[\s\S]*?\(([A-Z0-9]{10})\)\s+(\d+)\s+([\d,]+)/g;
   let m;
   while ((m = blockRe.exec(text)) !== null) {
-    const source = cleanText(m[1]);
-    const amount = parseAmount(m[4]);
-    const count = parseInt(m[3]);
+    const amount = parseAmount(m[3]);
+    const count = parseInt(m[2]);
     let tcs = 0;
     const afterBlock = text.substring(m.index + m[0].length, m.index + m[0].length + 2000);
     const tcsRe = /([\d,]+)\s+([\d,]+)\s+([\d,]+)\s+Active/g;
@@ -219,6 +241,12 @@ function extractLRSTCS(text) {
       tcs += parseAmount(tm[2]);
       rowCount++;
     }
+    
+    // Extract source name from the match by looking back in the text
+    const beforePanText = text.substring(m.index, m.index + m[0].length);
+    const sourceMatch = beforePanText.match(/LRS[\s\S]*?([A-Z][\s\w]*)\s*\(([A-Z0-9]{10})\)/);
+    const source = sourceMatch ? cleanText(sourceMatch[1]) : 'Unknown Source';
+
     results.push({ source, amount, tcs });
   }
   return results;
