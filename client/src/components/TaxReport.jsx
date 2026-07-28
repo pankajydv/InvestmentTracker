@@ -1360,7 +1360,7 @@ export default function TaxReport() {
             )}
 
             <Accordion.Item eventKey="1">
-              <Accordion.Header>Schedule 1: Salary & Perquisite Income ({report.perquisite_income.length} vests{ais?.salary?.length ? ` · Gross ${formatINR(ais.salary.reduce((s, e) => s + (e.gross || 0), 0))}` : ''})</Accordion.Header>
+              <Accordion.Header>Schedule Salary: Salary & Perquisite Income ({report.perquisite_income.length} vests{ais?.salary?.length ? ` · Gross ${formatINR(ais.salary.reduce((s, e) => s + (e.gross || 0), 0))}` : ''})</Accordion.Header>
               <Accordion.Body>
                 {ais?.salary?.length > 0 && (
                   <div className="mb-3">
