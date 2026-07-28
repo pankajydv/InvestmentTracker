@@ -1390,9 +1390,15 @@ module.exports = function (db) {
     if (input == null) return null;
     const raw = String(input).trim().toUpperCase();
     if (!raw) return null;
-    if (String(assetType || '').toUpperCase() === 'MUTUAL_FUND') return raw;
-    if (raw.includes('.')) return raw;
-    return `${raw}.NS`;
+    const normalizedType = String(assetType || '').toUpperCase();
+    if (normalizedType === 'MUTUAL_FUND') return raw;
+    if (normalizedType === 'INDIAN_STOCK') {
+      return raw.includes('.') ? raw : `${raw}.NS`;
+    }
+    if (normalizedType === 'FOREIGN_STOCK') {
+      return raw.replace(/\.(NS|BO)$/i, '');
+    }
+    return raw;
   }
 
   function assertValidDateRangeOrThrow(validFrom, validTo) {

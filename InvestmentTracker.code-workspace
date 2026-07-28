@@ -1,7 +1,13 @@
 {
-	"folders": [
-		{
-			"path": "."
-		}
-	]
+  "folders": [{"path": "."}],
+  "settings": {
+    "files.watcherExclude": {
+      "**/node_modules/**": true,
+      "**/.git/**": true,
+      "**/data/**": true,
+      "**/data_backup_prod/**": true,
+      "**/.venv/**": true,
+      "**/dist/**": true
+    }
+  }
 }

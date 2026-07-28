@@ -406,7 +406,7 @@ export default function InvestmentDetail() {
   const [selectedTypes, setSelectedTypes] = useState([]);
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
-  const [hideFutureVestings, setHideFutureVestings] = useState(false);
+  const [hideFutureVestings, setHideFutureVestings] = useState(true);
 
   // Delete confirmation modal state
   const [deleteConfirm, setDeleteConfirm] = useState(null);

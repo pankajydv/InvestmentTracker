@@ -18,6 +18,19 @@ import CollapsibleSectionHeader from './CollapsibleSectionHeader';
 
 const MARKET_DRIVEN_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'BOND']);
 
+function normalizeTickerForAssetType(input, assetType) {
+  const raw = String(input || '').trim().toUpperCase();
+  if (!raw) return null;
+  const type = String(assetType || '').toUpperCase();
+  if (type === 'INDIAN_STOCK') {
+    return raw.includes('.') ? raw : `${raw}.NS`;
+  }
+  if (type === 'FOREIGN_STOCK') {
+    return raw.replace(/\.(NS|BO)$/i, '');
+  }
+  return raw;
+}
+
 function addDaysIso(date, days) {
   const d = new Date(`${date}T00:00:00.000Z`);
   d.setUTCDate(d.getUTCDate() + Number(days || 0));
@@ -228,9 +241,12 @@ export default function InvestmentSettings() {
         getInvestmentSymbolHistory(id).catch(() => ({ history: [] })),
       ]);
       setData(result);
+      const initialTicker = String(result.ticker_symbol || '').trim();
       setForm({
         display_name: result.display_name || '',
-        ticker_symbol: (result.ticker_symbol || '').replace(/\.(NS|BO)$/, ''),
+        ticker_symbol: String(result.asset_type || '').toUpperCase() === 'INDIAN_STOCK'
+          ? initialTicker.replace(/\.(NS|BO)$/i, '')
+          : initialTicker,
         isin_code: result.isin_code || '',
         amfi_code: result.amfi_code || '',
         nps_fund_code: result.nps_fund_code || '',
@@ -390,9 +406,7 @@ export default function InvestmentSettings() {
       setSaving(true);
       setError(null);
       setSuccess(false);
-      const tickerToSave = form.ticker_symbol
-        ? (form.ticker_symbol.includes('.') ? form.ticker_symbol : form.ticker_symbol + '.NS')
-        : null;
+      const tickerToSave = normalizeTickerForAssetType(form.ticker_symbol, data?.asset_type);
       await updateInvestment(id, {
         display_name: form.display_name || null,
         ticker_symbol: tickerToSave,
