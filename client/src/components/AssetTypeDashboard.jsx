@@ -6,9 +6,10 @@ import { getDashboardSummary, getDashboardVersion, getAssetIntervalMetrics } fro
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { formatDate, formatINR, formatNumber, formatPct, profitColor, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS, ASSET_TYPE_SLUG_TO_KEY, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
-import { getDashboardCacheKey, getCachedDashboardSummary, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
+import { getDashboardCacheKey, getCachedDashboardSummary, removeCachedDashboardSummary, resolveDashboardCacheState, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
 import AssetTypeHoldingsTable from './AssetTypeHoldingsTable';
 import DashboardRolloverTable from './DashboardRolloverTable';
+import DashboardSkeleton from './DashboardSkeleton';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 function combineDashboardSummaries(results, selectedIds) {
@@ -222,14 +223,6 @@ function combineDashboardSummaries(results, selectedIds) {
   };
 }
 
-function LoadingSpinner() {
-  return (
-    <div className="d-flex justify-content-center align-items-center" style={{ height: '16rem' }}>
-      <Spinner animation="border" variant="primary" />
-    </div>
-  );
-}
-
 function ErrorMessage({ message }) {
   return (
     <Alert variant="danger">
@@ -247,6 +240,7 @@ export default function AssetTypeDashboard() {
   const { settings, loading: settingsLoading } = useAppSettings();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [cacheState, setCacheState] = useState('loading');
   const [error, setError] = useState(null);
   const [selectedInterval, setSelectedInterval] = useState('1D');
   const [showCustomDatePicker, setShowCustomDatePicker] = useState(false);
@@ -286,12 +280,14 @@ export default function AssetTypeDashboard() {
 
       try {
         setLoading(true);
+        setCacheState(cachedEntry ? 'validating' : 'loading');
         setIsIntervalSwitching(true);
 
-        // Instant paint from persisted cache (validated against server version next).
+        // Keep monetary values hidden until the lightweight version probe has
+        // confirmed that the persisted payload is authoritative.
         if (cachedEntry) {
-          setData(cachedEntry.data);
-          setLoading(false);
+          setData(null);
+          setLoading(true);
         }
 
         // Version gate: skip the expensive summary fetch when nothing changed.
@@ -304,13 +300,28 @@ export default function AssetTypeDashboard() {
             serverVersion = null;
           }
           if (cancelled) return;
-          if (serverVersion != null && String(serverVersion) === String(cachedEntry.dataVersion)) {
+          const versionState = resolveDashboardCacheState(cachedEntry.dataVersion, serverVersion);
+          if (versionState === 'offline') {
             setData(cachedEntry.data);
+            setCacheState('offline');
             setError(null);
             setLoading(false);
             setIsIntervalSwitching(false);
             return;
           }
+          if (versionState === 'valid') {
+            setData(cachedEntry.data);
+            setCacheState('valid');
+            setError(null);
+            setLoading(false);
+            setIsIntervalSwitching(false);
+            return;
+          }
+
+          removeCachedDashboardSummary(cacheKey);
+          setData(null);
+          setCacheState('stale');
+          setLoading(true);
         }
 
         const requestOptions = {
@@ -365,6 +376,7 @@ export default function AssetTypeDashboard() {
 
         setData(result);
         setCachedDashboardSummary(cacheKey, result, resultVersion);
+        setCacheState('fresh');
         setError(null);
       } catch (e) {
         if (cancelled) return;
@@ -383,7 +395,7 @@ export default function AssetTypeDashboard() {
     return () => { cancelled = true; };
   }, [selectedId, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading, selectedInterval, customFromDate, customToDate]);
 
-  if (loading) return <LoadingSpinner />;
+  if (loading) return <DashboardSkeleton assetType />;
   if (error) return <ErrorMessage message={error} />;
   if (!data) return null;
 
@@ -425,6 +437,11 @@ export default function AssetTypeDashboard() {
 
   return (
     <div className="d-flex flex-column gap-4">
+      {cacheState === 'offline' && (
+        <Alert variant="warning" className="py-2 mb-0">
+          You are offline. Showing the last locally cached dashboard; values may be out of date.
+        </Alert>
+      )}
       <div className="d-flex justify-content-between align-items-start flex-wrap gap-3">
         <div>
           <Link to="/" className="small text-muted text-decoration-none d-flex align-items-center gap-1 mb-2">

@@ -553,7 +553,7 @@ module.exports = function (db) {
   }
 
   // ─── Portfolio Summary (Dashboard) ────────────────────────────────────
-  router.get('/summary', (req, res) => {
+  const handleSummary = (req, res) => {
     const { portfolio_id, hide_sold } = req.query;
     const includeSoldInReturnsRaw = String(req.query.include_sold_in_returns || '').trim().toLowerCase();
     const includeSoldInReturnsRequested = includeSoldInReturnsRaw === 'true' || includeSoldInReturnsRaw === '1' || includeSoldInReturnsRaw === 'yes';
@@ -1784,7 +1784,58 @@ module.exports = function (db) {
     }
 
     res.json(responsePayload);
-  });
+  };
+
+  router.get('/summary', handleSummary);
+
+  router.warmSnapshots = async () => {
+    if (!isSnapshotEnabled()) return { warmed: 0, failed: 0 };
+
+    const portfolioIds = db.prepare('SELECT id FROM portfolios ORDER BY id').all().map((row) => row.id);
+    const scopes = [null, ...portfolioIds];
+    let warmed = 0;
+    let failed = 0;
+
+    for (const portfolioId of scopes) {
+      for (const xirrMode of ['portfolio_only', 'full']) {
+        try {
+          await new Promise((resolve, reject) => {
+            const req = {
+              query: {
+                interval: '1D',
+                xirr_mode: xirrMode,
+                ...(portfolioId == null ? {} : { portfolio_id: String(portfolioId) }),
+              },
+            };
+            const res = {
+              statusCode: 200,
+              status(code) {
+                this.statusCode = code;
+                return this;
+              },
+              json(payload) {
+                if (this.statusCode >= 400) {
+                  reject(new Error(payload?.error || `Dashboard warm failed (${this.statusCode})`));
+                } else {
+                  resolve(payload);
+                }
+              },
+            };
+            try {
+              handleSummary(req, res);
+            } catch (error) {
+              reject(error);
+            }
+          });
+          warmed += 1;
+        } catch (_error) {
+          failed += 1;
+        }
+      }
+    }
+
+    return { warmed, failed };
+  };
 
   // ─── Asset-type interval metrics for an arbitrary portfolio subset ─────
   // The /summary endpoint only understands a single portfolio or "all". For a genuine subset
@@ -1854,9 +1905,18 @@ module.exports = function (db) {
 
   // ─── Data version (lightweight cache-validation probe) ─────────────────
   router.get('/version', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const cycleValue = db.prepare("SELECT value FROM config WHERE key = 'dashboard_last_scheduler_cycle'").get()?.value;
+    let lastSchedulerCycle = null;
+    try {
+      lastSchedulerCycle = cycleValue ? JSON.parse(cycleValue) : null;
+    } catch (_error) {
+      lastSchedulerCycle = null;
+    }
     res.json({
       dataVersion: getDataVersion(db),
       lastUpdate: db.prepare("SELECT value FROM config WHERE key = 'last_price_update'").get()?.value,
+      lastSchedulerCycle,
     });
   });
 

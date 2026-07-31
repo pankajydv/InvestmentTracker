@@ -5,13 +5,14 @@ import { getDashboardSummary, getDashboardVersion, getDailyValuesHealthStatus, g
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_SLUG, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle, ShieldAlert, ShieldCheck, ShieldX } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
 import DashboardRolloverTable from './DashboardRolloverTable';
+import DashboardSkeleton from './DashboardSkeleton';
 import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
-import { getDashboardCacheKey, getCachedDashboardSummary, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
+import { getDashboardCacheKey, getCachedDashboardSummary, removeCachedDashboardSummary, resolveDashboardCacheState, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 
 function AllocationChartTooltip({ active, payload }) {
@@ -456,10 +457,11 @@ function mergeXirrEnrichment(baseData, enrichedData) {
 
 export default function Dashboard() {
   usePrivacyMaskRefresh();
-  const { selectionMode, selectedId, selectedIds, selectedPortfolio, selectedPortfolios, portfolios } = usePortfolio();
+  const { selectionMode, selectedId, selectedIds } = usePortfolio();
   const { settings, loading: settingsLoading } = useAppSettings();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [cacheState, setCacheState] = useState('loading');
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
   const [sortConfigs, setSortConfigs] = useState({});
@@ -616,13 +618,15 @@ export default function Dashboard() {
     try {
       if (showBlockingLoader) setLoading(true);
       else setRefreshing(true);
+      setCacheState(cachedEntry ? 'validating' : 'loading');
       setShowHealthDetails(false);
 
-      // Instant paint from the persisted cache (validated against server version next).
-      if (showBlockingLoader && cachedEntry) {
-        setData(cachedEntry.data);
-        setLoading(false);
-        setShowDetailTables(true);
+      // Keep monetary values hidden behind the skeleton until the lightweight
+      // version probe confirms that the persisted payload is authoritative.
+      if (cachedEntry) {
+        setData(null);
+        setLoading(true);
+        setShowDetailTables(false);
       }
 
       // Version gate: when we hold a cached copy, ask the server for the current
@@ -637,14 +641,29 @@ export default function Dashboard() {
           serverVersion = null;
         }
         if (runId !== loadRunRef.current) return;
-        if (serverVersion != null && String(serverVersion) === String(cachedEntry.dataVersion)) {
+        const versionState = resolveDashboardCacheState(cachedEntry.dataVersion, serverVersion);
+        if (versionState === 'offline') {
           setData(cachedEntry.data);
+          setCacheState('offline');
+          setLoading(false);
+          setShowDetailTables(true);
+          setError(null);
+          return;
+        }
+        if (versionState === 'valid') {
+          setData(cachedEntry.data);
+          setCacheState('valid');
           setLoading(false);
           setShowDetailTables(true);
           setError(null);
           lastLoadedIntervalSigRef.current = intervalSig;
           return;
         }
+
+        removeCachedDashboardSummary(cacheKey);
+        setData(null);
+        setCacheState('stale');
+        setLoading(true);
       }
 
       if (isPartialMulti) {
@@ -696,6 +715,7 @@ export default function Dashboard() {
         if (runId !== loadRunRef.current) return;
         setData(combined);
         setCachedDashboardSummary(cacheKey, combined, resultVersion);
+        setCacheState('fresh');
         setLoading(false);
         setShowDetailTables(true);
       } else if (showBlockingLoader && !cachedEntry) {
@@ -711,6 +731,7 @@ export default function Dashboard() {
         if (runId !== loadRunRef.current) return;
         setData(fastResult);
         setCachedDashboardSummary(cacheKey, fastResult, fastResult?.dataVersion);
+        setCacheState('fresh');
         setLoading(false);
 
         await new Promise((resolve) => {
@@ -749,6 +770,7 @@ export default function Dashboard() {
         if (runId !== loadRunRef.current) return;
         setData(result);
         setCachedDashboardSummary(cacheKey, result, result?.dataVersion);
+        setCacheState('fresh');
         setShowDetailTables(true);
       }
 
@@ -783,11 +805,11 @@ export default function Dashboard() {
     }
   };
 
-  if (loading) return <LoadingSpinner />;
+  if (loading) return <DashboardSkeleton />;
   if (error) return <ErrorMessage message={error} />;
   if (!data) return null;
 
-  const { portfolio, investments, byType, lastUpdate, portfolioCount, totalExpenses, rollupWarning, stalePricesWarning } = data;
+  const { portfolio, investments, byType, portfolioCount, totalExpenses, rollupWarning, stalePricesWarning } = data;
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
   const totalRealizedGain = Number(portfolio.total_realized_proceeds) || 0;
@@ -936,59 +958,13 @@ export default function Dashboard() {
     || complianceSnapshot?.lastScan?.runDate
     || complianceSnapshot?.scanFloor
   );
-  const prewarnScopes = Number(dailyHealth?.counts?.prewarn_scopes || 0);
-  const complianceIndicator = dailyHealth?.status === 'error'
-    ? { icon: ShieldX, tone: 'error', title: 'Compliance error' }
-    : dailyHealth?.status === 'warning'
-      ? { icon: ShieldAlert, tone: 'warning', title: 'Compliance warning' }
-      : prewarnScopes > 0
-        ? { icon: ShieldAlert, tone: 'warning', title: 'Compliance pre-warning' }
-        : { icon: ShieldCheck, tone: 'healthy', title: 'Compliance healthy' };
-  const ComplianceIcon = complianceIndicator.icon;
-  const headerPortfolios = (selectedPortfolios && selectedPortfolios.length)
-    ? selectedPortfolios
-    : (portfolios || []);
-  const headerPortfolioDots = headerPortfolios.slice(0, 4);
-  const headerPortfolioOverflow = Math.max(0, headerPortfolios.length - headerPortfolioDots.length);
-  const headerDotAria = selectedPortfolio
-    ? 'Selected portfolio'
-    : (selectedIds.length > 1 ? 'Selected portfolios' : 'Portfolio selection');
-
   return (
     <div className="dashboard-page">
-      <div className="dashboard-header mb-4">
-        <div className="dashboard-title-row dashboard-portfolio-strip" aria-label={headerDotAria}>
-          {headerPortfolioDots.map((portfolio) => (
-            <span
-              key={portfolio.id}
-              className="portfolio-dot dashboard-portfolio-dot"
-              style={{ backgroundColor: resolvePortfolioColor(portfolio) }}
-              title={portfolio.name}
-              aria-label={portfolio.name}
-            />
-          ))}
-          {headerPortfolioOverflow > 0 && (
-            <span className="dashboard-portfolio-overflow" title={`${headerPortfolioOverflow} more portfolios`}>
-              +{headerPortfolioOverflow}
-            </span>
-          )}
-        </div>
-        <div className="dashboard-header-meta">
-          {lastUpdate && (
-            <span className="dashboard-last-updated">
-              Updated {formatDate(lastUpdate)} {new Date(lastUpdate).toLocaleTimeString('en-IN')}
-            </span>
-          )}
-          <span
-            className={`dashboard-compliance-indicator dashboard-compliance-${complianceIndicator.tone}`}
-            title={complianceIndicator.title}
-            aria-label={complianceIndicator.title}
-          >
-            <ComplianceIcon size={16} />
-          </span>
-        </div>
-      </div>
-
+      {cacheState === 'offline' && (
+        <Alert variant="warning" className="py-2 mb-4">
+          You are offline. Showing the last locally cached dashboard; values may be out of date.
+        </Alert>
+      )}
       {refreshing && (
         <div className="text-muted small mb-2 d-flex align-items-center gap-2">
           <Spinner animation="border" size="sm" />
@@ -1390,14 +1366,6 @@ export default function Dashboard() {
         </Card>
       )}
 
-    </div>
-  );
-}
-
-function LoadingSpinner() {
-  return (
-    <div className="d-flex justify-content-center align-items-center" style={{ height: '16rem' }}>
-      <Spinner animation="border" variant="primary" />
     </div>
   );
 }

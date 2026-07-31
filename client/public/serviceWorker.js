@@ -61,6 +61,13 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url);
 
+  // Cache validation must always reach the server. Falling back to an old
+  // version response could incorrectly mark stale local dashboard data valid.
+  if (url.pathname === '/api/dashboard/version') {
+    event.respondWith(fetch(request));
+    return;
+  }
+
   // API GET: network-first, bounded cache fallback for offline.
   if (url.pathname.startsWith('/api/')) {
     event.respondWith((async () => {

@@ -7,7 +7,7 @@ const compression = require('compression');
 const session = require('express-session');
 const path = require('path');
 const { getDb, initializeDb, ensureNPSFundCodeMigration, ensureRemoveCombinedAggregatesMigration } = require('./db/schema');
-const { startScheduler } = require('./services/scheduler');
+const { startScheduler, setDashboardSnapshotWarmer } = require('./services/scheduler');
 const { requireAuth } = require('./middleware/auth');
 const { ensureDashboardSnapshotTable, bumpDataVersion } = require('./services/dashboardSnapshotService');
 const { logAppInfo, logAppError, getUnifiedLogPathForDate, installConsoleCapture } = require('./services/appLogger');
@@ -26,6 +26,9 @@ initializeDb(db);
 ensureNPSFundCodeMigration(db);
 ensureRemoveCombinedAggregatesMigration(db);
 ensureDashboardSnapshotTable(db);
+// A previous process may have stopped mid-cycle. Start with a new version so
+// no snapshot created before that boundary can be treated as authoritative.
+bumpDataVersion(db);
 
 // Middleware
 app.use(compression());
@@ -76,7 +79,9 @@ app.use('/api', (req, res, next) => {
 app.use('/api/portfolios', require('./routes/portfolios')(db));
 app.use('/api/investments', require('./routes/investments')(db));
 app.use('/api/transactions', require('./routes/transactions')(db));
-app.use('/api/dashboard', require('./routes/dashboard')(db));
+const dashboardRouter = require('./routes/dashboard')(db);
+setDashboardSnapshotWarmer(dashboardRouter.warmSnapshots);
+app.use('/api/dashboard', dashboardRouter);
 app.use('/api/utils', require('./routes/utils')(db));
 app.use('/api/cas', require('./routes/cas')(db));
 app.use('/api/stocks', require('./routes/stocks')(db));

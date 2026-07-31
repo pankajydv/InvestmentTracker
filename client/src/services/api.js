@@ -40,7 +40,7 @@ export const getCurrentUser = () => fetchJSON('/auth/me');
 export const logout = () => fetchJSON('/auth/logout', { method: 'POST' });
 
 // Dashboard
-export const getDashboardVersion = () => fetchJSON('/dashboard/version');
+export const getDashboardVersion = () => fetchJSON('/dashboard/version', { cache: 'no-store' });
 export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);

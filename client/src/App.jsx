@@ -6,6 +6,7 @@ import { AppSettingsProvider } from './context/AppSettingsContext';
 import Navbar from './components/Navbar';
 import Login from './components/Login';
 import Dashboard from './components/Dashboard';
+import AppStatusStrip from './components/AppStatusStrip';
 import BackToTopButton from './components/BackToTopButton';
 import { useServiceWorker } from './hooks/useServiceWorker';
 import { getAuthConfig, getCurrentUser, loginWithGoogle, logout } from './services/api';
@@ -129,6 +130,7 @@ export default function App() {
           <div style={{ minHeight: '100%', backgroundColor: '#f8f9fa' }}>
             <Navbar user={user} onLogout={handleLogout} />
             <main className="container py-4 app-main-shell">
+              <AppStatusStrip />
               <Suspense fallback={<RouteLoadingFallback />}>
                 <Routes>
                   <Route path="/" element={<Dashboard />} />

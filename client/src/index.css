@@ -197,6 +197,47 @@ tr:hover .row-actions {
   border-color: #f5b5ad;
 }
 
+.dashboard-shimmer {
+  display: block;
+  overflow: hidden;
+  position: relative;
+  border-radius: 5px;
+  background: #e8edf3;
+}
+
+.dashboard-shimmer::after {
+  position: absolute;
+  inset: 0;
+  content: '';
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.72), transparent);
+  animation: dashboard-shimmer 1.35s ease-in-out infinite;
+}
+
+@keyframes dashboard-shimmer {
+  100% { transform: translateX(100%); }
+}
+
+.dashboard-shimmer-title { width: 9rem; height: 1.7rem; }
+.dashboard-shimmer-title-wide { width: 14rem; height: 1.7rem; }
+.dashboard-shimmer-control { width: 5rem; height: 2rem; }
+.dashboard-shimmer-label { width: 45%; height: 0.7rem; }
+.dashboard-shimmer-value { width: 72%; height: 1.55rem; margin-top: 0.85rem; }
+.dashboard-shimmer-value-small { width: 62%; height: 1.15rem; margin-top: 0.7rem; }
+.dashboard-shimmer-detail { width: 58%; height: 0.65rem; margin-top: 0.75rem; }
+.dashboard-shimmer-section-title { width: 8rem; height: 1rem; }
+.dashboard-skeleton-allocation { display: grid; grid-template-columns: minmax(0, 1fr) 12rem; gap: 1rem; align-items: center; }
+.dashboard-skeleton-tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; }
+.dashboard-skeleton-tile { min-height: 6.4rem; padding: 0.8rem; border: 1px solid #e8edf3; border-radius: 6px; }
+.dashboard-shimmer-donut { width: 9rem; height: 9rem; margin: auto; border-radius: 50%; }
+.dashboard-skeleton-row { display: grid; grid-template-columns: 2fr repeat(3, 1fr); gap: 1rem; min-height: 2.8rem; align-items: center; border-top: 1px solid #eef1f5; }
+.dashboard-shimmer-cell-wide { width: 70%; height: 0.75rem; }
+.dashboard-shimmer-cell { width: 65%; height: 0.75rem; justify-self: end; }
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-shimmer::after { animation: none; }
+}
+
 @media (max-width: 768px) {
   .dashboard-header {
     align-items: flex-start;
@@ -237,6 +278,12 @@ tr:hover .row-actions {
   .dashboard-health-alert {
     margin-bottom: 0.8rem !important;
   }
+
+  .dashboard-skeleton-allocation { grid-template-columns: 1fr; }
+  .dashboard-skeleton-tiles { grid-template-columns: 1fr 1fr; }
+  .dashboard-shimmer-donut { width: 7rem; height: 7rem; }
+  .dashboard-skeleton-row { grid-template-columns: 1.7fr 1fr; }
+  .dashboard-skeleton-row .dashboard-shimmer-cell:nth-child(n+3) { display: none; }
 }
 
 .asset-allocation-card {

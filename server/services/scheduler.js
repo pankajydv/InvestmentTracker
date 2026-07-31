@@ -30,6 +30,7 @@ const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
 const { scanAndRepairComplianceGaps, refreshComplianceScanFloor } = require('./compliance/complianceScanService');
 const { DIRTY_SCOPE_LOOKBACK_SESSIONS } = require('./freshnessPolicy');
 const { preCalculateXirrCache } = require('./xirrCacheService');
+const { bumpDataVersion } = require('./dashboardSnapshotService');
 
 function parsePositiveIntEnv(name, fallback) {
   const parsed = Number(process.env[name]);
@@ -69,6 +70,41 @@ const LOCF_LAG_RECONCILE_ASSET_TYPES = ['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'S
 const EXITED_UNITS_EPSILON = 1e-6;
 
 let isSchedulerCycleRunning = false;
+let dashboardSnapshotWarmer = null;
+
+function setDashboardSnapshotWarmer(warmer) {
+  dashboardSnapshotWarmer = typeof warmer === 'function' ? warmer : null;
+}
+
+async function publishDashboardVersion(db, label, warmer = dashboardSnapshotWarmer) {
+  const dataVersion = bumpDataVersion(db);
+  const completedAt = new Date().toISOString();
+  const cycleId = `${dataVersion || 'unknown'}-${Date.now()}`;
+  try {
+    db.prepare(`
+      INSERT INTO config (key, value, updated_at)
+      VALUES ('dashboard_last_scheduler_cycle', ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET
+        value = excluded.value,
+        updated_at = datetime('now')
+    `).run(JSON.stringify({ cycleId, label, completedAt, dataVersion }));
+  } catch (_error) {
+    // Version publication remains authoritative even if metadata cannot be stored.
+  }
+  if (!warmer) return { dataVersion, warmed: 0, failed: 0 };
+
+  try {
+    const warmResult = await warmer();
+    logAppInfo(`[Scheduler] ${label}: Dashboard snapshots warmed`, { dataVersion, ...warmResult });
+    return { dataVersion, ...warmResult };
+  } catch (warmError) {
+    logAppWarn(`[Scheduler] ${label}: Dashboard snapshot warm failed`, {
+      dataVersion,
+      error: warmError.message,
+    });
+    return { dataVersion, warmed: 0, failed: 1 };
+  }
+}
 
 function addDays(isoDate, days) {
   return addDaysIso(isoDate, days);
@@ -1068,6 +1104,9 @@ async function runSchedulerCycle(db, label, options = {}) {
 
   return { rollingFreshness, dailyBootstrap, fxUpgradeSweep, catchUp, foreignReconcile, locfReconcile, preflight, result, xirrCacheResult, complianceResult };
   } finally {
+    // Publish one new version only after the complete cycle has stopped mutating
+    // dashboard inputs. This also invalidates caches after partial failures.
+    await publishDashboardVersion(db, label);
     isSchedulerCycleRunning = false;
   }
 }
@@ -1301,5 +1340,5 @@ function startScheduler(db) {
   });
 }
 
-module.exports = { startScheduler, runSchedulerCycle };
+module.exports = { startScheduler, runSchedulerCycle, setDashboardSnapshotWarmer, publishDashboardVersion };
 

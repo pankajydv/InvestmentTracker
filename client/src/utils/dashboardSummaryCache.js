@@ -12,6 +12,11 @@ const DASHBOARD_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const DASHBOARD_CACHE_PREFIX = 'itrack:dash:v2:';
 const DASHBOARD_CACHE_MAX_ENTRIES = 24;
 
+export function resolveDashboardCacheState(cachedVersion, serverVersion) {
+  if (serverVersion == null) return 'offline';
+  return String(serverVersion) === String(cachedVersion) ? 'valid' : 'stale';
+}
+
 export function getDashboardCacheKey({
   targetPortfolioId,
   hideSold,
@@ -56,6 +61,16 @@ export function getCachedDashboardSummary(cacheKey) {
     return { data: parsed.data, dataVersion: parsed.dataVersion ?? null };
   } catch (_e) {
     return null;
+  }
+}
+
+export function removeCachedDashboardSummary(cacheKey) {
+  const store = safeLocalStorage();
+  if (!store) return;
+  try {
+    store.removeItem(DASHBOARD_CACHE_PREFIX + cacheKey);
+  } catch (_e) {
+    // fail open
   }
 }
 
