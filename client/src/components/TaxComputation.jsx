@@ -91,8 +91,16 @@ function TaxComputationView({ data, fy }) {
 
           {/* Capital Gains at Special Rates */}
           <tr className="table-light"><td colSpan={2} className="fw-semibold">Capital Gains at Special Rates</td><td></td></tr>
-          <tr><td></td><td>STCG 111A — Equity, STT paid (@ 20%)</td><td className="text-end">{formatINR(h.capital_gains.stcg_111a)}</td></tr>
-          <tr><td></td><td>LTCG 112A — Equity (@ 12.5%) · Gross {formatINR(h.capital_gains.ltcg_112a_gross)}, Exempt {formatINR(h.capital_gains.ltcg_112a_exemption)}</td><td className="text-end">{formatINR(h.capital_gains.ltcg_112a_taxable)}</td></tr>
+          <tr><td></td><td>STCG 111A — Equity (STT paid)</td><td className="text-end text-danger">{formatImpact(h.capital_gains.stcg_111a)}</td></tr>
+
+          {/* LTCG 112A step-down */}
+          {h.capital_gains.ltcg_112a_gross !== 0 && <>
+            <tr><td></td><td>LTCG 112A — Equity</td><td className="text-end text-danger">{formatImpact(h.capital_gains.ltcg_112a_gross)}</td></tr>
+            {h.capital_gains.ltcg_112a_ltcl_setoff > 0 && <tr><td></td><td className="ps-4 text-muted">Less: LTCL Setoff</td><td className="text-end text-success">{formatImpact(-h.capital_gains.ltcg_112a_ltcl_setoff)}</td></tr>}
+            {h.capital_gains.ltcg_112a_exemption > 0 && <tr><td></td><td className="ps-4 text-muted">Less: LTCG Exemption ({formatINR(data.taxation_rules?.capital_gains?.ltcg_equity?.exemption ?? 125000)} limit)</td><td className="text-end text-success">{formatImpact(-h.capital_gains.ltcg_112a_exemption)}</td></tr>}
+          </>}
+
+          {/* Property gain/loss rows */}
           {p.rows_count > 0 && (
             <tr>
               <td></td>
@@ -103,20 +111,19 @@ function TaxComputationView({ data, fy }) {
           {h.capital_gains.property_section_54_exemption > 0 && (
             <tr>
               <td></td>
-              <td>Less: Section 54 Exemption (from New Property investment)</td>
+              <td className="ps-4 text-muted">Less: Section 54 Exemption</td>
               <td className="text-end text-success">{formatImpact(-h.capital_gains.property_section_54_exemption)}</td>
             </tr>
           )}
-          <tr>
-            <td></td>
-            <td>
-              LTCG 112 — Foreign (@ 12.5%)
-              {h.capital_gains.ltcg_112_transfer_expense > 0 ? ` · Gross ${formatINR(h.capital_gains.ltcg_112)} − Transfer ₹${h.capital_gains.ltcg_112_transfer_expense}` : ''}
-              {h.capital_gains.property_ltcg_added > 0 ? ` + Property LTCG (after Sec54) ${formatINR(h.capital_gains.property_ltcg_added)}` : ''}
-              {h.capital_gains.property_ltcl_setoff_used > 0 ? ` − LTCL Setoff ${formatINR(h.capital_gains.property_ltcl_setoff_used)}` : ''}
-            </td>
-            <td className="text-end">{formatINR(h.capital_gains.ltcg_112_adjusted ?? h.capital_gains.ltcg_112)}</td>
-          </tr>
+
+          {/* LTCG 112 step-down */}
+          {h.capital_gains.ltcg_112 !== 0 && <>
+            <tr><td></td><td>LTCG 112 — Foreign</td><td className="text-end text-danger">{formatImpact(h.capital_gains.ltcg_112)}</td></tr>
+            {h.capital_gains.ltcg_112_transfer_expense > 0 && <tr><td></td><td className="ps-4 text-muted">Less: Transfer Expense</td><td className="text-end text-success">{formatImpact(-h.capital_gains.ltcg_112_transfer_expense)}</td></tr>}
+            {h.capital_gains.property_ltcg_added > 0 && <tr><td></td><td className="ps-4 text-muted">Add: Property LTCG (after Sec 54)</td><td className="text-end text-danger">{formatImpact(h.capital_gains.property_ltcg_added)}</td></tr>}
+            {(h.capital_gains.property_ltcl_setoff_on_112 ?? 0) > 0 && <tr><td></td><td className="ps-4 text-muted">Less: LTCL Setoff</td><td className="text-end text-success">{formatImpact(-(h.capital_gains.property_ltcl_setoff_on_112))}</td></tr>}
+          </>}
+
           {h.capital_gains.property_ltcl_carry_forward > 0 && (
             <tr>
               <td></td>

@@ -1073,10 +1073,11 @@ function buildTaxComputation(db, fy, portfolioId) {
   const stcg111a = cg.cg_stcg_111a || 0;
   const ltcg112aGross = cg.cg_ltcg_112a_gross || 0;
   const ltcg112aExemption = cg.cg_ltcg_112a_exemption || 0;
-  const ltcg112aTaxable = cg.cg_ltcg_112a_taxable || 0;
+  // ltcg112aTaxable is recomputed below after LTCL setoff; this is the pre-setoff report value only.
+  const ltcg112aTaxableFromReport = cg.cg_ltcg_112a_taxable || 0;
   const ltcg112 = cg.cg_ltcg_112 || 0;
   const stcgSlab = cg.cg_stcg_slab || 0;
-  const totalCG = stcg111a + ltcg112aTaxable + ltcg112 + stcgSlab;
+  const totalCG = stcg111a + ltcg112aTaxableFromReport + ltcg112 + stcgSlab;
 
   // ── Head 5: Other Sources ──
   const dividendINR = cg.total_dividend_inr || 0;
@@ -1113,11 +1114,19 @@ function buildTaxComputation(db, fy, portfolioId) {
   const section54ExemptionUsed = Math.min(oldPropertyLTCGBefore54, Math.max(0, newPropertyEligibleInvestment));
   const oldPropertyLTCGAfter54 = Math.max(0, oldPropertyLTCGBefore54 - section54ExemptionUsed);
 
-  // Apply property gain/loss on LTCG-112 bucket.
+  // Apply property LTCL setoff across all LTCG buckets (112A gross first, then 112).
+  // LTCL can offset both 112A and 112; exemption on 112A is applied after setoff.
   const ltcg112WithPropertyGain = ltcg112AfterTransfer + oldPropertyLTCGAfter54;
-  const propertyLtclSetoffUsed = Math.min(ltcg112WithPropertyGain, oldPropertyLTCL);
+  const totalLtcgAvailableForSetoff = Math.max(0, ltcg112aGross) + ltcg112WithPropertyGain;
+  const propertyLtclSetoffUsed = Math.min(totalLtcgAvailableForSetoff, oldPropertyLTCL);
   const propertyLtclCarryForward = Math.max(0, oldPropertyLTCL - propertyLtclSetoffUsed);
-  const ltcg112Adjusted = Math.max(0, ltcg112WithPropertyGain - propertyLtclSetoffUsed);
+  // Allocate setoff to 112A first, then 112.
+  const ltcl112aSetoff = Math.min(Math.max(0, ltcg112aGross), propertyLtclSetoffUsed);
+  const ltcl112Setoff = propertyLtclSetoffUsed - ltcl112aSetoff;
+  const ltcg112aAfterLtcl = Math.max(0, ltcg112aGross - ltcl112aSetoff);
+  const ltcg112aAfterExemption = Math.max(0, ltcg112aAfterLtcl - ltcgEquityExemption);
+  const ltcg112aTaxable = ltcg112aAfterExemption;
+  const ltcg112Adjusted = Math.max(0, ltcg112WithPropertyGain - ltcl112Setoff);
 
   const totalCGAdjusted = stcg111a + ltcg112aTaxable + ltcg112Adjusted + stcgSlab;
 
@@ -1206,7 +1215,8 @@ function buildTaxComputation(db, fy, portfolioId) {
       capital_gains: {
         stcg_111a: stcg111a,
         ltcg_112a_gross: ltcg112aGross,
-        ltcg_112a_exemption: ltcg112aExemption,
+        ltcg_112a_ltcl_setoff: ltcl112aSetoff,
+        ltcg_112a_exemption: roundCurrency(Math.min(ltcg112aAfterLtcl, ltcgEquityExemption)),
         ltcg_112a_taxable: ltcg112aTaxable,
         ltcg_112: ltcg112,
         ltcg_112_after_transfer: ltcg112AfterTransfer,
@@ -1214,6 +1224,7 @@ function buildTaxComputation(db, fy, portfolioId) {
         property_section_54_exemption: section54ExemptionUsed,
         property_ltcg_added: oldPropertyLTCGAfter54,
         property_ltcl_setoff_used: propertyLtclSetoffUsed,
+        property_ltcl_setoff_on_112: ltcl112Setoff,
         property_ltcl_carry_forward: propertyLtclCarryForward,
         ltcg_112_adjusted: ltcg112Adjusted,
         ltcg_112_transfer_expense: cgTransferExpense,
