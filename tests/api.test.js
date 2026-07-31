@@ -16,7 +16,11 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { computeBondAccruedCoupon } = require('../server/services/bondAccrualService');
-const { markAllTrackedInvestmentsDirtyFromDate } = require('../server/services/dirtyBackfillService');
+const {
+  markAllTrackedInvestmentsDirtyFromDate,
+  runDailyBootstrapDirtyScopeEnqueue,
+} = require('../server/services/dirtyBackfillService');
+const { detectGapsForTable } = require('../server/services/compliance/complianceScanService');
 const { updateAllPrices } = require('../server/services/updater');
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1597,6 +1601,168 @@ describe('Dirty scope source guard for exited holdings', () => {
       assert.equal(scope.portfolio_id, portfolio.lastInsertRowid);
       assert.equal(scope.dirty_from_date, '2014-05-01');
       assert.equal(scope.status, 'pending');
+    } finally {
+      localDb.close();
+      fs.rmSync(localDataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('enqueues zero-unit provident balances for scheduler catch-up', () => {
+    const Database = require('better-sqlite3');
+    const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-provident-dirtyscope-test-'));
+    const localDbPath = path.join(localDataDir, 'investments.db');
+    const localDb = new Database(localDbPath);
+
+    try {
+      localDb.pragma('journal_mode = WAL');
+      localDb.pragma('foreign_keys = ON');
+
+      const { initializeDb } = require('../server/db/schema');
+      initializeDb(localDb);
+
+      const portfolio = localDb.prepare(`
+        INSERT INTO portfolios (name) VALUES (?)
+      `).run('Provident Catch-up Test Portfolio');
+
+      const investment = localDb.prepare(`
+        INSERT INTO investments (name, asset_type, is_active, exclude_from_tracking)
+        VALUES (?, 'PF', 1, 0)
+      `).run('Zero-unit PF Catch-up Test');
+
+      localDb.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees
+        ) VALUES (?, ?, 'EMPLOYER_CONTRIBUTION', ?, 0, 0, ?, 0)
+      `).run(investment.lastInsertRowid, portfolio.lastInsertRowid, '2026-06-01', 10000);
+
+      const enqueued = markAllTrackedInvestmentsDirtyFromDate(
+        localDb,
+        '2026-07-31',
+        'scheduler-downtime-catchup',
+        'test-provident-catchup'
+      );
+
+      assert.equal(enqueued, 1);
+      const scope = localDb.prepare(`
+        SELECT investment_id, portfolio_id, dirty_from_date, status
+        FROM dirty_backfill_scope
+      `).get();
+
+      assert.equal(scope.investment_id, investment.lastInsertRowid);
+      assert.equal(scope.portfolio_id, portfolio.lastInsertRowid);
+      assert.equal(scope.dirty_from_date, '2026-07-31');
+      assert.equal(scope.status, 'pending');
+    } finally {
+      localDb.close();
+      fs.rmSync(localDataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('enqueues a behind zero-unit provident balance during conditional bootstrap', () => {
+    const Database = require('better-sqlite3');
+    const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-provident-bootstrap-test-'));
+    const localDbPath = path.join(localDataDir, 'investments.db');
+    const localDb = new Database(localDbPath);
+
+    try {
+      localDb.pragma('journal_mode = WAL');
+      localDb.pragma('foreign_keys = ON');
+
+      const { initializeDb } = require('../server/db/schema');
+      initializeDb(localDb);
+
+      const portfolio = localDb.prepare(`
+        INSERT INTO portfolios (name) VALUES (?)
+      `).run('Provident Bootstrap Test Portfolio');
+
+      const investment = localDb.prepare(`
+        INSERT INTO investments (name, asset_type, is_active, exclude_from_tracking)
+        VALUES (?, 'SSY', 1, 0)
+      `).run('Zero-unit SSY Bootstrap Test');
+
+      localDb.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees
+        ) VALUES (?, ?, 'DEPOSIT', ?, 0, 0, ?, 0)
+      `).run(investment.lastInsertRowid, portfolio.lastInsertRowid, '2026-05-04', 10000);
+
+      const result = runDailyBootstrapDirtyScopeEnqueue(localDb, {
+        runDate: '2026-07-31',
+        lookbackDays: 2,
+        conditional: true,
+        trigger: 'test-provident-bootstrap',
+      });
+
+      assert.equal(result.enqueued, 1);
+      const scope = localDb.prepare(`
+        SELECT investment_id, portfolio_id, dirty_from_date, status
+        FROM dirty_backfill_scope
+      `).get();
+
+      assert.equal(scope.investment_id, investment.lastInsertRowid);
+      assert.equal(scope.portfolio_id, portfolio.lastInsertRowid);
+      assert.equal(scope.dirty_from_date, '2026-07-29');
+      assert.equal(scope.status, 'pending');
+    } finally {
+      localDb.close();
+      fs.rmSync(localDataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Provident compliance coverage', () => {
+  it('checks active provident snapshots through the scan date without extending stock coverage', () => {
+    const Database = require('better-sqlite3');
+    const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-provident-compliance-test-'));
+    const localDbPath = path.join(localDataDir, 'investments.db');
+    const localDb = new Database(localDbPath);
+
+    try {
+      localDb.pragma('journal_mode = WAL');
+      localDb.pragma('foreign_keys = ON');
+
+      const { initializeDb } = require('../server/db/schema');
+      initializeDb(localDb);
+
+      const portfolio = localDb.prepare('INSERT INTO portfolios (name) VALUES (?)')
+        .run('Provident Compliance Test Portfolio');
+      const insertInvestment = localDb.prepare(`
+        INSERT INTO investments (name, asset_type, is_active, exclude_from_tracking)
+        VALUES (?, ?, 1, 0)
+      `);
+      const provident = insertInvestment.run('PF Compliance Test', 'PF');
+      const stock = insertInvestment.run('Stock Compliance Boundary Test', 'INDIAN_STOCK');
+      const insertTransaction = localDb.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees
+        ) VALUES (?, ?, ?, '2026-07-29', ?, ?, ?, 0)
+      `);
+      insertTransaction.run(provident.lastInsertRowid, portfolio.lastInsertRowid, 'EMPLOYER_CONTRIBUTION', 0, 0, 10000);
+      insertTransaction.run(stock.lastInsertRowid, portfolio.lastInsertRowid, 'BUY', 10, 100, 1000);
+
+      const insertDailyValue = localDb.prepare(`
+        INSERT INTO daily_values (
+          investment_id, portfolio_id, date, price_per_unit, total_units,
+          current_value, invested_amount, profit_loss, price_source, day_change
+        ) VALUES (?, ?, '2026-07-29', ?, ?, ?, ?, ?, ?, 0)
+      `);
+      insertDailyValue.run(provident.lastInsertRowid, portfolio.lastInsertRowid, 8.25, 1, 10000, 10000, 0, 'COMPUTED');
+      insertDailyValue.run(stock.lastInsertRowid, portfolio.lastInsertRowid, 100, 10, 1000, 1000, 0, 'LIVE');
+
+      const gaps = detectGapsForTable(localDb, 'daily_values', 'investment_id', 'investment', {
+        startDate: '2026-07-29',
+        endDate: '2026-07-31',
+      });
+
+      assert.deepEqual(gaps, [{
+        table_name: 'daily_values',
+        entity_id: Number(provident.lastInsertRowid),
+        gap_start_date: '2026-07-30',
+        gap_end_date: '2026-07-31',
+      }]);
     } finally {
       localDb.close();
       fs.rmSync(localDataDir, { recursive: true, force: true });

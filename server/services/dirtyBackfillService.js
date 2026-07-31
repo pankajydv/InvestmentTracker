@@ -202,6 +202,7 @@ function markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourc
   const rows = db.prepare(`
     SELECT
       i.id AS investment_id,
+      i.asset_type,
       t.portfolio_id,
       MAX(date(t.transaction_date)) AS max_txn_date,
       COALESCE(SUM(
@@ -223,7 +224,8 @@ function markAllTrackedInvestmentsDirtyFromDate(db, dirtyFromDate, reason, sourc
   for (const row of rows) {
     const maxTxnDate = toIsoDate(row.max_txn_date);
     const netUnits = Number(row.net_units || 0);
-    const isExited = Math.abs(netUnits) <= EXITED_UNITS_EPSILON;
+    const isExited = !PROVIDENT_TYPES.has(row.asset_type)
+      && Math.abs(netUnits) <= EXITED_UNITS_EPSILON;
 
     // Source-side guard: don't enqueue scopes for exited holdings when dirty date is after exit.
     if (isExited && maxTxnDate && normalized > maxTxnDate) {
@@ -263,6 +265,7 @@ function enqueueBehindTrackedScopes(db, runDate, dirtyFromDate, reason, sourceEv
   const rows = db.prepare(`
     SELECT
       i.id AS investment_id,
+      i.asset_type,
       t.portfolio_id,
       COALESCE(SUM(
         CASE
@@ -281,8 +284,9 @@ function enqueueBehindTrackedScopes(db, runDate, dirtyFromDate, reason, sourceEv
     WHERE i.is_active != 0
       AND COALESCE(i.exclude_from_tracking, 0) != 1
       AND t.portfolio_id IS NOT NULL
-    GROUP BY i.id, t.portfolio_id
-    HAVING net_units > ${EXITED_UNITS_EPSILON}
+    GROUP BY i.id, i.asset_type, t.portfolio_id
+    HAVING i.asset_type IN ('PF', 'PPF', 'SSY')
+      OR net_units > ${EXITED_UNITS_EPSILON}
   `).all();
 
   let enqueued = 0;

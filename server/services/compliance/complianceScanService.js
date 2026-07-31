@@ -13,6 +13,7 @@ const COMPLIANCE_LAST_RUN_DATE_KEY = 'compliance_last_run_date';
 const COMPLIANCE_LAST_GAPS_KEY = 'compliance_last_gaps_detected';
 const COMPLIANCE_LAST_REPAIRS_KEY = 'compliance_last_repairs_enqueued';
 const INCREMENTAL_LOOKBACK_DAYS = Math.max(1, Number(process.env.INCREMENTAL_COMPLIANCE_LOOKBACK_DAYS || 14));
+const BALANCE_BASED_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MARKET_DATA_CUTOFF_MINUTES_IST = Object.freeze({
   // US equities settle after midnight IST; avoid same-day compliance gaps until end of IST day.
   FOREIGN_STOCK: 23 * 60 + 59,
@@ -239,7 +240,7 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
   if (tableName === 'daily_values') {
     // For daily_values: get investments and check their date ranges
     const investments = db.prepare(`
-      SELECT DISTINCT i.id, i.asset_type, 
+      SELECT DISTINCT i.id, i.asset_type, i.is_active, i.exclude_from_tracking,
              MIN(date(t.transaction_date)) as start_date, MAX(date(t.transaction_date)) as end_date
       FROM investments i
       LEFT JOIN transactions t ON i.id = t.investment_id
@@ -252,7 +253,12 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
       if (!start_date || !end_date) continue;
 
       const effectiveStartDate = startBoundary && startBoundary > start_date ? startBoundary : start_date;
-      let effectiveEndDate = endBoundary && endBoundary < end_date ? endBoundary : end_date;
+      const trackBalanceThroughScanDate = BALANCE_BASED_ASSET_TYPES.has(String(asset_type || '').toUpperCase())
+        && inv.is_active !== 0
+        && inv.exclude_from_tracking !== 1;
+      let effectiveEndDate = trackBalanceThroughScanDate
+        ? endBoundary
+        : (endBoundary && endBoundary < end_date ? endBoundary : end_date);
       if (shouldDeferSameDayMarketLinkedGap(asset_type, endBoundary) && effectiveEndDate === endBoundary) {
         effectiveEndDate = addDaysIso(effectiveEndDate, -1);
       }
