@@ -453,6 +453,25 @@ export const importContractNotes = async (portfolioId, broker, trades) => {
   });
 };
 
+export const previewFidelityTradeConfirmations = async (files) => {
+  const formData = new FormData();
+  files.forEach((file) => formData.append('files', file));
+  const res = await fetch(`${API_BASE}/stocks/fidelity-trade-confirmations/preview`, {
+    method: 'POST', body: formData, credentials: 'include',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'Upload failed');
+  }
+  return res.json();
+};
+
+export const importFidelityTradeConfirmations = (portfolioId, trades) =>
+  fetchJSON('/stocks/fidelity-trade-confirmations/import', {
+    method: 'POST',
+    body: JSON.stringify({ portfolio_id: portfolioId, trades }),
+  });
+
 // RSU Grants (annual, on-hire, special)
 export const previewRsuGrantSchedule = (params = {}) => {
   const qs = new URLSearchParams();

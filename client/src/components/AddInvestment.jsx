@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, Row, Col, Button, Form, Alert, Spinner, Collapse, Table } from 'react-bootstrap';
-import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction, previewRsuGrantDocuments, importRsuGrantSchedule, getUSDINRRate } from '../services/api';
+import { createInvestment, addTransaction, getInvestments, searchMutualFunds, searchStock, searchStockByName, previewContractNotes, importContractNotes, uploadPnLStatement, uploadCASPreview, importCASHoldings, importCAMSCASTransactions, previewNPSStatements, importNPSTransactions, previewPPFStatements, importPPFTransactions, previewPFStatements, importPFTransactions, addManualPFTransaction, previewRsuGrantDocuments, importRsuGrantSchedule, getUSDINRRate, previewFidelityTradeConfirmations, importFidelityTradeConfirmations } from '../services/api';
 import { ASSET_TYPE_LABELS } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp, Plus } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -53,6 +53,13 @@ export default function AddInvestment() {
   const [rsuCreating, setRsuCreating] = useState(false);
   const [rsuIncludeFuture, setRsuIncludeFuture] = useState(false);
   const [rsuOverwriteExisting, setRsuOverwriteExisting] = useState(false);
+
+  const fidelityFileRef = useRef(null);
+  const [fidelityFiles, setFidelityFiles] = useState([]);
+  const [fidelityPreview, setFidelityPreview] = useState(null);
+  const [fidelityParsing, setFidelityParsing] = useState(false);
+  const [fidelityImporting, setFidelityImporting] = useState(false);
+  const [fidelityResult, setFidelityResult] = useState(null);
 
   // Manual stock transaction state (for Foreign Stocks)
   const [showManualStockTxn, setShowManualStockTxn] = useState(false);
@@ -342,6 +349,45 @@ export default function AddInvestment() {
     setRsuIncludeFuture(false);
     setRsuOverwriteExisting(false);
     if (rsuGrantFileRef.current) rsuGrantFileRef.current.value = '';
+  };
+
+  const handleFidelityPreview = async () => {
+    setError('');
+    if (!portfolioId) return setError('Please select a portfolio first');
+    if (!fidelityFiles.length) return setError('Please select at least one Fidelity confirmation PDF');
+    setFidelityParsing(true);
+    try {
+      setFidelityPreview(await previewFidelityTradeConfirmations(fidelityFiles));
+      setFidelityResult(null);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setFidelityParsing(false);
+    }
+  };
+
+  const handleFidelityImport = async () => {
+    if (!fidelityPreview?.trades?.length) return;
+    setError('');
+    setFidelityImporting(true);
+    try {
+      const result = await importFidelityTradeConfirmations(Number(portfolioId), fidelityPreview.trades);
+      setFidelityResult(result);
+      setFidelityPreview(null);
+      await refreshPortfolios();
+      navigate(`/investments/${result.investmentId}`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setFidelityImporting(false);
+    }
+  };
+
+  const handleFidelityReset = () => {
+    setFidelityFiles([]);
+    setFidelityPreview(null);
+    setFidelityResult(null);
+    if (fidelityFileRef.current) fidelityFileRef.current.value = '';
   };
 
   const updateManualStockTxn = (field, value) => {
@@ -3262,6 +3308,96 @@ export default function AddInvestment() {
                     </Button>
                   </div>
                 )}
+                </Card.Body>
+              </Collapse>
+            </Card>
+          )}
+
+          {isForeignStock && (
+            <Card className="shadow-sm">
+              <Card.Header
+                className="d-flex align-items-center gap-2 bg-white py-2 px-3"
+                style={{ cursor: 'pointer' }}
+                onClick={() => toggleSection('fidelity-confirmations')}
+              >
+                <FileText size={20} className="text-primary" />
+                <span className="h6 fw-semibold mb-0 flex-grow-1">Upload Fidelity Trade Confirmations</span>
+                {expandedSection === 'fidelity-confirmations' ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+              </Card.Header>
+              <Collapse in={expandedSection === 'fidelity-confirmations'}>
+                <Card.Body>
+                  <Form.Label className="small">Trade Confirmation PDFs</Form.Label>
+                  <Form.Control
+                    ref={fidelityFileRef}
+                    size="sm"
+                    type="file"
+                    accept=".pdf,application/pdf"
+                    multiple
+                    onChange={(e) => {
+                      setFidelityFiles(Array.from(e.target.files || []));
+                      setFidelityPreview(null);
+                      setFidelityResult(null);
+                    }}
+                  />
+                  {fidelityFiles.length > 0 && (
+                    <div className="small text-muted mt-2">Selected {fidelityFiles.length} file(s)</div>
+                  )}
+
+                  <div className="d-flex flex-wrap gap-2 mt-3">
+                    <Button size="sm" variant="outline-primary" onClick={handleFidelityPreview} disabled={fidelityParsing || fidelityImporting || !fidelityFiles.length}>
+                      {fidelityParsing ? <><Spinner size="sm" className="me-1" /> Parsing...</> : 'Preview Confirmations'}
+                    </Button>
+                    <Button size="sm" variant="outline-secondary" onClick={handleFidelityReset} disabled={fidelityParsing || fidelityImporting}>
+                      Reset
+                    </Button>
+                  </div>
+
+                  {fidelityResult && (
+                    <Alert variant="success" className="small py-2 mt-3 mb-0">
+                      Imported {fidelityResult.transactionsCreated} and skipped {fidelityResult.transactionsSkipped} existing transaction(s).
+                    </Alert>
+                  )}
+
+                  {fidelityPreview && (
+                    <div className="mt-3">
+                      <div className="small mb-2">
+                        <strong>{fidelityPreview.filesProcessed} confirmation(s)</strong>
+                        {' | '}Gross ${Number(fidelityPreview.summary.grossProceedsUsd).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                        {' | '}Fees ${Number(fidelityPreview.summary.totalFeesUsd).toFixed(2)}
+                        {' | '}Net ${Number(fidelityPreview.summary.netProceedsUsd).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                      </div>
+                      <div className="table-responsive">
+                        <Table size="sm" bordered hover className="small mb-2">
+                          <thead className="table-light">
+                            <tr>
+                              <th>Trade / Settlement</th><th>Security</th><th>Shares</th><th>Price</th>
+                              <th>Gross</th><th>Fees</th><th>Net</th><th>Identifiers</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {fidelityPreview.trades.map((trade) => (
+                              <tr key={`${trade.transactionNumber}-${trade.fileName}`}>
+                                <td>{trade.tradeDate}<br /><span className="text-muted">{trade.settlementDate}</span></td>
+                                <td><strong>{trade.ticker}</strong><br /><span className="text-muted">{trade.security}</span></td>
+                                <td>{trade.quantity}</td>
+                                <td>${Number(trade.rate).toFixed(4)}</td>
+                                <td>${Number(trade.grossProceedsUsd).toFixed(2)}</td>
+                                <td>${Number(trade.feesUsd).toFixed(2)}</td>
+                                <td>${Number(trade.netProceedsUsd).toFixed(2)}</td>
+                                <td>
+                                  Txn {trade.transactionNumber}<br />Ref {trade.referenceNumber}<br />CUSIP {trade.cusip}
+                                  <br /><span className="text-muted">Participant {trade.participantId} | Customer {trade.customerNumber}</span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </Table>
+                      </div>
+                      <Button size="sm" variant="primary" onClick={handleFidelityImport} disabled={fidelityImporting}>
+                        {fidelityImporting ? <><Spinner size="sm" className="me-1" /> Importing...</> : 'Import Transactions'}
+                      </Button>
+                    </div>
+                  )}
                 </Card.Body>
               </Collapse>
             </Card>

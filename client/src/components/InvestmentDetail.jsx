@@ -4,6 +4,7 @@ import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal, Dropdown, C
 import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions, getInvestmentDailyValues, getPortfolios } from '../services/api';
 import { formatINR, formatINRExact, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
 import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
+import { allocateForeignStockSoldUnits, isForeignStockLotFullySold } from '../utils/foreignStockLots';
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil, Wallet, PiggyBank, BarChart3, TrendingUp, TrendingDown } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -816,42 +817,8 @@ export default function InvestmentDetail() {
     }
   };
 
-  const soldUnitsByVestLotKey = (data.transactions || []).reduce((acc, txn) => {
-    if (txn.transaction_type !== 'SELL') return acc;
-    const text = String(txn.notes || '');
-    const acqDate = text.match(/Acquired\s+(\d{4}-\d{2}-\d{2})/i)?.[1];
-    const award = text.match(/Award\s+(\d+)/i)?.[1] || null;
-    const tranche = text.match(/Tranche\s+(\d+\/\d+)/i)?.[1] || null;
-    if (!acqDate || !award || !tranche) return acc;
-    const key = `${acqDate}|${award}|${tranche}`;
-    acc[key] = (acc[key] || 0) + Number(txn.units || 0);
-    return acc;
-  }, {});
-
-  const soldUnitsByEsppDate = (data.transactions || []).reduce((acc, txn) => {
-    if (txn.transaction_type !== 'SELL') return acc;
-    const text = String(txn.notes || '');
-    if (!/^ESPP Sale\s*\|/i.test(text)) return acc;
-    const acqDate = text.match(/Acquired\s+(\d{4}-\d{2}-\d{2})/i)?.[1];
-    if (!acqDate) return acc;
-    acc[acqDate] = (acc[acqDate] || 0) + Number(txn.units || 0);
-    return acc;
-  }, {});
-
-  const isFullySoldLot = (txn) => {
-    if (!txn || (txn.transaction_type !== 'VEST' && txn.transaction_type !== 'ESPP_PURCHASE')) return false;
-
-    if (txn.transaction_type === 'ESPP_PURCHASE') {
-      const soldUnits = Number(soldUnitsByEsppDate[txn.transaction_date] || 0);
-      return soldUnits > 0 && soldUnits >= (Number(txn.units || 0) - 0.0001);
-    }
-
-    const meta = parseGrantMeta(txn);
-    if (!meta.awardNumber || !meta.tranche) return false;
-    const key = `${txn.transaction_date}|${meta.awardNumber}|${meta.tranche}`;
-    const soldUnits = Number(soldUnitsByVestLotKey[key] || 0);
-    return soldUnits > 0 && soldUnits >= (Number(txn.units || 0) - 0.0001);
-  };
+  const soldUnitsByTransactionId = allocateForeignStockSoldUnits(data.transactions || []);
+  const isFullySoldLot = (txn) => isForeignStockLotFullySold(txn, soldUnitsByTransactionId);
 
   // SGB calculations
   let sgbDetails = null;

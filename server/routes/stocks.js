@@ -3,6 +3,7 @@ const multer = require('multer');
 const { PDFParse } = require('pdf-parse');
 const { lookupTickerByISIN, fetchCorporateActions, toNSETicker, fetchHistoricalStockPrice, fetchHistoricalOHLC, fetchHistoricalUSDToINR } = require('../services/priceService');
 const { parseContractNotes } = require('../services/contractNoteParser');
+const { parseFidelityTradeConfirmation } = require('../services/fidelityTradeConfirmationParser');
 const { parsePnLStatement } = require('../services/pnlParser');
 const { GRANTS, generateRsuSchedule } = require('../services/rsuGrantService');
 const { OFFERINGS, generateEsppSchedule } = require('../services/esppGrantService');
@@ -1409,6 +1410,165 @@ module.exports = function (db) {
         error: e.message,
       });
       res.status(500).json({ error: 'Failed to parse stock grant documents: ' + e.message });
+    }
+  });
+
+  router.post('/fidelity-trade-confirmations/preview', upload.array('files', 20), async (req, res) => {
+    try {
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No PDF files uploaded' });
+      }
+
+      const confirmations = [];
+      for (const file of req.files) {
+        const parsed = await parseFidelityTradeConfirmation(file.buffer, file.originalname);
+        if (!parsed) {
+          return res.status(400).json({ error: `${file.originalname} is not a supported Fidelity trade confirmation` });
+        }
+        confirmations.push(parsed);
+      }
+
+      const trades = confirmations.flatMap((confirmation) => confirmation.trades.map((trade) => ({
+        ...trade,
+        fileName: confirmation.fileName,
+        participantId: confirmation.participantId,
+        customerNumber: confirmation.customerNumber,
+        planType: confirmation.planType,
+      })));
+
+      res.json({
+        broker: 'Fidelity',
+        filesProcessed: confirmations.length,
+        trades,
+        summary: {
+          totalShares: trades.reduce((sum, trade) => sum + trade.quantity, 0),
+          grossProceedsUsd: trades.reduce((sum, trade) => sum + trade.grossProceedsUsd, 0),
+          totalFeesUsd: trades.reduce((sum, trade) => sum + trade.feesUsd, 0),
+          netProceedsUsd: trades.reduce((sum, trade) => sum + trade.netProceedsUsd, 0),
+        },
+      });
+    } catch (e) {
+      logAppError('[Stocks] Fidelity trade confirmation preview failed', {
+        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        error: e.message,
+      });
+      res.status(500).json({ error: 'Failed to parse Fidelity trade confirmations: ' + e.message });
+    }
+  });
+
+  router.post('/fidelity-trade-confirmations/import', express.json(), async (req, res) => {
+    try {
+      const portfolioId = parseInt(req.body?.portfolio_id, 10);
+      const trades = Array.isArray(req.body?.trades) ? req.body.trades : [];
+      if (!portfolioId || trades.length === 0) {
+        return res.status(400).json({ error: 'portfolio_id and trades are required' });
+      }
+      const portfolio = db.prepare('SELECT id FROM portfolios WHERE id = ?').get(portfolioId);
+      if (!portfolio) return res.status(404).json({ error: 'Portfolio not found' });
+
+      const tickers = [...new Set(trades.map((trade) => String(trade.ticker || '').trim().toUpperCase()).filter(Boolean))];
+      if (tickers.length !== 1) {
+        return res.status(400).json({ error: 'Uploaded confirmations must contain exactly one stock ticker' });
+      }
+      const ticker = tickers[0];
+      const investments = db.prepare(`
+        SELECT id FROM investments
+        WHERE asset_type = 'FOREIGN_STOCK' AND UPPER(ticker_symbol) = ?
+      `).all(ticker);
+      if (investments.length > 1) {
+        return res.status(409).json({ error: `Found multiple ${ticker} foreign-stock investments; merge them before importing` });
+      }
+
+      const fxByDate = new Map();
+      for (const tradeDate of [...new Set(trades.map((trade) => trade.tradeDate))]) {
+        fxByDate.set(tradeDate, Number(await fetchHistoricalUSDToINR(tradeDate)));
+      }
+
+      const insertInvestment = db.prepare(`
+        INSERT INTO investments (name, asset_type, ticker_symbol, currency, notes)
+        VALUES (?, 'FOREIGN_STOCK', ?, 'USD', ?)
+      `);
+      const findExisting = db.prepare(`
+        SELECT id FROM transactions
+        WHERE investment_id = ? AND portfolio_id = ? AND broker = 'Fidelity'
+          AND notes LIKE ?
+      `);
+      const insertTransaction = db.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees, broker, notes, exchange_rate_used, usd_amount
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Fidelity', ?, ?, ?)
+      `);
+
+      let investmentId = investments[0]?.id || null;
+      let investmentCreated = false;
+      let transactionsCreated = 0;
+      let transactionsSkipped = 0;
+      const dirtyCandidates = [];
+
+      const importAll = db.transaction(() => {
+        if (!investmentId) {
+          investmentId = Number(insertInvestment.run(
+            trades[0].security || ticker,
+            ticker,
+            'Created from Fidelity trade confirmations',
+          ).lastInsertRowid);
+          investmentCreated = true;
+        }
+
+        for (const trade of trades) {
+          const transactionNumber = String(trade.transactionNumber || '').trim();
+          if (!transactionNumber) throw new Error('Every trade requires a Fidelity transaction number');
+          if (findExisting.get(investmentId, portfolioId, `%Fidelity Transaction ${transactionNumber}%`)) {
+            transactionsSkipped += 1;
+            continue;
+          }
+
+          const fxRate = fxByDate.get(trade.tradeDate);
+          if (!(fxRate > 0)) throw new Error(`USD/INR rate unavailable for ${trade.tradeDate}`);
+          const grossProceedsUsd = Number(trade.grossProceedsUsd);
+          const feesUsd = Number(trade.feesUsd || 0);
+          const notes = [
+            `Fidelity Transaction ${transactionNumber}`,
+            trade.referenceNumber ? `Ref ${trade.referenceNumber}` : null,
+            trade.cusip ? `CUSIP ${trade.cusip}` : null,
+            trade.settlementDate ? `Settlement ${trade.settlementDate}` : null,
+            `Net USD ${Number(trade.netProceedsUsd).toFixed(2)}`,
+            trade.participantId ? `Participant ${trade.participantId}` : null,
+            trade.customerNumber ? `Customer ${trade.customerNumber}` : null,
+            trade.fileName ? `Source ${trade.fileName}` : null,
+          ].filter(Boolean).join(' | ');
+
+          insertTransaction.run(
+            investmentId,
+            portfolioId,
+            trade.type,
+            trade.tradeDate,
+            Number(trade.quantity),
+            Number(trade.rate),
+            grossProceedsUsd * fxRate,
+            feesUsd * fxRate,
+            notes,
+            fxRate,
+            grossProceedsUsd,
+          );
+          transactionsCreated += 1;
+          dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: trade.tradeDate });
+        }
+      });
+
+      importAll();
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'fidelity-trade-confirmation-import', `ticker:${ticker}`);
+      }
+
+      res.json({ investmentId, investmentCreated, transactionsCreated, transactionsSkipped });
+    } catch (e) {
+      logAppError('[Stocks] Fidelity trade confirmation import failed', {
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
+      res.status(500).json({ error: 'Failed to import Fidelity trade confirmations: ' + e.message });
     }
   });
 
