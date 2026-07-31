@@ -41,6 +41,22 @@ export const logout = () => fetchJSON('/auth/logout', { method: 'POST' });
 
 // Dashboard
 export const getDashboardVersion = () => fetchJSON('/dashboard/version', { cache: 'no-store' });
+const appendDashboardScopeParams = (params, { portfolioIds, hideSold, includeFullySoldInReturns } = {}) => {
+  if (Array.isArray(portfolioIds) && portfolioIds.length > 0) {
+    params.set('portfolio_ids', portfolioIds.map((id) => String(id)).join(','));
+  }
+  if (hideSold) params.set('hide_sold', 'true');
+  if (includeFullySoldInReturns) params.set('include_sold_in_returns', 'true');
+  return params;
+};
+export const getDashboardOverview = (options = {}) => {
+  const params = appendDashboardScopeParams(new URLSearchParams(), options);
+  return fetchJSON(`/dashboard/overview?${params}`);
+};
+export const getDashboardXirrSummary = (options = {}) => {
+  const params = appendDashboardScopeParams(new URLSearchParams(), options);
+  return fetchJSON(`/dashboard/xirr-summary?${params}`);
+};
 export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
-import { getDashboardSummary, getDashboardVersion, getDailyValuesHealthStatus, getDashboardBatch, getAssetIntervalMetrics } from '../services/api';
+import { getDashboardOverview, getDashboardSummary, getDashboardVersion, getDashboardXirrSummary, getDailyValuesHealthStatus, getAssetIntervalMetrics } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_SLUG, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
@@ -463,6 +463,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [cacheState, setCacheState] = useState('loading');
   const [refreshing, setRefreshing] = useState(false);
+  const [xirrLoading, setXirrLoading] = useState(false);
   const [error, setError] = useState(null);
   const [sortConfigs, setSortConfigs] = useState({});
   const [dailyHealth, setDailyHealth] = useState(null);
@@ -506,12 +507,13 @@ export default function Dashboard() {
     loadData();
   }, [selectedId, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading, selectedInterval, customFromDate, customToDate]);
 
+  // Defer health/compliance until after dashboard cards have rendered to avoid
+  // blocking the overview response on the single-threaded Node.js event loop.
   useEffect(() => {
-    if (settingsLoading) return undefined;
+    if (settingsLoading || !data) return undefined;
     const runId = loadRunRef.current;
     const timeoutId = setTimeout(() => {
       if (runId === loadRunRef.current) {
-        // Parallel load: health + compliance together
         Promise.all([
           (async () => {
             try {
@@ -550,7 +552,7 @@ export default function Dashboard() {
       }
     }, 100);
     return () => clearTimeout(timeoutId);
-  }, [selectedId, selectedIdsKey, settingsLoading]);
+  }, [selectedId, selectedIdsKey, settingsLoading, data]);
 
   useEffect(() => {
     const hash = window.location.hash;
@@ -611,7 +613,9 @@ export default function Dashboard() {
       selectedInterval,
       customFromDate,
       customToDate,
-      extra: isPartialMulti ? `combine:${selectedIdsKey}` : undefined,
+      extra: selectedInterval === '1D'
+        ? (isPartialMulti ? `overview:combine:${selectedIdsKey}` : 'overview')
+        : (isPartialMulti ? `combine:${selectedIdsKey}` : undefined),
     });
     const cachedEntry = getCachedDashboardSummary(cacheKey);
 
@@ -644,6 +648,7 @@ export default function Dashboard() {
         const versionState = resolveDashboardCacheState(cachedEntry.dataVersion, serverVersion);
         if (versionState === 'offline') {
           setData(cachedEntry.data);
+          setXirrLoading(false);
           setCacheState('offline');
           setLoading(false);
           setShowDetailTables(true);
@@ -652,6 +657,7 @@ export default function Dashboard() {
         }
         if (versionState === 'valid') {
           setData(cachedEntry.data);
+          setXirrLoading(false);
           setCacheState('valid');
           setLoading(false);
           setShowDetailTables(true);
@@ -666,7 +672,46 @@ export default function Dashboard() {
         setLoading(true);
       }
 
-      if (isPartialMulti) {
+      if (selectedInterval === '1D') {
+        setShowDetailTables(false);
+        setXirrLoading(true);
+        const scopeOptions = {
+          portfolioIds: isAllScope ? undefined : selectedIds,
+          hideSold,
+          includeFullySoldInReturns,
+        };
+        const overview = await getDashboardOverview(scopeOptions);
+        if (runId !== loadRunRef.current) return;
+        setData(overview);
+        setCacheState('fresh');
+        setLoading(false);
+        setShowDetailTables(true);
+
+        await new Promise((resolve) => {
+          if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+            window.requestIdleCallback(() => resolve(), { timeout: 500 });
+          } else {
+            setTimeout(resolve, 50);
+          }
+        });
+        if (runId !== loadRunRef.current) return;
+
+        try {
+          const enrichment = await getDashboardXirrSummary(scopeOptions);
+          if (runId !== loadRunRef.current) return;
+          if (String(enrichment?.dataVersion) === String(overview?.dataVersion)) {
+            setData((prev) => {
+              const merged = mergeXirrEnrichment(prev, enrichment);
+              setCachedDashboardSummary(cacheKey, merged, merged?.dataVersion);
+              return merged;
+            });
+          }
+        } catch (_e) {
+          // The overview remains authoritative; XIRR can retry on the next load.
+        } finally {
+          if (runId === loadRunRef.current) setXirrLoading(false);
+        }
+      } else if (isPartialMulti) {
         // No server summary endpoint for a partial subset: fetch each selected portfolio and
         // combine client-side. Additive amounts and the 1D/YD % are exact from the combine.
         setShowDetailTables(false);
@@ -718,46 +763,6 @@ export default function Dashboard() {
         setCacheState('fresh');
         setLoading(false);
         setShowDetailTables(true);
-      } else if (showBlockingLoader && !cachedEntry) {
-        setShowDetailTables(false);
-        const fastResult = await getDashboardSummary(targetPortfolioId, {
-          hideSold,
-          includeFullySoldInReturns,
-          xirrMode: 'portfolio_only',
-          interval: selectedInterval,
-          customFromDate: customFromDate || undefined,
-          customToDate: customToDate || undefined,
-        });
-        if (runId !== loadRunRef.current) return;
-        setData(fastResult);
-        setCachedDashboardSummary(cacheKey, fastResult, fastResult?.dataVersion);
-        setCacheState('fresh');
-        setLoading(false);
-
-        await new Promise((resolve) => {
-          if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
-            window.requestIdleCallback(() => resolve(), { timeout: 2000 });
-          } else {
-            setTimeout(resolve, 350);
-          }
-        });
-        if (runId !== loadRunRef.current) return;
-        setShowDetailTables(true);
-
-        const fullResult = await getDashboardSummary(targetPortfolioId, {
-          hideSold,
-          includeFullySoldInReturns,
-          xirrMode: 'full',
-          interval: selectedInterval,
-          customFromDate: customFromDate || undefined,
-          customToDate: customToDate || undefined,
-        });
-        if (runId !== loadRunRef.current) return;
-        setData((prev) => {
-          const merged = mergeXirrEnrichment(prev, fullResult);
-          setCachedDashboardSummary(cacheKey, merged, fullResult?.dataVersion ?? merged?.dataVersion);
-          return merged;
-        });
       } else {
         const result = await getDashboardSummary(targetPortfolioId, {
           hideSold,
@@ -809,7 +814,7 @@ export default function Dashboard() {
   if (error) return <ErrorMessage message={error} />;
   if (!data) return null;
 
-  const { portfolio, investments, byType, portfolioCount, totalExpenses, rollupWarning, stalePricesWarning } = data;
+  const { portfolio, investments = [], investmentCount = investments.length, byType, portfolioCount, totalExpenses, rollupWarning, stalePricesWarning } = data;
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
   const totalRealizedGain = Number(portfolio.total_realized_proceeds) || 0;
@@ -1226,7 +1231,11 @@ export default function Dashboard() {
               <div className={`small ${profitColor(netReturnPct)}`}>
                 <span>Abs: {formatPct(netReturnPct)}</span>
                 <span className="mx-2 text-muted">|</span>
-                <span>XIRR: {portfolio.xirr_pct == null ? 'N/A' : formatPct(portfolio.xirr_pct)}</span>
+                <span>
+                  XIRR: {xirrLoading ? (
+                    <span className="dashboard-inline-shimmer" aria-label="Loading XIRR" />
+                  ) : portfolio.xirr_pct == null ? 'N/A' : formatPct(portfolio.xirr_pct)}
+                </span>
               </div>
             </Card.Body>
           </Card>
@@ -1276,7 +1285,9 @@ export default function Dashboard() {
                     </span>
                     <span className="asset-metric-separator">·</span>
                     <span className={`asset-metric-rate ${lifetimeClass}`}>
-                      {info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}
+                      {xirrLoading ? (
+                        <span className="dashboard-inline-shimmer" aria-label="Loading XIRR" />
+                      ) : info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}
                     </span>
                   </div>
                   <div className="asset-metric-line">
@@ -1355,7 +1366,7 @@ export default function Dashboard() {
       />
 
       {/* Empty state */}
-      {investments.length === 0 && (
+      {investmentCount === 0 && (
         <Card className="shadow-sm text-center p-5">
           <Card.Body>
             <PiggyBank size={64} className="text-muted mx-auto mb-3" style={{ opacity: 0.3 }} />

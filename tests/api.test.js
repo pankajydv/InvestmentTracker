@@ -1005,6 +1005,11 @@ describe('Transaction metadata endpoints', () => {
 // ======================================================================
 
 describe('Dashboard', () => {
+  const assertNear = (actual, expected, label) => {
+    const delta = Math.abs(Number(actual || 0) - Number(expected || 0));
+    assert.ok(delta < 1e-6, `${label}: expected ${expected}, received ${actual}`);
+  };
+
   it('GET /dashboard/summary returns valid structure', async () => {
     const { status, body } = await api('GET', '/dashboard/summary?portfolio_id=1');
     assert.equal(status, 200);
@@ -1019,6 +1024,38 @@ describe('Dashboard', () => {
     const { status, body } = await api('GET', '/dashboard/summary');
     assert.equal(status, 200);
     assert.ok('portfolio' in body);
+  });
+
+  it('GET /dashboard/overview matches visible 1D summary values', async () => {
+    for (const query of ['', 'portfolio_id=1', 'portfolio_id=1&hide_sold=true&include_sold_in_returns=true']) {
+      const separator = query ? '&' : '';
+      const summary = await api('GET', `/dashboard/summary?${query}${separator}interval=1D&xirr_mode=portfolio_only`);
+      const overviewQuery = query.replace('portfolio_id=', 'portfolio_ids=');
+      const overview = await api('GET', `/dashboard/overview?${overviewQuery}`);
+      assert.equal(overview.status, 200);
+
+      for (const field of ['total_value', 'total_invested', 'total_profit_loss', 'total_realized_proceeds', 'day_change', 'day_change_pct']) {
+        assertNear(overview.body.portfolio[field], summary.body.portfolio[field], `portfolio.${field} (${query || 'all'})`);
+      }
+      assert.equal(overview.body.investmentCount, summary.body.investments.length);
+      assert.deepEqual(Object.keys(overview.body.byType).sort(), Object.keys(summary.body.byType).sort());
+      for (const type of Object.keys(summary.body.byType)) {
+        for (const field of ['totalValue', 'totalInvested', 'totalProfitLoss', 'totalRealizedGain', 'dayChange', 'intervalChangePct']) {
+          assertNear(overview.body.byType[type][field], summary.body.byType[type][field], `${type}.${field} (${query || 'all'})`);
+        }
+      }
+    }
+  });
+
+  it('GET /dashboard/xirr-summary matches full summary lifetime XIRRs', async () => {
+    const summary = await api('GET', '/dashboard/summary?portfolio_id=1&interval=1D&xirr_mode=full');
+    const enrichment = await api('GET', '/dashboard/xirr-summary?portfolio_ids=1');
+    assert.equal(enrichment.status, 200);
+    assert.equal(String(enrichment.body.dataVersion), String(summary.body.dataVersion));
+    assertNear(enrichment.body.portfolio.xirr_pct, summary.body.portfolio.xirr_pct, 'portfolio.xirr_pct');
+    for (const type of Object.keys(summary.body.byType)) {
+      assertNear(enrichment.body.byType[type]?.xirrPct, summary.body.byType[type]?.xirrPct, `${type}.xirrPct`);
+    }
   });
 
   it('GET /dashboard/allocation returns asset allocation', async () => {

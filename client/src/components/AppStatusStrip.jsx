@@ -42,24 +42,24 @@ export default function AppStatusStrip() {
 
   useEffect(() => {
     let active = true;
+    getDashboardVersion().catch(() => null).then((version) => {
+      if (active) setLastUpdate(version?.lastUpdate || null);
+    });
+    return () => { active = false; };
+  }, [pathname, selectedId, selectedIdsKey]);
 
-    async function loadStatus() {
-      const [version, healthResults] = await Promise.all([
-        getDashboardVersion().catch(() => null),
-        selectedIds.length > 1
-          ? Promise.all(selectedIds.map((id) => getDailyValuesHealthStatus(id).catch(() => null)))
-          : getDailyValuesHealthStatus(selectedId).then((result) => [result]).catch(() => []),
-      ]);
-
-      if (!active) return;
-      setLastUpdate(version?.lastUpdate || null);
-      setDailyHealth(combineIndicatorHealth(healthResults));
-    }
-
-    loadStatus();
-    return () => {
-      active = false;
-    };
+  // Defer the heavy health check so it doesn't block the dashboard overview on the event loop.
+  useEffect(() => {
+    let active = true;
+    const timeoutId = setTimeout(async () => {
+      try {
+        const healthResults = selectedIds.length > 1
+          ? await Promise.all(selectedIds.map((id) => getDailyValuesHealthStatus(id).catch(() => null)))
+          : await getDailyValuesHealthStatus(selectedId).then((r) => [r]).catch(() => []);
+        if (active) setDailyHealth(combineIndicatorHealth(healthResults));
+      } catch { /* fail open */ }
+    }, 2000);
+    return () => { active = false; clearTimeout(timeoutId); };
   }, [pathname, selectedId, selectedIdsKey]);
 
   const headerPortfolios = selectedPortfolios?.length ? selectedPortfolios : (portfolios || []);
