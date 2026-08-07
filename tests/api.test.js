@@ -1164,6 +1164,8 @@ describe('Contract Notes — Groww PDF Parser', () => {
       PAN AAAAA0000A Trade Date 04-08-2026
       INE000A01001 SAMPLE LIMITED 100 10.00 0.20 10.20 -1020.00 -100 11.00 0.20 10.80 1080.00 0 60.00
       INE000B01002 DELIVERY LIMITED 0 0.00 0.00 0.00 0.00 -5 20.00 1.00 19.00 95.00 -5 95.00
+      INE000C01003 BUY LIMITED 5 10.00 0.10 10.10 -50.50 0 0.00 0.00 0.00 0.00 5 -50.50
+      INE000D01004 WRAPPED BUY LIMITED 7 20.00 0.10 20.10 -140.70 0 0.00 0.00 0.00 0.00 7 - 140.70
       Taxable Value of Supply (Brokerage) -45.00
       Exchange Transaction Charges -4.00
       IGST (18% on charges) -8.00
@@ -1178,9 +1180,11 @@ describe('Contract Notes — Groww PDF Parser', () => {
     `;
 
     const note = parseGrowwPDF(text, 'contract.pdf');
-    assert.equal(note.trades.length, 1);
+  assert.equal(note.trades.length, 3);
     assert.equal(note.trades[0].type, 'SELL');
     assert.equal(note.trades[0].quantity, 5);
+  assert.equal(note.trades[1].security, 'BUY LIMITED');
+  assert.equal(note.trades[2].security, 'WRAPPED BUY LIMITED');
     assert.equal(note.intradayTrades.length, 1);
     assert.equal(note.intradayTrades[0].quantity, 100);
     assert.equal(note.intradayTrades[0].grossProfit, 100);

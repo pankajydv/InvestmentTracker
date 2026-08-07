@@ -347,7 +347,7 @@ function parseGrowwPDF(text, fileName) {
 
   // Parse the Groww security summary. It contains gross buy/sell quantities,
   // WAPs and exact brokerage per share before the net settlement columns.
-  const summaryRowRegex = /(IN[EF][A-Z0-9]{9})\s+(.+?)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(-?[\d,.]+)\s+(-?\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d,.]+)\s+(-?\d+)\s+([\d,.]+)/g;
+  const summaryRowRegex = /(IN[EF][A-Z0-9]{9})\s+(.+?)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(-?[\d,.]+)\s+(-?\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d,.]+)\s+(-?\d+)\s+(-?\s*[\d,.]+)/g;
   const summaryRows = [];
   let m;
   while ((m = summaryRowRegex.exec(fullText)) !== null) {
@@ -361,7 +361,7 @@ function parseGrowwPDF(text, fileName) {
       sellRate: parseFloat(m[9]) || 0,
       sellBrokeragePerShare: parseFloat(m[10]) || 0,
       netQuantity: parseInt(m[13].replace(/,/g, '')) || 0,
-      netAmountAfterBrokerage: Math.abs(parseFloat(m[14].replace(/,/g, ''))) || 0,
+      netAmountAfterBrokerage: Math.abs(parseFloat(m[14].replace(/[\s,]/g, ''))) || 0,
     });
   }
 
