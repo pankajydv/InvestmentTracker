@@ -6,14 +6,22 @@ import { formatINRExact as formatINR } from '../utils/formatters';
 export default function TaxComputation({ fy, portfolioId, refreshNonce = 0, onRecomputed }) {
   const [computation, setComputation] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [unavailableMessage, setUnavailableMessage] = useState('');
 
   const loadComputation = useCallback(async () => {
     setLoading(true);
+    setUnavailableMessage('');
     try {
       const data = await getTaxComputation(fy, portfolioId || undefined);
+      if (data && data.supported === false) {
+        setComputation(null);
+        setUnavailableMessage(data.message || `Tax computation is not available for FY ${fy} yet.`);
+        return;
+      }
       setComputation(data);
     } catch (err) {
       setComputation(null);
+      setUnavailableMessage('Tax computation is temporarily unavailable. Schedule reports are still available.');
     } finally {
       setLoading(false);
     }
@@ -31,6 +39,13 @@ export default function TaxComputation({ fy, portfolioId, refreshNonce = 0, onRe
           <div className="small text-muted mb-2">
             <Spinner animation="border" size="sm" className="me-2" />Computing tax...
           </div>
+        )}
+        {!loading && unavailableMessage && (
+          <Card className="border-warning mb-2">
+            <Card.Body className="py-2 small text-muted">
+              {unavailableMessage} You can still use Schedule Salary/CG/OS/FA sections as a partial report.
+            </Card.Body>
+          </Card>
         )}
         {computation && <TaxComputationView data={computation} fy={fy} />}
       </Accordion.Body>
@@ -72,6 +87,8 @@ function TaxComputationView({ data, fy }) {
           <tr><td></td><td>Less: Standard Deduction</td><td className="text-end text-success">{formatImpact(-h.salary.standard_deduction)}</td></tr>
           <tr className="fw-semibold"><td></td><td>Net Salary</td><td className="text-end">{formatINR(h.salary.net)}</td></tr>
           <tr><td></td><td>Other Sources (Dividends + Interest){h.other_sources.transfer_expense > 0 ? ` − Remittance ₹${h.other_sources.transfer_expense}` : ''}</td><td className="text-end">{formatINR(h.other_sources.total)}</td></tr>
+          {h.speculative_business?.taxable_profit > 0 && <tr><td></td><td>Speculative Business — Equity Intraday</td><td className="text-end">{formatINR(h.speculative_business.taxable_profit)}</td></tr>}
+          {h.speculative_business?.loss_carry_forward > 0 && <tr><td></td><td>Speculative Loss Carry Forward (not set off here)</td><td className="text-end text-success">{formatImpact(-h.speculative_business.loss_carry_forward)}</td></tr>}
           {h.capital_gains.stcg_slab !== 0 && <tr><td></td><td>STCG — Foreign (slab rate)</td><td className="text-end">{formatINR(h.capital_gains.stcg_slab)}</td></tr>}
           {d.nps_employer_80ccd2 > 0 && (
             <tr>

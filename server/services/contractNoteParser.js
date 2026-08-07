@@ -299,9 +299,26 @@ function parseSharekhanHTM(text, fileName) {
   };
 }
 
+function allocateCharge(total, targets, weightFor, field) {
+  const roundedTotal = Math.round((Number(total) || 0) * 100) / 100;
+  if (roundedTotal <= 0 || targets.length === 0) return;
+
+  const weights = targets.map((target) => Math.max(0, Number(weightFor(target)) || 0));
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  let allocated = 0;
+  targets.forEach((target, index) => {
+    const amount = index === targets.length - 1
+      ? roundedTotal - allocated
+      : Math.round((totalWeight > 0 ? roundedTotal * weights[index] / totalWeight : roundedTotal / targets.length) * 100) / 100;
+    target[field] = Math.round(((target[field] || 0) + amount) * 100) / 100;
+    allocated = Math.round((allocated + amount) * 100) / 100;
+  });
+}
+
 /**
  * Parse a Groww PDF contract note.
- * Extracts trades from "Total ISIN qty total" lines and charges from summary section.
+ * The summary table contains both sides of same-day trades, while Annexure
+ * "Total ISIN" rows contain only the net settlement quantity.
  */
 function parseGrowwPDF(text, fileName) {
   // Extract PAN
@@ -325,56 +342,117 @@ function parseGrowwPDF(text, fileName) {
   }
   if (!tradeDate) return null;
 
-  // Join all text to handle line wraps (order numbers can span multiple lines)
+  // Join all text to handle line wraps in security names and table headers.
   const fullText = text.replace(/\r?\n/g, ' ').replace(/\s+/g, ' ');
 
-  // Build ISIN → security name map from trade lines
-  // Pattern: OrderTime TradeNo TradeTime SecurityName Exchange B/S
-  const tradeLineRegex = /\d{2}:\d{2}:\d{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+(.*?)\s+(BSE|NSE)\s+([BS])\s/g;
-  const secEntries = [];
+  // Parse the Groww security summary. It contains gross buy/sell quantities,
+  // WAPs and exact brokerage per share before the net settlement columns.
+  const summaryRowRegex = /(IN[EF][A-Z0-9]{9})\s+(.+?)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(-?[\d,.]+)\s+(-?\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d,.]+)\s+(-?\d+)\s+([\d,.]+)/g;
+  const summaryRows = [];
   let m;
-  while ((m = tradeLineRegex.exec(fullText)) !== null) {
-    secEntries.push({ name: m[1].trim(), pos: m.index });
+  while ((m = summaryRowRegex.exec(fullText)) !== null) {
+    summaryRows.push({
+      isin: m[1],
+      security: m[2].trim(),
+      buyQuantity: Math.abs(parseInt(m[3].replace(/,/g, '')) || 0),
+      buyRate: parseFloat(m[4]) || 0,
+      buyBrokeragePerShare: parseFloat(m[5]) || 0,
+      sellQuantity: Math.abs(parseInt(m[8].replace(/,/g, '')) || 0),
+      sellRate: parseFloat(m[9]) || 0,
+      sellBrokeragePerShare: parseFloat(m[10]) || 0,
+      netQuantity: parseInt(m[13].replace(/,/g, '')) || 0,
+      netAmountAfterBrokerage: Math.abs(parseFloat(m[14].replace(/,/g, ''))) || 0,
+    });
   }
 
-  // Also try 2026+ summary table: "ISIN SECURITY_NAME qty ..."
-  const isinNames = {};
-  const summaryRegex = /(IN[EF]\w{9,10})\s+([A-Za-z][A-Za-z\s\-&.()]+?)\s+\d+\s+[\d.]+/g;
-  while ((m = summaryRegex.exec(fullText)) !== null) {
-    const name = m[2].trim();
-    if (name.length > 1 && !/^(Buy|Sell|Net|Total|ISIN|Security)$/i.test(name)) {
-      isinNames[m[1]] = name;
-    }
-  }
-
-  // Parse "Total ISIN qty netTotal" lines
   const trades = [];
-  const totalRegex = /Total\s+(IN[EF]\w{9,10})\s+([\-\d,]+)\s+([\-\d,.]+)/g;
-  while ((m = totalRegex.exec(fullText)) !== null) {
-    const isin = m[1];
-    const qty = parseInt(m[2].replace(/,/g, ''));
-    const netTotal = parseFloat(m[3].replace(/,/g, ''));
+  const intradayTrades = [];
+  const chargeTargets = [];
 
-    // Find security name: last trade line name before this Total, or from summary table
-    let secName = '';
-    for (const entry of secEntries) {
-      if (entry.pos < m.index) secName = entry.name;
+  for (const row of summaryRows) {
+    const matchedQuantity = Math.min(row.buyQuantity, row.sellQuantity);
+    if (matchedQuantity > 0) {
+      const grossBuyValue = matchedQuantity * row.buyRate;
+      const grossSellValue = matchedQuantity * row.sellRate;
+      const intraday = {
+        tradeDate,
+        security: row.security,
+        isin: row.isin,
+        quantity: matchedQuantity,
+        buyRate: row.buyRate,
+        sellRate: row.sellRate,
+        buyValue: parseFloat(grossBuyValue.toFixed(2)),
+        sellValue: parseFloat(grossSellValue.toFixed(2)),
+        grossProfit: parseFloat((grossSellValue - grossBuyValue).toFixed(2)),
+        brokerage: 0,
+        stt: 0,
+        fees: 0,
+      };
+      intradayTrades.push(intraday);
+      chargeTargets.push({
+        kind: 'intraday',
+        record: intraday,
+        buyValue: intraday.buyValue,
+        sellValue: intraday.sellValue,
+        brokerageWeight: matchedQuantity * (row.buyBrokeragePerShare + row.sellBrokeragePerShare),
+        sttWeight: intraday.sellValue * (/gold|silver/i.test(row.security) ? 0.00001 : 0.00025),
+      });
     }
-    if (!secName) secName = isinNames[isin] || isin;
-    if (isinNames[isin] && isinNames[isin].length > secName.length) {
-      secName = isinNames[isin]; // prefer longer (more complete) name from summary
-    }
 
-    const type = qty > 0 ? 'BUY' : 'SELL';
-    const absQty = Math.abs(qty);
-    const absTotal = Math.abs(netTotal);
-    const rate = absQty > 0 ? parseFloat((absTotal / absQty).toFixed(4)) : 0;
-
-    if (absQty > 0 && rate > 0) {
-      trades.push({
-        tradeDate, security: secName, isin, type,
-        quantity: absQty, rate, total: absTotal,
+    const residualBuyQuantity = Math.max(0, row.buyQuantity - matchedQuantity);
+    const residualSellQuantity = Math.max(0, row.sellQuantity - matchedQuantity);
+    const quantity = residualBuyQuantity || residualSellQuantity;
+    if (quantity > 0) {
+      const type = residualBuyQuantity > 0 ? 'BUY' : 'SELL';
+      const rate = type === 'BUY' ? row.buyRate : row.sellRate;
+      const total = parseFloat((quantity * rate).toFixed(2));
+      const trade = {
+        tradeDate, security: row.security, isin: row.isin, type,
+        quantity, rate, total,
         brokerage: 0, stt: 0,
+      };
+      trades.push(trade);
+      chargeTargets.push({
+        kind: 'delivery',
+        record: trade,
+        buyValue: type === 'BUY' ? total : 0,
+        sellValue: type === 'SELL' ? total : 0,
+        brokerageWeight: quantity * (type === 'BUY' ? row.buyBrokeragePerShare : row.sellBrokeragePerShare),
+        sttWeight: type === 'SELL' ? total * (/gold|silver/i.test(row.security) ? 0.00001 : 0.001) : 0,
+      });
+    }
+  }
+
+  // Legacy fallback: older Groww PDFs may omit the gross-side summary layout.
+  // Preserve the previous behavior for their non-zero settlement totals.
+  if (summaryRows.length === 0) {
+    const securityEntries = [];
+    const tradeLineRegex = /\d{2}:\d{2}:\d{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+(.*?)\s+(BSE|NSE)\s+[BS]\s/g;
+    while ((m = tradeLineRegex.exec(fullText)) !== null) {
+      securityEntries.push({ name: m[1].trim(), pos: m.index });
+    }
+    const legacyTotalRegex = /Total\s+(IN[EF][A-Z0-9]{9})\s+([\-\d,]+)\s+([\-\d,.]+)/g;
+    while ((m = legacyTotalRegex.exec(fullText)) !== null) {
+      const quantity = parseInt(m[2].replace(/,/g, '')) || 0;
+      if (quantity === 0) continue;
+      const total = Math.abs(parseFloat(m[3].replace(/,/g, ''))) || 0;
+      const rate = total / Math.abs(quantity);
+      let security = m[1];
+      for (const entry of securityEntries) {
+        if (entry.pos < m.index) security = entry.name;
+      }
+      const trade = {
+        tradeDate, security, isin: m[1], type: quantity > 0 ? 'BUY' : 'SELL',
+        quantity: Math.abs(quantity), rate: parseFloat(rate.toFixed(4)), total,
+        brokerage: 0, stt: 0,
+      };
+      trades.push(trade);
+      chargeTargets.push({
+        kind: 'delivery', record: trade,
+        buyValue: quantity > 0 ? total : 0,
+        sellValue: quantity < 0 ? total : 0,
+        brokerageWeight: total,
+        sttWeight: quantity < 0 ? total * (/gold|silver/i.test(security) ? 0.00001 : 0.001) : 0,
       });
     }
   }
@@ -401,49 +479,48 @@ function parseGrowwPDF(text, fileName) {
   // Extract DP charges from the separate DP section (only present when sells exist)
   // Formats: "DP Charges 67.50 12.15 79.65" or "CDSL DP Charges ... / Groww DP Charges ..."
   // The section ends with a "Total <amount>" line before "Amount Chargeable"
-  const dpTotalMatch = text.match(/Total\s+([\d.]+)\s*\nAmount\s+Chargeable/i);
+  const dpTotalMatch = text.match(/Total\s+([\d.]+)\s*\r?\n\s*Amount\s+Chargeable/i);
   if (dpTotalMatch) {
     dpCharges = parseFloat(dpTotalMatch[1]) || 0;
   }
 
   const tradingCharges = brokerage + stt + gst + stampDuty + exchangeCharges + sebiCharges + ipftCharges;
-  const totalCharges = tradingCharges + dpCharges;
+  const totalCharges = parseFloat((tradingCharges + dpCharges).toFixed(2));
 
-  // Pro-rate trading charges across ALL trades by trade value,
-  // and DP charges across SELL trades only (DP is a depository debit fee on sells)
-  if (trades.length > 0) {
-    const totalTradeValue = trades.reduce((s, t) => s + t.total, 0);
-    const sellTrades = trades.filter(t => t.type === 'SELL');
-    const totalSellValue = sellTrades.reduce((s, t) => s + t.total, 0);
+  allocateCharge(brokerage, chargeTargets, (target) => target.brokerageWeight || target.buyValue + target.sellValue, 'brokerage');
+  allocateCharge(exchangeCharges, chargeTargets, (target) => target.buyValue + target.sellValue, 'exchangeCharges');
+  allocateCharge(sebiCharges, chargeTargets, (target) => target.buyValue + target.sellValue, 'sebiCharges');
+  allocateCharge(ipftCharges, chargeTargets, (target) => target.buyValue + target.sellValue, 'ipftCharges');
+  allocateCharge(gst, chargeTargets, (target) => target.brokerage + target.exchangeCharges + target.sebiCharges + target.ipftCharges, 'gst');
+  allocateCharge(stampDuty, chargeTargets.filter((target) => target.buyValue > 0), (target) => target.buyValue, 'stampDuty');
+  allocateCharge(stt, chargeTargets.filter((target) => target.sellValue > 0), (target) => target.sttWeight, 'stt');
+  allocateCharge(dpCharges, chargeTargets.filter((target) => target.kind === 'delivery' && target.sellValue > 0), () => 1, 'dpCharges');
 
-    for (const trade of trades) {
-      let charge = 0;
-      // Trading charges pro-rated across all trades
-      if (tradingCharges > 0) {
-        charge += totalTradeValue > 0
-          ? (trade.total / totalTradeValue) * tradingCharges
-          : tradingCharges / trades.length;
-      }
-      // DP charges pro-rated across sell trades only
-      if (dpCharges > 0 && trade.type === 'SELL') {
-        charge += totalSellValue > 0
-          ? (trade.total / totalSellValue) * dpCharges
-          : dpCharges / sellTrades.length;
-      }
-      trade.brokerage = parseFloat(charge.toFixed(2));
+  for (const target of chargeTargets) {
+    const breakdown = {
+      brokerage: target.brokerage || 0,
+      stt: target.stt || 0,
+      gst: target.gst || 0,
+      stampDuty: target.stampDuty || 0,
+      exchangeCharges: target.exchangeCharges || 0,
+      sebiCharges: target.sebiCharges || 0,
+      ipftCharges: target.ipftCharges || 0,
+      dpCharges: target.dpCharges || 0,
+    };
+    const fees = parseFloat(Object.values(breakdown).reduce((sum, value) => sum + value, 0).toFixed(2));
+    target.record.chargeBreakdown = breakdown;
+    target.record.stt = breakdown.stt;
+    if (target.kind === 'delivery') {
+      target.record.brokerage = fees;
+    } else {
+      target.record.fees = fees;
+      target.record.netProfit = parseFloat((target.record.grossProfit - fees).toFixed(2));
     }
-  }
-
-  const totalTradeValueForStt = trades.reduce((s, t) => s + t.total, 0);
-  for (const trade of trades) {
-    trade.stt = (stt > 0 && totalTradeValueForStt > 0)
-      ? parseFloat(((trade.total / totalTradeValueForStt) * stt).toFixed(2))
-      : 0;
   }
 
   return {
     broker: 'Groww', clientCode, panNumber, tradeDate,
-    trades,
+    trades, intradayTrades,
     charges: {
       total: totalCharges, brokerage, stt, gst,
       stampDuty, exchangeCharges, sebiCharges, ipftCharges, dpCharges,
@@ -508,5 +585,5 @@ async function parseContractNotes(buffer, fileName, password) {
   return results;
 }
 
-module.exports = { parseContractNotes };
+module.exports = { parseContractNotes, parseGrowwPDF };
 

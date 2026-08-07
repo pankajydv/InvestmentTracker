@@ -271,6 +271,7 @@ function calculateInvestmentIntervalXirr(db, {
   fromDate,
   toDate,
   isPresetOneDay,
+  isFullyExited = false,
 }) {
   const isPortfolioScoped = Number.isInteger(portfolioId) && portfolioId > 0;
 
@@ -410,6 +411,8 @@ function calculateInvestmentIntervalXirr(db, {
 
   let intervalChange = closing - opening;
   let intervalChangePct = opening > 0 ? (intervalChange / opening) * 100 : 0;
+  let asOfDate = chosenToDate;
+  let usesFallback = false;
 
   if (isPresetOneDay) {
     const rowsDesc = getDayChangeRowsForInvestment(db, investmentId, portfolioId);
@@ -418,6 +421,8 @@ function calculateInvestmentIntervalXirr(db, {
     intervalChangePct = Number(resolved.latestCurrentValue || 0) > 0
       ? (intervalChange / Number(resolved.latestCurrentValue || 0)) * 100
       : 0;
+    asOfDate = resolved.asOfDate || chosenToDate;
+    usesFallback = !!resolved.usedFallback;
   } else {
     const summedIntervalChange = isPortfolioScoped
       ? Number(db.prepare(`
@@ -484,12 +489,19 @@ function calculateInvestmentIntervalXirr(db, {
   }
 
   const xirrRate = calculateXirr(flows);
+  if (isFullyExited) {
+    intervalChange = 0;
+    intervalChangePct = 0;
+    usesFallback = false;
+  }
   return {
     xirr_pct: xirrRate == null ? null : xirrRate * 100,
     interval_change: intervalChange,
     interval_change_pct: intervalChangePct,
     opening_value: opening,
     closing_value: closing,
+    as_of_date: asOfDate,
+    uses_fallback: usesFallback,
     confidence: xirrRate == null ? 'partial' : 'full',
     error: null,
     requested_from_date: fromDate,
@@ -747,8 +759,16 @@ module.exports = function (db) {
       }
 
       const today = todayIso();
-      const toDate = parseDateOnly(req.query.to) || today;
-      const fromDate = parseDateOnly(req.query.from) || getTrailingYearStartIso(toDate);
+      // For exited investments, default to the latest daily_values date so the
+      // trailing-year window doesn't land entirely after the last data point.
+      const latestDvDate = db.prepare(
+        'SELECT MAX(date) AS d FROM daily_values WHERE investment_id = ?'
+      ).get(investmentId)?.d || today;
+      const toDate = parseDateOnly(req.query.to) || (latestDvDate < today ? latestDvDate : today);
+      const earliestTxnDate = db.prepare(
+        'SELECT MIN(DATE(transaction_date)) AS d FROM transactions WHERE investment_id = ?'
+      ).get(investmentId)?.d || null;
+      const fromDate = parseDateOnly(req.query.from) || earliestTxnDate || getTrailingYearStartIso(toDate);
       if (fromDate > toDate) {
         return res.status(400).json({ error: 'from must be less than or equal to to' });
       }
@@ -1217,8 +1237,8 @@ module.exports = function (db) {
 
     const intervalWindow = resolveIntervalDates(intervalParam, customFromDate, customToDate, latestDateInScope);
     const isPresetOneDay = !intervalWindow.isCustom && intervalParam === '1D';
-    const dayChangeRows = getDayChangeRowsForInvestment(db, inv.id, parsedPortfolioId);
-    const dayChangeResolved = resolveDisplayDayChangeFromRows(dayChangeRows, inv.asset_type);
+    const INTERNAL_BALANCE_TYPES = new Set(['PF', 'PPF', 'SSY']);
+    const isFullyExited = !INTERNAL_BALANCE_TYPES.has(inv.asset_type) && Math.abs(totals.total_units) <= 0.001;
     const intervalXIRR = calculateInvestmentIntervalXirr(db, {
       investmentId: inv.id,
       portfolioId: parsedPortfolioId,
@@ -1226,14 +1246,12 @@ module.exports = function (db) {
       fromDate: intervalWindow.from,
       toDate: intervalWindow.to,
       isPresetOneDay,
+      isFullyExited,
     });
 
     res.json({
       ...inv,
       latestValue,
-      dayChangeDisplay: Number(dayChangeResolved.dayChange || 0),
-      dayChangeAsOfDate: dayChangeResolved.asOfDate || null,
-      dayChangeUsesFallback: !!dayChangeResolved.usedFallback,
       totalUnits: totals.total_units,
       totalInvested: totals.total_invested,
       saleProceeds: totals.sale_proceeds,

@@ -140,14 +140,16 @@ module.exports = function (db) {
         const existingTxns = getExistingTransactionMap(portfolioId);
         const isinCanon = buildIsinCanonicalMap();
 
-        // Find existing investments by ISIN for matching
+        // Find existing investments by ISIN — search globally, not scoped to
+        // the selected portfolio, to avoid creating duplicates when two portfolios
+        // hold different folios of the same fund.
         const existingByIsin = {};
         const invRows = db.prepare(
           `SELECT DISTINCT i.id, i.name, i.isin_code
            FROM investments i
-           JOIN transactions t ON t.investment_id = i.id AND t.portfolio_id = ?
-           WHERE i.asset_type = 'MUTUAL_FUND'`
-        ).all(portfolioId);
+           WHERE i.asset_type = 'MUTUAL_FUND'
+             AND i.isin_code IS NOT NULL AND i.isin_code != ''`
+        ).all();
         for (const inv of invRows) {
           if (inv.isin_code) existingByIsin[inv.isin_code] = inv;
         }

@@ -286,6 +286,72 @@ module.exports = function (db) {
     res.json(names);
   });
 
+  // --- Get stock intraday rows (read-only) ---
+  router.get('/stocks/intraday', (req, res) => {
+    const { from, to, portfolio_id, broker, investment_name, limit, offset } = req.query;
+    let where = `
+      WHERE i.asset_type = 'INDIAN_STOCK'
+    `;
+    const filterParams = [];
+
+    if (portfolio_id) { where += ' AND s.portfolio_id = ?'; filterParams.push(portfolio_id); }
+    if (from) { where += ' AND s.trade_date >= ?'; filterParams.push(from); }
+    if (to) { where += ' AND s.trade_date <= ?'; filterParams.push(to); }
+    if (broker) { where += ' AND s.broker = ?'; filterParams.push(broker); }
+    if (investment_name) { where += ' AND COALESCE(i.display_name, i.name) = ?'; filterParams.push(investment_name); }
+
+    const countQuery = `
+      SELECT COUNT(*) AS total
+      FROM stock_intraday_trades s
+      JOIN investments i ON s.investment_id = i.id
+      ${where}
+    `;
+    const total = db.prepare(countQuery).get(...filterParams).total;
+
+    let dataQuery = `
+      SELECT s.*, COALESCE(i.display_name, i.name) AS investment_name, i.asset_type, i.isin_code,
+        p.name AS portfolio_name, p.color AS portfolio_color
+      FROM stock_intraday_trades s
+      JOIN investments i ON s.investment_id = i.id
+      LEFT JOIN portfolios p ON s.portfolio_id = p.id
+      ${where}
+      ORDER BY s.trade_date DESC, s.id DESC
+    `;
+    const dataParams = [...filterParams];
+
+    const parsedLimit = Number(limit);
+    const parsedOffset = Number(offset);
+    const hasLimit = Number.isFinite(parsedLimit) && parsedLimit > 0;
+    const hasOffset = Number.isFinite(parsedOffset) && parsedOffset >= 0;
+
+    let safeLimit = null;
+    let safeOffset = 0;
+    if (hasLimit) {
+      safeLimit = Math.min(Math.floor(parsedLimit), 200);
+      dataQuery += ' LIMIT ?';
+      dataParams.push(safeLimit);
+      if (hasOffset) {
+        safeOffset = Math.floor(parsedOffset);
+        dataQuery += ' OFFSET ?';
+        dataParams.push(safeOffset);
+      }
+    }
+
+    const items = db.prepare(dataQuery).all(...dataParams).map((row) => {
+      let charge_breakdown = {};
+      if (row.charge_breakdown_json) {
+        try {
+          charge_breakdown = JSON.parse(row.charge_breakdown_json);
+        } catch (_) {
+          charge_breakdown = {};
+        }
+      }
+      return { ...row, charge_breakdown };
+    });
+
+    res.json({ items, total, limit: safeLimit, offset: safeOffset });
+  });
+
   router.get('/', (req, res) => {
     const { from, to, type, portfolio_id, broker, investment_id, investment_name, limit, offset } = req.query;
     let where = ' WHERE 1=1';

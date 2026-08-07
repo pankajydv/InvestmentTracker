@@ -241,8 +241,8 @@ export default function InvestmentDetail() {
       setDailyValuesData(result);
       setDailyValuesFilters((prev) => ({
         ...prev,
-        from: prev.from || result?.window?.requested_from || '',
-        to: prev.to || result?.window?.requested_to || '',
+        from: prev.from || result?.window?.from || '',
+        to: prev.to || result?.window?.to || '',
         page: Number(result?.pagination?.page || prev.page || 1),
         pageSize: Number(result?.pagination?.page_size || prev.pageSize || 366),
       }));
@@ -700,13 +700,12 @@ export default function InvestmentDetail() {
   const xirrRate = calculateXirr(xirrCashflows);
   const xirrPct = xirrRate == null ? null : xirrRate * 100;
   const realizedGain = saleProceeds;
-  const detailDayChange = Number(data.dayChangeDisplay ?? data.latestValue?.day_change ?? 0);
-  const detailDayChangeAsOf = data.dayChangeAsOfDate || null;
-  const detailDayChangeUsesFallback = !!data.dayChangeUsesFallback;
   const intervalMetrics = data.intervalXIRR || {};
   const intervalChange = Number(intervalMetrics.interval_change || 0);
   const intervalChangePct = Number(intervalMetrics.interval_change_pct || 0);
   const intervalXirrPct = intervalMetrics.xirr_pct == null ? null : Number(intervalMetrics.xirr_pct);
+  const intervalAsOfDate = intervalMetrics.as_of_date || null;
+  const intervalUsesFallback = !!intervalMetrics.uses_fallback;
   const isDayChangeMode = selectedInterval === '1D' || selectedInterval === 'YD';
   const todayIso = new Date().toISOString().split('T')[0];
   const placeholderVestCount = isForeignUSD
@@ -884,9 +883,9 @@ export default function InvestmentDetail() {
     isSGB && sgbDetails && sgbDetails.accrued_interest > 0 ? { label: 'Accrued Interest', value: `₹${formatNumber(sgbDetails.accrued_interest, 2)}` } : null,
     !isPPF && data.latestValue
       ? {
-          label: detailDayChangeAsOf ? `1D Change (As of ${formatDate(detailDayChangeAsOf)})` : '1D Change',
-          value: isPrivacyMaskEnabled() ? getMaskedValue() : formatNumber(detailDayChange, 0),
-          color: profitColor(detailDayChange),
+          label: intervalAsOfDate ? `1D Change (As of ${formatDate(intervalAsOfDate)})` : '1D Change',
+          value: isPrivacyMaskEnabled() ? getMaskedValue() : formatNumber(intervalChange, 0),
+          color: profitColor(intervalChange),
         }
       : null,
   ].filter(Boolean);
@@ -1041,9 +1040,9 @@ export default function InvestmentDetail() {
                   <div className={`small ${profitColor(intervalChangePct)}`}>
                     Change: {formatPct(intervalChangePct)}
                   </div>
-                  {detailDayChangeUsesFallback && detailDayChangeAsOf && (
+                  {intervalUsesFallback && intervalAsOfDate && (
                     <div className="small text-muted">
-                      As of {formatDate(detailDayChangeAsOf)}
+                      As of {formatDate(intervalAsOfDate)}
                     </div>
                   )}
                 </>

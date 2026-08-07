@@ -505,7 +505,12 @@ export default function AddInvestment() {
     if (!contractPreview) return;
     setContractImporting(true);
     try {
-      const result = await importContractNotes(portfolioId, contractPreview.broker, contractPreview.trades);
+      const result = await importContractNotes(
+        portfolioId,
+        contractPreview.broker,
+        contractPreview.trades,
+        contractPreview.intradayTrades || [],
+      );
       setContractResult(result);
       setContractPreview(null);
       await refreshPortfolios();
@@ -1221,7 +1226,7 @@ export default function AddInvestment() {
               )}
 
               {/* Preview Table */}
-              {contractPreview && contractPreview.trades.length > 0 && (
+              {contractPreview && (contractPreview.trades.length > 0 || contractPreview.intradayTrades?.length > 0) && (
                 <div className="mt-3">
                   <div className="d-flex align-items-center gap-2 mb-2">
                     <span className="badge bg-info">{contractPreview.broker}</span>
@@ -1287,6 +1292,40 @@ export default function AddInvestment() {
                       </tbody>
                     </table>
                   </div>
+                  {contractPreview.intradayTrades?.length > 0 && (
+                    <div className="mt-3">
+                      <div className="fw-semibold small mb-1">Intraday trades (speculative business)</div>
+                      <div className="table-responsive">
+                        <table className="table table-sm table-bordered small mb-0">
+                          <thead className="table-light">
+                            <tr>
+                              <th>Stock</th><th>Date</th><th className="text-end">Shares</th>
+                              <th className="text-end">Buy</th><th className="text-end">Sell</th>
+                              <th className="text-end">Gross P&amp;L</th><th className="text-end">Charges</th>
+                              <th className="text-end">Net P&amp;L</th><th className="text-center">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {contractPreview.intradayTrades.map((trade, index) => (
+                              <tr key={`${trade.isin || trade.security}-${index}`}>
+                                <td title={trade.isin || ''}>{trade.security}</td>
+                                <td>{trade.tradeDate}</td>
+                                <td className="text-end">{Number(trade.quantity).toLocaleString('en-IN')}</td>
+                                <td className="text-end">₹{Number(trade.buyRate).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                                <td className="text-end">₹{Number(trade.sellRate).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                                <td className="text-end">₹{Number(trade.grossProfit).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                                <td className="text-end">₹{Number(trade.fees).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                                <td className={`text-end fw-semibold ${Number(trade.netProfit) >= 0 ? 'text-success' : 'text-danger'}`}>₹{Number(trade.netProfit).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                                <td className="text-center">
+                                  <span className={`badge ${trade.status === 'unchanged' ? 'bg-secondary' : 'bg-success'}`}>{trade.status}</span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
                   {/* Summary row */}
                   <div className="d-flex justify-content-between mt-2 small text-muted">
                     <span>
@@ -1348,6 +1387,9 @@ export default function AddInvestment() {
                   {contractResult.transactionsCreated > 0 && `Created ${contractResult.transactionsCreated} transaction${contractResult.transactionsCreated !== 1 ? 's' : ''}. `}
                   {contractResult.transactionsUpdated > 0 && `Updated ${contractResult.transactionsUpdated}. `}
                   {contractResult.transactionsSkipped > 0 && `Skipped ${contractResult.transactionsSkipped} (already imported). `}
+                  {contractResult.intradayCreated > 0 && `Created ${contractResult.intradayCreated} intraday trade${contractResult.intradayCreated !== 1 ? 's' : ''}. `}
+                  {contractResult.intradayUpdated > 0 && `Updated ${contractResult.intradayUpdated} intraday trade${contractResult.intradayUpdated !== 1 ? 's' : ''}. `}
+                  {contractResult.intradaySkipped > 0 && `Skipped ${contractResult.intradaySkipped} intraday trade${contractResult.intradaySkipped !== 1 ? 's' : ''} (already imported). `}
                   {contractResult.investmentsCreated > 0 && `${contractResult.investmentsCreated} new stock${contractResult.investmentsCreated !== 1 ? 's' : ''} added.`}
                   <button className="btn btn-link btn-sm p-0 ms-2" onClick={() => { setContractResult(null); setContractFiles([]); if (contractFileRef.current) contractFileRef.current.value = ''; }}>
                     Upload more

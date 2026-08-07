@@ -57,6 +57,16 @@ export const getDashboardXirrSummary = (options = {}) => {
   const params = appendDashboardScopeParams(new URLSearchParams(), options);
   return fetchJSON(`/dashboard/xirr-summary?${params}`);
 };
+export const getAssetTypeOverview = (assetType, options = {}) => {
+  const params = appendDashboardScopeParams(new URLSearchParams(), options);
+  params.set('asset_type', assetType);
+  return fetchJSON(`/dashboard/asset-overview?${params}`);
+};
+export const getAssetTypeXirr = (assetType, options = {}) => {
+  const params = appendDashboardScopeParams(new URLSearchParams(), options);
+  params.set('asset_type', assetType);
+  return fetchJSON(`/dashboard/asset-xirr?${params}`);
+};
 export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);
@@ -217,6 +227,14 @@ export const deleteInvestmentSymbolHistory = (id, historyId) =>
 export const getTransactions = (params = {}) => {
   const qs = new URLSearchParams(params);
   return fetchJSON(`/transactions?${qs}`);
+};
+export const getStockIntradayTransactions = (params = {}) => {
+  const qs = new URLSearchParams();
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') return;
+    qs.set(key, String(value));
+  });
+  return fetchJSON(`/transactions/stocks/intraday?${qs}`);
 };
 export const getBrokers = (params = {}) => {
   const qs = new URLSearchParams(params).toString();
@@ -462,10 +480,10 @@ export const previewContractNotes = async (files, portfolioId) => {
 };
 
 // Contract Notes - Import approved trades
-export const importContractNotes = async (portfolioId, broker, trades) => {
+export const importContractNotes = async (portfolioId, broker, trades, intradayTrades = []) => {
   return fetchJSON('/stocks/contract-notes/import', {
     method: 'POST',
-    body: JSON.stringify({ portfolio_id: portfolioId, broker, trades }),
+    body: JSON.stringify({ portfolio_id: portfolioId, broker, trades, intradayTrades }),
   });
 };
 

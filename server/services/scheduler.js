@@ -966,6 +966,36 @@ async function runSchedulerCycle(db, label, options = {}) {
     pendingScopes,
   });
 
+  // Materialize orphaned dirty flags: if an investment has is_dirty_daily_values=1
+  // but no pending/running/failed scope entries, create them so the preflight can process.
+  if (dirtyInvestments.length > 0) {
+    const orphaned = dirtyInvestments.filter((inv) =>
+      !pendingScopes.some((s) => s.investment_id === inv.id)
+    );
+    let orphanedEnqueued = 0;
+    for (const inv of orphaned) {
+      const portfolioIds = db.prepare(`
+        SELECT DISTINCT portfolio_id FROM transactions
+        WHERE investment_id = ? AND portfolio_id IS NOT NULL
+      `).all(inv.id).map((r) => r.portfolio_id);
+      for (const pid of portfolioIds) {
+        markScopeDirty(db, {
+          investmentId: inv.id,
+          portfolioId: pid,
+          dirtyFromDate: inv.dirty_from_date || preflightRunDate,
+          reason: 'orphaned-dirty-flag',
+        });
+        orphanedEnqueued++;
+      }
+    }
+    if (orphanedEnqueued > 0) {
+      logAppInfo(`[Scheduler] ${label}: materialized orphaned dirty flags into scopes`, {
+        orphanedInvestments: orphaned.length,
+        scopesEnqueued: orphanedEnqueued,
+      });
+    }
+  }
+
   console.log(`[Scheduler] ${label}: preflight dirty backfill check for ${preflightRunDate}...`);
   logAppInfo(`[Scheduler] ${label}: started`, {
     runDate,

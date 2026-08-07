@@ -15,6 +15,82 @@
  */
 
 const TAXATION_RULES = {
+  // FY 2026-27 (AY 2027-28)
+  '2026-27': {
+    status: 'active',
+    budgetYear: 2026,
+    newRegime: {
+      status: 'supported',
+      standardDeduction: 75000,
+      slabs: [
+        { upto: 400000, rate: 0.00, label: '₹0 – ₹4L' },
+        { upto: 800000, rate: 0.05, label: '₹4L – ₹8L' },
+        { upto: 1200000, rate: 0.10, label: '₹8L – ₹12L' },
+        { upto: 1600000, rate: 0.15, label: '₹12L – ₹16L' },
+        { upto: 2000000, rate: 0.20, label: '₹16L – ₹20L' },
+        { upto: 2400000, rate: 0.25, label: '₹20L – ₹24L' },
+        { upto: Infinity, rate: 0.30, label: '₹24L and above' },
+      ],
+      capitalGains: {
+        stcg: {
+          rate: 0.20,
+          section: '111A (Equity, STT paid)',
+          description: 'Short-Term Capital Gain (equity with STT)',
+        },
+        ltcgEquity: {
+          rate: 0.125,
+          section: '112A',
+          exemption: 125000,
+          description: 'Long-Term Capital Gain (equity) – ₹1.25L exempt',
+        },
+        ltcgForeign: {
+          rate: 0.125,
+          section: '112',
+          description: 'Long-Term Capital Gain (foreign)',
+        },
+        stcgForeign: {
+          rate: 'slab',
+          section: 'Slab rate',
+          description: 'Short-Term Capital Gain (foreign) – taxed at slab rate',
+        },
+      },
+      rebate87A: {
+        limit: 1200000,
+        amount: 60000,
+        description: 'Rebate under Section 87A for income up to ₹12L (AY 2026-27 onwards under Section 115BAC(1A))',
+      },
+      surcharge: [
+        { upto: 5000000, rate: 0.00, label: 'Up to ₹50L' },
+        { upto: 10000000, rate: 0.10, label: '₹50L – ₹1Cr' },
+        { upto: 20000000, rate: 0.15, label: '₹1Cr – ₹2Cr' },
+        { upto: Infinity, rate: 0.25, label: '₹2Cr and above' },
+      ],
+      cess: {
+        rate: 0.04,
+        baseAmount: 'Tax + Surcharge',
+        description: 'Health & Education Cess – 4% on total tax + surcharge',
+      },
+      holdingPeriods: {
+        equity: {
+          stcgThreshold: 365,
+          description: 'Holding ≤365 days = STCG; >365 days = LTCG',
+        },
+        debt: {
+          stcgThreshold: 730,
+          description: 'Holding ≤730 days = STCG; >730 days = LTCG',
+        },
+        foreign: {
+          stcgThreshold: 730,
+          description: 'Holding ≤730 days = STCG; >730 days = LTCG',
+        },
+      },
+    },
+    oldRegime: {
+      status: 'not_supported',
+      reason: 'Use New Regime for FY 2026-27',
+    },
+  },
+
   // FY 2025-26 (AY 2026-27) - Current as of 2026
   '2025-26': {
     status: 'active',

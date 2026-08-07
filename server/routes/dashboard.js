@@ -619,6 +619,378 @@ function buildDashboardXirrSummary(db, query = {}) {
   };
 }
 
+function buildAssetTypeOverview(db, assetType, query = {}) {
+  const scopeIds = parsePortfolioIds(query);
+  const hideSold = isTruthyQueryValue(query.hide_sold);
+  const includeSoldInReturns = hideSold ? isTruthyQueryValue(query.include_sold_in_returns) : true;
+  const scope = portfolioScopeClause('t.portfolio_id', scopeIds);
+
+  // Get investments of this type with transaction aggregates
+  const transactions = db.prepare(`
+    SELECT
+      t.investment_id,
+      t.transaction_type,
+      COALESCE(t.units, 0) AS units,
+      COALESCE(t.amount, 0) AS amount,
+      COALESCE(t.fees, 0) AS fees,
+      t.folio_number
+    FROM transactions t
+    JOIN investments i ON i.id = t.investment_id
+    WHERE ${scope.clause}
+      AND i.exclude_from_tracking = 0
+      AND UPPER(i.asset_type) = ?
+  `).all(...scope.params, assetType);
+
+  const investmentTotals = new Map();
+  const foliosByInvestment = new Map();
+  for (const txn of transactions) {
+    const id = Number(txn.investment_id);
+    if (!investmentTotals.has(id)) {
+      investmentTotals.set(id, { netUnits: 0, invested: 0, realized: 0 });
+    }
+    const t = investmentTotals.get(id);
+    if (ACQUIRED_UNITS_TYPES.has(txn.transaction_type)) t.netUnits += Number(txn.units);
+    if (DISPOSED_UNITS_TYPES.has(txn.transaction_type)) t.netUnits -= Number(txn.units);
+    if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) t.invested += Number(txn.amount) + Number(txn.fees);
+    const internalBalance = INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES.has(assetType);
+    const receivedTypes = internalBalance ? INTERNAL_RECEIVED_TYPES : RECEIVED_TYPES;
+    if (receivedTypes.has(txn.transaction_type)) t.realized += Number(txn.amount) - Number(txn.fees);
+    if (assetType === 'MUTUAL_FUND' && txn.folio_number) {
+      if (!foliosByInvestment.has(id)) foliosByInvestment.set(id, new Map());
+      const folioMap = foliosByInvestment.get(id);
+      if (!folioMap.has(txn.folio_number)) folioMap.set(txn.folio_number, 0);
+      const units = Number(txn.units);
+      if (ACQUIRED_UNITS_TYPES.has(txn.transaction_type)) folioMap.set(txn.folio_number, folioMap.get(txn.folio_number) + units);
+      if (DISPOSED_UNITS_TYPES.has(txn.transaction_type)) folioMap.set(txn.folio_number, folioMap.get(txn.folio_number) - units);
+    }
+  }
+
+  const investmentIds = [...investmentTotals.keys()];
+  if (!investmentIds.length) {
+    return { byType: {}, investments: [], portfolio: { total_value: 0 }, dataVersion: getDataVersion(db) };
+  }
+
+  // Get investment metadata
+  const investmentMeta = new Map(
+    db.prepare(`
+      SELECT id, COALESCE(display_name, name) AS name, asset_type, ticker_symbol,
+             amfi_code, currency, isin_code, display_name
+      FROM investments
+      WHERE id IN (${investmentIds.map(() => '?').join(',')})
+    `).all(...investmentIds).map((r) => [Number(r.id), r])
+  );
+
+  // USD cost basis for foreign stocks
+  let usdCostBasisMap = new Map();
+  if (assetType === 'FOREIGN_STOCK') {
+    const usdScope = portfolioScopeClause('t.portfolio_id', scopeIds);
+    usdCostBasisMap = new Map(
+      db.prepare(`
+        SELECT t.investment_id,
+          SUM(CASE WHEN t.transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}) THEN COALESCE(t.amount,0)+COALESCE(t.fees,0) ELSE 0 END) AS invested_inr,
+          SUM(CASE WHEN t.transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}) THEN COALESCE(
+            t.usd_amount,
+            CASE WHEN COALESCE(t.exchange_rate_used,0)>0 THEN (COALESCE(t.amount,0)+COALESCE(t.fees,0))/t.exchange_rate_used ELSE NULL END,
+            0) ELSE 0 END) AS invested_usd
+        FROM transactions t
+        JOIN investments i ON i.id=t.investment_id
+        WHERE ${usdScope.clause} AND i.currency='USD' AND i.id IN (${investmentIds.map(() => '?').join(',')})
+        GROUP BY t.investment_id
+      `).all(...usdScope.params, ...investmentIds).map((r) => [Number(r.investment_id), r])
+    );
+  }
+
+  // Bounded day-change window
+  const latestDailyScope = portfolioScopeClause('dv.portfolio_id', scopeIds);
+  const pdScope = portfolioScopeClause('portfolio_id', scopeIds);
+  const latestDate = db.prepare(`
+    SELECT MAX(date) AS max_date FROM portfolio_daily WHERE ${pdScope.clause}
+  `).get(...pdScope.params)?.max_date || null;
+  // For a single asset type, the day-change floor is simply MAX_NON_LOCF_SESSION_LAG+1
+  // trading days back — at most ~10 calendar days, well under the 366 iteration ceiling.
+  const dayChangeFloor = latestDate ? addDaysIso(latestDate, -10) : null;
+
+  // Latest value per investment (unbounded — authoritative for current_value)
+  const latestValueRows = db.prepare(`
+    WITH latest_dates AS (
+      SELECT dv.investment_id, MAX(dv.date) AS max_date
+      FROM daily_values dv
+      JOIN investments i ON i.id = dv.investment_id
+      WHERE ${latestDailyScope.clause} AND i.exclude_from_tracking = 0 AND UPPER(i.asset_type) = ?
+      GROUP BY dv.investment_id
+    )
+    SELECT ld.investment_id, ld.max_date AS date,
+      SUM(COALESCE(dv.current_value, 0)) AS current_value,
+      MAX(dv.price_per_unit) AS price_per_unit,
+      SUM(COALESCE(dv.total_units, 0)) AS total_units,
+      SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
+      SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
+      SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss
+    FROM latest_dates ld
+    JOIN daily_values dv ON dv.investment_id = ld.investment_id AND dv.date = ld.max_date AND ${portfolioScopeClause('dv.portfolio_id', scopeIds).clause}
+    GROUP BY ld.investment_id, ld.max_date
+  `).all(...latestDailyScope.params, assetType, ...portfolioScopeClause('dv.portfolio_id', scopeIds).params);
+  const latestValueByInv = new Map(latestValueRows.map((r) => [Number(r.investment_id), r]));
+
+  // Recent rows for day-change resolution only
+  const recentRows = db.prepare(`
+    SELECT
+      dv.investment_id, dv.date,
+      SUM(COALESCE(dv.current_value, 0)) AS current_value,
+      SUM(COALESCE(dv.day_change, 0)) AS day_change,
+      MAX(dv.price_per_unit) AS price_per_unit,
+      SUM(COALESCE(dv.total_units, 0)) AS total_units,
+      SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
+      SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
+      SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
+      MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE ${latestDailyScope.clause}
+      AND dv.date >= ? AND dv.date <= ?
+      AND i.exclude_from_tracking = 0
+      AND UPPER(i.asset_type) = ?
+    GROUP BY dv.investment_id, dv.date
+    ORDER BY dv.investment_id, dv.date DESC
+  `).all(...latestDailyScope.params, dayChangeFloor || '2000-01-01', latestDate || '2000-01-01', assetType);
+
+  const recentByInvestment = new Map();
+  for (const row of recentRows) {
+    const id = Number(row.investment_id);
+    if (!recentByInvestment.has(id)) recentByInvestment.set(id, []);
+    recentByInvestment.get(id).push(row);
+  }
+
+  const investments = [];
+  let latestInvestmentDate = latestDate;
+  const internalBalance = INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES.has(assetType);
+  for (const id of investmentIds) {
+    const totals = investmentTotals.get(id);
+    const meta = investmentMeta.get(id);
+    if (!meta) continue;
+    const isHeld = internalBalance || Number(totals.netUnits) > 0.001;
+    if (hideSold && !isHeld) continue;
+
+    const rows = recentByInvestment.get(id) || [];
+    const latestRow = rows[0] || null;
+    const latestValue = latestValueByInv.get(id);
+    const date = latestValue?.date || latestRow?.date || null;
+
+    let dayChange = 0;
+    let dayChangeAsOfDate = null;
+    let dayChangeUsesFallback = false;
+    if (isHeld && latestRow) {
+      if (!internalBalance && Number(latestRow.has_non_locf || 0) === 0) {
+        const candidate = rows.slice(1).find((r) => Number(r.has_non_locf || 0) > 0) || null;
+        if (candidate && sessionDistance(candidate.date, date, assetType) <= MAX_NON_LOCF_SESSION_LAG) {
+          dayChange = Number(candidate.day_change || 0);
+          dayChangeAsOfDate = candidate.date;
+          dayChangeUsesFallback = true;
+        }
+      } else {
+        dayChange = Number(latestRow.day_change || 0);
+        dayChangeAsOfDate = date;
+      }
+    }
+
+    const acquiredUnits = Number(totals.netUnits > 0 ? totals.netUnits : 0);
+    const currencyCode = String(meta.currency || 'INR').toUpperCase();
+    let weightedFxRate = null;
+    let investedNative = Number(totals.invested);
+    let avgCostNative = acquiredUnits > 0 ? totals.invested / acquiredUnits : null;
+    if (currencyCode === 'USD') {
+      const usd = usdCostBasisMap.get(id);
+      const investedUsd = Number(usd?.invested_usd || 0);
+      const investedInr = Number(usd?.invested_inr || 0);
+      weightedFxRate = investedUsd > 0 ? investedInr / investedUsd : null;
+      investedNative = investedUsd;
+      avgCostNative = acquiredUnits > 0 && investedUsd > 0 ? investedUsd / acquiredUnits : null;
+    }
+
+    const folioMap = foliosByInvestment.get(id);
+    let openFoliosCount = null;
+    let totalFoliosCount = null;
+    if (folioMap) {
+      totalFoliosCount = folioMap.size;
+      openFoliosCount = [...folioMap.values()].filter((u) => u > 0.0001).length;
+    }
+
+    investments.push({
+      id, name: meta.name, asset_type: assetType,
+      ticker_symbol: meta.ticker_symbol, amfi_code: meta.amfi_code,
+      currency: meta.currency, isin_code: meta.isin_code, display_name: meta.display_name,
+      date,
+      price_per_unit: Number(latestValue?.price_per_unit || latestRow?.price_per_unit || 0),
+      current_value: Number(latestValue?.current_value || 0),
+      invested_amount: Number(latestValue?.invested_amount || totals.invested || 0),
+      realized_proceeds: Number(latestValue?.realized_proceeds || totals.realized || 0),
+      profit_loss: Number(latestValue?.profit_loss || 0),
+      total_units: Number(latestValue?.total_units || latestRow?.total_units || 0),
+      acquired_units: acquiredUnits,
+      day_change: dayChange,
+      day_change_pct: 0,
+      day_change_as_of_date: dayChangeAsOfDate,
+      day_change_uses_fallback: dayChangeUsesFallback,
+      xirr_pct: null,
+      weighted_fx_rate: weightedFxRate,
+      invested_amount_native: investedNative,
+      avg_cost_per_unit_native: avgCostNative,
+      open_folios_count: openFoliosCount,
+      total_folios_count: totalFoliosCount,
+      portfolio_pct: 0,
+    });
+  }
+
+  // Stale-scope suppression: compute cutoff date once, then compare directly
+  const latestSnapshotDate = investments.reduce((max, inv) => (!inv.date ? max : !max || inv.date > max ? inv.date : max), null);
+  if (latestSnapshotDate) {
+    const marketLinked = MARKET_LINKED_DAY_CHANGE_ASSET_TYPES.has(assetType);
+    let staleThresholdDate = null;
+    if (marketLinked) {
+      // Find the earliest date that is still within lag by stepping back from latest
+      let cursor = latestSnapshotDate;
+      for (let i = 0; i <= MAX_NON_LOCF_SESSION_LAG + 5; i++) {
+        cursor = addDaysIso(cursor, -1);
+        if (sessionDistance(cursor, latestSnapshotDate, assetType) > MAX_NON_LOCF_SESSION_LAG) {
+          staleThresholdDate = cursor;
+          break;
+        }
+      }
+      if (!staleThresholdDate) staleThresholdDate = addDaysIso(latestSnapshotDate, -(MAX_NON_LOCF_SESSION_LAG + 5));
+    }
+    for (const inv of investments) {
+      if (!inv.date || inv.date >= latestSnapshotDate) continue;
+      if (!marketLinked || inv.date <= staleThresholdDate) {
+        inv.day_change = 0; inv.day_change_as_of_date = null; inv.day_change_uses_fallback = false;
+      }
+    }
+  }
+
+  // Compute day_change_pct and portfolio_pct
+  const totalValue = investments.reduce((sum, inv) => sum + inv.current_value, 0);
+  const portfolioValue = Number(db.prepare(`
+    SELECT SUM(total_value) AS v FROM portfolio_daily
+    WHERE ${pdScope.clause} AND date = ?
+  `).get(...pdScope.params, latestDate || '2000-01-01')?.v || 0) || totalValue;
+  for (const inv of investments) {
+    const prevValue = inv.current_value - inv.day_change;
+    inv.day_change_pct = prevValue > 0 ? (inv.day_change / prevValue) * 100 : 0;
+    inv.day_change_opening_value = prevValue > 0 ? prevValue : 0;
+    inv.portfolio_pct = portfolioValue > 0 ? (inv.current_value / portfolioValue) * 100 : 0;
+  }
+
+  // Card totals: grouped transaction scan (same approach as main dashboard overview)
+  const internalBalanceTypes = INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES.has(assetType);
+  const receivedTypes = internalBalanceTypes ? INTERNAL_RECEIVED_TYPES : RECEIVED_TYPES;
+  let cardInvested = 0;
+  let cardRealized = 0;
+  for (const txn of transactions) {
+    if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) cardInvested += Number(txn.amount) + Number(txn.fees);
+    if (receivedTypes.has(txn.transaction_type)) cardRealized += Number(txn.amount) - Number(txn.fees);
+  }
+  const totalInvested = cardInvested;
+  const totalRealized = cardRealized;
+  const totalProfitLoss = totalValue + totalRealized - totalInvested;
+
+  // Interest rate for PF/PPF/SSY
+  if (INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES.has(assetType)) {
+    const latestRate = db.prepare(`
+      SELECT rate FROM interest_rates WHERE rate_type = ? ORDER BY effective_from DESC LIMIT 1
+    `).get(assetType);
+    if (latestRate) {
+      for (const inv of investments) {
+        if (!inv.price_per_unit || inv.price_per_unit === 0) inv.price_per_unit = Number(latestRate.rate);
+      }
+    }
+  }
+
+  const dayChange = investments.reduce((sum, inv) => sum + inv.day_change, 0);
+  const openingValue = totalValue - dayChange;
+
+  const byType = {
+    [assetType]: {
+      investments,
+      totalValue,
+      totalInvested,
+      totalProfitLoss,
+      totalRealizedGain: totalRealized,
+      dayChange,
+      intervalChangePct: openingValue > 0 ? (dayChange / openingValue) * 100 : 0,
+      xirrPct: null,
+    },
+  };
+
+  return {
+    portfolio: { total_value: portfolioValue, xirr_pct: null },
+    byType,
+    investments,
+    lastUpdate: db.prepare("SELECT value FROM config WHERE key = 'last_price_update'").get()?.value,
+    dataVersion: getDataVersion(db),
+  };
+}
+
+function buildAssetTypeXirr(db, assetType, query = {}, prebuiltOverview = null) {
+  const overview = prebuiltOverview || buildAssetTypeOverview(db, assetType, query);
+  const scopeIds = parsePortfolioIds(query);
+  const scope = portfolioScopeClause('t.portfolio_id', scopeIds);
+
+  const txnRows = db.prepare(`
+    SELECT t.investment_id, t.transaction_type, t.transaction_date,
+      COALESCE(t.amount, 0) AS amount, COALESCE(t.fees, 0) AS fees, t.notes
+    FROM transactions t
+    JOIN investments i ON i.id = t.investment_id
+    WHERE ${scope.clause} AND UPPER(i.asset_type) = ?
+  `).all(...scope.params, assetType);
+
+  const assetFlows = [];
+  const flowsByInvestment = new Map();
+  for (const txn of txnRows) {
+    const date = new Date(txn.transaction_date);
+    if (Number.isNaN(date.getTime())) continue;
+    const id = Number(txn.investment_id);
+    if (!flowsByInvestment.has(id)) flowsByInvestment.set(id, []);
+    const amount = Number(txn.amount) + Number(txn.fees);
+    const internal = isInternalXirrCashflow(assetType, txn.transaction_type);
+    const accrualOnly = isAccrualOnlyXirrCashflow(txn.transaction_type, txn.notes);
+    let cashflow = 0;
+    if (!accrualOnly && CASH_OUTFLOW_TYPES.has(txn.transaction_type)) cashflow = -(Number(txn.amount) + Number(txn.fees));
+    else if (!accrualOnly && CASH_INFLOW_TYPES.has(txn.transaction_type) && !internal) cashflow = Number(txn.amount) - Number(txn.fees);
+    if (Math.abs(cashflow) <= 1e-9) continue;
+    const flow = { amount: cashflow, date };
+    assetFlows.push(flow);
+    flowsByInvestment.get(id).push(flow);
+  }
+
+  // Per-investment XIRR
+  const investmentXirr = {};
+  for (const inv of overview.investments || []) {
+    const flows = [...(flowsByInvestment.get(Number(inv.id)) || [])];
+    const terminalValue = Number(inv.current_value || 0);
+    if (terminalValue > 0 && inv.date) {
+      const d = new Date(`${inv.date}T00:00:00.000Z`);
+      if (!Number.isNaN(d.getTime())) flows.push({ amount: terminalValue, date: d });
+    }
+    const rate = calculateXirr(flows);
+    investmentXirr[inv.id] = rate == null ? null : rate * 100;
+  }
+
+  // Asset-type level XIRR
+  const assetTerminal = Number(overview.byType?.[assetType]?.totalValue || 0);
+  const latestDate = (overview.investments || []).reduce((max, inv) => (!inv.date ? max : !max || inv.date > max ? inv.date : max), null);
+  if (assetTerminal > 0 && latestDate) {
+    const d = new Date(`${latestDate}T00:00:00.000Z`);
+    if (!Number.isNaN(d.getTime())) assetFlows.push({ amount: assetTerminal, date: d });
+  }
+  const assetRate = calculateXirr(assetFlows);
+
+  return {
+    assetType,
+    xirrPct: assetRate == null ? null : assetRate * 100,
+    investmentXirr,
+    dataVersion: overview.dataVersion,
+  };
+}
+
 function assignDisplayDayChangeForSeries(rows) {
   const byInvestment = new Map();
   for (const row of rows || []) {
@@ -973,6 +1345,60 @@ module.exports = function (db) {
   } catch (_e) {
     // fail open: snapshot reads/writes guard themselves individually
   }
+
+  // Asset-type scoped overview: one type's holdings + totals without XIRR.
+  router.get('/asset-overview', (req, res) => {
+    try {
+      const assetType = String(req.query.asset_type || '').trim().toUpperCase();
+      if (!assetType) return res.status(400).json({ error: 'asset_type is required' });
+      const scopeIds = parsePortfolioIds(req.query);
+      const version = getDataVersion(db);
+      const cacheKey = JSON.stringify({
+        kind: 'asset-overview-v1',
+        assetType,
+        scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
+        hideSold: isTruthyQueryValue(req.query.hide_sold),
+        includeSoldInReturns: isTruthyQueryValue(req.query.include_sold_in_returns),
+      });
+      if (isSnapshotEnabled()) {
+        const cached = getCachedSnapshot(db, cacheKey, version);
+        if (cached) return res.json(cached);
+      }
+      const payload = buildAssetTypeOverview(db, assetType, req.query);
+      if (isSnapshotEnabled()) putSnapshot(db, cacheKey, version, payload);
+      return res.json(payload);
+    } catch (error) {
+      const status = error.message === 'Invalid portfolio id' ? 400 : 500;
+      return res.status(status).json({ error: error.message || 'Failed to build asset overview' });
+    }
+  });
+
+  // Asset-type scoped XIRR: per-investment + type-level lifetime XIRR only.
+  router.get('/asset-xirr', (req, res) => {
+    try {
+      const assetType = String(req.query.asset_type || '').trim().toUpperCase();
+      if (!assetType) return res.status(400).json({ error: 'asset_type is required' });
+      const scopeIds = parsePortfolioIds(req.query);
+      const version = getDataVersion(db);
+      const cacheKey = JSON.stringify({
+        kind: 'asset-xirr-v1',
+        assetType,
+        scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
+        hideSold: isTruthyQueryValue(req.query.hide_sold),
+        includeSoldInReturns: isTruthyQueryValue(req.query.include_sold_in_returns),
+      });
+      if (isSnapshotEnabled()) {
+        const cached = getCachedSnapshot(db, cacheKey, version);
+        if (cached) return res.json(cached);
+      }
+      const payload = buildAssetTypeXirr(db, assetType, req.query);
+      if (isSnapshotEnabled()) putSnapshot(db, cacheKey, version, payload);
+      return res.json(payload);
+    } catch (error) {
+      const status = error.message === 'Invalid portfolio id' ? 400 : 500;
+      return res.status(status).json({ error: error.message || 'Failed to calculate asset XIRR' });
+    }
+  });
 
   router.get('/overview', (req, res) => {
     try {

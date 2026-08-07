@@ -552,12 +552,31 @@ function buildTaxReport(db, fy, portfolioId, ltcgEquityExemption = 125000) {
   const investments = db.prepare(invSql).all(...invParams);
 
   if (investments.length === 0) {
+    let intradaySql = `
+      SELECT s.*, i.name AS investment_name, i.display_name, i.ticker_symbol, i.isin_code
+      FROM stock_intraday_trades s
+      JOIN investments i ON i.id = s.investment_id
+      WHERE s.trade_date >= ? AND s.trade_date <= ?
+    `;
+    const intradayParams = [fyStartStr, fyEndStr];
+    if (portfolioId) {
+      intradaySql += ' AND s.portfolio_id = ?';
+      intradayParams.push(portfolioId);
+    }
+    const speculativeBusiness = db.prepare(`${intradaySql} ORDER BY s.trade_date, s.id`).all(...intradayParams)
+      .map((row) => ({
+        ...row,
+        investment: row.display_name || row.investment_name,
+        charge_breakdown: row.charge_breakdown_json ? JSON.parse(row.charge_breakdown_json) : {},
+      }));
+    const netSpeculativeProfit = roundCurrency(speculativeBusiness.reduce((sum, row) => sum + (Number(row.net_profit) || 0), 0));
     return {
       fy,
       fy_start: fyStartStr,
       fy_end: fyEndStr,
       perquisite_income: [],
       capital_gains: [],
+      speculative_business: speculativeBusiness,
       dividend_income: [],
       form_67: [],
       schedule_fa: [],
@@ -565,6 +584,7 @@ function buildTaxReport(db, fy, portfolioId, ltcgEquityExemption = 125000) {
         total_perquisite_inr: 0,
         total_stcg_inr: 0,
         total_ltcg_inr: 0,
+        total_speculative_business_inr: netSpeculativeProfit,
         total_dividend_inr: 0,
         stcg_lots: 0,
         ltcg_lots: 0,
@@ -847,6 +867,24 @@ function buildTaxReport(db, fy, portfolioId, ltcgEquityExemption = 125000) {
   const totalSTCGINR = stcgRows.reduce((s, r) => s + (r.gain_loss_inr || 0), 0);
   const totalLTCGINR = ltcgRows.reduce((s, r) => s + (r.gain_loss_inr || 0), 0);
   const totalDividendINR = dividendRows.reduce((s, r) => s + (r.amount_inr || 0), 0);
+  let intradaySql = `
+    SELECT s.*, i.name AS investment_name, i.display_name, i.ticker_symbol, i.isin_code
+    FROM stock_intraday_trades s
+    JOIN investments i ON i.id = s.investment_id
+    WHERE s.trade_date >= ? AND s.trade_date <= ?
+  `;
+  const intradayParams = [fyStartStr, fyEndStr];
+  if (portfolioId) {
+    intradaySql += ' AND s.portfolio_id = ?';
+    intradayParams.push(portfolioId);
+  }
+  const speculativeBusiness = db.prepare(`${intradaySql} ORDER BY s.trade_date, s.id`).all(...intradayParams)
+    .map((row) => ({
+      ...row,
+      investment: row.display_name || row.investment_name,
+      charge_breakdown: row.charge_breakdown_json ? JSON.parse(row.charge_breakdown_json) : {},
+    }));
+  const totalSpeculativeBusinessINR = roundCurrency(speculativeBusiness.reduce((sum, row) => sum + (Number(row.net_profit) || 0), 0));
 
   // ── Dividend quarter-wise breakup (for Section 234C advance-tax interest) ──
   const dividendQuarterly = FY_QUARTERS.map((q) => {
@@ -938,6 +976,7 @@ function buildTaxReport(db, fy, portfolioId, ltcgEquityExemption = 125000) {
     fy_end: fyEndStr,
     perquisite_income: perquisiteRows,
     capital_gains: capitalGainsRows,
+    speculative_business: speculativeBusiness,
     cg_sections: cgSections,
     cg_quarterly: cgQuarterly,
     cg_quarter_labels: FY_QUARTERS,
@@ -950,6 +989,7 @@ function buildTaxReport(db, fy, portfolioId, ltcgEquityExemption = 125000) {
       total_perquisite_inr: roundCurrency(totalPerquisiteINR),
       total_stcg_inr: roundCurrency(totalSTCGINR),
       total_ltcg_inr: roundCurrency(totalLTCGINR),
+      total_speculative_business_inr: totalSpeculativeBusinessINR,
       total_dividend_inr: roundCurrency(totalDividendINR),
       total_ftc_inr: roundCurrency(totalFTCINR),
       stcg_lots: stcgRows.length,
@@ -961,7 +1001,7 @@ function buildTaxReport(db, fy, portfolioId, ltcgEquityExemption = 125000) {
       cg_ltcg_112: ltcg112,
       cg_stcg_slab: stcgSlab,
       ltcg_112a_exemption_limit: ltcgEquityExemption,
-      tax_note: 'Equity (STT-paid) → 111A STCG / 112A LTCG with 12-month threshold and ₹1.25L LTCG exemption. Foreign & non-equity → slab STCG / 112 LTCG with 24-month threshold. Equity classification uses STT charged on disposal as the primary signal.',
+      tax_note: 'Equity (STT-paid) → 111A STCG / 112A LTCG with 12-month threshold and ₹1.25L LTCG exemption. Intraday equity round trips are reported separately as speculative business income and do not affect capital-gains FIFO.',
     },
   };
 }
@@ -1077,6 +1117,9 @@ function buildTaxComputation(db, fy, portfolioId) {
   const ltcg112aTaxableFromReport = cg.cg_ltcg_112a_taxable || 0;
   const ltcg112 = cg.cg_ltcg_112 || 0;
   const stcgSlab = cg.cg_stcg_slab || 0;
+  const speculativeBusinessNet = Number(cg.total_speculative_business_inr) || 0;
+  const speculativeBusinessTaxable = Math.max(0, speculativeBusinessNet);
+  const speculativeLossCarryForward = Math.max(0, -speculativeBusinessNet);
   const totalCG = stcg111a + ltcg112aTaxableFromReport + ltcg112 + stcgSlab;
 
   // ── Head 5: Other Sources ──
@@ -1131,7 +1174,7 @@ function buildTaxComputation(db, fy, portfolioId) {
   const totalCGAdjusted = stcg111a + ltcg112aTaxable + ltcg112Adjusted + stcgSlab;
 
   // ── Gross Total Income ──
-  const grossTotalIncome = netSalary + totalCGAdjusted + totalOS;
+  const grossTotalIncome = netSalary + totalCGAdjusted + totalOS + speculativeBusinessTaxable;
 
   // ── Deductions (New Regime: only 80CCD(2) employer NPS) ──
   const { start: fyStart, end: fyEnd } = parseFY(fy);
@@ -1163,7 +1206,7 @@ function buildTaxComputation(db, fy, portfolioId) {
 
   // ── Income grouping by tax rate (applied to taxable income after deductions) ──
   // Slab-rate income: Salary + Other Sources + STCG at slab (foreign STCG)
-  const slabIncome = netSalary + totalOS + stcgSlab;
+  const slabIncome = netSalary + totalOS + stcgSlab + speculativeBusinessTaxable;
   // Special-rate CG: taxed at flat rates, not slab
   const specialRateCG = stcg111a + ltcg112aTaxable + ltcg112Adjusted;
 
@@ -1241,6 +1284,12 @@ function buildTaxComputation(db, fy, portfolioId) {
         transfer_expense: osTransferExpense,
         total: totalOS,
         tds: otherIncomeTDS,
+      },
+      speculative_business: {
+        net_profit: speculativeBusinessNet,
+        taxable_profit: speculativeBusinessTaxable,
+        loss_carry_forward: speculativeLossCarryForward,
+        trades: investmentReport.speculative_business || [],
       },
     },
     slab_income: slabIncome,
@@ -1355,14 +1404,20 @@ module.exports = function (db) {
       const { portfolio_id } = req.query;
       const assetPlaceholders = [...SUPPORTED_TAX_ASSET_TYPES].map(() => '?').join(',');
       let sql = `
-        SELECT MIN(DATE(t.transaction_date)) AS earliest_transaction_date
-        FROM transactions t
-        JOIN investments i ON i.id = t.investment_id
-        WHERE i.asset_type IN (${assetPlaceholders})
+        SELECT MIN(activity_date) AS earliest_transaction_date FROM (
+          SELECT DATE(t.transaction_date) AS activity_date, t.portfolio_id
+          FROM transactions t
+          JOIN investments i ON i.id = t.investment_id
+          WHERE i.asset_type IN (${assetPlaceholders})
+          UNION ALL
+          SELECT DATE(s.trade_date) AS activity_date, s.portfolio_id
+          FROM stock_intraday_trades s
+        ) activity
+        WHERE 1 = 1
       `;
       const params = [...SUPPORTED_TAX_ASSET_TYPES];
       if (portfolio_id) {
-        sql += ' AND t.portfolio_id = ?';
+        sql += ' AND activity.portfolio_id = ?';
         params.push(portfolio_id);
       }
       const row = db.prepare(sql).get(...params);
@@ -1684,6 +1739,16 @@ module.exports = function (db) {
       if (!portfolio_id) return res.status(400).json({ error: 'portfolio_id is required' });
       res.json(buildTaxComputation(db, fy, portfolio_id));
     } catch (e) {
+      const msg = String(e?.message || '');
+      if (msg.includes('Tax computation not supported for FY')) {
+        return res.json({
+          supported: false,
+          fy: req.query?.fy,
+          regime: 'newRegime',
+          message: msg,
+          rules_summary: getTaxationRulesSummary(),
+        });
+      }
       console.error('Tax computation error:', e);
       res.status(500).json({ error: e.message });
     }

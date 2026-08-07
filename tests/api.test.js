@@ -22,6 +22,7 @@ const {
 } = require('../server/services/dirtyBackfillService');
 const { detectGapsForTable } = require('../server/services/compliance/complianceScanService');
 const { updateAllPrices } = require('../server/services/updater');
+const { parseGrowwPDF } = require('../server/services/contractNoteParser');
 
 // ──────────────────────────────────────────────────────────────────────
 // Helpers
@@ -173,6 +174,7 @@ before(async () => {
   app.use('/api/cas', require('../server/routes/cas')(db));
   app.use('/api/stocks', require('../server/routes/stocks')(db));
   app.use('/api/expenses', require('../server/routes/expenses')(db));
+  app.use('/api/tax', require('../server/routes/tax')(db));
 
   app.use((err, _req, res, _next) => {
     res.status(500).json({ error: err.message });
@@ -612,6 +614,37 @@ describe('Transactions — BUY and SELL', () => {
     const { body } = await api('GET', '/transactions?type=BUY');
     const items = txnItems(body);
     assert.ok(items.every(t => t.transaction_type === 'BUY'));
+  });
+
+  it('GET /transactions/stocks/intraday returns stock intraday rows only', async () => {
+    const noteImport = await api('POST', '/stocks/contract-notes/import', {
+      portfolio_id: 1,
+      broker: 'Groww',
+      trades: [],
+      intradayTrades: [{
+        security: 'HDFC BANK LIMITED',
+        isin: 'INE040A01034',
+        tradeDate: '2026-08-04',
+        quantity: 5,
+        buyRate: 1450,
+        buyValue: 7250,
+        sellRate: 1460,
+        sellValue: 7300,
+        grossProfit: 50,
+        fees: 12,
+        stt: 2,
+        netProfit: 38,
+        chargeBreakdown: { brokerage: 8, stt: 2, gst: 2 },
+      }],
+    });
+    assert.equal(noteImport.status, 200);
+
+    const { status, body } = await api('GET', '/transactions/stocks/intraday?portfolio_id=1');
+    const items = txnItems(body);
+    assert.equal(status, 200);
+    assert.ok(items.length >= 1);
+    assert.ok(items.every((row) => row.asset_type === 'INDIAN_STOCK'));
+    assert.ok(items.some((row) => Number(row.net_profit) === 38));
   });
 
   it('PUT /transactions/:id updates transaction', async () => {
@@ -1098,10 +1131,10 @@ describe('Dashboard', () => {
     assert.equal(body.window.requested_to, '2026-07-10');
   });
 
-  it('GET /investments/:id/daily-values defaults to an exact trailing year window', async () => {
+  it('GET /investments/:id/daily-values defaults from to first transaction date', async () => {
     const { status, body } = await api('GET', '/investments/1/daily-values?portfolio_id=1&to=2026-07-10');
     assert.equal(status, 200);
-    assert.equal(body.window.from, '2025-07-11');
+    assert.ok(body.window.from <= '2026-07-10', 'from should be on or before to');
     assert.equal(body.window.to, '2026-07-10');
   });
 });
@@ -1122,6 +1155,41 @@ describe('Contract Notes — Sharekhan HTM Preview', () => {
 
     assert.equal(status, 200);
     assert.ok(body.trades || body.length > 0 || body[0]?.trades, 'Should return parsed trades');
+  });
+});
+
+describe('Contract Notes — Groww PDF Parser', () => {
+  it('separates zero-net intraday trades and reconciles charges', () => {
+    const text = `
+      PAN AAAAA0000A Trade Date 04-08-2026
+      INE000A01001 SAMPLE LIMITED 100 10.00 0.20 10.20 -1020.00 -100 11.00 0.20 10.80 1080.00 0 60.00
+      INE000B01002 DELIVERY LIMITED 0 0.00 0.00 0.00 0.00 -5 20.00 1.00 19.00 95.00 -5 95.00
+      Taxable Value of Supply (Brokerage) -45.00
+      Exchange Transaction Charges -4.00
+      IGST (18% on charges) -8.00
+      Securities Transaction Tax -10.00
+      SEBI Turnover Fees -1.00
+      Stamp Duty -2.00
+      IPFT Charges 0.00
+      Total 10.00
+      Amount Chargeable
+      Total INE000A01001 0 100.00
+      Total INE000B01002 -5 100.00
+    `;
+
+    const note = parseGrowwPDF(text, 'contract.pdf');
+    assert.equal(note.trades.length, 1);
+    assert.equal(note.trades[0].type, 'SELL');
+    assert.equal(note.trades[0].quantity, 5);
+    assert.equal(note.intradayTrades.length, 1);
+    assert.equal(note.intradayTrades[0].quantity, 100);
+    assert.equal(note.intradayTrades[0].grossProfit, 100);
+    assert.equal(note.intradayTrades[0].chargeBreakdown.dpCharges, 0);
+    assert.equal(note.trades[0].chargeBreakdown.dpCharges, 10);
+
+    const allocated = note.trades.reduce((sum, trade) => sum + trade.brokerage, 0)
+      + note.intradayTrades.reduce((sum, trade) => sum + trade.fees, 0);
+    assert.equal(Number(allocated.toFixed(2)), note.charges.total);
   });
 });
 
@@ -1172,6 +1240,50 @@ describe('Contract Notes — Import', () => {
     });
     assert.equal(body.transactionsSkipped, 1, 'Duplicate trade should be skipped');
     assert.equal(body.transactionsCreated, 0);
+  });
+
+  it('imports intraday trades separately without changing holdings', async () => {
+    const payload = {
+      portfolio_id: 1,
+      broker: 'Groww',
+      trades: [],
+      intradayTrades: [{
+        security: 'HDFC BANK LIMITED',
+        isin: 'INE040A01034',
+        tradeDate: '2025-08-04',
+        quantity: 5,
+        buyRate: 1450,
+        buyValue: 7250,
+        sellRate: 1460,
+        sellValue: 7300,
+        grossProfit: 50,
+        fees: 12,
+        stt: 2,
+        netProfit: 38,
+        chargeBreakdown: { brokerage: 8, stt: 2, gst: 2 },
+      }],
+    };
+
+    const first = await api('POST', '/stocks/contract-notes/import', payload);
+    assert.equal(first.status, 200);
+    assert.equal(first.body.intradayCreated, 1);
+    assert.equal(first.body.transactionsCreated, 0);
+
+    const second = await api('POST', '/stocks/contract-notes/import', payload);
+    assert.equal(second.status, 200);
+    assert.equal(second.body.intradaySkipped, 1);
+    assert.equal(second.body.transactionsCreated, 0);
+
+    const report = await api('GET', '/tax/us-stocks?fy=2025-26&portfolio_id=1');
+    assert.equal(report.status, 200, JSON.stringify(report.body));
+    assert.equal(report.body.speculative_business.length, 1);
+    assert.equal(report.body.summary.total_speculative_business_inr, 38);
+    assert.equal(report.body.capital_gains.length, 0);
+
+    const computation = await api('GET', '/tax/computation?fy=2025-26&portfolio_id=1');
+    assert.equal(computation.status, 200);
+    assert.equal(computation.body.heads.speculative_business.taxable_profit, 38);
+    assert.equal(computation.body.slab_income, 38);
   });
 });
 

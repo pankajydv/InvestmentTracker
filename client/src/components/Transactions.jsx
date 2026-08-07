@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Card, Table, Spinner, Form, Modal, Button, Row, Col } from 'react-bootstrap';
-import { getTransactions, getBrokers, getTransactionTypes, getInvestmentNames, getPortfolios, updateTransaction, deleteTransaction } from '../services/api';
+import { getTransactions, getStockIntradayTransactions, getBrokers, getTransactionTypes, getInvestmentNames, getPortfolios, updateTransaction, deleteTransaction } from '../services/api';
 import { formatNumber, formatDate, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 import { resolvePortfolioColor } from '../utils/portfolioColors';
@@ -121,6 +121,8 @@ export default function Transactions() {
   const { selectedId, selectedIds } = usePortfolio();
   const [transactions, setTransactions] = useState([]);
   const [totalTransactions, setTotalTransactions] = useState(0);
+  const [intradayTransactions, setIntradayTransactions] = useState([]);
+  const [totalIntradayTransactions, setTotalIntradayTransactions] = useState(0);
   const [portfolioMeta, setPortfolioMeta] = useState({});
   const [brokers, setBrokers] = useState([]);
   const [transactionTypes, setTransactionTypes] = useState(TRANSACTION_TYPES_DEFAULT);
@@ -370,9 +372,16 @@ export default function Transactions() {
       params.group_pf = '1';
 
       if (selectedIds.length > 1) {
-        const results = await Promise.all(
-          selectedIds.map((id) => getTransactions({ ...params, portfolio_id: id }))
-        );
+        const [results, intradayResults] = await Promise.all([
+          Promise.all(selectedIds.map((id) => getTransactions({ ...params, portfolio_id: id }))),
+          Promise.all(selectedIds.map((id) => getStockIntradayTransactions({
+            portfolio_id: id,
+            from: filterStartDate || undefined,
+            to: filterEndDate || undefined,
+            broker: filterBroker || undefined,
+            investment_name: filterInvestment || undefined,
+          }))),
+        ]);
         const mergedMap = new Map();
         for (const result of results) {
           const items = Array.isArray(result) ? result : (result.items || []);
@@ -387,15 +396,46 @@ export default function Transactions() {
         });
         setTransactions(merged);
         setTotalTransactions(merged.length);
+
+        const intradayMergedMap = new Map();
+        for (const result of intradayResults) {
+          const items = Array.isArray(result) ? result : (result.items || []);
+          for (const row of items) {
+            if (!intradayMergedMap.has(row.id)) intradayMergedMap.set(row.id, row);
+          }
+        }
+        const intradayMerged = Array.from(intradayMergedMap.values()).sort((a, b) => {
+          const dateCmp = String(b.trade_date || '').localeCompare(String(a.trade_date || ''));
+          if (dateCmp !== 0) return dateCmp;
+          return (b.id || 0) - (a.id || 0);
+        });
+        setIntradayTransactions(intradayMerged);
+        setTotalIntradayTransactions(intradayMerged.length);
       } else {
         if (selectedId) params.portfolio_id = selectedId;
-        const result = await getTransactions(params);
+        const [result, intradayResult] = await Promise.all([
+          getTransactions(params),
+          getStockIntradayTransactions({
+            portfolio_id: selectedId || undefined,
+            from: filterStartDate || undefined,
+            to: filterEndDate || undefined,
+            broker: filterBroker || undefined,
+            investment_name: filterInvestment || undefined,
+          }),
+        ]);
         if (Array.isArray(result)) {
           setTransactions(result);
           setTotalTransactions(result.length);
         } else {
           setTransactions(result.items || []);
           setTotalTransactions(result.total || 0);
+        }
+        if (Array.isArray(intradayResult)) {
+          setIntradayTransactions(intradayResult);
+          setTotalIntradayTransactions(intradayResult.length);
+        } else {
+          setIntradayTransactions(intradayResult.items || []);
+          setTotalIntradayTransactions(intradayResult.total || 0);
         }
       }
     } catch (e) {
@@ -501,7 +541,8 @@ export default function Transactions() {
       <div className="d-flex align-items-center justify-content-between">
         <h1 className="h4 fw-bold mb-0">Transactions</h1>
         <span className="d-flex align-items-center gap-2 small text-muted">
-          {totalTransactions} transaction{totalTransactions !== 1 ? 's' : ''}
+          {totalTransactions + totalIntradayTransactions} transaction{(totalTransactions + totalIntradayTransactions) !== 1 ? 's' : ''}
+          {totalIntradayTransactions > 0 && <span>(including {totalIntradayTransactions} intraday)</span>}
           <button
             onClick={loadTransactions}
             disabled={loading}
@@ -716,7 +757,7 @@ export default function Transactions() {
             <Spinner animation="border" variant="primary" />
           </div>
         </Card>
-      ) : totalTransactions === 0 ? (
+      ) : (totalTransactions + totalIntradayTransactions) === 0 ? (
         <Card className="shadow-sm">
           <div className="p-5 text-center text-muted">
             <p>No transactions found.</p>
@@ -744,6 +785,7 @@ export default function Transactions() {
         <>
           {visibleGroupedAssetTypes.map((type) => {
             const allTxns = groupedTransactions[type] || [];
+            const intradayTxns = type === 'INDIAN_STOCK' ? intradayTransactions : [];
             const isDebtLike = isDebtLikeAssetType(type);
             const isPf = type === 'PF';
             const totalForType = groupedTotals[type] || allTxns.length;
@@ -761,6 +803,7 @@ export default function Transactions() {
                     {txns.length}
                     {totalForType !== txns.length ? ` / ${totalForType}` : ''}
                     {' '}transaction{totalForType !== 1 ? 's' : ''}
+                    {type === 'INDIAN_STOCK' && totalIntradayTransactions > 0 ? ` + ${totalIntradayTransactions} intraday` : ''}
                   </span>
                 </Card.Header>
                 <div className="responsive-table">
@@ -864,6 +907,73 @@ export default function Transactions() {
                     </tbody>
                   </Table>
                 </div>
+                {type === 'INDIAN_STOCK' && (
+                  <>
+                    <div className="px-3 py-2 border-top bg-light small fw-semibold text-muted">
+                      Intraday (Speculative) Trades
+                    </div>
+                    <div className="responsive-table">
+                      <Table hover size="sm" className="mb-0 small">
+                        <thead className="table-light">
+                          <tr>
+                            <th className="px-3 py-2">Date</th>
+                            <th className="px-3 py-2">Investment</th>
+                            <th className="px-3 py-2 text-end">Qty</th>
+                            <th className="px-3 py-2 text-end">Buy Value</th>
+                            <th className="px-3 py-2 text-end">Sell Value</th>
+                            <th className="px-3 py-2 text-end">Gross P&amp;L</th>
+                            <th className="px-3 py-2 text-end">Fees</th>
+                            <th className="px-3 py-2 text-end">STT</th>
+                            <th className="px-3 py-2 text-end">Net P&amp;L</th>
+                            <th className="px-3 py-2">Broker</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {intradayTxns.length === 0 ? (
+                            <tr>
+                              <td className="px-3 py-2 text-muted" colSpan={10}>No intraday trades for current filters.</td>
+                            </tr>
+                          ) : intradayTxns.map((txn) => (
+                            <tr key={`intraday-${txn.id}`}>
+                              <td className="px-3 py-2 text-nowrap">{formatDate(txn.trade_date)}</td>
+                              <td className="px-3 py-2">
+                                <div className="d-flex align-items-center gap-2">
+                                  <Link to={`/investments/${txn.investment_id}`} state={{ from: 'transactions', transactionsSearch: window.location.search, fromLabel: 'Transactions' }} className="text-primary fw-medium text-decoration-none">
+                                    {txn.investment_name}
+                                  </Link>
+                                  {(selectedIds.length !== 1) && txn.portfolio_name && (
+                                    <span
+                                      title={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
+                                      aria-label={(portfolioMeta[txn.portfolio_id]?.name || txn.portfolio_name || 'Portfolio')}
+                                      style={{
+                                        width: 10,
+                                        height: 10,
+                                        borderRadius: '50%',
+                                        display: 'inline-block',
+                                        backgroundColor: portfolioMeta[txn.portfolio_id]?.color || txn.portfolio_color || '#6c757d',
+                                        border: '1px solid rgba(0,0,0,0.15)',
+                                        cursor: 'help',
+                                        flexShrink: 0
+                                      }}
+                                    />
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-3 py-2 text-end">{formatNumber(txn.quantity || 0, 4)}</td>
+                              <td className="px-3 py-2 text-end">₹{formatNumber(txn.buy_value || 0, 2)}</td>
+                              <td className="px-3 py-2 text-end">₹{formatNumber(txn.sell_value || 0, 2)}</td>
+                              <td className="px-3 py-2 text-end">₹{formatNumber(txn.gross_profit || 0, 2)}</td>
+                              <td className="px-3 py-2 text-end">₹{formatNumber(txn.fees || 0, 2)}</td>
+                              <td className="px-3 py-2 text-end">₹{formatNumber(txn.stt || 0, 2)}</td>
+                              <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.net_profit || 0, 2)}</td>
+                              <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </Table>
+                    </div>
+                  </>
+                )}
                 <div className="d-flex align-items-center justify-content-between px-3 py-2 border-top small">
                   <div className="d-flex align-items-center gap-2">
                     <span className="text-muted">Rows per page:</span>

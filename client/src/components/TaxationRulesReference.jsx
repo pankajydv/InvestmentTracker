@@ -19,7 +19,10 @@ export default function TaxationRulesReference({ rules, fy }) {
   }
 
   const regime = 'New Regime (Section 115BAC)';
-  const isCurrentOrLatest = ['2025-26', '2024-25'].includes(fy);
+  const now = new Date();
+  const currentFyStartYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+  const fyStartYear = Number(String(fy || '').slice(0, 4));
+  const isCurrentOrLatest = Number.isFinite(fyStartYear) && fyStartYear >= currentFyStartYear - 1;
 
   return (
     <Card className="mt-4 border-info bg-light">

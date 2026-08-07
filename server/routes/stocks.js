@@ -284,16 +284,26 @@ module.exports = function (db) {
         SELECT id, amount, fees, stt, locked FROM transactions
         WHERE investment_id = ? AND transaction_type = ? AND transaction_date = ? AND units = ? AND price_per_unit = ?
       `);
+      const findExistingIntraday = db.prepare(`
+        SELECT id, buy_value, sell_value, gross_profit, fees, stt, net_profit
+        FROM stock_intraday_trades
+        WHERE investment_id = ? AND portfolio_id = ? AND trade_date = ?
+          AND quantity = ? AND buy_price = ? AND sell_price = ? AND broker = ?
+      `);
+
+      const resolveInvestmentId = (trade) => {
+        let invId = null;
+        if (trade.isin) {
+          invId = findByIsinPrev.get(trade.isin)?.id || findByPrevIsinPrev.get(trade.isin)?.id || null;
+        }
+        return invId || findByNameOrTicker.get(trade.security, trade.security)?.id || null;
+      };
 
       const classifyTrade = (trade) => {
         const newAmount = trade.total || (trade.quantity * trade.rate);
         const newFees = trade.brokerage || 0;
         const newStt = trade.stt || 0;
-        let invId = null;
-        if (trade.isin) {
-          invId = findByIsinPrev.get(trade.isin)?.id || findByPrevIsinPrev.get(trade.isin)?.id || null;
-        }
-        if (!invId) invId = findByNameOrTicker.get(trade.security, trade.security)?.id || null;
+        const invId = resolveInvestmentId(trade);
         if (!invId) return { status: 'new', new_stt: newStt, new_fees: newFees };
         const ex = findExistingTxn.get(invId, trade.type, trade.tradeDate, trade.quantity, trade.rate);
         if (!ex) return { status: 'new', new_stt: newStt, new_fees: newFees };
@@ -316,7 +326,21 @@ module.exports = function (db) {
         return { status: 'unchanged' };
       };
 
+      const classifyIntraday = (trade) => {
+        const invId = resolveInvestmentId(trade);
+        if (!invId) return { status: 'new' };
+        const existing = findExistingIntraday.get(
+          invId, portfolioId, trade.tradeDate, trade.quantity,
+          trade.buyRate, trade.sellRate, broker,
+        );
+        if (!existing) return { status: 'new' };
+        const changed = ['buy_value', 'sell_value', 'gross_profit', 'fees', 'stt', 'net_profit']
+          .some((field) => Math.abs((Number(existing[field]) || 0) - (Number(trade[field === 'buy_value' ? 'buyValue' : field === 'sell_value' ? 'sellValue' : field === 'gross_profit' ? 'grossProfit' : field === 'net_profit' ? 'netProfit' : field]) || 0)) > 0.01);
+        return { status: changed ? 'update' : 'unchanged' };
+      };
+
       const trades = [];
+      const intradayTrades = [];
       for (const note of allParsed) {
         for (const trade of note.trades) {
           const cls = classifyTrade(trade);
@@ -333,10 +357,14 @@ module.exports = function (db) {
             ...cls,
           });
         }
+        for (const trade of note.intradayTrades || []) {
+          intradayTrades.push({ ...trade, ...classifyIntraday(trade) });
+        }
       }
 
-      const newTradeCount = trades.filter(t => t.status === 'new').length;
-      const updateTradeCount = trades.filter(t => t.status === 'update').length;
+      const allImportRows = [...trades, ...intradayTrades];
+      const newTradeCount = allImportRows.filter(t => t.status === 'new').length;
+      const updateTradeCount = allImportRows.filter(t => t.status === 'update').length;
 
       // Summary
       const buys = trades.filter(t => t.type === 'BUY');
@@ -358,6 +386,7 @@ module.exports = function (db) {
         clientCode: allParsed[0].clientCode,
         portfolioName: portfolio.name,
         trades,
+        intradayTrades,
         summary: {
           totalBuys: buys.length,
           totalBuyValue: buys.reduce((s, t) => s + t.total, 0),
@@ -365,6 +394,9 @@ module.exports = function (db) {
           totalSells: sells.length,
           totalSellValue: sells.reduce((s, t) => s + t.total, 0),
           totalSellShares: sells.reduce((s, t) => s + t.quantity, 0),
+          totalIntradayTrades: intradayTrades.length,
+          totalIntradayGrossProfit: intradayTrades.reduce((s, t) => s + t.grossProfit, 0),
+          totalIntradayNetProfit: intradayTrades.reduce((s, t) => s + t.netProfit, 0),
           totalBrokerage: totalCharges,
           newTrades: newTradeCount,
           updateTrades: updateTradeCount,
@@ -390,9 +422,9 @@ module.exports = function (db) {
    */
   router.post('/contract-notes/import', express.json(), async (req, res) => {
     try {
-      const { portfolio_id, broker, trades } = req.body;
-      if (!portfolio_id || !trades?.length) {
-        return res.status(400).json({ error: 'portfolio_id and trades are required' });
+      const { portfolio_id, broker, trades = [], intradayTrades = [] } = req.body;
+      if (!portfolio_id || (trades.length === 0 && intradayTrades.length === 0)) {
+        return res.status(400).json({ error: 'portfolio_id and at least one trade are required' });
       }
 
       const portfolioId = parseInt(portfolio_id);
@@ -428,11 +460,33 @@ module.exports = function (db) {
       const updateTransaction = db.prepare(`
         UPDATE transactions SET amount = ?, fees = ?, stt = ?, notes = ? WHERE id = ?
       `);
+      const findIntradayTrade = db.prepare(`
+        SELECT id, buy_value, sell_value, gross_profit, fees, stt, net_profit, charge_breakdown_json
+        FROM stock_intraday_trades
+        WHERE investment_id = ? AND portfolio_id = ? AND trade_date = ?
+          AND quantity = ? AND buy_price = ? AND sell_price = ? AND broker = ?
+      `);
+      const insertIntradayTrade = db.prepare(`
+        INSERT INTO stock_intraday_trades (
+          investment_id, portfolio_id, trade_date, quantity,
+          buy_price, buy_value, sell_price, sell_value,
+          gross_profit, fees, stt, net_profit, charge_breakdown_json, broker, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const updateIntradayTrade = db.prepare(`
+        UPDATE stock_intraday_trades
+        SET buy_value = ?, sell_value = ?, gross_profit = ?, fees = ?, stt = ?,
+            net_profit = ?, charge_breakdown_json = ?, notes = ?
+        WHERE id = ?
+      `);
 
       let investmentsCreated = 0;
       let transactionsCreated = 0;
       let transactionsUpdated = 0;
       let transactionsSkipped = 0;
+      let intradayCreated = 0;
+      let intradayUpdated = 0;
+      let intradaySkipped = 0;
       const errors = [];
       const dirtyCandidates = [];
 
@@ -441,9 +495,16 @@ module.exports = function (db) {
       for (const trade of trades) {
         const key = trade.isin || trade.security;
         if (!stockMap[key]) {
-          stockMap[key] = { security: trade.security, isin: trade.isin, trades: [] };
+          stockMap[key] = { security: trade.security, isin: trade.isin, trades: [], intradayTrades: [] };
         }
         stockMap[key].trades.push(trade);
+      }
+      for (const trade of intradayTrades) {
+        const key = trade.isin || trade.security;
+        if (!stockMap[key]) {
+          stockMap[key] = { security: trade.security, isin: trade.isin, trades: [], intradayTrades: [] };
+        }
+        stockMap[key].intradayTrades.push(trade);
       }
 
       for (const [key, stock] of Object.entries(stockMap)) {
@@ -518,6 +579,51 @@ module.exports = function (db) {
               transactionsCreated++;
             }
           }
+
+          for (const trade of stock.intradayTrades) {
+            const chargeBreakdownJson = JSON.stringify(trade.chargeBreakdown || {});
+            const notes = `${broker || 'Broker'} contract note - intraday`;
+            const values = {
+              buyValue: Number(trade.buyValue) || 0,
+              sellValue: Number(trade.sellValue) || 0,
+              grossProfit: Number(trade.grossProfit) || 0,
+              fees: Number(trade.fees) || 0,
+              stt: Number(trade.stt) || 0,
+              netProfit: Number(trade.netProfit) || 0,
+            };
+            const existingTrade = findIntradayTrade.get(
+              investmentId, portfolioId, trade.tradeDate, trade.quantity,
+              trade.buyRate, trade.sellRate, broker || 'Unknown',
+            );
+
+            if (!existingTrade) {
+              insertIntradayTrade.run(
+                investmentId, portfolioId, trade.tradeDate, trade.quantity,
+                trade.buyRate, values.buyValue, trade.sellRate, values.sellValue,
+                values.grossProfit, values.fees, values.stt, values.netProfit,
+                chargeBreakdownJson, broker || 'Unknown', notes,
+              );
+              intradayCreated++;
+              continue;
+            }
+
+            const changed = Math.abs(existingTrade.buy_value - values.buyValue) > 0.01
+              || Math.abs(existingTrade.sell_value - values.sellValue) > 0.01
+              || Math.abs(existingTrade.gross_profit - values.grossProfit) > 0.01
+              || Math.abs(existingTrade.fees - values.fees) > 0.01
+              || Math.abs(existingTrade.stt - values.stt) > 0.01
+              || Math.abs(existingTrade.net_profit - values.netProfit) > 0.01
+              || existingTrade.charge_breakdown_json !== chargeBreakdownJson;
+            if (changed) {
+              updateIntradayTrade.run(
+                values.buyValue, values.sellValue, values.grossProfit, values.fees,
+                values.stt, values.netProfit, chargeBreakdownJson, notes, existingTrade.id,
+              );
+              intradayUpdated++;
+            } else {
+              intradaySkipped++;
+            }
+          }
         } catch (e) {
           errors.push(`${stock.security}: ${e.message}`);
         }
@@ -532,6 +638,9 @@ module.exports = function (db) {
         transactionsCreated,
         transactionsUpdated,
         transactionsSkipped,
+        intradayCreated,
+        intradayUpdated,
+        intradaySkipped,
         errors: errors.length > 0 ? errors : undefined,
       });
       logAppInfo('[Stocks] Contract notes import completed', {
@@ -541,6 +650,9 @@ module.exports = function (db) {
         transactions_created: transactionsCreated,
         transactions_updated: transactionsUpdated,
         transactions_skipped: transactionsSkipped,
+        intraday_created: intradayCreated,
+        intraday_updated: intradayUpdated,
+        intraday_skipped: intradaySkipped,
         errors: errors.length,
       });
     } catch (e) {

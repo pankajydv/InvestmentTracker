@@ -854,6 +854,7 @@ function combineTaxReports(reports) {
   const combined = {
     perquisite_income: [],
     capital_gains: [],
+    speculative_business: [],
     dividend_income: [],
     form_67: [],
     schedule_fa: [],
@@ -861,6 +862,7 @@ function combineTaxReports(reports) {
       total_perquisite_inr: 0,
       total_stcg_inr: 0,
       total_ltcg_inr: 0,
+      total_speculative_business_inr: 0,
       total_dividend_inr: 0,
       total_ftc_inr: 0,
       tax_note: reports[0]?.summary?.tax_note || '',
@@ -870,6 +872,7 @@ function combineTaxReports(reports) {
   for (const report of reports) {
     combined.perquisite_income.push(...(report?.perquisite_income || []));
     combined.capital_gains.push(...(report?.capital_gains || []));
+    combined.speculative_business.push(...(report?.speculative_business || []));
     combined.dividend_income.push(...(report?.dividend_income || []));
     combined.form_67.push(...(report?.form_67 || []));
     combined.schedule_fa.push(...(report?.schedule_fa || []));
@@ -877,6 +880,7 @@ function combineTaxReports(reports) {
     combined.summary.total_perquisite_inr += Number(report?.summary?.total_perquisite_inr) || 0;
     combined.summary.total_stcg_inr += Number(report?.summary?.total_stcg_inr) || 0;
     combined.summary.total_ltcg_inr += Number(report?.summary?.total_ltcg_inr) || 0;
+    combined.summary.total_speculative_business_inr += Number(report?.summary?.total_speculative_business_inr) || 0;
     combined.summary.total_dividend_inr += Number(report?.summary?.total_dividend_inr) || 0;
     combined.summary.total_ftc_inr += Number(report?.summary?.total_ftc_inr) || 0;
   }
@@ -1128,7 +1132,11 @@ export default function TaxReport() {
   const refreshTaxComputation = async () => {
     try {
       const comp = await getTaxComputation(fy, portfolioId);
-      setComputation(comp);
+      if (comp && comp.supported === false) {
+        setComputation(null);
+      } else {
+        setComputation(comp);
+      }
     } catch (e) {
       setComputation(null);
     } finally {
@@ -1323,6 +1331,7 @@ export default function TaxReport() {
             {computation ? (
               <>
                 <Col xs={6} md={2}><SummaryCard label="Net Salary" value={formatINR(computation.heads?.salary?.net || 0)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="Speculative Business" value={formatINR(computation.heads?.speculative_business?.net_profit || 0)} color={profitColor(computation.heads?.speculative_business?.net_profit || 0)} sub="Equity intraday" /></Col>
                 <Col xs={6} md={2}><SummaryCard label="STCG (111A + Slab)" value={formatINR((computation.heads?.capital_gains?.stcg_111a || 0) + (computation.heads?.capital_gains?.stcg_slab || 0))} color={profitColor((computation.heads?.capital_gains?.stcg_111a || 0) + (computation.heads?.capital_gains?.stcg_slab || 0))} /></Col>
                 <Col xs={6} md={2}><SummaryCard label="LTCG 112A (Equity)" value={formatINR(computation.heads?.capital_gains?.ltcg_112a_taxable || 0)} color={profitColor(computation.heads?.capital_gains?.ltcg_112a_taxable)} sub={`Gross ${formatINR(computation.heads?.capital_gains?.ltcg_112a_gross || 0)}`} /></Col>
                 <Col xs={6} md={2}><SummaryCard label="LTCG 112 (Foreign)" value={formatINR((computation.heads?.capital_gains?.ltcg_112_adjusted ?? computation.heads?.capital_gains?.ltcg_112) || 0)} color={profitColor(computation.heads?.capital_gains?.ltcg_112 || 0)} /></Col>
@@ -1332,6 +1341,7 @@ export default function TaxReport() {
             ) : (
               <>
                 <Col xs={6} md={2}><SummaryCard label="Perquisite (Sch 1)" value={formatINR(summary.total_perquisite_inr || 0)} /></Col>
+                <Col xs={6} md={2}><SummaryCard label="Speculative Business" value={formatINR(summary.total_speculative_business_inr || 0)} color={profitColor(summary.total_speculative_business_inr || 0)} sub="Equity intraday" /></Col>
                 <Col xs={6} md={2}><SummaryCard label="STCG 111A (Equity)" value={formatINR(cgView.summary.stcg111a)} color={profitColor(cgView.summary.stcg111a)} /></Col>
                 <Col xs={6} md={2}><SummaryCard label="LTCG 112A taxable" value={formatINR(cgView.summary.ltcg112aTaxable)} color={profitColor(cgView.summary.ltcg112aTaxable)} sub={`Gross ${formatINR(cgView.summary.ltcg112aGross)} · exempt ${formatINR(cgView.summary.ltcg112aExemption)}`} /></Col>
                 <Col xs={6} md={2}><SummaryCard label="LTCG 112 (Foreign)" value={formatINR(cgView.summary.ltcg112)} color={profitColor(cgView.summary.ltcg112)} /></Col>
@@ -1505,6 +1515,52 @@ export default function TaxReport() {
                   </div>
                   )}
                 </SubSectionShell>
+              </Accordion.Body>
+            </Accordion.Item>
+
+            <Accordion.Item eventKey="2a">
+              <Accordion.Header>Speculative Business: Equity Intraday ({report.speculative_business?.length || 0} trades · Net {formatINR(summary.total_speculative_business_inr || 0)})</Accordion.Header>
+              <Accordion.Body>
+                <div className="d-flex justify-content-end mb-2">
+                  <Button size="sm" variant="outline-secondary" onClick={() => downloadCSV(`speculative_business_${fy}.csv`, report.speculative_business || [])}>
+                    <Download size={14} className="me-1" /> Export CSV
+                  </Button>
+                </div>
+                <div className="table-responsive">
+                  <Table size="sm" hover className="small">
+                    <thead className="table-light">
+                      <tr>
+                        <th>Date</th><th>Investment</th><th>ISIN</th><th className="text-end">Qty</th>
+                        <th className="text-end">Buy Value</th><th className="text-end">Sell Value</th>
+                        <th className="text-end">Gross P&amp;L</th><th className="text-end">Fees</th>
+                        <th className="text-end">STT</th><th className="text-end">Net P&amp;L</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(report.speculative_business || []).map((row) => (
+                        <tr key={row.id}>
+                          <td>{formatDate(row.trade_date)}</td>
+                          <td>{row.investment}</td>
+                          <td>{row.isin_code || '-'}</td>
+                          <td className="text-end">{formatNumber(row.quantity || 0, 4)}</td>
+                          <td className="text-end">{formatINR(row.buy_value || 0)}</td>
+                          <td className="text-end">{formatINR(row.sell_value || 0)}</td>
+                          <td className={`text-end ${profitColor(row.gross_profit)}`}>{formatINR(row.gross_profit || 0)}</td>
+                          <td className="text-end">{formatINR(row.fees || 0)}</td>
+                          <td className="text-end">{formatINR(row.stt || 0)}</td>
+                          <td className={`text-end fw-semibold ${profitColor(row.net_profit)}`}>{formatINR(row.net_profit || 0)}</td>
+                        </tr>
+                      ))}
+                      {(report.speculative_business || []).length === 0 && (
+                        <tr><td colSpan={10} className="text-center text-muted py-3">No equity intraday trades in this financial year.</td></tr>
+                      )}
+                    </tbody>
+                    <tfoot className="table-light fw-semibold">
+                      <tr><td colSpan={9}>Net speculative business profit/loss</td><td className={`text-end ${profitColor(summary.total_speculative_business_inr || 0)}`}>{formatINR(summary.total_speculative_business_inr || 0)}</td></tr>
+                    </tfoot>
+                  </Table>
+                </div>
+                <div className="small text-muted">Positive net profit is taxed at slab rates. A net speculative loss is shown for carry-forward and is not offset against other income heads.</div>
               </Accordion.Body>
             </Accordion.Item>
 

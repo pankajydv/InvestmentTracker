@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { Alert, Button, Card, Col, Row, Spinner } from 'react-bootstrap';
 import { ArrowLeft, PiggyBank, TrendingDown, TrendingUp, Wallet } from 'lucide-react';
-import { getDashboardSummary, getDashboardVersion, getAssetIntervalMetrics } from '../services/api';
+import { getAssetTypeOverview, getAssetTypeXirr, getDashboardSummary, getDashboardVersion, getAssetIntervalMetrics } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { formatDate, formatINR, formatNumber, formatPct, profitColor, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS, ASSET_TYPE_SLUG_TO_KEY, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
@@ -335,6 +335,47 @@ export default function AssetTypeDashboard() {
 
         let result;
         let resultVersion = null;
+
+        // Fast path: 1D uses lightweight asset-specific endpoints
+        if (selectedInterval === '1D') {
+          const scopeOptions = {
+            portfolioIds: isAllScope ? undefined : selectedIds,
+            hideSold,
+            includeFullySoldInReturns,
+          };
+          const overview = await getAssetTypeOverview(assetType, scopeOptions);
+          if (cancelled) return;
+          result = overview;
+          resultVersion = overview?.dataVersion ?? null;
+          setData(result);
+          setCacheState('fresh');
+          setLoading(false);
+          setError(null);
+
+          // Enrich with XIRR after first paint
+          try {
+            const enrichment = await getAssetTypeXirr(assetType, scopeOptions);
+            if (cancelled) return;
+            if (String(enrichment?.dataVersion) === String(resultVersion) && enrichment?.investmentXirr) {
+              setData((prev) => {
+                if (!prev?.byType?.[assetType]) return prev;
+                const info = { ...prev.byType[assetType] };
+                info.xirrPct = enrichment.xirrPct;
+                info.investments = (info.investments || []).map((inv) => ({
+                  ...inv,
+                  xirr_pct: enrichment.investmentXirr[inv.id] ?? inv.xirr_pct,
+                }));
+                const merged = { ...prev, byType: { ...prev.byType, [assetType]: info } };
+                setCachedDashboardSummary(cacheKey, merged, resultVersion);
+                return merged;
+              });
+            }
+          } catch (_e) { /* XIRR enrichment is optional */ }
+          setCachedDashboardSummary(cacheKey, result, resultVersion);
+          setIsIntervalSwitching(false);
+          return;
+        }
+
         if (isPartialMulti) {
           const results = await Promise.all(selectedIds.map((id) => getDashboardSummary(id, requestOptions)));
           result = combineDashboardSummaries(results, selectedIds);

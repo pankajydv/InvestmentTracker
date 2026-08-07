@@ -153,6 +153,31 @@ function initializeDb(db) {
       FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE
     );
 
+    -- Same-day stock round trips. Kept separate so they never affect holdings
+    -- or capital-gains FIFO lots.
+    CREATE TABLE IF NOT EXISTS stock_intraday_trades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      investment_id INTEGER NOT NULL,
+      portfolio_id INTEGER NOT NULL,
+      trade_date TEXT NOT NULL,
+      quantity REAL NOT NULL,
+      buy_price REAL NOT NULL,
+      buy_value REAL NOT NULL,
+      sell_price REAL NOT NULL,
+      sell_value REAL NOT NULL,
+      gross_profit REAL NOT NULL,
+      fees REAL NOT NULL DEFAULT 0,
+      stt REAL NOT NULL DEFAULT 0,
+      net_profit REAL NOT NULL,
+      charge_breakdown_json TEXT,
+      broker TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (investment_id) REFERENCES investments(id) ON DELETE CASCADE,
+      FOREIGN KEY (portfolio_id) REFERENCES portfolios(id) ON DELETE CASCADE,
+      UNIQUE(investment_id, portfolio_id, trade_date, quantity, buy_price, sell_price, broker)
+    );
+
     -- Daily snapshot of each investment's value (per portfolio + combined)
     CREATE TABLE IF NOT EXISTS daily_values (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -313,6 +338,8 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_asset_type_daily_type_date ON asset_type_daily(asset_type, date);
     CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_portfolio_investment ON transactions(portfolio_id, investment_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_intraday_portfolio_date ON stock_intraday_trades(portfolio_id, trade_date);
+    CREATE INDEX IF NOT EXISTS idx_stock_intraday_investment_date ON stock_intraday_trades(investment_id, trade_date);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_status_date ON dirty_backfill_scope(status, dirty_from_date);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_investment_portfolio ON dirty_backfill_scope(investment_id, portfolio_id, status);
     CREATE INDEX IF NOT EXISTS idx_symbol_history_investment_dates ON investment_symbol_history(investment_id, valid_from, valid_to);
