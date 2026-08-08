@@ -496,19 +496,27 @@ export default function AssetTypeDashboard() {
       </div>
 
       <Row className="g-3">
-        <Col md={6} lg={4}>
+        <Col md={6} lg={4} className="order-1">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 <Wallet size={16} /> Current Value
               </div>
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINRExact(typeInfo.totalValue)}</div>
-              <div className="text-muted small">Net Invested: {formatINRExact(currentInvested)}</div>
-              <div className="text-muted small">Cash Proceeds: {formatINRExact(totalRealizedGain)}</div>
+              <div className="dashboard-detail-rows">
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Net Invested</span>
+                  <span className="dashboard-detail-value">{formatINRExact(currentInvested)}</span>
+                </div>
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Cash Proceeds</span>
+                  <span className="dashboard-detail-value">{formatINRExact(totalRealizedGain)}</span>
+                </div>
+              </div>
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={4}>
+        <Col md={6} lg={4} className="order-3">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
@@ -602,7 +610,7 @@ export default function AssetTypeDashboard() {
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={4}>
+        <Col md={6} lg={4} className="order-2">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
@@ -612,7 +620,7 @@ export default function AssetTypeDashboard() {
                 {netProfitLoss >= 0 ? '+' : ''}{formatINRExact(netProfitLoss)}
               </div>
               <div className={`small ${profitColor(netReturnPct)}`}>
-                <span>Abs: {formatPct(netReturnPct)}</span>
+                <span>Absolute: {formatPct(netReturnPct)}</span>
                 <span className="mx-2 text-muted">|</span>
                 <span>XIRR: {typeInfo.xirrPct == null ? 'N/A' : formatPct(typeInfo.xirrPct)}</span>
               </div>

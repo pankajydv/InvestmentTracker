@@ -141,18 +141,6 @@ export const ASSET_TYPE_SLUG_TO_KEY = Object.fromEntries(
   Object.entries(ASSET_TYPE_LABELS).map(([key, label]) => [label.toLowerCase(), key])
 );
 
-export const ASSET_TYPE_DISPLAY_ORDER = {
-  INDIAN_STOCK: 1,
-  MUTUAL_FUND: 2,
-  NPS: 3,
-  SGB: 4,
-  BOND: 5,
-  PF: 6,
-  PPF: 7,
-  SSY: 8,
-  FOREIGN_STOCK: 9,
-};
-
 export const ASSET_TYPE_FILTER_ORDER = [
   'INDIAN_STOCK',
   'MUTUAL_FUND',
@@ -164,6 +152,17 @@ export const ASSET_TYPE_FILTER_ORDER = [
   'SSY',
   'FOREIGN_STOCK',
 ];
+
+export const ASSET_TYPE_DISPLAY_ORDER = Object.fromEntries(
+  ASSET_TYPE_FILTER_ORDER.map((assetType, index) => [assetType, index + 1])
+);
+
+export function compareAssetTypes(typeA, typeB) {
+  const orderA = ASSET_TYPE_DISPLAY_ORDER[typeA] ?? 999;
+  const orderB = ASSET_TYPE_DISPLAY_ORDER[typeB] ?? 999;
+  if (orderA !== orderB) return orderA - orderB;
+  return String(typeA).localeCompare(String(typeB));
+}
 
 /**
  * Asset type colors for charts

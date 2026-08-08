@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Card, Table, Spinner, Form, Modal, Button, Row, Col } from 'react-bootstrap';
 import { getTransactions, getStockIntradayTransactions, getBrokers, getTransactionTypes, getInvestmentNames, getPortfolios, updateTransaction, deleteTransaction } from '../services/api';
-import { formatNumber, formatDate, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS } from '../utils/formatters';
+import { formatINRExact, formatNumber, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, compareAssetTypes } from '../utils/formatters';
 import { usePortfolio } from '../context/PortfolioContext';
 import { resolvePortfolioColor } from '../utils/portfolioColors';
 
@@ -480,17 +480,9 @@ export default function Transactions() {
     return acc;
   }, {});
 
-  const groupedAssetTypes = Object.keys(groupedTotals).sort((a, b) => {
-    const labelA = ASSET_TYPE_LABELS[a] || a;
-    const labelB = ASSET_TYPE_LABELS[b] || b;
-    return labelA.localeCompare(labelB);
-  });
+  const groupedAssetTypes = Object.keys(groupedTotals).sort(compareAssetTypes);
 
-  const visibleGroupedAssetTypes = Object.keys(groupedTransactions).sort((a, b) => {
-    const labelA = ASSET_TYPE_LABELS[a] || a;
-    const labelB = ASSET_TYPE_LABELS[b] || b;
-    return labelA.localeCompare(labelB);
-  });
+  const visibleGroupedAssetTypes = Object.keys(groupedTransactions).sort(compareAssetTypes);
 
   useEffect(() => {
     // Keep per-type page numbers in valid bounds after filtering/data changes.
@@ -965,7 +957,9 @@ export default function Transactions() {
                               <td className="px-3 py-2 text-end">₹{formatNumber(txn.gross_profit || 0, 2)}</td>
                               <td className="px-3 py-2 text-end">₹{formatNumber(txn.fees || 0, 2)}</td>
                               <td className="px-3 py-2 text-end">₹{formatNumber(txn.stt || 0, 2)}</td>
-                              <td className="px-3 py-2 text-end fw-medium">₹{formatNumber(txn.net_profit || 0, 2)}</td>
+                              <td className={`px-3 py-2 text-end fw-medium ${profitColor(txn.net_profit)}`}>
+                                {formatINRExact(txn.net_profit || 0, 2)}
+                              </td>
                               <td className="px-3 py-2 text-muted" style={{ fontSize: '0.75rem' }}>{txn.broker || '-'}</td>
                             </tr>
                           ))}

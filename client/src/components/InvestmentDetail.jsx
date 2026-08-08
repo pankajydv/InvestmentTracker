@@ -934,19 +934,27 @@ export default function InvestmentDetail() {
 
       {/* Summary Cards */}
       <Row className="g-3 mb-4">
-        <Col md={6} lg={3}>
+        <Col md={6} lg={3} className="order-1">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 <Wallet size={16} /> Current Value
               </div>
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINR(currentValue)}</div>
-              <div className="text-muted small">Total Invested: {formatINR(totalInvested)}</div>
-              <div className="text-muted small">Cash Proceeds: {formatINR(realizedGain)}</div>
+              <div className="dashboard-detail-rows">
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Total Invested</span>
+                  <span className="dashboard-detail-value">{formatINR(totalInvested)}</span>
+                </div>
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Cash Proceeds</span>
+                  <span className="dashboard-detail-value">{formatINR(realizedGain)}</span>
+                </div>
+              </div>
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={3}>
+        <Col md={6} lg={3} className="order-4">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
@@ -1032,7 +1040,7 @@ export default function InvestmentDetail() {
                 </div>
               )}
 
-              <div className={`fw-bold ${profitColor(intervalChange)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
+              <div className={`fs-3 fw-bold ${profitColor(intervalChange)}`}>
                 {formatINR(intervalChange, 0)}
               </div>
               {isDayChangeMode && (
@@ -1055,18 +1063,27 @@ export default function InvestmentDetail() {
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={3}>
+        <Col md={6} lg={3} className="order-3">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 <BarChart3 size={16} /> Cumulative Value
               </div>
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINR(cumulativeValue)}</div>
-              <div className="text-muted small">Current + Cash Out</div>
+              <div className="dashboard-detail-rows">
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Current Value</span>
+                  <span className="dashboard-detail-value">{formatINR(currentValue)}</span>
+                </div>
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Cash Proceeds</span>
+                  <span className="dashboard-detail-value">{formatINR(realizedGain)}</span>
+                </div>
+              </div>
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={3}>
+        <Col md={6} lg={3} className="order-2">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
@@ -1075,10 +1092,19 @@ export default function InvestmentDetail() {
               <div className={`fw-bold ${profitColor(totalProfitLoss)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
                 {totalProfitLoss >= 0 ? '+' : ''}{formatINR(totalProfitLoss)}
               </div>
-              <div className={`small ${profitColor(absoluteReturnPct)}`}>
-                <span>Abs: {formatPct(absoluteReturnPct)}</span>
-                <span className="mx-2 text-muted">|</span>
-                <span>XIRR: {xirrPct == null ? 'N/A' : formatPct(xirrPct)}</span>
+              <div className="dashboard-return-rows">
+                <div className="dashboard-return-row">
+                  <span className="dashboard-return-label">Absolute</span>
+                  <span className={`dashboard-return-value ${profitColor(absoluteReturnPct)}`}>
+                    {formatPct(absoluteReturnPct)}
+                  </span>
+                </div>
+                <div className="dashboard-return-row">
+                  <span className="dashboard-return-label">XIRR</span>
+                  <span className={`dashboard-return-value ${profitColor(xirrPct)}`}>
+                    {xirrPct == null ? 'N/A' : formatPct(xirrPct)}
+                  </span>
+                </div>
               </div>
             </Card.Body>
           </Card>

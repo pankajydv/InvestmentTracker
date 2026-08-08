@@ -2,9 +2,9 @@ import React, { useState } from 'react';
 import { Modal, Button, Form, Alert, Badge, Spinner } from 'react-bootstrap';
 import { Eye, Trash2 } from 'lucide-react';
 import { purgeMarketPriceCache } from '../services/api';
-import { ASSET_TYPE_FULL_NAMES, ASSET_TYPE_LABELS } from '../utils/formatters';
+import { ASSET_TYPE_FILTER_ORDER, ASSET_TYPE_FULL_NAMES } from '../utils/formatters';
 
-const ASSET_TYPES = Object.keys(ASSET_TYPE_LABELS);
+const ASSET_TYPES = ASSET_TYPE_FILTER_ORDER;
 const DATE_STRATEGIES = [
   { value: 'scope_first_transaction', label: 'From First Transaction (default)', desc: 'Uses earliest transaction date per investment' },
   { value: 'max_of_fixed_and_scope_first', label: 'Fixed OR First (max)', desc: 'Later of fixed date or first transaction date' },

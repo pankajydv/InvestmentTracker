@@ -4,13 +4,14 @@ import { Card, Row, Col, Table, Spinner, Alert, Button } from 'react-bootstrap';
 import { getDashboardOverview, getDashboardSummary, getDashboardVersion, getDashboardXirrSummary, getDailyValuesHealthStatus, getAssetIntervalMetrics } from '../services/api';
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
-import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_DISPLAY_ORDER, ASSET_TYPE_SLUG, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
+import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_SLUG, compareAssetTypes, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
 import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
 import DashboardRolloverTable from './DashboardRolloverTable';
 import DashboardSkeleton from './DashboardSkeleton';
+import DayChangeRows from './DayChangeRows';
 import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { getDashboardCacheKey, getCachedDashboardSummary, removeCachedDashboardSummary, resolveDashboardCacheState, setCachedDashboardSummary } from '../utils/dashboardSummaryCache';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
@@ -66,12 +67,7 @@ function renderPortfolioScope(portfolioLike) {
 }
 
 function sortAssetTypeEntries(byType) {
-  return Object.entries(byType || {}).sort(([typeA], [typeB]) => {
-    const orderA = ASSET_TYPE_DISPLAY_ORDER[typeA] ?? 999;
-    const orderB = ASSET_TYPE_DISPLAY_ORDER[typeB] ?? 999;
-    if (orderA !== orderB) return orderA - orderB;
-    return String(typeA).localeCompare(String(typeB));
-  });
+  return Object.entries(byType || {}).sort(([typeA], [typeB]) => compareAssetTypes(typeA, typeB));
 }
 
 function combineDashboardSummaries(results, selectedIds) {
@@ -1093,24 +1089,34 @@ export default function Dashboard() {
 
       {/* Portfolio Summary Cards */}
       <Row className="g-3 mb-4">
-        <Col md={6} lg={4}>
+        <Col md={6} lg={4} className="order-1">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
                 <Wallet size={16} /> Current Value
               </div>
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINRExact(portfolio.total_value)}</div>
-              <div className="text-muted small">Net Invested: {formatINRExact(currentInvested)}</div>
-              <div className="text-muted small">Cash Proceeds: {formatINRExact(totalRealizedGain)}</div>
+              <div className="dashboard-detail-rows">
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Net Invested</span>
+                  <span className="dashboard-detail-value">{formatINRExact(currentInvested)}</span>
+                </div>
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Cash Proceeds</span>
+                  <span className="dashboard-detail-value">{formatINRExact(totalRealizedGain)}</span>
+                </div>
+              </div>
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={4}>
+        <Col md={6} lg={4} className="order-3">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
                 <div className="d-flex align-items-center gap-2 text-muted small">
-                  {(data?.intervalXIRR?.interval_change ?? 0) >= 0 ? (
+                  {(selectedInterval === '1D'
+                    ? Number(portfolio.dayChanges?.oneDay?.change || 0)
+                    : Number(data?.intervalXIRR?.interval_change || 0)) >= 0 ? (
                     <TrendingUp size={16} className="text-success" />
                   ) : (
                     <TrendingDown size={16} className="text-danger" />
@@ -1119,7 +1125,7 @@ export default function Dashboard() {
                     {selectedInterval === 'CUSTOM'
                       ? `${customFromDate} to ${customToDate}`
                       : selectedInterval === '1D'
-                      ? '1 Day Change'
+                      ? 'Daily Change'
                       : selectedInterval === 'YD'
                       ? 'Yesterday Change'
                       : `${selectedInterval} Change`}
@@ -1143,7 +1149,6 @@ export default function Dashboard() {
                     style={{ maxWidth: '100px', fontSize: '0.85rem' }}
                   >
                     <option value="1D">1D</option>
-                    <option value="YD">YD</option>
                     <option value="2D">2D</option>
                     <option value="1W">1W</option>
                     <option value="1M">1M</option>
@@ -1198,28 +1203,28 @@ export default function Dashboard() {
                 </div>
               ) : (
                 <>
-                  <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
-                    {formatINR(data?.intervalXIRR?.interval_change || 0, 0)}
-                  </div>
-                  {isDayChangeMode ? (
-                    <div className={`small ${profitColor(data?.intervalXIRR?.interval_change_pct)}`}>
-                      Change: {formatPct(data?.intervalXIRR?.interval_change_pct || 0)}
+                  {selectedInterval === '1D' ? (
+                    <DayChangeRows dayChanges={portfolio.dayChanges} />
+                  ) : (
+                    <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
+                      {formatINR(data?.intervalXIRR?.interval_change || 0, 0)}
                     </div>
-                  ) : data?.intervalXIRR?.xirr_pct != null ? (
+                  )}
+                  {selectedInterval !== '1D' && data?.intervalXIRR?.xirr_pct != null ? (
                     <div className={`small ${profitColor(data.intervalXIRR.xirr_pct)}`}>
                       Change: {formatPct(data.intervalXIRR.xirr_pct)} p.a.
                     </div>
-                  ) : (
+                  ) : selectedInterval !== '1D' ? (
                     <div className="small text-warning" title={data?.intervalXIRR?.error || 'XIRR could not be calculated for this interval'}>
                       ⚠ XIRR unavailable
                     </div>
-                  )}
+                  ) : null}
                 </>
               )}
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={4}>
+        <Col md={6} lg={4} className="order-2">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
@@ -1228,14 +1233,21 @@ export default function Dashboard() {
               <div className={`fw-bold ${profitColor(netProfitLoss)}`} style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>
                 {netProfitLoss >= 0 ? '+' : ''}{formatINRExact(netProfitLoss)}
               </div>
-              <div className={`small ${profitColor(netReturnPct)}`}>
-                <span>Abs: {formatPct(netReturnPct)}</span>
-                <span className="mx-2 text-muted">|</span>
-                <span>
-                  XIRR: {xirrLoading ? (
+              <div className="dashboard-return-rows">
+                <div className="dashboard-return-row">
+                  <span className="dashboard-return-label">Absolute</span>
+                  <span className={`dashboard-return-value ${profitColor(netReturnPct)}`}>
+                    {formatPct(netReturnPct)}
+                  </span>
+                </div>
+                <div className="dashboard-return-row">
+                  <span className="dashboard-return-label">XIRR</span>
+                  <span className={`dashboard-return-value ${profitColor(portfolio.xirr_pct)}`}>
+                    {xirrLoading ? (
                     <span className="dashboard-inline-shimmer" aria-label="Loading XIRR" />
-                  ) : portfolio.xirr_pct == null ? 'N/A' : formatPct(portfolio.xirr_pct)}
-                </span>
+                    ) : portfolio.xirr_pct == null ? 'N/A' : formatPct(portfolio.xirr_pct)}
+                  </span>
+                </div>
               </div>
             </Card.Body>
           </Card>

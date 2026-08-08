@@ -12,6 +12,7 @@ const {
   putSnapshot,
 } = require('../services/dashboardSnapshotService');
 const { DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS } = require('../services/freshnessPolicy');
+const { resolveDayChangePair, aggregateDayChangePairs } = require('../services/dayChangeService');
 const {
   ACQUIRED_UNITS_INFLOW_TYPES_SQL,
   ACQUIRED_UNITS_INFLOW_TYPES,
@@ -223,9 +224,40 @@ function getDashboardDayChangeFloor(latestDate) {
   return cursor;
 }
 
+function buildStrictPortfolioDayChangePair(rows) {
+  const toMetric = (row) => {
+    if (!row) {
+      return {
+        change: 0, changePct: 0, openingValue: 0, currentValue: 0,
+        asOfDate: null, source: null, sourceMixed: false,
+        usedFallback: false, staleFallback: false,
+      };
+    }
+    const change = Number(row.day_change || 0);
+    const currentValue = Number(row.current_value || 0);
+    const openingValue = Math.max(currentValue - change, 0);
+    return {
+      change,
+      changePct: openingValue > 0 ? (change / openingValue) * 100 : 0,
+      openingValue,
+      currentValue,
+      asOfDate: row.date || null,
+      source: null,
+      sourceMixed: false,
+      usedFallback: false,
+      staleFallback: false,
+    };
+  };
+
+  return {
+    oneDay: toMetric(rows?.[0]),
+    yesterday: toMetric(rows?.[1]),
+  };
+}
+
 function buildDashboardOverviewCacheKey(scopeIds, query = {}) {
   return JSON.stringify({
-    kind: 'dashboard-overview-v1',
+    kind: 'dashboard-overview-v4',
     scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
     hideSold: isTruthyQueryValue(query.hide_sold),
     includeSoldInReturns: isTruthyQueryValue(query.include_sold_in_returns),
@@ -379,6 +411,7 @@ function buildDashboardOverview(db, query = {}) {
       dv.date,
       SUM(COALESCE(dv.current_value, 0)) AS current_value,
       SUM(COALESCE(dv.day_change, 0)) AS day_change,
+      MAX(dv.price_source) AS price_source,
       MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
     FROM daily_values dv
     JOIN investments i ON i.id = dv.investment_id
@@ -427,67 +460,64 @@ function buildDashboardOverview(db, query = {}) {
     const isHeld = internalBalance || Number(totals?.netUnits || 0) > 0.001;
     const date = investment.date || null;
     if (!date) continue;
-    let dayChange = isHeld ? Number(investment.day_change || 0) : 0;
-    let asOfDate = date;
-    if (isHeld && !internalBalance && Number(investment.has_non_locf || 0) === 0) {
-      const candidate = rows.slice(1).find((row) => Number(row.has_non_locf || 0) > 0) || null;
-      if (candidate && sessionDistance(candidate.date, date, investment.asset_type) <= MAX_NON_LOCF_SESSION_LAG) {
-        dayChange = Number(candidate.day_change || 0);
-        asOfDate = candidate.date;
-      } else {
-        dayChange = 0;
-        asOfDate = null;
-      }
-    }
-    dayRows.push({ investment, date, asOfDate, dayChange });
+    const assetDayChanges = isHeld
+      ? resolveDayChangePair(rows, investment.asset_type)
+      : resolveDayChangePair([], investment.asset_type);
+    dayRows.push({
+      investment,
+      date,
+      dayChange: assetDayChanges.oneDay.change,
+      assetDayChanges,
+      includeDayChanges: isHeld,
+    });
   }
 
+  const assetDayChangesByType = new Map();
   for (const row of dayRows) {
     if (row.date < latestInvestmentDate) {
       const marketLinked = MARKET_LINKED_DAY_CHANGE_ASSET_TYPES.has(row.investment.asset_type);
       const withinLag = marketLinked
         && sessionDistance(row.date, latestInvestmentDate, row.investment.asset_type) <= MAX_NON_LOCF_SESSION_LAG;
-      if (!withinLag) row.dayChange = 0;
+      if (!withinLag) {
+        row.dayChange = 0;
+        row.includeDayChanges = false;
+      }
     }
     if (!byType[row.investment.asset_type]) continue;
     byType[row.investment.asset_type].dayChange += row.dayChange;
+    if (!row.includeDayChanges) continue;
+    if (!assetDayChangesByType.has(row.investment.asset_type)) {
+      assetDayChangesByType.set(row.investment.asset_type, []);
+    }
+    assetDayChangesByType.get(row.investment.asset_type).push(row.assetDayChanges);
   }
 
-  for (const info of Object.values(byType)) {
+  for (const [assetType, info] of Object.entries(byType)) {
     const openingValue = info.totalValue - info.dayChange;
     info.intervalChangePct = openingValue > 0 ? (info.dayChange / openingValue) * 100 : 0;
+    info.dayChanges = aggregateDayChangePairs(assetDayChangesByType.get(assetType) || []);
   }
-
-  const latestPortfolio = latestDate
-    ? db.prepare(`
-        SELECT
-          SUM(COALESCE(total_value, 0)) AS total_value,
-          SUM(COALESCE(day_change, 0)) AS day_change
-        FROM portfolio_daily
-        WHERE ${scope.clause} AND date = ?
-      `).get(...scope.params, latestDate)
-    : null;
-  const previousDate = latestDate
-    ? db.prepare(`
-        SELECT MAX(date) AS prev_date
-        FROM portfolio_daily
-        WHERE ${scope.clause} AND date < ?
-      `).get(...scope.params, latestDate)?.prev_date || null
-    : null;
-  const previousPortfolio = previousDate
-    ? db.prepare(`
-        SELECT SUM(COALESCE(total_value, 0)) AS total_value
-        FROM portfolio_daily
-        WHERE ${scope.clause} AND date = ?
-      `).get(...scope.params, previousDate)
-    : null;
+  const strictPortfolioRows = db.prepare(`
+    SELECT
+      date,
+      SUM(COALESCE(total_value, 0)) AS current_value,
+      SUM(COALESCE(day_change, 0)) AS day_change
+    FROM portfolio_daily
+    WHERE ${scope.clause}
+    GROUP BY date
+    ORDER BY date DESC
+    LIMIT 2
+  `).all(...scope.params);
+  const portfolioDayChanges = buildStrictPortfolioDayChangePair(strictPortfolioRows);
+  const latestPortfolio = strictPortfolioRows[0] || null;
+  const previousPortfolio = strictPortfolioRows[1] || null;
 
   const totalValue = Object.values(byType).reduce((sum, info) => sum + info.totalValue, 0);
   const totalInvested = portfolioReturnTotals.invested;
   const totalRealized = portfolioReturnTotals.realized;
   const totalProfitLoss = portfolioReturnTotals.profitLoss;
   const dayChange = Number(latestPortfolio?.day_change || 0);
-  const previousValue = Number(previousPortfolio?.total_value || 0);
+  const previousValue = Number(previousPortfolio?.current_value || 0);
   const today = todayIso();
   const stalePricesWarning = !latestDate || latestDate < today
     ? {
@@ -512,6 +542,7 @@ function buildDashboardOverview(db, query = {}) {
       total_profit_loss_pct: totalInvested > 0 ? (totalProfitLoss / totalInvested) * 100 : 0,
       day_change: dayChange,
       day_change_pct: previousValue > 0 ? (dayChange / previousValue) * 100 : 0,
+      dayChanges: portfolioDayChanges,
       xirr_pct: null,
     },
     byType,
@@ -743,6 +774,7 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
       SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
       SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
       SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
+      MAX(dv.price_source) AS price_source,
       MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
     FROM daily_values dv
     JOIN investments i ON i.id = dv.investment_id
@@ -779,18 +811,12 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
     let dayChange = 0;
     let dayChangeAsOfDate = null;
     let dayChangeUsesFallback = false;
+    let dayChanges = resolveDayChangePair([], assetType);
     if (isHeld && latestRow) {
-      if (!internalBalance && Number(latestRow.has_non_locf || 0) === 0) {
-        const candidate = rows.slice(1).find((r) => Number(r.has_non_locf || 0) > 0) || null;
-        if (candidate && sessionDistance(candidate.date, date, assetType) <= MAX_NON_LOCF_SESSION_LAG) {
-          dayChange = Number(candidate.day_change || 0);
-          dayChangeAsOfDate = candidate.date;
-          dayChangeUsesFallback = true;
-        }
-      } else {
-        dayChange = Number(latestRow.day_change || 0);
-        dayChangeAsOfDate = date;
-      }
+      dayChanges = resolveDayChangePair(rows, assetType);
+      dayChange = dayChanges.oneDay.change;
+      dayChangeAsOfDate = dayChanges.oneDay.asOfDate;
+      dayChangeUsesFallback = dayChanges.oneDay.usedFallback;
     }
 
     const acquiredUnits = Number(totals.netUnits > 0 ? totals.netUnits : 0);
@@ -831,6 +857,7 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
       day_change_pct: 0,
       day_change_as_of_date: dayChangeAsOfDate,
       day_change_uses_fallback: dayChangeUsesFallback,
+      dayChanges,
       xirr_pct: null,
       weighted_fx_rate: weightedFxRate,
       invested_amount_native: investedNative,
@@ -862,6 +889,7 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
       if (!inv.date || inv.date >= latestSnapshotDate) continue;
       if (!marketLinked || inv.date <= staleThresholdDate) {
         inv.day_change = 0; inv.day_change_as_of_date = null; inv.day_change_uses_fallback = false;
+        inv.dayChanges = resolveDayChangePair([], assetType);
       }
     }
   }
@@ -906,6 +934,7 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
 
   const dayChange = investments.reduce((sum, inv) => sum + inv.day_change, 0);
   const openingValue = totalValue - dayChange;
+  const dayChanges = aggregateDayChangePairs(investments.map((inv) => inv.dayChanges));
 
   const byType = {
     [assetType]: {
@@ -916,6 +945,7 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
       totalRealizedGain: totalRealized,
       dayChange,
       intervalChangePct: openingValue > 0 ? (dayChange / openingValue) * 100 : 0,
+      dayChanges,
       xirrPct: null,
     },
   };
@@ -1354,7 +1384,7 @@ module.exports = function (db) {
       const scopeIds = parsePortfolioIds(req.query);
       const version = getDataVersion(db);
       const cacheKey = JSON.stringify({
-        kind: 'asset-overview-v1',
+        kind: 'asset-overview-v2',
         assetType,
         scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
         hideSold: isTruthyQueryValue(req.query.hide_sold),

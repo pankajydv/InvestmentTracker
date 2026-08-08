@@ -23,6 +23,7 @@ const {
 const { detectGapsForTable } = require('../server/services/compliance/complianceScanService');
 const { updateAllPrices } = require('../server/services/updater');
 const { parseGrowwPDF } = require('../server/services/contractNoteParser');
+const { resolveDayChangePair } = require('../server/services/dayChangeService');
 
 // ──────────────────────────────────────────────────────────────────────
 // Helpers
@@ -1051,6 +1052,74 @@ describe('Dashboard', () => {
     assert.ok('byType' in body);
     assert.ok(typeof body.portfolio.total_invested === 'number');
     assert.ok(Array.isArray(body.investments));
+  });
+
+  it('includes PRE/POST in paired FS changes', () => {
+    const rows = [
+      { date: '2026-08-08', price_source: 'POST', current_value: 130, day_change: 30 },
+      { date: '2026-08-07', price_source: 'LIVE', current_value: 110, day_change: 10 },
+      { date: '2026-08-06', price_source: 'LIVE', current_value: 100, day_change: -5 },
+    ];
+
+    const assetPair = resolveDayChangePair(rows, 'FOREIGN_STOCK');
+    assert.equal(assetPair.oneDay.change, 30);
+    assert.equal(assetPair.oneDay.changePct, 30);
+    assert.equal(assetPair.yesterday.change, 10);
+    assert.equal(assetPair.yesterday.changePct, 10);
+
+    assert.equal(assetPair.oneDay.asOfDate, '2026-08-08');
+    assert.equal(assetPair.yesterday.asOfDate, '2026-08-07');
+  });
+
+  it('lightweight portfolio, asset, and investment responses include 1D/YD pairs', async () => {
+    const portfolioId = Number(db.prepare('INSERT INTO portfolios (name) VALUES (?)').run('Day Pair Test').lastInsertRowid);
+    const investmentId = Number(db.prepare(`
+      INSERT INTO investments (name, asset_type, ticker_symbol)
+      VALUES ('Day Pair Stock', 'FOREIGN_STOCK', 'PAIR')
+    `).run().lastInsertRowid);
+
+    try {
+      db.prepare(`
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees)
+        VALUES (?, ?, 'BUY', '2026-08-01', 1, 100, 100, 0)
+      `).run(investmentId, portfolioId);
+      const insertDaily = db.prepare(`
+        INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+        VALUES (?, ?, ?, ?, 1, ?, 100, 0, ?, ?, ?)
+      `);
+      insertDaily.run(investmentId, portfolioId, '2026-08-06', 100, 100, 0, 'LIVE', -5);
+      insertDaily.run(investmentId, portfolioId, '2026-08-07', 110, 110, 10, 'LIVE', 10);
+      const insertPortfolioDaily = db.prepare(`
+        INSERT INTO portfolio_daily (portfolio_id, date, total_value, total_invested, total_profit_loss, total_profit_loss_pct, day_change, day_change_pct)
+        VALUES (?, ?, ?, 100, ?, ?, ?, ?)
+      `);
+      insertPortfolioDaily.run(portfolioId, '2026-08-06', 100, 0, 0, -5, (-5 / 105) * 100);
+      insertPortfolioDaily.run(portfolioId, '2026-08-07', 110, 10, 10, 10, 10);
+
+      const overview = await api('GET', `/dashboard/overview?portfolio_ids=${portfolioId}`);
+      assert.equal(overview.status, 200);
+      assert.ok(overview.body.portfolio.dayChanges?.oneDay);
+      assert.ok(overview.body.portfolio.dayChanges?.yesterday);
+      assert.equal(overview.body.portfolio.dayChanges.oneDay.change, 10);
+      assert.equal(overview.body.portfolio.dayChanges.yesterday.change, -5);
+
+      const assetOverview = await api('GET', `/dashboard/asset-overview?asset_type=FOREIGN_STOCK&portfolio_ids=${portfolioId}`);
+      assert.equal(assetOverview.status, 200);
+      assert.ok(assetOverview.body.byType.FOREIGN_STOCK.dayChanges?.oneDay);
+      assert.ok(assetOverview.body.byType.FOREIGN_STOCK.dayChanges?.yesterday);
+      assert.ok(assetOverview.body.investments[0].dayChanges?.oneDay);
+
+      const detail = await api('GET', `/investments/${investmentId}?portfolio_id=${portfolioId}&interval=1D`);
+      assert.equal(detail.status, 200);
+      assert.ok(detail.body.dayChanges?.oneDay);
+      assert.ok(detail.body.dayChanges?.yesterday);
+    } finally {
+      db.prepare('DELETE FROM portfolio_daily WHERE portfolio_id = ?').run(portfolioId);
+      db.prepare('DELETE FROM daily_values WHERE investment_id = ?').run(investmentId);
+      db.prepare('DELETE FROM transactions WHERE investment_id = ?').run(investmentId);
+      db.prepare('DELETE FROM investments WHERE id = ?').run(investmentId);
+      db.prepare('DELETE FROM portfolios WHERE id = ?').run(portfolioId);
+    }
   });
 
   it('GET /dashboard/summary works for all portfolios', async () => {

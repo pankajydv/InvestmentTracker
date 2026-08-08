@@ -68,13 +68,13 @@ export default function MetricsFaq() {
           </Accordion.Body>
         </Accordion.Item>
         <Accordion.Item eventKey="6">
-          <Accordion.Header>How is Dashboard 1 Day Change shown when latest row is LOCF?</Accordion.Header>
+          <Accordion.Header>How are Dashboard 1D and YD changes selected?</Accordion.Header>
           <Accordion.Body>
-            For market-linked assets, dashboard 1-day change prefers the latest <strong>non-LOCF</strong> row when the latest row is LOCF.
+            The daily change card shows <strong>1D</strong> and <strong>YD</strong> together, each calculated from its own opening value.
             <br />
-            The fallback is allowed only when that non-LOCF row is within <strong>4 market sessions</strong>; otherwise 1-day change is shown as <strong>0</strong>.
+            For market-linked assets, both rows prefer the latest eligible <strong>non-LOCF</strong> values. The fallback is allowed only within <strong>4 market sessions</strong>; otherwise the change is shown as <strong>0</strong>.
             <br />
-            The dashboard also shows an <strong>as-of date</strong> for 1-day change. At aggregate levels, this can be shown as mixed when contributing investments have different as-of dates.
+            Foreign-stock <strong>PRE</strong> and <strong>POST</strong> phase changes are eligible at portfolio, asset, and investment levels.
           </Accordion.Body>
         </Accordion.Item>
       </Accordion>

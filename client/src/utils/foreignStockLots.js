@@ -1,4 +1,13 @@
 const EPSILON = 0.0001;
+const ACQUISITION_TYPES = new Set([
+  'BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN',
+  'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE',
+]);
+const DISPOSAL_TYPES = new Set([
+  'SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL',
+  'CONSOLIDATION', 'CHARGES', 'AMC',
+]);
+const CORPORATE_ACTION_TYPES = new Set(['SPLIT', 'BONUS', 'RIGHTS', 'MERGER', 'CONSOLIDATION']);
 
 function explicitLotKey(txn) {
   const text = String(txn?.notes || '');
@@ -28,6 +37,8 @@ export function allocateForeignStockSoldUnits(transactions) {
   const lotsByKey = new Map();
   const ordered = [...(transactions || [])].sort((left, right) =>
     String(left.transaction_date || '').localeCompare(String(right.transaction_date || ''))
+      || Number(CORPORATE_ACTION_TYPES.has(right.transaction_type))
+        - Number(CORPORATE_ACTION_TYPES.has(left.transaction_type))
       || Number(left.id || 0) - Number(right.id || 0));
 
   const allocate = (lot, requestedUnits) => {
@@ -40,22 +51,21 @@ export function allocateForeignStockSoldUnits(transactions) {
   for (const txn of ordered) {
     const units = Number(txn.units || 0);
     const lotKey = acquisitionLotKey(txn);
-    if (lotKey && units > EPSILON) {
+    if (ACQUISITION_TYPES.has(txn.transaction_type) && units > EPSILON) {
       const lot = { transactionId: txn.id, remainingUnits: units };
       lots.push(lot);
-      lotsByKey.set(lotKey, lot);
+      if (lotKey) lotsByKey.set(lotKey, lot);
       continue;
     }
 
-    if (txn.transaction_type !== 'SELL' || units <= EPSILON) continue;
+    if (!DISPOSAL_TYPES.has(txn.transaction_type) || units <= EPSILON) continue;
 
     const referencedLot = lotsByKey.get(explicitLotKey(txn));
+    let remainingToAllocate = units;
     if (referencedLot) {
-      allocate(referencedLot, units);
-      continue;
+      remainingToAllocate = allocate(referencedLot, remainingToAllocate);
     }
 
-    let remainingToAllocate = units;
     for (const lot of lots) {
       if (remainingToAllocate <= EPSILON) break;
       if (lot.remainingUnits <= EPSILON) continue;
@@ -67,7 +77,7 @@ export function allocateForeignStockSoldUnits(transactions) {
 }
 
 export function isForeignStockLotFullySold(txn, soldByTransactionId) {
-  if (!txn || (txn.transaction_type !== 'VEST' && txn.transaction_type !== 'ESPP_PURCHASE')) return false;
+  if (!txn || !ACQUISITION_TYPES.has(txn.transaction_type)) return false;
   const units = Number(txn.units || 0);
   const soldUnits = Number(soldByTransactionId?.[txn.id] || 0);
   return units > EPSILON && soldUnits >= units - EPSILON;

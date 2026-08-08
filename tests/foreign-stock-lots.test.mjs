@@ -30,3 +30,23 @@ test('does not allocate a sale to future acquisition lots', () => {
 
   assert.deepEqual(allocateForeignStockSoldUnits(transactions), {});
 });
+
+test('dims only fully consumed acquisition rows across buys and a split', () => {
+  const transactions = [
+    { id: 1, transaction_date: '2024-05-30', transaction_type: 'BUY', units: 46 },
+    { id: 2, transaction_date: '2024-11-22', transaction_type: 'BUY', units: 9 },
+    { id: 3, transaction_date: '2025-05-23', transaction_type: 'BUY', units: 28 },
+    { id: 4, transaction_date: '2025-05-23', transaction_type: 'SPLIT', units: 166 },
+    { id: 5, transaction_date: '2026-04-01', transaction_type: 'SELL', units: 249 },
+    { id: 6, transaction_date: '2026-04-02', transaction_type: 'BUY', units: 545 },
+    { id: 7, transaction_date: '2026-04-08', transaction_type: 'SELL', units: 245 },
+  ];
+
+  const sold = allocateForeignStockSoldUnits(transactions);
+
+  assert.equal(isForeignStockLotFullySold(transactions[0], sold), true);
+  assert.equal(isForeignStockLotFullySold(transactions[1], sold), true);
+  assert.equal(isForeignStockLotFullySold(transactions[2], sold), true);
+  assert.equal(isForeignStockLotFullySold(transactions[3], sold), true);
+  assert.equal(isForeignStockLotFullySold(transactions[5], sold), false);
+});

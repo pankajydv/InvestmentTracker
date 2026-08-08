@@ -9,7 +9,7 @@ const {
 } = require('../constants/transactionTypes');
 const { markScopeDirty, markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 const { getInvestmentSeries, getMarketSessionDates, getSeries } = require('../services/marketPriceCache');
-const { DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS } = require('../services/freshnessPolicy');
+const { resolveDayChangePair } = require('../services/dayChangeService');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -40,79 +40,15 @@ const CASH_INFLOW_TYPES = new Set(XIRR_CASH_INFLOW_TYPES);
 
 const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MARKET_DRIVEN_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
-const MARKET_LINKED_DAY_CHANGE_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'SGB', 'MUTUAL_FUND', 'NPS']);
-const MAX_NON_LOCF_SESSION_LAG = DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS;
-
-function isNonLocfSource(row) {
-  if (!row) return false;
-  if (row.has_non_locf != null) return Number(row.has_non_locf) > 0;
-  return String(row.price_source || '').toUpperCase() !== 'LOCF';
-}
-
-function sessionDistance(candidateDate, targetDate, assetType) {
-  if (!candidateDate || !targetDate) return Number.POSITIVE_INFINITY;
-  if (candidateDate > targetDate) return Number.POSITIVE_INFINITY;
-  const sessions = getMarketSessionDates(candidateDate, targetDate, assetType);
-  if (!Array.isArray(sessions) || sessions.length === 0) return Number.POSITIVE_INFINITY;
-  return Math.max(sessions.length - 1, 0);
-}
 
 function resolveDisplayDayChangeFromRows(rowsDesc, assetType) {
-  const latestRow = Array.isArray(rowsDesc) && rowsDesc.length ? rowsDesc[0] : null;
-  if (!latestRow) {
-    return {
-      dayChange: 0,
-      asOfDate: null,
-      usedFallback: false,
-      staleFallback: false,
-      latestCurrentValue: 0,
-    };
-  }
-
-  const normalizedType = String(assetType || '').toUpperCase();
-  const latestCurrentValue = Number(latestRow.current_value || 0);
-  if (!MARKET_LINKED_DAY_CHANGE_ASSET_TYPES.has(normalizedType)) {
-    return {
-      dayChange: Number(latestRow.day_change || 0),
-      asOfDate: latestRow.date || null,
-      usedFallback: false,
-      staleFallback: false,
-      latestCurrentValue,
-    };
-  }
-
-  if (isNonLocfSource(latestRow)) {
-    return {
-      dayChange: Number(latestRow.day_change || 0),
-      asOfDate: latestRow.date || null,
-      usedFallback: false,
-      staleFallback: false,
-      latestCurrentValue,
-    };
-  }
-
-  for (let idx = 1; idx < rowsDesc.length; idx += 1) {
-    const candidate = rowsDesc[idx];
-    if (!isNonLocfSource(candidate)) continue;
-    const lag = sessionDistance(candidate.date, latestRow.date, normalizedType);
-    if (lag <= MAX_NON_LOCF_SESSION_LAG) {
-      return {
-        dayChange: Number(candidate.day_change || 0),
-        asOfDate: candidate.date || null,
-        usedFallback: true,
-        staleFallback: false,
-        latestCurrentValue,
-      };
-    }
-    break;
-  }
-
+  const metric = resolveDayChangePair(rowsDesc, assetType).oneDay;
   return {
-    dayChange: 0,
-    asOfDate: null,
-    usedFallback: true,
-    staleFallback: true,
-    latestCurrentValue,
+    dayChange: metric.change,
+    asOfDate: metric.asOfDate,
+    usedFallback: metric.usedFallback,
+    staleFallback: metric.staleFallback,
+    latestCurrentValue: metric.currentValue,
   };
 }
 
@@ -133,6 +69,7 @@ function getDayChangeRowsForInvestment(db, investmentId, portfolioId) {
       date,
       COALESCE(SUM(day_change), 0) AS day_change,
       COALESCE(SUM(current_value), 0) AS current_value,
+      MAX(price_source) AS price_source,
       MAX(CASE WHEN UPPER(COALESCE(price_source, '')) != 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
     FROM daily_values
     WHERE investment_id = ? AND portfolio_id IS NOT NULL
@@ -272,6 +209,7 @@ function calculateInvestmentIntervalXirr(db, {
   toDate,
   isPresetOneDay,
   isFullyExited = false,
+  dayChangeRows,
 }) {
   const isPortfolioScoped = Number.isInteger(portfolioId) && portfolioId > 0;
 
@@ -415,7 +353,7 @@ function calculateInvestmentIntervalXirr(db, {
   let usesFallback = false;
 
   if (isPresetOneDay) {
-    const rowsDesc = getDayChangeRowsForInvestment(db, investmentId, portfolioId);
+    const rowsDesc = dayChangeRows || getDayChangeRowsForInvestment(db, investmentId, portfolioId);
     const resolved = resolveDisplayDayChangeFromRows(rowsDesc, assetType);
     intervalChange = Number(resolved.dayChange || 0);
     intervalChangePct = Number(resolved.latestCurrentValue || 0) > 0
@@ -1239,6 +1177,9 @@ module.exports = function (db) {
     const isPresetOneDay = !intervalWindow.isCustom && intervalParam === '1D';
     const INTERNAL_BALANCE_TYPES = new Set(['PF', 'PPF', 'SSY']);
     const isFullyExited = !INTERNAL_BALANCE_TYPES.has(inv.asset_type) && Math.abs(totals.total_units) <= 0.001;
+    const dayChangeRows = isFullyExited
+      ? []
+      : getDayChangeRowsForInvestment(db, inv.id, parsedPortfolioId);
     const intervalXIRR = calculateInvestmentIntervalXirr(db, {
       investmentId: inv.id,
       portfolioId: parsedPortfolioId,
@@ -1247,7 +1188,9 @@ module.exports = function (db) {
       toDate: intervalWindow.to,
       isPresetOneDay,
       isFullyExited,
+      dayChangeRows,
     });
+    const dayChanges = resolveDayChangePair(dayChangeRows, inv.asset_type);
 
     res.json({
       ...inv,
@@ -1256,6 +1199,7 @@ module.exports = function (db) {
       totalInvested: totals.total_invested,
       saleProceeds: totals.sale_proceeds,
       intervalXIRR,
+      dayChanges,
       transactions,
       folio_summary,
       folio_options,
