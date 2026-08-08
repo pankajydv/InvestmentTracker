@@ -413,6 +413,14 @@ async function updateAllPrices(db, options = {}) {
     ORDER BY date(transaction_date) ASC, id ASC
   `);
 
+  // Bond coupon income on a specific date (for total-return day_change adjustment)
+  const getBondIncomeToday = db.prepare(`
+    SELECT COALESCE(SUM(COALESCE(amount, 0)), 0) AS income
+    FROM transactions
+    WHERE investment_id = ? AND portfolio_id = ? AND date(transaction_date) = ?
+      AND transaction_type = 'INTEREST'
+  `);
+
   const getOpenUnitsPortfolio = db.prepare(`
     SELECT COALESCE(
       SUM(CASE
@@ -758,8 +766,11 @@ async function updateAllPrices(db, options = {}) {
 
       const prevValue = Number(previousRow?.current_value || 0);
       const netFlowToday = Number(getNetFlowTodayPortfolio.get(inv.id, pid, asOfDate)?.net_flow || 0);
+      const bondIncomeToday = inv.asset_type === 'BOND'
+        ? Number(getBondIncomeToday.get(inv.id, pid, asOfDate)?.income || 0)
+        : 0;
       const dayChange = previousRow
-        ? (currentValue - prevValue - netFlowToday)
+        ? (currentValue - prevValue - netFlowToday + bondIncomeToday)
         : 0;
 
       const existingRow = getExistingDailyRowByScopeDate.get(inv.id, pid, asOfDate);

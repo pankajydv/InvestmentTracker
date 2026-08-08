@@ -1423,7 +1423,7 @@ module.exports = function (db) {
         if (!Array.isArray(selector.asset_types)) {
           return res.status(400).json({ error: 'selector.asset_types must be an array' });
         }
-        const validAssetTypes = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'PPF', 'SSY', 'PF', 'CASH']);
+        const validAssetTypes = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'BOND', 'PPF', 'SSY', 'PF', 'CASH']);
         for (const at of selector.asset_types) {
           if (!validAssetTypes.has(String(at).toUpperCase())) {
             return res.status(400).json({ error: `Invalid asset_type: ${at}` });

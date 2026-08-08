@@ -537,7 +537,7 @@ function getPendingDirtyScopes(db, runDate = todayIso(), options = {}) {
 }
 
 async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {}) {
-  const { runBackfillInTwoSteps } = require('./backfillService');
+  const { runBackfillPipeline } = require('./backfillService');
   const effectiveRunDate = normalizeDirtyDate(runDate) || todayIso();
   const scopes = getPendingDirtyScopes(db, effectiveRunDate, options);
   if (!scopes.length) {
@@ -575,7 +575,7 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {})
   });
 
   try {
-    const result = await runBackfillInTwoSteps(db, {
+    const result = await runBackfillPipeline(db, {
       runDate: effectiveRunDate,
       scopes,
       suppressRunDateWritesForMarketLinked: options.suppressRunDateWritesForMarketLinked === true,
@@ -669,35 +669,6 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {})
     for (const id of scopeIds) markFailed.run(` | preflight failed: ${e.message}`, id);
     throw e;
   }
-}
-
-async function runBackfillInTwoSteps(db, { runDate, scopes }) {
-  const { backfillNPSHistoricalNAV } = require('./backfillService');
-  const { logBackfillInfo } = require('./appLogger');
-
-  let processed = 0;
-  let rowsWritten = 0;
-  let skippedFuture = 0;
-
-  for (const scope of scopes) {
-    const { investment_id: investmentId, dirty_from_date: dirtyFromDate } = scope;
-
-    const investment = db.prepare('SELECT id, asset_type FROM investments WHERE id = ?').get(investmentId);
-    if (!investment) {
-      logBackfillInfo(`[Backfill] Skipping unknown investment ${investmentId}`);
-      continue;
-    }
-
-    if (investment.asset_type === 'NPS') {
-      await backfillNPSHistoricalNAV(db, investmentId, dirtyFromDate, runDate);
-      processed += 1;
-      continue;
-    }
-
-    // Existing backfill logic for other asset types...
-  }
-
-  return { processed, rowsWritten, skippedFuture };
 }
 
 function markNPSDirty(db, investmentId, dirtyFromDate, reason = 'NPS data update', sourceEventId = null) {

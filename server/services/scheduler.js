@@ -28,7 +28,11 @@ const { hydrateStockSeriesForPhase2 } = require('./marketPriceCache');
 const { todayIso, addDaysIso, eachDateIso, istDateFromUnixSeconds, exchangeDateFromUnixSeconds } = require('./dateUtils');
 const { logAppInfo, logAppWarn, logAppError } = require('./appLogger');
 const { scanAndRepairComplianceGaps, refreshComplianceScanFloor } = require('./compliance/complianceScanService');
-const { DIRTY_SCOPE_LOOKBACK_SESSIONS } = require('./freshnessPolicy');
+const {
+  DIRTY_SCOPE_LOOKBACK_SESSIONS,
+  LOCF_STREAK_WARN_SESSIONS,
+  FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS,
+} = require('./freshnessPolicy');
 const { preCalculateXirrCache } = require('./xirrCacheService');
 const { bumpDataVersion } = require('./dashboardSnapshotService');
 
@@ -67,6 +71,7 @@ const LOCF_RECONCILE_LOOKBACK_DAYS = parsePositiveIntEnv('LOCF_RECONCILE_LOOKBAC
 // Asset types covered by the generic LOCF-lag self-healing path in the scheduler.
 // FOREIGN_STOCK is now included; its session check uses weekday-only (no holiday DB).
 const LOCF_LAG_RECONCILE_ASSET_TYPES = ['INDIAN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB', 'FOREIGN_STOCK'];
+const PROVISIONAL_SOURCES = new Set(['LOCF', 'PRE', 'POST']);
 const EXITED_UNITS_EPSILON = 1e-6;
 
 let isSchedulerCycleRunning = false;
@@ -239,6 +244,46 @@ function isIsoWeekday(dateIso) {
   if (!dateIso) return false;
   const day = new Date(`${dateIso}T00:00:00.000Z`).getUTCDay();
   return day !== 0 && day !== 6;
+}
+
+function loadIndianMarketHolidaySet(db, fromDate, toDate) {
+  const rows = db.prepare(`
+    SELECT date
+    FROM market_holidays
+    WHERE date >= ? AND date <= ?
+    ORDER BY date ASC
+  `).all(fromDate, toDate);
+
+  return new Set(
+    rows
+      .map((row) => String(row.date || ''))
+      .filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date))
+  );
+}
+
+function isIndianMarketSessionDate(dateIso, marketHolidaySet) {
+  return isIsoWeekday(dateIso) && !marketHolidaySet.has(dateIso);
+}
+
+function isAssetSessionDate(dateIso, assetType, marketHolidaySet) {
+  return String(assetType || '').toUpperCase() === 'FOREIGN_STOCK'
+    ? isIsoWeekday(dateIso)
+    : isIndianMarketSessionDate(dateIso, marketHolidaySet);
+}
+
+function getProvisionalStreakThreshold(assetType) {
+  return String(assetType || '').toUpperCase() === 'FOREIGN_STOCK'
+    ? Math.max(1, Number(FOREIGN_STOCK_LOCF_STREAK_WARN_SESSIONS || 5))
+    : Math.max(1, Number(LOCF_STREAK_WARN_SESSIONS || 3));
+}
+
+function addScopeDate(setMap, key, dateIso) {
+  const existing = setMap.get(key);
+  if (existing) {
+    existing.add(dateIso);
+    return;
+  }
+  setMap.set(key, new Set([dateIso]));
 }
 
 function minIsoDate(...dates) {
@@ -754,8 +799,9 @@ function ensureSchedulerCatchUpScopes(db, runDate, label) {
  * Two modes:
  *  forceAllScopes=true  (22:35 nightly): unconditionally mark ALL active scopes dirty from
  *    the start of the lookback window so backfill repairs everything nightly.
- *  forceAllScopes=false (all other runs): only mark dirty if the scope has any LOCF row or
- *    is missing entirely from the window.
+ *  forceAllScopes=false (all other runs): only mark dirty when the scope is missing from
+ *    the recent window or has a stale provisional-source streak (LOCF/PRE/POST) that
+ *    exceeds the asset-type threshold.
  *
  * Duplicate enqueues are safe — markScopeDirty coalesces to the earliest dirty_from_date.
  *
@@ -792,12 +838,87 @@ function ensureRollingFreshnessDirtyScopes(db, runDate, label, options = {}) {
     END) > 0.0001
   `).all(...ALL_MARKET_LINKED_TYPES);
 
+  const activeScopeMeta = new Map();
+  for (const scope of activeScopes) {
+    activeScopeMeta.set(`${scope.investment_id}:${scope.portfolio_id}`, {
+      investmentId: Number(scope.investment_id),
+      portfolioId: Number(scope.portfolio_id),
+      assetType: String(scope.asset_type || '').toUpperCase(),
+    });
+  }
+
+  const openScopeRows = db.prepare(`
+    SELECT investment_id, portfolio_id, MIN(dirty_from_date) AS dirty_from_date
+    FROM dirty_backfill_scope
+    WHERE status IN ('pending', 'running', 'failed')
+      AND dirty_from_date <= ?
+      AND investment_id IS NOT NULL
+      AND portfolio_id IS NOT NULL
+    GROUP BY investment_id, portfolio_id
+  `).all(runDate);
+
+  const openDirtyFromByScope = new Map();
+  for (const row of openScopeRows) {
+    openDirtyFromByScope.set(`${row.investment_id}:${row.portfolio_id}`, String(row.dirty_from_date || ''));
+  }
+
+  const marketHolidaySet = loadIndianMarketHolidaySet(db, windowStart, windowEnd);
+
+  const scopeRows = db.prepare(`
+    SELECT
+      dv.investment_id,
+      dv.portfolio_id,
+      dv.date,
+      dv.price_source
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    WHERE i.asset_type IN (${typePlaceholders})
+      AND dv.portfolio_id IS NOT NULL
+      AND date(dv.date) >= ?
+      AND date(dv.date) <= ?
+  `).all(...ALL_MARKET_LINKED_TYPES, windowStart, windowEnd);
+
+  const rowSourceByScopeDate = new Map();
+  const latestDateByScope = new Map();
+  const provisionalDatesByScope = new Map();
+  for (const row of scopeRows) {
+    const key = `${row.investment_id}:${row.portfolio_id}`;
+    if (!activeScopeMeta.has(key)) continue;
+
+    const dateIso = String(row.date || '');
+    const source = String(row.price_source || '').toUpperCase();
+    rowSourceByScopeDate.set(`${key}:${dateIso}`, source);
+
+    const prevLatest = latestDateByScope.get(key);
+    if (!prevLatest || dateIso > prevLatest) latestDateByScope.set(key, dateIso);
+
+    if (PROVISIONAL_SOURCES.has(source)) addScopeDate(provisionalDatesByScope, key, dateIso);
+  }
+
   let enqueued = 0;
   let skipped = 0;
+  let skippedExistingOpen = 0;
+  let missingScopesDetected = 0;
+  let staleProvisionalScopesDetected = 0;
+  let provisionalScopesSeen = 0;
+  let provisionalScopesIgnored = 0;
+
+  const shouldSkipBecauseOpenScope = (scopeKey, nextDirtyFromDate) => {
+    const existingDirtyFrom = openDirtyFromByScope.get(scopeKey);
+    if (!existingDirtyFrom) return false;
+    if (existingDirtyFrom <= nextDirtyFromDate) {
+      skipped += 1;
+      skippedExistingOpen += 1;
+      return true;
+    }
+    return false;
+  };
 
   if (forceAllScopes) {
     // Nightly unconditional sweep: dirty every active scope from windowStart.
     for (const scope of activeScopes) {
+      const key = `${scope.investment_id}:${scope.portfolio_id}`;
+      if (shouldSkipBecauseOpenScope(key, windowStart)) continue;
       const dirtyDate = markScopeDirty(db, {
         investmentId: scope.investment_id,
         portfolioId: scope.portfolio_id,
@@ -814,53 +935,65 @@ function ensureRollingFreshnessDirtyScopes(db, runDate, label, options = {}) {
       activeScopes: activeScopes.length,
       enqueued,
       skipped,
+      skippedExistingOpen,
     });
     return { windowStart, forceAllScopes, activeScopes: activeScopes.length, enqueued, skipped };
-  }
-
-  // Conditional: build coverage map for the window.
-  const coverageRows = db.prepare(`
-    SELECT
-      dv.investment_id,
-      dv.portfolio_id,
-      MIN(CASE WHEN dv.price_source IN ('LOCF', 'PRE', 'POST') THEN dv.date END) AS earliest_locf_date,
-      COUNT(CASE WHEN dv.price_source IN ('LOCF', 'PRE', 'POST') THEN 1 END) AS locf_count,
-      MAX(dv.date) AS latest_date
-    FROM daily_values dv
-    JOIN investments i ON i.id = dv.investment_id
-    WHERE i.asset_type IN (${typePlaceholders})
-      AND dv.portfolio_id IS NOT NULL
-      AND date(dv.date) >= ?
-      AND date(dv.date) <= ?
-    GROUP BY dv.investment_id, dv.portfolio_id
-  `).all(...ALL_MARKET_LINKED_TYPES, windowStart, windowEnd);
-
-  const coverageMap = new Map();
-  for (const row of coverageRows) {
-    coverageMap.set(`${row.investment_id}:${row.portfolio_id}`, row);
   }
 
   const yesterday = addDays(runDate, -1);
   for (const scope of activeScopes) {
     const key = `${scope.investment_id}:${scope.portfolio_id}`;
-    const cov = coverageMap.get(key);
-    const missingFromWindow = !cov || String(cov.latest_date || '') < yesterday;
-    const hasLocf = cov && Number(cov.locf_count || 0) > 0;
+    const assetType = String(scope.asset_type || '').toUpperCase();
+    const latestDate = latestDateByScope.get(key) || null;
+    const missingFromWindow = !latestDate || latestDate < yesterday;
+    const provisionalDates = provisionalDatesByScope.get(key) || new Set();
 
-    if (!missingFromWindow && !hasLocf) {
+    if (provisionalDates.size > 0) provisionalScopesSeen += 1;
+
+    let staleProvisionalFromDate = null;
+    if (provisionalDates.size > 0) {
+      const threshold = getProvisionalStreakThreshold(assetType);
+      let streak = 0;
+      let cursor = yesterday;
+      while (cursor >= windowStart) {
+        if (!isAssetSessionDate(cursor, assetType, marketHolidaySet)) {
+          cursor = addDays(cursor, -1);
+          continue;
+        }
+        const source = rowSourceByScopeDate.get(`${key}:${cursor}`);
+        if (!PROVISIONAL_SOURCES.has(String(source || '').toUpperCase())) break;
+        streak += 1;
+        staleProvisionalFromDate = cursor;
+        cursor = addDays(cursor, -1);
+      }
+
+      if (streak < threshold) {
+        staleProvisionalFromDate = null;
+        provisionalScopesIgnored += 1;
+      }
+    }
+
+    const hasStaleProvisional = !!staleProvisionalFromDate;
+
+    if (!missingFromWindow && !hasStaleProvisional) {
       skipped += 1;
       continue;
     }
 
-    const dirtyFrom = (cov?.earliest_locf_date && cov.earliest_locf_date < runDate)
-      ? cov.earliest_locf_date
+    if (missingFromWindow) missingScopesDetected += 1;
+    if (hasStaleProvisional) staleProvisionalScopesDetected += 1;
+
+    const dirtyFrom = hasStaleProvisional
+      ? staleProvisionalFromDate
       : windowStart;
+
+    if (shouldSkipBecauseOpenScope(key, dirtyFrom)) continue;
 
     const dirtyDate = markScopeDirty(db, {
       investmentId: scope.investment_id,
       portfolioId: scope.portfolio_id,
       dirtyFromDate: dirtyFrom,
-      reason: missingFromWindow ? 'rolling-freshness-missing' : 'rolling-freshness-locf',
+      reason: missingFromWindow ? 'rolling-freshness-missing' : 'rolling-freshness-stale-provisional',
       sourceEventId: `rolling-freshness:${runDate}`,
     });
     if (dirtyDate) enqueued += 1;
@@ -871,10 +1004,40 @@ function ensureRollingFreshnessDirtyScopes(db, runDate, label, options = {}) {
     runDate,
     windowStart,
     activeScopes: activeScopes.length,
+    provisionalScopesSeen,
+    provisionalScopesIgnored,
+    staleProvisionalScopesDetected,
+    missingScopesDetected,
     enqueued,
     skipped,
+    skippedExistingOpen,
   });
   return { windowStart, forceAllScopes, activeScopes: activeScopes.length, enqueued, skipped };
+}
+
+function logSchedulerStep(level, label, step, substep, stepName, phase, meta = {}) {
+  const normalizedStep = Number.isFinite(Number(step)) ? String(step) : String(step || 'NA');
+  const normalizedSubstep = substep == null ? null : String(substep);
+  const tag = normalizedSubstep ? `Step-${normalizedStep}.${normalizedSubstep}` : `Step-${normalizedStep}`;
+  const phaseLabel = String(phase || 'running').toUpperCase();
+  const message = `[Scheduler] ${label}: [${tag}] ${stepName} [${phaseLabel}]`;
+  const payload = {
+    step: normalizedStep,
+    substep: normalizedSubstep,
+    stepName,
+    phase,
+    ...meta,
+  };
+
+  if (level === 'warn') {
+    logAppWarn(message, payload);
+    return;
+  }
+  if (level === 'error') {
+    logAppError(message, payload);
+    return;
+  }
+  logAppInfo(message, payload);
 }
 
 /**
@@ -903,11 +1066,11 @@ async function runSchedulerCycle(db, label, options = {}) {
   const runDate = todayIso();
   const preflightRunDate = runDate;
 
-  // ── Step 1/6: Rolling freshness dirty scopes ──────────────────────────────
+  // ── Stage 1: Rolling freshness dirty scopes ───────────────────────────────
   // Mark active scopes dirty if they have any LOCF or missing rows in the recent
   // lookback window.  At 22:35 (forceFreshnessAllScopes=true), mark ALL active
   // scopes dirty unconditionally so backfill heals everything nightly.
-  logAppInfo(`[Scheduler] ${label}: Step 1/6 rolling freshness dirty scopes`, {
+  logSchedulerStep('info', label, 1, 1, 'Rolling freshness dirty scopes', 'start', {
     runDate,
     forceFreshnessAllScopes: !!options.forceFreshnessAllScopes,
   });
@@ -928,14 +1091,17 @@ async function runSchedulerCycle(db, label, options = {}) {
       trigger: options.runTag || label || 'scheduler-cycle',
     });
   } catch (bootstrapErr) {
-    logAppError(`[Scheduler] ${label}: Step 1/6 daily bootstrap enqueue failed (non-fatal)`, {
+    logSchedulerStep('error', label, 1, 2, 'Daily bootstrap enqueue', 'failed', {
       error: bootstrapErr.message,
     });
   }
-  logAppInfo(`[Scheduler] ${label}: Step 1/6 completed`, { rollingFreshness, dailyBootstrap });
+  logSchedulerStep('info', label, 1, null, 'Rolling freshness + daily bootstrap', 'completed', {
+    rollingFreshness,
+    dailyBootstrap,
+  });
 
-  // ── Step 2/6: Scheduler cycle started (context snapshot) ─────────────────
-  logAppInfo(`[Scheduler] ${label}: Step 2/6 scheduler cycle started`, {
+  // ── Stage 2: Scheduler cycle context snapshot ─────────────────────────────
+  logSchedulerStep('info', label, 2, 1, 'Cycle context snapshot', 'start', {
     runDate,
     options,
   });
@@ -957,8 +1123,8 @@ async function runSchedulerCycle(db, label, options = {}) {
     LIMIT 100
   `).all(preflightRunDate);
 
-  // ── Step 3/6: Dirty scope snapshot ───────────────────────────────────────
-  logAppInfo(`[Scheduler] ${label}: Step 3/6 dirty scope snapshot`, {
+  // ── Stage 3: Dirty scope snapshot and reconciliation inputs ───────────────
+  logSchedulerStep('info', label, 3, 1, 'Dirty scope snapshot', 'completed', {
     preflightRunDate,
     dirtyInvestmentCount: dirtyInvestments.length,
     pendingScopeCount: pendingScopes.length,
@@ -989,7 +1155,7 @@ async function runSchedulerCycle(db, label, options = {}) {
       }
     }
     if (orphanedEnqueued > 0) {
-      logAppInfo(`[Scheduler] ${label}: materialized orphaned dirty flags into scopes`, {
+      logSchedulerStep('info', label, 3, 2, 'Orphan dirty-flag materialization', 'completed', {
         orphanedInvestments: orphaned.length,
         scopesEnqueued: orphanedEnqueued,
       });
@@ -997,11 +1163,6 @@ async function runSchedulerCycle(db, label, options = {}) {
   }
 
   console.log(`[Scheduler] ${label}: preflight dirty backfill check for ${preflightRunDate}...`);
-  logAppInfo(`[Scheduler] ${label}: started`, {
-    runDate,
-    preflightRunDate,
-    options,
-  });
 
   let fxUpgradeSweep = {
     enabled: ENABLE_FX_UPGRADE_SWEEP,
@@ -1012,7 +1173,7 @@ async function runSchedulerCycle(db, label, options = {}) {
   };
 
   if (ENABLE_FX_UPGRADE_SWEEP) {
-    logAppInfo(`[Scheduler] ${label}: Step 3.5/6 FX upgrade sweep`, {
+    logSchedulerStep('info', label, 3, 5, 'FX upgrade sweep', 'start', {
       runDate: preflightRunDate,
       minSessions: FX_UPGRADE_SWEEP_SESSIONS,
       maxSessions: FX_UPGRADE_SWEEP_MAX_SESSIONS,
@@ -1036,11 +1197,11 @@ async function runSchedulerCycle(db, label, options = {}) {
       enabled: true,
       dirtyScopesEnqueued,
     };
-    logAppInfo(`[Scheduler] ${label}: Step 3.5/6 completed`, fxUpgradeSweep);
+    logSchedulerStep('info', label, 3, 5, 'FX upgrade sweep', 'completed', fxUpgradeSweep);
   }
 
-  // ── Step 4/6: Catch-up + dirty preflight ─────────────────────────────────
-  logAppInfo(`[Scheduler] ${label}: Step 4/6 running catch-up + dirty preflight (Backfill Step-1 Cache-Warm -> Step-2 CA -> Step-3 Recompute -> Step-4 Aggregate Refresh)`, {
+  // ── Stage 4: Catch-up + dirty preflight ───────────────────────────────────
+  logSchedulerStep('info', label, 4, 1, 'Catch-up + dirty preflight', 'start', {
     preflightRunDate,
   });
   const catchUp = ensureSchedulerCatchUpScopes(db, preflightRunDate, label);
@@ -1049,7 +1210,7 @@ async function runSchedulerCycle(db, label, options = {}) {
   const preflight = await runDirtyBackfillPreflight(db, preflightRunDate, {
     suppressRunDateWritesForMarketLinked: options.skipPriceUpdate !== true,
   });
-  logAppInfo(`[Scheduler] ${label}: Step 4/6 completed (catch-up + backfill preflight)`, {
+  logSchedulerStep('info', label, 4, 1, 'Catch-up + dirty preflight', 'completed', {
     fxUpgradeSweep,
     catchUp,
     foreignReconcile,
@@ -1058,7 +1219,7 @@ async function runSchedulerCycle(db, label, options = {}) {
   });
 
   if (options.skipPriceUpdate) {
-    logAppInfo(`[Scheduler] ${label}: Step 5/6 skipped price update (preflight-only)`, {
+    logSchedulerStep('info', label, 5, null, 'Price update', 'skipped', {
       runDate,
       preflightRunDate,
       rollingFreshness,
@@ -1079,15 +1240,15 @@ async function runSchedulerCycle(db, label, options = {}) {
     cacheWarm = await warmRecentMarketCache(db, runDate, warmRecentCacheDays, label);
   }
 
-  // ── Step 5/6: Price update ────────────────────────────────────────────────
-  logAppInfo(`[Scheduler] ${label}: Step 5/6 running updateAllPrices`, {
+  // ── Stage 5: Price update ──────────────────────────────────────────────────
+  logSchedulerStep('info', label, 5, 1, 'Update prices', 'start', {
     assetTypes: options.assetTypes || null,
     warmRecentCacheDays: warmRecentCacheDays > 0 ? warmRecentCacheDays : null,
     historicalRepairMode: 'step1-generalized-only',
   });
   const result = await updateAllPrices(db, options);
   const refreshedScanFloor = refreshComplianceScanFloor(db, runDate);
-  logAppInfo(`[Scheduler] ${label}: Step 5/6 completed`, {
+  logSchedulerStep('info', label, 5, 1, 'Update prices', 'completed', {
     runDate,
     preflightRunDate,
     rollingFreshness,
@@ -1105,31 +1266,38 @@ async function runSchedulerCycle(db, label, options = {}) {
     complianceScanFloor: refreshedScanFloor,
   });
 
-  // ── Step 5.5/6: XIRR pre-calculation (new) ──────────────────────────────
-  logAppInfo(`[Scheduler] ${label}: Step 5.5/6 pre-calculating XIRR cache`, {});
+  // ── Stage 5.5: XIRR pre-calculation ───────────────────────────────────────
+  logSchedulerStep('info', label, 5, 5, 'XIRR cache pre-calculation', 'start', {});
   let xirrCacheResult = null;
   try {
     xirrCacheResult = await preCalculateXirrCache(db, label);
   } catch (xirrErr) {
-    logAppError(`[Scheduler] ${label}: Step 5.5/6 XIRR pre-calculation failed (non-fatal)`, {
+    logSchedulerStep('error', label, 5, 5, 'XIRR cache pre-calculation', 'failed', {
       error: xirrErr.message,
     });
   }
-  logAppInfo(`[Scheduler] ${label}: Step 5.5/6 completed`, xirrCacheResult || {});
+  logSchedulerStep('info', label, 5, 5, 'XIRR cache pre-calculation', 'completed', xirrCacheResult || {});
 
-  // ── Step 6/6: Compliance scan ─────────────────────────────────────────────
+  // ── Stage 6: Compliance scan ───────────────────────────────────────────────
   let complianceResult = null;
   const complianceScanMode = options.complianceScanMode || null;
   if (complianceScanMode) {
-    logAppInfo(`[Scheduler] ${label}: Step 6/6 running compliance scan`, { mode: complianceScanMode });
-    complianceResult = await runComplianceScan(db, label, { mode: complianceScanMode });
-    logAppInfo(`[Scheduler] ${label}: Step 6/6 completed`, {
+    logSchedulerStep('info', label, 6, 1, 'Compliance scan', 'start', { mode: complianceScanMode });
+    complianceResult = await runComplianceScan(db, label, {
+      mode: complianceScanMode,
+      step: 6,
+      substep: 2,
+      stepName: 'Compliance scan execution',
+    });
+    logSchedulerStep('info', label, 6, 1, 'Compliance scan', 'completed', {
       gapsDetected: complianceResult?.gapsDetected || 0,
       repairsEnqueued: complianceResult?.repairsEnqueued || 0,
       locfQualityIssues: complianceResult?.locfQualityIssues || 0,
     });
   } else {
-    logAppInfo(`[Scheduler] ${label}: Step 6/6 compliance scan skipped (no mode specified)`);
+    logSchedulerStep('info', label, 6, 1, 'Compliance scan', 'skipped', {
+      reason: 'no-mode-specified',
+    });
   }
 
   return { rollingFreshness, dailyBootstrap, fxUpgradeSweep, catchUp, foreignReconcile, locfReconcile, preflight, result, xirrCacheResult, complianceResult };
@@ -1142,12 +1310,15 @@ async function runSchedulerCycle(db, label, options = {}) {
 }
 
 async function runComplianceScan(db, label, options = {}) {
+  const step = options.step == null ? 'compliance' : options.step;
+  const substep = options.substep == null ? 'run' : options.substep;
+  const stepName = String(options.stepName || 'Compliance scan execution');
   try {
     const mode = options.mode || 'full';
-    logAppInfo(`[Scheduler] ${label}: Running compliance scan`, { mode });
+    logSchedulerStep('info', label, step, substep, stepName, 'start', { mode });
     const result = scanAndRepairComplianceGaps({ mode, db });
 
-    logAppInfo(`[Scheduler] ${label}: Compliance scan completed`, {
+    logSchedulerStep('info', label, step, substep, stepName, 'completed', {
       mode: result.mode,
       runDate: result.runDate,
       gapsDetected: result.gapsDetected,
@@ -1157,7 +1328,7 @@ async function runComplianceScan(db, label, options = {}) {
     return result;
   } catch (e) {
     console.error(`[Scheduler] ${label}: Compliance scan failed:`, e.message);
-    logAppError(`[Scheduler] ${label}: Compliance scan failed`, { error: e.message });
+    logSchedulerStep('error', label, step, substep, stepName, 'failed', { error: e.message });
     return null;
   }
 }
@@ -1169,7 +1340,12 @@ function startScheduler(db) {
       try {
         await runSchedulerCycle(db, 'Startup catch-up', { skipPriceUpdate: true });
         if (ENABLE_STARTUP_COMPLIANCE) {
-          await runComplianceScan(db, 'Startup catch-up', { mode: 'incremental' });
+          await runComplianceScan(db, 'Startup catch-up', {
+            mode: 'incremental',
+            step: 'startup',
+            substep: 1,
+            stepName: 'Startup compliance scan',
+          });
         }
         logAppInfo('[Scheduler] Startup preflight completed');
       } catch (e) {

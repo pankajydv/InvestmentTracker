@@ -330,8 +330,11 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date);
     CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id);
     CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_investment_portfolio_date_source ON daily_values(investment_id, portfolio_id, date, price_source);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_source_date_investment_portfolio ON daily_values(price_source, date, investment_id, portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
+    CREATE INDEX IF NOT EXISTS idx_transactions_investment_portfolio_date ON transactions(investment_id, portfolio_id, transaction_date);
     CREATE INDEX IF NOT EXISTS idx_portfolio_daily_date ON portfolio_daily(date);
     CREATE INDEX IF NOT EXISTS idx_portfolio_daily_portfolio ON portfolio_daily(portfolio_id, date);
     CREATE INDEX IF NOT EXISTS idx_asset_type_daily_portfolio_date ON asset_type_daily(portfolio_id, date);
@@ -342,6 +345,7 @@ function initializeDb(db) {
     CREATE INDEX IF NOT EXISTS idx_stock_intraday_investment_date ON stock_intraday_trades(investment_id, trade_date);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_status_date ON dirty_backfill_scope(status, dirty_from_date);
     CREATE INDEX IF NOT EXISTS idx_dirty_scope_investment_portfolio ON dirty_backfill_scope(investment_id, portfolio_id, status);
+    CREATE INDEX IF NOT EXISTS idx_investments_asset_tracking ON investments(asset_type, is_active, exclude_from_tracking, id);
     CREATE INDEX IF NOT EXISTS idx_symbol_history_investment_dates ON investment_symbol_history(investment_id, valid_from, valid_to);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_symbol_history_unique_window ON investment_symbol_history(investment_id, symbol, valid_from);
     CREATE INDEX IF NOT EXISTS idx_hist_price_repair_status_priority ON historical_price_repair_scope(status, priority, created_at);

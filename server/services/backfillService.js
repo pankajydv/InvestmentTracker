@@ -401,6 +401,20 @@ function buildMissingNpsWindows(inv, missingSegments) {
 const AGGREGATE_RESUME_KEY = 'backfill_aggregate_resume_v1';
 const ENABLE_ROW_WRITE_AUDIT = String(process.env.APP_ROW_WRITE_AUDIT_LOG || 'true').toLowerCase() === 'true';
 
+function logBackfillStep(step, substep, stepName, phase, meta = {}) {
+  const normalizedStep = Number.isFinite(Number(step)) ? String(step) : String(step || 'NA');
+  const normalizedSubstep = substep == null ? null : String(substep);
+  const tag = normalizedSubstep ? `Step-${normalizedStep}.${normalizedSubstep}` : `Step-${normalizedStep}`;
+  const phaseLabel = String(phase || 'running').toUpperCase();
+  logBackfillInfo(`[Backfill][${tag}] ${stepName} [${phaseLabel}]`, {
+    step: normalizedStep,
+    substep: normalizedSubstep,
+    stepName,
+    phase,
+    ...meta,
+  });
+}
+
 function readAggregateResumeState(db) {
   const row = db.prepare('SELECT value FROM config WHERE key = ? LIMIT 1').get(AGGREGATE_RESUME_KEY);
   if (!row?.value) return null;
@@ -1384,6 +1398,16 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC',
   ]);
 
+  // Bond coupon income by date (for total-return day_change adjustment)
+  const bondIncomeByDate = new Map();
+  if (inv.asset_type === 'BOND') {
+    for (const tx of txRows) {
+      if (String(tx.transaction_type || '').toUpperCase() === 'INTEREST' && tx.tx_date >= fromDate) {
+        bondIncomeByDate.set(tx.tx_date, (bondIncomeByDate.get(tx.tx_date) || 0) + Number(tx.amount || 0));
+      }
+    }
+  }
+
   const byDate = new Map();
   let cumulativeUnits = 0;
   let cumulativeInvested = 0;
@@ -1593,7 +1617,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       exitDate = date;
     }
 
-    const dayChange = currentValue - prevValue - carriedNetFlowSinceLastWrite;
+    const bondIncomeToday = bondIncomeByDate.get(date) || 0;
+    const dayChange = currentValue - prevValue - carriedNetFlowSinceLastWrite + bondIncomeToday;
     const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
 
     if (suppressRunDateWritesForMarketLinked && isMarketLinkedAsset && date === toDate) {
@@ -4483,7 +4508,7 @@ async function updateDailyValues(db, options = {}) {
   const stride = progressLogStride(totalScopes, 10);
   let lastScopeHeartbeatAt = Date.now();
 
-  logBackfillInfo(`[Backfill][Step-3] Recomputing daily values for ${totalScopes} scope(s)...`);
+  logBackfillStep(3, null, 'Recompute daily values', 'start', { totalScopes });
 
   const daysBetweenIso = (startIso, endIso) => {
     const start = Date.parse(`${startIso}T00:00:00.000Z`);
@@ -4641,7 +4666,10 @@ async function updateDailyValues(db, options = {}) {
     }
   }
 
-  logBackfillInfo(`[Backfill][Step-3] Completed daily recompute. scopes=${totalScopes}, rowsWritten=${totalRows}`);
+  logBackfillStep(3, null, 'Recompute daily values', 'completed', {
+    totalScopes,
+    rowsWritten: totalRows,
+  });
 
   // Robustness: the aggregate refresh window is normally derived from each dirty scope's
   // dirty_from_date. If a recompute rewrote daily_values rows further back than expected
@@ -4654,14 +4682,14 @@ async function updateDailyValues(db, options = {}) {
       'SELECT MIN(date) AS d FROM daily_values WHERE portfolio_id IS NOT NULL AND updated_at >= ?'
     ).get(aggregateFloorProbeTs)?.d || null;
     if (touchedFloor && (earliestAggregateDate == null || touchedFloor < earliestAggregateDate)) {
-      logBackfillInfo('[Backfill][Step-4] Widened aggregate refresh floor to earliest touched daily_values date.', {
+      logBackfillStep(4, 1, 'Resolve aggregate refresh floor', 'completed', {
         scopeDerivedEarliestAggregateDate: earliestAggregateDate,
         touchedFloor,
       });
       earliestAggregateDate = touchedFloor;
     }
   } catch (floorErr) {
-    logBackfillWarn('[Backfill][Step-4] Failed to compute touched-date floor; falling back to scope-derived earliestAggregateDate.', {
+    logBackfillWarn('[Backfill][Step-4.1] Resolve aggregate refresh floor failed; falling back to scope-derived earliestAggregateDate.', {
       error: floorErr.message,
     });
   }
@@ -4677,7 +4705,9 @@ async function updateDailyValues(db, options = {}) {
       runDate,
       startedAt: new Date().toISOString(),
     });
-    logBackfillInfo('[Backfill][Step-4] Skipping aggregate refresh because no daily-value rows changed.');
+    logBackfillStep(4, 2, 'Refresh aggregate tables', 'skipped', {
+      reason: 'no-daily-value-rows-changed',
+    });
     return {
       rowsWritten: totalRows,
       details,
@@ -4702,9 +4732,16 @@ async function updateDailyValues(db, options = {}) {
   const aggregateStartedAtMs = Date.now();
 
   if (canResume) {
-    logBackfillInfo(`[Backfill][Step-4] Resuming aggregate refresh from ${aggregateStartDate} (range ${earliestAggregateDate} to ${runDate})...`);
+    logBackfillStep(4, 2, 'Refresh aggregate tables', 'resume', {
+      aggregateStartDate,
+      earliestAggregateDate,
+      runDate,
+    });
   } else {
-    logBackfillInfo(`[Backfill][Step-4] Refreshing aggregate tables from ${earliestAggregateDate} to ${runDate}...`);
+    logBackfillStep(4, 2, 'Refresh aggregate tables', 'start', {
+      earliestAggregateDate,
+      runDate,
+    });
   }
 
   const aggregateReplayDays = daysBetweenIso(earliestAggregateDate, runDate);
@@ -4800,7 +4837,10 @@ async function updateDailyValues(db, options = {}) {
     startedAt: new Date().toISOString(),
   });
 
-  logBackfillInfo('[Backfill][Step-4] Aggregate refresh completed.');
+  logBackfillStep(4, 2, 'Refresh aggregate tables', 'completed', {
+    fromDate: aggregateStartDate,
+    toDate: runDate,
+  });
 
   return {
     rowsWritten: totalRows,
@@ -4874,16 +4914,19 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
     rangeEnd: getMarketCacheEvaluationEndDate(runDate),
   };
 
-  logBackfillInfo(`[Backfill][Step-1][Cache-Warm] Starting price cache prewarm...`, {
+  logBackfillStep(1, 1, 'Cache warm', 'start', {
     generalizedScopes: step1ScopeList.length,
     dirtyScopes: scopeList.length,
   });
 
   await preloadStockHistoryForRun(db, invMap, step1ScopeList, runDate, startByInvestment, fetchStartByInvestment, fetchEndByInvestment, cache);
 
-  logBackfillInfo('[Backfill][Step-1] Cache-warm phase completed.');
+  logBackfillStep(1, 1, 'Cache warm', 'completed', {
+    generalizedScopes: step1ScopeList.length,
+    dirtyScopes: scopeList.length,
+  });
 
-  logBackfillInfo('[Backfill][Step-2] Starting corporate-action sync...');
+  logBackfillStep(2, 1, 'Corporate-action sync', 'start');
 
   const step1Result = await processAutoBackfillCAEntries(db, {
     scopeList,
@@ -4893,7 +4936,7 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
     startByInvestment,
   });
 
-  logBackfillInfo(`[Backfill][Step-2] Phase complete.`, {
+  logBackfillStep(2, 1, 'Corporate-action sync', 'completed', {
     caSuggested: step1Result?.modified || 0,
     caInserted: step1Result?.inserted || 0,
     caUpdated: step1Result?.updated || 0,
@@ -4903,7 +4946,7 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
   });
 
   if (options.step1Only === true) {
-    logBackfillInfo(`[Backfill] Step-1 only mode completed. modified=${Number(step1Result?.modified || 0)}`);  
+    logBackfillInfo(`[Backfill] Phase-1-only mode completed. modified=${Number(step1Result?.modified || 0)}`);  
     return {
       runDate,
       processed: scopeList.length,
@@ -4934,16 +4977,30 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
   };
 }
 
-async function runBackfillInTwoSteps(db, options = {}) {
+async function runBackfillPipeline(db, options = {}) {
   const runDate = clampEndDateToToday(options.runDate || todayIso());
   const scopes = options.scopes || [];
-  logBackfillInfo(`[Backfill] Starting four-step backfill for ${runDate} with ${scopes.length} scope(s)...`);
+  logBackfillInfo(`[Backfill] Starting backfill pipeline for ${runDate} with ${scopes.length} scope(s)...`, {
+    pipelineName: 'dirty-scope-backfill',
+    totalSteps: 4,
+    steps: [
+      { step: '1.1', name: 'Cache warm' },
+      { step: '2.1', name: 'Corporate-action sync' },
+      { step: '3', name: 'Recompute daily values' },
+      { step: '4.2', name: 'Refresh aggregate tables' },
+    ],
+  });
 
   const result = await backfillDirtyScopes(db, scopes, {
     runDate,
     suppressRunDateWritesForMarketLinked: options.suppressRunDateWritesForMarketLinked === true,
   });
-  logBackfillInfo('[Backfill] Four-step backfill completed.');
+  logBackfillInfo('[Backfill] Backfill pipeline completed.', {
+    pipelineName: 'dirty-scope-backfill',
+    processed: result?.processed || 0,
+    rowsWritten: result?.rowsWritten || 0,
+    skippedFuture: result?.skippedFuture || 0,
+  });
   return result;
 }
 
@@ -5065,7 +5122,7 @@ module.exports = {
   clampEndDateToToday,
   todayIso,
   toIsoDate,
-  runBackfillInTwoSteps,
+  runBackfillPipeline,
   processAutoBackfillCAEntries,
   updateDailyValues,
   backfillNPSHistoricalNAV,
