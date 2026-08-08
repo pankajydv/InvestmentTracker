@@ -341,7 +341,6 @@ function normalizeNavAssetTypeToken(token) {
 
 function resolveNavComplianceSettings(db) {
   const configuredTypes = getConfigValue(db, NAV_COMPLIANCE_ASSET_TYPES_KEY)
-    || process.env.NAV_COMPLIANCE_ASSET_TYPES
     || NAV_COMPLIANCE_DEFAULT_ASSET_TYPES;
   const typeSet = parseCsvUpperSet(configuredTypes);
   const normalizedAssetTypes = new Set(
@@ -350,8 +349,7 @@ function resolveNavComplianceSettings(db) {
       .filter(Boolean)
   );
 
-  const configuredWarnAfter = getConfigValue(db, NAV_COMPLIANCE_WARN_AFTER_SESSIONS_KEY)
-    || process.env.NAV_COMPLIANCE_WARN_AFTER_SESSIONS;
+  const configuredWarnAfter = getConfigValue(db, NAV_COMPLIANCE_WARN_AFTER_SESSIONS_KEY);
   const parsedWarnAfter = Number(configuredWarnAfter);
 
   return {

@@ -16,7 +16,6 @@ const app = express();
 const PORT = process.env.PORT || 4000;
 const appMode = String(process.env.APP_MODE || 'production').toLowerCase();
 const isProduction = appMode !== 'dev' && appMode !== 'development' && appMode !== 'test';
-const schedulerEnabled = process.env.ENABLE_SCHEDULER === 'true';
 
 installConsoleCapture();
 
@@ -131,17 +130,10 @@ app.listen(PORT, () => {
   logAppInfo('Investment Tracker API started', {
     port: Number(PORT),
     appMode,
-    schedulerEnabled,
     logFile: getUnifiedLogPathForDate(),
   });
 
-  // Start scheduled price updates only when explicitly enabled.
-  if (schedulerEnabled) {
-    startScheduler(db);
-  } else {
-    console.log('[Scheduler] Disabled (set ENABLE_SCHEDULER=true to enable).');
-    logAppInfo('[Scheduler] Disabled (set ENABLE_SCHEDULER=true to enable).');
-  }
+  startScheduler(db);
 });
 
 // Graceful shutdown
