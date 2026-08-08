@@ -1268,7 +1268,7 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
     JOIN investments i ON i.id = t.investment_id
     WHERE ${txnScope.clause}
       AND i.asset_type = ?
-      AND DATE(t.transaction_date) >= ?
+      AND DATE(t.transaction_date) > ?
       AND DATE(t.transaction_date) <= ?
     ORDER BY DATE(t.transaction_date)
   `);
@@ -1277,6 +1277,14 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
     FROM transactions t
     JOIN investments i ON i.id = t.investment_id
     WHERE ${txnScope.clause} AND i.asset_type = ?
+  `);
+  const intervalDayChangeForType = db.prepare(`
+    SELECT COALESCE(SUM(day_change), 0) AS day_change
+    FROM asset_type_daily
+    WHERE ${dailyScope.clause}
+      AND asset_type = ?
+      AND date > ?
+      AND date <= ?
   `);
 
   const byType = {};
@@ -1306,8 +1314,7 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
       : Number(valueForType.get(...dailyScope.params, assetTypeKey, chosenFrom)?.total_value || 0);
     const closingValue = Number(valueForType.get(...dailyScope.params, assetTypeKey, chosenTo)?.total_value || 0);
 
-    const transactionsFromDate = isInceptionWindow ? intervalFromDate : chosenFrom;
-    const intervalTransactions = intervalTransactionsForType.all(...txnScope.params, assetTypeKey, transactionsFromDate, chosenTo);
+    const intervalTransactions = intervalTransactionsForType.all(...txnScope.params, assetTypeKey, chosenFrom, chosenTo);
 
     const intervalCashflows = [];
     if (openingValue !== 0) {
@@ -1337,7 +1344,9 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
     portfolioIntervalCashflows.push(...intervalCashflows);
 
     const intervalXirrRate = calculateXirr(intervalCashflows);
-    const intervalNetProfit = intervalCashflows.reduce((sum, flow) => sum + flow.amount, 0);
+    const intervalNetProfit = Number(intervalDayChangeForType.get(
+      ...dailyScope.params, assetTypeKey, chosenFrom, chosenTo,
+    )?.day_change || 0);
 
     byType[assetTypeKey] = {
       dayChange: intervalNetProfit,
@@ -2257,7 +2266,7 @@ module.exports = function (db) {
             FROM daily_values
             WHERE investment_id = ?
               AND portfolio_id = ?
-              AND date >= ?
+              AND date > ?
               AND date <= ?
           `)
         : db.prepare(`
@@ -2267,7 +2276,7 @@ module.exports = function (db) {
             FROM daily_values
             WHERE investment_id = ?
               AND portfolio_id IS NOT NULL
-              AND date >= ?
+              AND date > ?
               AND date <= ?
           `);
 
@@ -2820,7 +2829,7 @@ module.exports = function (db) {
       const cacheKey = (customFromDate || customToDate)
         ? null
         : JSON.stringify({
-            kind: 'interval-metrics',
+          kind: 'interval-metrics-v2',
             scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
             interval: intervalParam,
           });

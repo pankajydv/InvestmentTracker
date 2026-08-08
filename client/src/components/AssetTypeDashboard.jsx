@@ -277,15 +277,16 @@ export default function AssetTypeDashboard() {
         extra: isPartialMulti ? `at:combine:${selectedIdsKey}` : 'at',
       });
       const cachedEntry = getCachedDashboardSummary(cacheKey);
+      const showBlockingLoader = !data;
 
       try {
-        setLoading(true);
+        if (showBlockingLoader) setLoading(true);
         setCacheState(cachedEntry ? 'validating' : 'loading');
         setIsIntervalSwitching(true);
 
         // Keep monetary values hidden until the lightweight version probe has
         // confirmed that the persisted payload is authoritative.
-        if (cachedEntry) {
+        if (cachedEntry && showBlockingLoader) {
           setData(null);
           setLoading(true);
         }
@@ -319,9 +320,9 @@ export default function AssetTypeDashboard() {
           }
 
           removeCachedDashboardSummary(cacheKey);
-          setData(null);
+          if (showBlockingLoader) setData(null);
           setCacheState('stale');
-          setLoading(true);
+          if (showBlockingLoader) setLoading(true);
         }
 
         const requestOptions = {

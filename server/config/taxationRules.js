@@ -558,7 +558,21 @@ const TAXATION_RULES = {
  * @param {string} regime - 'newRegime' or 'oldRegime' (default: 'newRegime')
  * @returns {Object|null} Taxation rules object or null if not found
  */
-function getTaxationRules(fy, regime = 'newRegime') {
+function getTaxationRules(fy, regime = 'newRegime', db = null) {
+  // DB override takes precedence over static config
+  if (db) {
+    try {
+      const row = db.prepare('SELECT data_json FROM tax_custom_rules WHERE fy = ?').get(fy);
+      if (row) {
+        const parsed = JSON.parse(row.data_json);
+        const regimeData = parsed[regime];
+        if (regimeData && regimeData.status === 'supported') {
+          return { ...regimeData, _source: 'db' };
+        }
+      }
+    } catch (_) { /* fall through to static */ }
+  }
+
   const fyData = TAXATION_RULES[fy];
   if (!fyData) return null;
 
@@ -566,13 +580,10 @@ function getTaxationRules(fy, regime = 'newRegime') {
   if (!regimeData) return null;
 
   if (regimeData.status === 'not_supported') {
-    return {
-      status: 'not_supported',
-      reason: regimeData.reason,
-    };
+    return { status: 'not_supported', reason: regimeData.reason };
   }
 
-  return regimeData;
+  return { ...regimeData, _source: 'static' };
 }
 
 /**

@@ -367,13 +367,13 @@ function calculateInvestmentIntervalXirr(db, {
         SELECT COALESCE(SUM(day_change), 0) AS value
         FROM daily_values
         WHERE investment_id = ? AND portfolio_id = ?
-          AND date >= ? AND date <= ?
+          AND date > ? AND date <= ?
       `).get(investmentId, portfolioId, chosenFromDate, chosenToDate)?.value || 0)
       : Number(db.prepare(`
         SELECT COALESCE(SUM(day_change), 0) AS value
         FROM daily_values
         WHERE investment_id = ? AND portfolio_id IS NOT NULL
-          AND date >= ? AND date <= ?
+          AND date > ? AND date <= ?
       `).get(investmentId, chosenFromDate, chosenToDate)?.value || 0);
 
     intervalChange = summedIntervalChange;
@@ -389,7 +389,7 @@ function calculateInvestmentIntervalXirr(db, {
         END), 0) AS net_flow
         FROM transactions
         WHERE investment_id = ? AND portfolio_id = ?
-          AND DATE(transaction_date) >= ? AND DATE(transaction_date) <= ?
+          AND DATE(transaction_date) > ? AND DATE(transaction_date) <= ?
       `).get(investmentId, portfolioId, chosenFromDate, chosenToDate)?.net_flow || 0)
       : Number(db.prepare(`
         SELECT COALESCE(SUM(CASE
@@ -400,7 +400,7 @@ function calculateInvestmentIntervalXirr(db, {
         END), 0) AS net_flow
         FROM transactions
         WHERE investment_id = ?
-          AND DATE(transaction_date) >= ? AND DATE(transaction_date) <= ?
+          AND DATE(transaction_date) > ? AND DATE(transaction_date) <= ?
       `).get(investmentId, chosenFromDate, chosenToDate)?.net_flow || 0);
 
     const snapshotDerivedIntervalChange = closing - opening - netFlow;

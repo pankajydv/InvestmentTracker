@@ -1083,25 +1083,40 @@ describe('Dashboard', () => {
         INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees)
         VALUES (?, ?, 'BUY', '2026-08-01', 1, 100, 100, 0)
       `).run(investmentId, portfolioId);
+      db.prepare(`
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees)
+        VALUES (?, ?, 'SELL', '2026-08-06', 0, 800, 800, 0)
+      `).run(investmentId, portfolioId);
       const insertDaily = db.prepare(`
         INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
         VALUES (?, ?, ?, ?, 1, ?, 100, 0, ?, ?, ?)
       `);
       insertDaily.run(investmentId, portfolioId, '2026-08-06', 100, 100, 0, 'LIVE', -5);
       insertDaily.run(investmentId, portfolioId, '2026-08-07', 110, 110, 10, 'LIVE', 10);
+      insertDaily.run(investmentId, portfolioId, '2026-08-08', 108, 108, 8, 'LIVE', -2);
       const insertPortfolioDaily = db.prepare(`
         INSERT INTO portfolio_daily (portfolio_id, date, total_value, total_invested, total_profit_loss, total_profit_loss_pct, day_change, day_change_pct)
         VALUES (?, ?, ?, 100, ?, ?, ?, ?)
       `);
       insertPortfolioDaily.run(portfolioId, '2026-08-06', 100, 0, 0, -5, (-5 / 105) * 100);
       insertPortfolioDaily.run(portfolioId, '2026-08-07', 110, 10, 10, 10, 10);
+      insertPortfolioDaily.run(portfolioId, '2026-08-08', 108, 8, 8, -2, (-2 / 110) * 100);
+      const insertAssetDaily = db.prepare(`
+        INSERT INTO asset_type_daily (
+          portfolio_id, asset_type, date, total_value, total_invested,
+          total_profit_loss, total_realized_proceeds, day_change, day_change_pct
+        ) VALUES (?, 'FOREIGN_STOCK', ?, ?, 100, ?, 0, ?, ?)
+      `);
+      insertAssetDaily.run(portfolioId, '2026-08-06', 100, 0, -5, (-5 / 105) * 100);
+      insertAssetDaily.run(portfolioId, '2026-08-07', 110, 10, 10, 10);
+      insertAssetDaily.run(portfolioId, '2026-08-08', 108, 8, -2, (-2 / 110) * 100);
 
       const overview = await api('GET', `/dashboard/overview?portfolio_ids=${portfolioId}`);
       assert.equal(overview.status, 200);
       assert.ok(overview.body.portfolio.dayChanges?.oneDay);
       assert.ok(overview.body.portfolio.dayChanges?.yesterday);
-      assert.equal(overview.body.portfolio.dayChanges.oneDay.change, 10);
-      assert.equal(overview.body.portfolio.dayChanges.yesterday.change, -5);
+      assert.equal(overview.body.portfolio.dayChanges.oneDay.change, -2);
+      assert.equal(overview.body.portfolio.dayChanges.yesterday.change, 10);
 
       const assetOverview = await api('GET', `/dashboard/asset-overview?asset_type=FOREIGN_STOCK&portfolio_ids=${portfolioId}`);
       assert.equal(assetOverview.status, 200);
@@ -1113,7 +1128,14 @@ describe('Dashboard', () => {
       assert.equal(detail.status, 200);
       assert.ok(detail.body.dayChanges?.oneDay);
       assert.ok(detail.body.dayChanges?.yesterday);
+
+      const twoDay = await api('GET', `/dashboard/summary?portfolio_id=${portfolioId}&interval=2D&xirr_mode=portfolio_only`);
+      assert.equal(twoDay.status, 200);
+      assert.equal(twoDay.body.intervalXIRR.interval_change, 8);
+      assert.equal(twoDay.body.byType.FOREIGN_STOCK.dayChange, 8);
+      assert.equal(twoDay.body.investments[0].day_change, 8);
     } finally {
+      db.prepare('DELETE FROM asset_type_daily WHERE portfolio_id = ?').run(portfolioId);
       db.prepare('DELETE FROM portfolio_daily WHERE portfolio_id = ?').run(portfolioId);
       db.prepare('DELETE FROM daily_values WHERE investment_id = ?').run(investmentId);
       db.prepare('DELETE FROM transactions WHERE investment_id = ?').run(investmentId);

@@ -7,8 +7,8 @@
 // open on quota errors (network remains the source of truth).
 
 const DASHBOARD_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-// v5: portfolio paired metrics use strict portfolio daily rollups.
-const DASHBOARD_CACHE_PREFIX = 'itrack:dash:v5:';
+// v6: interval changes exclude the opening snapshot date and use strict daily P&L.
+const DASHBOARD_CACHE_PREFIX = 'itrack:dash:v6:';
 const DASHBOARD_CACHE_MAX_ENTRIES = 24;
 
 export function resolveDashboardCacheState(cachedVersion, serverVersion) {

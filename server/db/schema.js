@@ -408,6 +408,14 @@ function initializeDb(db) {
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tax_form16_data_fy ON tax_form16_data(fy, portfolio_id);
 
+    -- Tax: user-managed per-FY taxation rules (override static config)
+    CREATE TABLE IF NOT EXISTS tax_custom_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fy TEXT NOT NULL UNIQUE,
+      data_json TEXT NOT NULL,
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
     -- Tax: property capital gains inputs (old/new property amounts and custom costs)
     CREATE TABLE IF NOT EXISTS tax_property_items (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

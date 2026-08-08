@@ -324,6 +324,13 @@ export const getForm16Data = (fy, portfolioId) => {
   return fetchJSON(`/tax/form16?${params}`);
 };
 
+export const getTaxRules = (fy) => fetchJSON(`/tax/rules/${encodeURIComponent(fy)}`);
+export const getTaxRulesFlat = (fy) => fetchJSON(`/tax/rules-flat/${encodeURIComponent(fy)}`);
+export const saveTaxRules = (fy, rules) =>
+  fetchJSON(`/tax/rules/${encodeURIComponent(fy)}`, { method: 'PUT', body: JSON.stringify(rules) });
+export const deleteTaxRules = (fy) =>
+  fetchJSON(`/tax/rules/${encodeURIComponent(fy)}`, { method: 'DELETE' });
+
 // Tax: Other Income
 export const getOtherIncome = (fy, portfolioId) => {
   const params = new URLSearchParams({ fy });

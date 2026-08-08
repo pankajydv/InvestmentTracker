@@ -1060,7 +1060,7 @@ function computeSurcharge(totalIncome, baseTax, surchargeSlabs) {
 
 function buildTaxComputation(db, fy, portfolioId) {
   // ── Fetch taxation rules for this financial year ──
-  const taxRules = getTaxationRules(fy, 'newRegime');
+  const taxRules = getTaxationRules(fy, 'newRegime', db);
   if (!taxRules || taxRules.status === 'not_supported') {
     throw new Error(`Tax computation not supported for FY ${fy} in New Regime`);
   }
@@ -1342,6 +1342,7 @@ function buildTaxComputation(db, fy, portfolioId) {
     taxation_rules: {
       fy,
       regime: 'newRegime',
+      source: taxRules._source || 'static',
       standard_deduction: standardDeduction,
       slabs: slabs.map((s) => ({ upto: s.upto, rate: s.rate, label: s.label })),
       capital_gains: {
@@ -1465,6 +1466,77 @@ module.exports = function (db) {
         calendarYear: Number(calendar_year),
       });
       res.json(result);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ── Custom Taxation Rules CRUD ───────────────────────────────────────────────
+  // Returns flat shape identical to computation.taxation_rules for direct use in UI
+  router.get('/rules-flat/:fy', (req, res) => {
+    try {
+      const { fy } = req.params;
+      const taxRules = getTaxationRules(fy, 'newRegime', db);
+      if (!taxRules || taxRules.status === 'not_supported') {
+        return res.json(null);
+      }
+      res.json({
+        fy,
+        regime: 'newRegime',
+        source: taxRules._source || 'static',
+        standard_deduction: taxRules.standardDeduction,
+        slabs: taxRules.slabs.map((s) => ({ upto: s.upto, rate: s.rate, label: s.label })),
+        capital_gains: {
+          stcg: { rate: taxRules.capitalGains.stcg.rate, section: taxRules.capitalGains.stcg.section, description: taxRules.capitalGains.stcg.description },
+          ltcg_equity: { rate: taxRules.capitalGains.ltcgEquity.rate, section: taxRules.capitalGains.ltcgEquity.section, exemption: taxRules.capitalGains.ltcgEquity.exemption, description: taxRules.capitalGains.ltcgEquity.description },
+          ltcg_foreign: { rate: taxRules.capitalGains.ltcgForeign.rate, section: taxRules.capitalGains.ltcgForeign.section, description: taxRules.capitalGains.ltcgForeign.description },
+        },
+        rebate_87a: { limit: taxRules.rebate87A.limit, amount: taxRules.rebate87A.amount, description: taxRules.rebate87A.description },
+        surcharge: taxRules.surcharge.map((s) => ({ upto: s.upto, rate: s.rate, label: s.label })),
+        cess: { rate: taxRules.cess.rate, description: taxRules.cess.description },
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.get('/rules/:fy', (req, res) => {
+    try {
+      const { fy } = req.params;
+      const row = db.prepare('SELECT data_json, updated_at FROM tax_custom_rules WHERE fy = ?').get(fy);
+      const staticRules = getTaxationRules(fy, 'newRegime');
+      res.json({
+        fy,
+        source: row ? 'db' : (staticRules ? 'static' : 'none'),
+        rules: row ? JSON.parse(row.data_json) : null,
+        updated_at: row ? row.updated_at : null,
+      });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.put('/rules/:fy', (req, res) => {
+    try {
+      const { fy } = req.params;
+      const body = req.body;
+      if (!body || typeof body !== 'object') return res.status(400).json({ error: 'Rules body is required' });
+      const json = JSON.stringify(body);
+      db.prepare(`
+        INSERT INTO tax_custom_rules (fy, data_json, updated_at) VALUES (?, ?, datetime('now'))
+        ON CONFLICT(fy) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at
+      `).run(fy, json);
+      res.json({ ok: true, fy, updated_at: db.prepare('SELECT updated_at FROM tax_custom_rules WHERE fy = ?').get(fy)?.updated_at });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  router.delete('/rules/:fy', (req, res) => {
+    try {
+      const { fy } = req.params;
+      db.prepare('DELETE FROM tax_custom_rules WHERE fy = ?').run(fy);
+      res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }

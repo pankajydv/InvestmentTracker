@@ -69,7 +69,7 @@ function sumPortfolioDayChange(db, portfolioId, fromDate, toDate) {
       SELECT COALESCE(SUM(day_change), 0) AS day_change
       FROM portfolio_daily
       WHERE portfolio_id = ?
-        AND date >= ?
+        AND date > ?
         AND date <= ?
     `).get(portfolioId, fromDate, toDate)?.day_change || 0);
   }
@@ -78,7 +78,7 @@ function sumPortfolioDayChange(db, portfolioId, fromDate, toDate) {
     SELECT COALESCE(SUM(day_change), 0) AS day_change
     FROM portfolio_daily
     WHERE portfolio_id IS NOT NULL
-      AND date >= ?
+      AND date > ?
       AND date <= ?
   `).get(fromDate, toDate)?.day_change || 0);
 }
@@ -94,7 +94,7 @@ function sumScopedNetExternalFlows(db, portfolioId, fromDate, toDate) {
       ELSE 0
     END), 0) AS net_flow
     FROM transactions
-    WHERE DATE(transaction_date) >= ?
+    WHERE DATE(transaction_date) > ?
       AND DATE(transaction_date) <= ?
   `;
 
@@ -168,7 +168,8 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
     const openingValue = getPortfolioValueOnDate(db, portfolioId, fromDate);
     const closingValue = getPortfolioValueOnDate(db, portfolioId, toDate);
 
-    // Get all transactions in interval (from_date to to_date, inclusive)
+    // The opening snapshot is end-of-day on fromDate, so only later flows belong
+    // to the interval. Including fromDate transactions would count them twice.
     let txnQuery = `
       SELECT
         DATE(t.transaction_date) AS txn_date,
@@ -176,7 +177,7 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
         COALESCE(t.amount, 0) AS amount,
         COALESCE(t.fees, 0) AS fees
       FROM transactions t
-      WHERE DATE(t.transaction_date) >= ? AND DATE(t.transaction_date) <= ?
+      WHERE DATE(t.transaction_date) > ? AND DATE(t.transaction_date) <= ?
         AND t.portfolio_id IS NOT NULL
       ORDER BY DATE(t.transaction_date)
     `;
@@ -190,7 +191,7 @@ function calculateIntervalXIRR(db, portfolioId, fromDate, toDate) {
           COALESCE(t.amount, 0) AS amount,
           COALESCE(t.fees, 0) AS fees
         FROM transactions t
-        WHERE DATE(t.transaction_date) >= ? AND DATE(t.transaction_date) <= ?
+        WHERE DATE(t.transaction_date) > ? AND DATE(t.transaction_date) <= ?
           AND t.portfolio_id = ?
         ORDER BY DATE(t.transaction_date)
       `;

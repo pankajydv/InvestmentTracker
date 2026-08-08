@@ -3,7 +3,7 @@ import { Card, Row, Col, Form, Button, Table, Badge, Spinner, Accordion } from '
 import { Download, Plus, Trash2, Info } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import CollapsibleSectionHeader from './CollapsibleSectionHeader';
-import { getTaxReport, getTaxMeta, getTaxComputation, uploadAIS, getAISData, uploadForm16, getForm16Data, getOtherIncome, addOtherIncome, updateOtherIncome, deleteOtherIncome, getScheduleFaA3 } from '../services/api';
+import { getTaxReport, getTaxMeta, getTaxComputation, uploadAIS, getAISData, uploadForm16, getForm16Data, getTaxRulesFlat, getOtherIncome, addOtherIncome, updateOtherIncome, deleteOtherIncome, getScheduleFaA3 } from '../services/api';
 import { formatINRExact as formatINR, formatDate, formatNumber, profitColor } from '../utils/formatters';
 import { usePrivacyMaskRefresh } from '../utils/privacyMode';
 import TaxComputation from './TaxComputation';
@@ -898,6 +898,7 @@ export default function TaxReport() {
   const [loading, setLoading] = useState(false);
   const [report, setReport] = useState(null);
   const [computation, setComputation] = useState(null);
+  const [taxationRules, setTaxationRules] = useState(null);
   const [error, setError] = useState('');
   const [perquisiteExpanded, setPerquisiteExpanded] = useState(false);
   const [cgQuarterExpanded, setCgQuarterExpanded] = useState(false);
@@ -1154,6 +1155,11 @@ export default function TaxReport() {
       source: 'a3_lot_rollup',
     };
   }, [scheduleFaA2Summary, scheduleFaA3Totals]);
+
+  useEffect(() => {
+    if (!fy) { setTaxationRules(null); return; }
+    getTaxRulesFlat(fy).then(setTaxationRules).catch(() => setTaxationRules(null));
+  }, [fy]);
 
   // ── AIS & Other Income ──
   useEffect(() => {
@@ -1864,12 +1870,19 @@ export default function TaxReport() {
             />
           </Accordion>
 
-          {computation?.taxation_rules && (
-            <TaxationRulesReference rules={computation.taxation_rules} fy={fy} />
-          )}
-
           <div className="small text-muted">{summary.tax_note}</div>
         </>
+      )}
+
+      {(taxationRules || computation?.taxation_rules) && (
+        <TaxationRulesReference
+          rules={computation?.taxation_rules ?? taxationRules}
+          fy={fy}
+          onSaved={async () => {
+            getTaxRulesFlat(fy).then(setTaxationRules).catch(() => {});
+            await refreshTaxComputation();
+          }}
+        />
       )}
     </div>
   );

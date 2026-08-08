@@ -9,10 +9,10 @@ function rowTitle(metric) {
   return details.join(' | ');
 }
 
-export default function DayChangeRows({ dayChanges }) {
+export default function DayChangeRows({ dayChanges, fullLabels = false }) {
   const rows = [
-    ['1D', dayChanges?.oneDay],
-    ['YD', dayChanges?.yesterday],
+    [fullLabels ? 'Today' : '1D', dayChanges?.oneDay],
+    [fullLabels ? 'Yesterday' : 'YD', dayChanges?.yesterday],
   ];
 
   return (

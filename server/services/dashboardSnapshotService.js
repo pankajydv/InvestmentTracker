@@ -92,6 +92,7 @@ function buildSnapshotKey(params = {}) {
   if (customFromDate || customToDate) return null;
 
   return JSON.stringify({
+    kind: 'dashboard-summary-v2',
     scope: portfolioId != null ? String(portfolioId) : 'all',
     hideSold: !!hideSold,
     includeFullySoldInReturns: !!includeFullySoldInReturns,

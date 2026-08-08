@@ -623,7 +623,7 @@ export default function Dashboard() {
 
       // Keep monetary values hidden behind the skeleton until the lightweight
       // version probe confirms that the persisted payload is authoritative.
-      if (cachedEntry) {
+      if (cachedEntry && showBlockingLoader) {
         setData(null);
         setLoading(true);
         setShowDetailTables(false);
@@ -663,9 +663,9 @@ export default function Dashboard() {
         }
 
         removeCachedDashboardSummary(cacheKey);
-        setData(null);
+        if (showBlockingLoader) setData(null);
         setCacheState('stale');
-        setLoading(true);
+        if (showBlockingLoader) setLoading(true);
       }
 
       if (selectedInterval === '1D') {
@@ -1204,7 +1204,7 @@ export default function Dashboard() {
               ) : (
                 <>
                   {selectedInterval === '1D' ? (
-                    <DayChangeRows dayChanges={portfolio.dayChanges} />
+                    <DayChangeRows dayChanges={portfolio.dayChanges} fullLabels />
                   ) : (
                     <div className={`fs-3 fw-bold ${profitColor(data?.intervalXIRR?.interval_change)}`}>
                       {formatINR(data?.intervalXIRR?.interval_change || 0, 0)}
