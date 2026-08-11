@@ -221,125 +221,135 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
           <tbody>
             {sortInvestments(info.investments).map((inv) => (
               <tr key={inv.id}>
-                {tableColumns.map((col) => {
-                  if (col.key === 'name') {
-                    return (
-                      <td key={`${inv.id}-name`} className="px-3 holdings-col-name">
-                        <Link to={`/investments/${inv.id}`} state={{ from: 'asset-type', fromLabel: ASSET_TYPE_LABELS[type] }} className="fw-medium text-decoration-none">
-                          {inv.name}
-                        </Link>
-                        <div className="d-flex align-items-center gap-2 mt-1">
-                          {inv.asset_type === 'MUTUAL_FUND' && inv.open_folios_count !== undefined ? (
-                            <span className="text-muted" style={{ fontSize: '0.7rem' }}>Folios: {inv.open_folios_count}</span>
-                          ) : inv.amfi_code ? (
-                            <span className="text-muted" style={{ fontSize: '0.7rem' }}>{inv.amfi_code}</span>
-                          ) : null}
-                        </div>
-                      </td>
-                    );
-                  }
+                {(() => {
+                  const investedAmount = Number(inv.invested_amount) || 0;
+                  const fallbackAbsPct = investedAmount > 0
+                    ? ((Number(inv.profit_loss) || 0) / investedAmount) * 100
+                    : 0;
+                  const rowAbsPct = Number.isFinite(Number(inv.profit_loss_pct))
+                    ? Number(inv.profit_loss_pct)
+                    : fallbackAbsPct;
 
-                  if (col.key === 'asOfDate') {
-                    return (
-                      <td key={`${inv.id}-asOfDate`} className="px-3 text-center holdings-col-asOfDate text-nowrap">
-                        {inv.day_change_uses_fallback && inv.day_change_as_of_date
-                          ? formatAsOfDate(inv.day_change_as_of_date)
-                          : '-'}
-                      </td>
-                    );
-                  }
-
-                  if (col.key === 'price') {
-                    const acquiredUnits = Number(inv.acquired_units) || 0;
-                    const avgCostText = acquiredUnits > 0.0001
-                      ? (String(inv.currency || 'INR').toUpperCase() === 'INR'
-                        ? formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)
-                        : `${inv.avg_cost_per_unit_native == null ? `${getCurrencySymbol(inv.currency)}N/A` : formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)} | ₹${formatNumber(inv.invested_amount / inv.acquired_units, 2)}`)
-                      : '';
-                    return (
-                      <td key={`${inv.id}-price`} className="px-3 text-end holdings-col-price">
-                        {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type) ? (
-                          <div className="fw-medium">
-                            {Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-'}
+                  return tableColumns.map((col) => {
+                    if (col.key === 'name') {
+                      return (
+                        <td key={`${inv.id}-name`} className="px-3 holdings-col-name">
+                          <Link to={`/investments/${inv.id}`} state={{ from: 'asset-type', fromLabel: ASSET_TYPE_LABELS[type] }} className="fw-medium text-decoration-none">
+                            {inv.name}
+                          </Link>
+                          <div className="d-flex align-items-center gap-2 mt-1">
+                            {inv.asset_type === 'MUTUAL_FUND' && inv.open_folios_count !== undefined ? (
+                              <span className="text-muted" style={{ fontSize: '0.7rem' }}>Folios: {inv.open_folios_count}</span>
+                            ) : inv.amfi_code ? (
+                              <span className="text-muted" style={{ fontSize: '0.7rem' }}>{inv.amfi_code}</span>
+                            ) : null}
                           </div>
-                        ) : (
-                          <div className="fw-medium">{formatWithSymbol(inv.price_per_unit, inv.currency, 2)}</div>
-                        )}
-                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>{avgCostText}</div>
-                      </td>
-                    );
-                  }
+                        </td>
+                      );
+                    }
 
-                  if (col.key === 'dayChange') {
-                    return (
-                      <td key={`${inv.id}-dayChange`} className="px-3 text-end holdings-col-dayChange">
-                        {isIntervalSwitching ? (
-                          <>
-                            <div className="fw-medium text-muted">...</div>
-                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
-                          </>
-                        ) : (
-                          <>
-                            <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatSensitiveAmount(inv.day_change, 0)}</div>
-                            <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>
-                              {formatPct(inv.day_change_pct)}
+                    if (col.key === 'asOfDate') {
+                      return (
+                        <td key={`${inv.id}-asOfDate`} className="px-3 text-center holdings-col-asOfDate text-nowrap">
+                          {inv.day_change_uses_fallback && inv.day_change_as_of_date
+                            ? formatAsOfDate(inv.day_change_as_of_date)
+                            : '-'}
+                        </td>
+                      );
+                    }
+
+                    if (col.key === 'price') {
+                      const acquiredUnits = Number(inv.acquired_units) || 0;
+                      const avgCostText = acquiredUnits > 0.0001
+                        ? (String(inv.currency || 'INR').toUpperCase() === 'INR'
+                          ? formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)
+                          : `${inv.avg_cost_per_unit_native == null ? `${getCurrencySymbol(inv.currency)}N/A` : formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)} | ₹${formatNumber(inv.invested_amount / inv.acquired_units, 2)}`)
+                        : '';
+                      return (
+                        <td key={`${inv.id}-price`} className="px-3 text-end holdings-col-price">
+                          {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type) ? (
+                            <div className="fw-medium">
+                              {Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-'}
                             </div>
-                          </>
-                        )}
-                      </td>
-                    );
-                  }
+                          ) : (
+                            <div className="fw-medium">{formatWithSymbol(inv.price_per_unit, inv.currency, 2)}</div>
+                          )}
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>{avgCostText}</div>
+                        </td>
+                      );
+                    }
 
-                  if (col.key === 'totalCost') {
-                    return (
-                      <td key={`${inv.id}-totalCost`} className="px-3 text-end holdings-col-totalCost">
-                        <div className="fw-medium">{formatSensitiveAmount((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
-                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                          {formatSensitiveAmount(inv.invested_amount, 0)}
-                        </div>
-                      </td>
-                    );
-                  }
+                    if (col.key === 'dayChange') {
+                      return (
+                        <td key={`${inv.id}-dayChange`} className="px-3 text-end holdings-col-dayChange">
+                          {isIntervalSwitching ? (
+                            <>
+                              <div className="fw-medium text-muted">...</div>
+                              <div className="text-muted" style={{ fontSize: '0.7rem' }}>...</div>
+                            </>
+                          ) : (
+                            <>
+                              <div className={`fw-medium ${profitColor(inv.day_change)}`}>{formatSensitiveAmount(inv.day_change, 0)}</div>
+                              <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>
+                                {formatPct(inv.day_change_pct)}
+                              </div>
+                            </>
+                          )}
+                        </td>
+                      );
+                    }
 
-                  if (col.key === 'currentValue') {
-                    return (
-                      <td key={`${inv.id}-currentValue`} className="px-3 text-end holdings-col-currentValue">
-                        <div className="fw-medium">{formatSensitiveAmount(inv.current_value, 0)}</div>
-                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                          {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
-                        </div>
-                      </td>
-                    );
-                  }
+                    if (col.key === 'totalCost') {
+                      return (
+                        <td key={`${inv.id}-totalCost`} className="px-3 text-end holdings-col-totalCost">
+                          <div className="fw-medium">{formatSensitiveAmount((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                            {formatSensitiveAmount(inv.invested_amount, 0)}
+                          </div>
+                        </td>
+                      );
+                    }
 
-                  if (col.key === 'portfolioPct') {
-                    return (
-                      <td key={`${inv.id}-portfolioPct`} className="px-3 text-end holdings-col-portfolioPct">
-                        <div className="fw-medium">{(inv.portfolio_pct || 0).toFixed(2)}%</div>
-                        <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                          {info.totalValue > 0 ? (((inv.current_value || 0) / info.totalValue) * 100).toFixed(2) : '0.00'}%
-                        </div>
-                      </td>
-                    );
-                  }
+                    if (col.key === 'currentValue') {
+                      return (
+                        <td key={`${inv.id}-currentValue`} className="px-3 text-end holdings-col-currentValue">
+                          <div className="fw-medium">{formatSensitiveAmount(inv.current_value, 0)}</div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                            {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
+                          </div>
+                        </td>
+                      );
+                    }
 
-                  if (col.key === 'totalReturn') {
-                    return (
-                      <td key={`${inv.id}-totalReturn`} className="px-3 text-end holdings-col-totalReturn">
-                        <div className={`fw-semibold ${profitColor(inv.profit_loss)}`}>
-                          {formatSensitiveAmount(inv.profit_loss, 0)}
-                        </div>
-                        <div className={profitColor(inv.profit_loss_pct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
-                          {isMobile
-                            ? `${formatPct(inv.profit_loss_pct)}|${inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}`
-                            : `${formatPct(inv.profit_loss_pct)} | ${inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}`}
-                        </div>
-                      </td>
-                    );
-                  }
+                    if (col.key === 'portfolioPct') {
+                      return (
+                        <td key={`${inv.id}-portfolioPct`} className="px-3 text-end holdings-col-portfolioPct">
+                          <div className="fw-medium">{(inv.portfolio_pct || 0).toFixed(2)}%</div>
+                          <div className="text-muted" style={{ fontSize: '0.7rem' }}>
+                            {info.totalValue > 0 ? (((inv.current_value || 0) / info.totalValue) * 100).toFixed(2) : '0.00'}%
+                          </div>
+                        </td>
+                      );
+                    }
 
-                  return null;
-                })}
+                    if (col.key === 'totalReturn') {
+                      return (
+                        <td key={`${inv.id}-totalReturn`} className="px-3 text-end holdings-col-totalReturn">
+                          <div className={`fw-semibold ${profitColor(inv.profit_loss)}`}>
+                            {formatSensitiveAmount(inv.profit_loss, 0)}
+                          </div>
+                          <div className={profitColor(rowAbsPct)} style={{ fontSize: '0.7rem', whiteSpace: 'nowrap' }}>
+                            {isMobile
+                              ? `${formatPct(rowAbsPct)}|${inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}`
+                              : `${formatPct(rowAbsPct)} | ${inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}`}
+                          </div>
+                        </td>
+                      );
+                    }
+
+                    return null;
+                  });
+                })()}
               </tr>
             ))}
             <tr className="table-light fw-semibold">

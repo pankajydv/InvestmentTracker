@@ -1519,12 +1519,17 @@ module.exports = function (db) {
     today.setHours(0, 0, 0, 0);
     const todayStr = today.toISOString().split('T')[0];
     
-    // Consolidate MAX(date) queries: fetch once and reuse
+    // Consolidate MAX(date) queries: keep the global date for stale-data warnings,
+    // but resolve interval bounds from the requested scope so single-portfolio
+    // requests do not drift to unrelated newer portfolio dates.
     const latestDateResult = db.prepare(`
       SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id IS NOT NULL
     `).get();
     const latestAggregateDate = latestDateResult?.max_date;
-    const latestDateInDb = latestAggregateDate;
+    const scopedPortfolioId = portfolio_id ? Number(portfolio_id) : null;
+    const latestDateInDb = Number.isInteger(scopedPortfolioId) && scopedPortfolioId > 0
+      ? (db.prepare('SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id = ?').get(scopedPortfolioId)?.max_date || null)
+      : latestAggregateDate;
 
     let stalePricesWarning = null;
     if (!latestAggregateDate || latestAggregateDate < todayStr) {

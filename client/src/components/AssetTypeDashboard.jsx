@@ -274,7 +274,9 @@ export default function AssetTypeDashboard() {
         selectedInterval,
         customFromDate,
         customToDate,
-        extra: isPartialMulti ? `at:combine:${selectedIdsKey}` : 'at',
+        // Include assetType in the namespace to avoid cross-type cache pollution
+        // (e.g. Stocks payload reused by MF/PPF page under same scope/interval).
+        extra: isPartialMulti ? `at:${assetType}:combine:${selectedIdsKey}` : `at:${assetType}`,
       });
       const cachedEntry = getCachedDashboardSummary(cacheKey);
       const showBlockingLoader = !data;
