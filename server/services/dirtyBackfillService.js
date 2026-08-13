@@ -579,6 +579,7 @@ async function runDirtyBackfillPreflight(db, runDate = todayIso(), options = {})
       runDate: effectiveRunDate,
       scopes,
       suppressRunDateWritesForMarketLinked: options.suppressRunDateWritesForMarketLinked === true,
+      suppressedRunDateAssetTypes: options.suppressedRunDateAssetTypes || null,
     });
 
     const markDone = db.prepare(`

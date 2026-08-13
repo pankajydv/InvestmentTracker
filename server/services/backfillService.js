@@ -1492,6 +1492,9 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   const isMarketLinkedAsset = ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(inv.asset_type || ''));
   const trackLocfStreak = ['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB'].includes(String(inv.asset_type || ''));
   const suppressRunDateWritesForMarketLinked = options.suppressRunDateWritesForMarketLinked === true;
+  const suppressedRunDateAssetTypes = Array.isArray(options.suppressedRunDateAssetTypes)
+    ? new Set(options.suppressedRunDateAssetTypes.map((assetType) => String(assetType || '').toUpperCase()))
+    : null;
   let carriedNetFlowSinceLastWrite = 0;
   for (const date of dates) {
     const dayDelta = byDate.get(date) || { unitsDelta: 0, investedDelta: 0, realizedDelta: 0, netFlowDelta: 0 };
@@ -1621,7 +1624,9 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     const dayChange = currentValue - prevValue - carriedNetFlowSinceLastWrite + bondIncomeToday;
     const dayChangePct = prevValue > 0 ? (dayChange / prevValue) * 100 : 0;
 
-    if (suppressRunDateWritesForMarketLinked && isMarketLinkedAsset && date === toDate) {
+    const isRunDateWriteSuppressed = !suppressedRunDateAssetTypes
+      || suppressedRunDateAssetTypes.has(String(inv.asset_type || '').toUpperCase());
+    if (suppressRunDateWritesForMarketLinked && isMarketLinkedAsset && isRunDateWriteSuppressed && date === toDate) {
       continue;
     }
 
@@ -4485,6 +4490,7 @@ async function updateDailyValues(db, options = {}) {
     invMap = new Map(),
     cache,
     suppressRunDateWritesForMarketLinked = false,
+    suppressedRunDateAssetTypes = null,
   } = options;
 
   const details = [];
@@ -4613,6 +4619,7 @@ async function updateDailyValues(db, options = {}) {
       },
       {
         suppressRunDateWritesForMarketLinked,
+        suppressedRunDateAssetTypes,
       }
     );
     totalRows += rows;
@@ -4965,6 +4972,7 @@ async function backfillDirtyScopes(db, scopes, options = {}) {
     invMap,
     cache,
     suppressRunDateWritesForMarketLinked: options.suppressRunDateWritesForMarketLinked === true,
+    suppressedRunDateAssetTypes: options.suppressedRunDateAssetTypes || null,
   });
 
   return {
@@ -4994,6 +5002,7 @@ async function runBackfillPipeline(db, options = {}) {
   const result = await backfillDirtyScopes(db, scopes, {
     runDate,
     suppressRunDateWritesForMarketLinked: options.suppressRunDateWritesForMarketLinked === true,
+    suppressedRunDateAssetTypes: options.suppressedRunDateAssetTypes || null,
   });
   logBackfillInfo('[Backfill] Backfill pipeline completed.', {
     pipelineName: 'dirty-scope-backfill',

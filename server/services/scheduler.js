@@ -1209,6 +1209,7 @@ async function runSchedulerCycle(db, label, options = {}) {
   const locfReconcile = ensureMarketLinkedLocfReconcileScopes(db, preflightRunDate, label);
   const preflight = await runDirtyBackfillPreflight(db, preflightRunDate, {
     suppressRunDateWritesForMarketLinked: options.skipPriceUpdate !== true,
+    suppressedRunDateAssetTypes: Array.isArray(options.assetTypes) ? options.assetTypes : null,
   });
   logSchedulerStep('info', label, 4, 1, 'Catch-up + dirty preflight', 'completed', {
     fxUpgradeSweep,
