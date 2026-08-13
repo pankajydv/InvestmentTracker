@@ -1294,6 +1294,7 @@ async function runSchedulerCycle(db, label, options = {}) {
       gapsDetected: complianceResult?.gapsDetected || 0,
       repairsEnqueued: complianceResult?.repairsEnqueued || 0,
       locfQualityIssues: complianceResult?.locfQualityIssues || 0,
+      rollupInvariantIssues: complianceResult?.rollupInvariantIssues || 0,
     });
   } else {
     logSchedulerStep('info', label, 6, 1, 'Compliance scan', 'skipped', {

@@ -20,8 +20,12 @@ const {
   markAllTrackedInvestmentsDirtyFromDate,
   runDailyBootstrapDirtyScopeEnqueue,
 } = require('../server/services/dirtyBackfillService');
-const { detectGapsForTable } = require('../server/services/compliance/complianceScanService');
+const {
+  detectGapsForTable,
+  detectRollupInvariantIssues,
+} = require('../server/services/compliance/complianceScanService');
 const { updateAllPrices } = require('../server/services/updater');
+const { updateDailyValues } = require('../server/services/backfillService');
 const { parseGrowwPDF } = require('../server/services/contractNoteParser');
 const { resolveDayChangePair } = require('../server/services/dayChangeService');
 
@@ -1085,7 +1089,7 @@ describe('Dashboard', () => {
       `).run(investmentId, portfolioId);
       db.prepare(`
         INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees)
-        VALUES (?, ?, 'SELL', '2026-08-06', 0, 800, 800, 0)
+        VALUES (?, ?, 'SELL', '2026-08-07', 0, 1, 1, 0)
       `).run(investmentId, portfolioId);
       const insertDaily = db.prepare(`
         INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
@@ -1131,9 +1135,10 @@ describe('Dashboard', () => {
 
       const twoDay = await api('GET', `/dashboard/summary?portfolio_id=${portfolioId}&interval=2D&xirr_mode=portfolio_only`);
       assert.equal(twoDay.status, 200);
-      assert.equal(twoDay.body.intervalXIRR.interval_change, 8);
-      assert.equal(twoDay.body.byType.FOREIGN_STOCK.dayChange, 8);
-      assert.equal(twoDay.body.investments[0].day_change, 8);
+      assert.equal(twoDay.body.intervalXIRR.interval_change, 9);
+      assert.ok(twoDay.body.intervalXIRR.xirr_pct > 0);
+      assert.equal(twoDay.body.byType.FOREIGN_STOCK.dayChange, 9);
+      assert.equal(twoDay.body.investments[0].day_change, 9);
     } finally {
       db.prepare('DELETE FROM asset_type_daily WHERE portfolio_id = ?').run(portfolioId);
       db.prepare('DELETE FROM portfolio_daily WHERE portfolio_id = ?').run(portfolioId);
@@ -1781,6 +1786,75 @@ describe('Route existence — all endpoints respond (not 404)', () => {
 // ======================================================================
 
 describe('Dirty scope source guard for exited holdings', () => {
+  it('removes stale daily rows from a fully sold then rebought holding gap', async () => {
+    const Database = require('better-sqlite3');
+    const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-rebuy-gap-test-'));
+    const localDbPath = path.join(localDataDir, 'investments.db');
+    const localDb = new Database(localDbPath);
+
+    try {
+      localDb.pragma('journal_mode = WAL');
+      localDb.pragma('foreign_keys = ON');
+
+      const { initializeDb } = require('../server/db/schema');
+      initializeDb(localDb);
+
+      const portfolioId = Number(localDb.prepare('INSERT INTO portfolios (name) VALUES (?)')
+        .run('Sold Rebuy Gap Test').lastInsertRowid);
+      const investmentId = Number(localDb.prepare(`
+        INSERT INTO investments (name, asset_type, ticker_symbol, is_active, exclude_from_tracking)
+        VALUES (?, 'INDIAN_STOCK', 'GAP.NS', 1, 0)
+      `).run('Sold Rebuy Gap Test').lastInsertRowid);
+      const insertTransaction = localDb.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees
+        ) VALUES (?, ?, ?, ?, ?, 100, ?, 0)
+      `);
+      insertTransaction.run(investmentId, portfolioId, 'BUY', '2026-08-01', 10, 1000);
+      insertTransaction.run(investmentId, portfolioId, 'SELL', '2026-08-04', 10, 1000);
+      insertTransaction.run(investmentId, portfolioId, 'BUY', '2026-08-07', 10, 1000);
+
+      const insertDaily = localDb.prepare(`
+        INSERT INTO daily_values (
+          investment_id, portfolio_id, date, price_per_unit, total_units,
+          current_value, invested_amount, realized_proceeds, profit_loss,
+          price_source, day_change
+        ) VALUES (?, ?, ?, 100, ?, ?, 1000, 1000, 0, 'LIVE', 0)
+      `);
+      insertDaily.run(investmentId, portfolioId, '2026-08-04', 0, 0);
+      insertDaily.run(investmentId, portfolioId, '2026-08-05', 10, 1000);
+
+      const investment = localDb.prepare('SELECT * FROM investments WHERE id = ?').get(investmentId);
+      const result = await updateDailyValues(localDb, {
+        scopeList: [{
+          investment_id: investmentId,
+          portfolio_id: portfolioId,
+          dirty_from_date: '2026-08-05',
+          requested_dirty_from_date: '2026-08-05',
+        }],
+        runDate: '2026-08-06',
+        invMap: new Map([[investmentId, investment]]),
+        cache: {},
+      });
+
+      assert.equal(result.rowsWritten, 1);
+      assert.equal(localDb.prepare(`
+        SELECT COUNT(*) AS count
+        FROM daily_values
+        WHERE investment_id = ? AND portfolio_id = ? AND date BETWEEN '2026-08-05' AND '2026-08-06'
+      `).get(investmentId, portfolioId).count, 0);
+      assert.equal(localDb.prepare(`
+        SELECT total_units
+        FROM daily_values
+        WHERE investment_id = ? AND portfolio_id = ? AND date = '2026-08-04'
+      `).get(investmentId, portfolioId).total_units, 0);
+    } finally {
+      localDb.close();
+      fs.rmSync(localDataDir, { recursive: true, force: true });
+    }
+  });
+
   it('drops catch-up enqueue after exit date but allows historical dirty date before exit', () => {
     const Database = require('better-sqlite3');
     const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-dirtyscope-test-'));
@@ -2007,6 +2081,106 @@ describe('Provident compliance coverage', () => {
         gap_start_date: '2026-07-30',
         gap_end_date: '2026-07-31',
       }]);
+    } finally {
+      localDb.close();
+      fs.rmSync(localDataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not report daily value gaps while a sold investment has zero units', () => {
+    const Database = require('better-sqlite3');
+    const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-zero-holding-compliance-test-'));
+    const localDbPath = path.join(localDataDir, 'investments.db');
+    const localDb = new Database(localDbPath);
+
+    try {
+      const { initializeDb } = require('../server/db/schema');
+      initializeDb(localDb);
+
+      const portfolioId = localDb.prepare('INSERT INTO portfolios (name) VALUES (?)')
+        .run('Zero Holding Compliance Portfolio').lastInsertRowid;
+      const investmentId = localDb.prepare(`
+        INSERT INTO investments (name, asset_type, is_active, exclude_from_tracking)
+        VALUES ('Zero Holding Compliance Stock', 'INDIAN_STOCK', 1, 0)
+      `).run().lastInsertRowid;
+      const insertTransaction = localDb.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees
+        ) VALUES (?, ?, ?, ?, ?, 100, ?, 0)
+      `);
+      insertTransaction.run(investmentId, portfolioId, 'BUY', '2026-08-03', 10, 1000);
+      insertTransaction.run(investmentId, portfolioId, 'SELL', '2026-08-04', 10, 1000);
+      insertTransaction.run(investmentId, portfolioId, 'BUY', '2026-08-07', 5, 500);
+
+      const insertDailyValue = localDb.prepare(`
+        INSERT INTO daily_values (
+          investment_id, portfolio_id, date, price_per_unit, total_units,
+          current_value, invested_amount, profit_loss, price_source, day_change
+        ) VALUES (?, ?, ?, 100, ?, ?, ?, 0, 'LIVE', 0)
+      `);
+      insertDailyValue.run(investmentId, portfolioId, '2026-08-03', 10, 1000, 1000);
+      insertDailyValue.run(investmentId, portfolioId, '2026-08-04', 0, 0, 0);
+      insertDailyValue.run(investmentId, portfolioId, '2026-08-07', 5, 500, 500);
+
+      const gaps = detectGapsForTable(localDb, 'daily_values', 'investment_id', 'investment', {
+        startDate: '2026-08-03',
+        endDate: '2026-08-07',
+      });
+
+      assert.deepEqual(gaps, []);
+    } finally {
+      localDb.close();
+      fs.rmSync(localDataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('detects rollup totals that disagree with latest underlying daily rows', () => {
+    const Database = require('better-sqlite3');
+    const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-rollup-invariant-test-'));
+    const localDb = new Database(path.join(localDataDir, 'investments.db'));
+
+    try {
+      const { initializeDb } = require('../server/db/schema');
+      initializeDb(localDb);
+
+      const portfolioId = localDb.prepare('INSERT INTO portfolios (name) VALUES (?)')
+        .run('Rollup Invariant Portfolio').lastInsertRowid;
+      const investmentId = localDb.prepare(`
+        INSERT INTO investments (name, asset_type, is_active, exclude_from_tracking)
+        VALUES ('Rollup Invariant Stock', 'INDIAN_STOCK', 1, 0)
+      `).run().lastInsertRowid;
+      localDb.prepare(`
+        INSERT INTO daily_values (
+          investment_id, portfolio_id, date, price_per_unit, total_units,
+          current_value, invested_amount, profit_loss, price_source, day_change
+        ) VALUES (?, ?, '2026-08-12', 110, 10, 1100, 1000, 100, 'LIVE', 100)
+      `).run(investmentId, portfolioId);
+      localDb.prepare(`
+        INSERT INTO portfolio_daily (
+          portfolio_id, date, total_value, total_invested, total_profit_loss,
+          total_profit_loss_pct, day_change, day_change_pct
+        ) VALUES (?, '2026-08-12', 999, 1000, 100, 10, 100, 10)
+      `).run(portfolioId);
+      localDb.prepare(`
+        INSERT INTO asset_type_daily (
+          portfolio_id, asset_type, date, total_value, total_invested,
+          total_profit_loss, total_realized_proceeds, total_unrealized_gain,
+          total_profit_loss_pct, day_change, day_change_pct
+        ) VALUES (?, 'INDIAN_STOCK', '2026-08-12', 1100, 1000, 100, 0, 100, 10, 100, 10)
+      `).run(portfolioId);
+
+      const issues = detectRollupInvariantIssues(localDb, {
+        startDate: '2026-08-12',
+        endDate: '2026-08-12',
+      });
+
+      assert.equal(issues.length, 1);
+      assert.equal(issues[0].table_name, 'portfolio_daily');
+      assert.equal(issues[0].entity_id, Number(portfolioId));
+      assert.equal(issues[0].date, '2026-08-12');
+      assert.equal(issues[0].actual.total_value, 999);
+      assert.equal(issues[0].expected.total_value, 1100);
     } finally {
       localDb.close();
       fs.rmSync(localDataDir, { recursive: true, force: true });

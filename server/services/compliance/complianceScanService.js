@@ -13,6 +13,8 @@ const COMPLIANCE_LAST_RUN_DATE_KEY = 'compliance_last_run_date';
 const COMPLIANCE_LAST_GAPS_KEY = 'compliance_last_gaps_detected';
 const COMPLIANCE_LAST_REPAIRS_KEY = 'compliance_last_repairs_enqueued';
 const INCREMENTAL_LOOKBACK_DAYS = Math.max(1, Number(process.env.INCREMENTAL_COMPLIANCE_LOOKBACK_DAYS || 14));
+const EXITED_UNITS_EPSILON = 1e-6;
+const ROLLUP_INVARIANT_TOLERANCE = 0.01;
 const BALANCE_BASED_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MARKET_DATA_CUTOFF_MINUTES_IST = Object.freeze({
   // US equities settle after midnight IST; avoid same-day compliance gaps until end of IST day.
@@ -239,6 +241,17 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
 
   if (tableName === 'daily_values') {
     // For daily_values: get investments and check their date ranges
+    const holdingUnitsAtDate = db.prepare(`
+      SELECT COALESCE(SUM(
+        CASE
+          WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0)
+          WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+          ELSE 0
+        END
+      ), 0) AS units
+      FROM transactions
+      WHERE investment_id = ? AND date(transaction_date) <= ?
+    `);
     const investments = db.prepare(`
       SELECT DISTINCT i.id, i.asset_type, i.is_active, i.exclude_from_tracking,
              MIN(date(t.transaction_date)) as start_date, MAX(date(t.transaction_date)) as end_date
@@ -289,8 +302,10 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
         }
 
         const exists = db.prepare(`SELECT 1 FROM ${tableName} WHERE ${keyColumn} = ? AND date = ?`).get(id, dateStr);
+        const intentionallyAbsent = isMarketLinked
+          && Number(holdingUnitsAtDate.get(id, dateStr)?.units || 0) <= EXITED_UNITS_EPSILON;
         
-        if (!exists) {
+        if (!exists && !intentionallyAbsent) {
           if (!gapStart) {
             gapStart = dateStr;
           }
@@ -440,6 +455,101 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
   }
 
   return gaps;
+}
+
+function detectRollupInvariantIssues(db, options = {}) {
+  const startDate = parseIsoDate(options.startDate);
+  const endDate = parseIsoDate(options.endDate) || todayIso();
+  const tolerance = Math.max(0, Number(options.tolerance ?? ROLLUP_INVARIANT_TOLERANCE));
+  const issues = [];
+
+  const portfolioRows = db.prepare(`
+    SELECT portfolio_id, date, total_value, total_invested, total_profit_loss
+    FROM portfolio_daily
+    WHERE (? IS NULL OR date >= ?) AND date <= ?
+  `).all(startDate, startDate, endDate);
+  const expectedPortfolio = db.prepare(`
+    SELECT
+      COALESCE(SUM(dv.current_value), 0) AS total_value,
+      COALESCE(SUM(dv.invested_amount), 0) AS total_invested,
+      COALESCE(SUM(dv.profit_loss), 0) AS total_profit_loss
+    FROM daily_values dv
+    INNER JOIN (
+      SELECT investment_id, portfolio_id, MAX(date) AS max_date
+      FROM daily_values
+      WHERE portfolio_id = ? AND date <= ?
+      GROUP BY investment_id, portfolio_id
+    ) latest ON dv.investment_id = latest.investment_id
+      AND dv.portfolio_id = latest.portfolio_id
+      AND dv.date = latest.max_date
+  `);
+
+  const assetRows = db.prepare(`
+    SELECT portfolio_id, asset_type, date, total_value, total_invested,
+           total_profit_loss, total_realized_proceeds, total_unrealized_gain
+    FROM asset_type_daily
+    WHERE (? IS NULL OR date >= ?) AND date <= ?
+  `).all(startDate, startDate, endDate);
+  const expectedAsset = db.prepare(`
+    SELECT
+      COALESCE(SUM(dv.current_value), 0) AS total_value,
+      COALESCE(SUM(dv.invested_amount), 0) AS total_invested,
+      COALESCE(SUM(dv.profit_loss), 0) AS total_profit_loss,
+      COALESCE(SUM(dv.realized_proceeds), 0) AS total_realized_proceeds,
+      COALESCE(SUM(dv.current_value - (dv.invested_amount - dv.realized_proceeds)), 0) AS total_unrealized_gain
+    FROM daily_values dv
+    JOIN investments i ON i.id = dv.investment_id
+    INNER JOIN (
+      SELECT investment_id, portfolio_id, MAX(date) AS max_date
+      FROM daily_values
+      WHERE portfolio_id = ? AND date <= ?
+      GROUP BY investment_id, portfolio_id
+    ) latest ON dv.investment_id = latest.investment_id
+      AND dv.portfolio_id = latest.portfolio_id
+      AND dv.date = latest.max_date
+    WHERE i.asset_type = ? AND i.exclude_from_tracking != 1
+  `);
+
+  const compare = (tableName, row, expected, fields) => {
+    const mismatchedFields = fields.filter((field) => (
+      Math.abs(Number(row[field] || 0) - Number(expected[field] || 0)) > tolerance
+    ));
+    if (mismatchedFields.length === 0) return;
+
+    issues.push({
+      table_name: tableName,
+      entity_id: Number(row.portfolio_id),
+      asset_type: row.asset_type || null,
+      date: row.date,
+      mismatched_fields: mismatchedFields,
+      actual: Object.fromEntries(fields.map((field) => [field, Number(row[field] || 0)])),
+      expected: Object.fromEntries(fields.map((field) => [field, Number(expected[field] || 0)])),
+    });
+  };
+
+  const portfolioFields = ['total_value', 'total_invested', 'total_profit_loss'];
+  for (const row of portfolioRows) {
+    compare('portfolio_daily', row, expectedPortfolio.get(row.portfolio_id, row.date), portfolioFields);
+  }
+
+  const assetFields = [
+    'total_value', 'total_invested', 'total_profit_loss',
+    'total_realized_proceeds', 'total_unrealized_gain',
+  ];
+  for (const row of assetRows) {
+    compare(
+      'asset_type_daily',
+      row,
+      expectedAsset.get(row.portfolio_id, row.date, row.asset_type),
+      assetFields,
+    );
+  }
+
+  if (issues.length > 0) {
+    console.warn(`[ComplianceScan][RollupInvariant] ${issues.length} rollup mismatch(es) detected.`);
+  }
+
+  return issues;
 }
 
 /**
@@ -626,6 +736,10 @@ function scanAndRepairComplianceGaps(options = {}) {
     startDate: window.startDate,
     endDate: window.endDate,
   });
+  const rollupInvariantIssues = detectRollupInvariantIssues(db, {
+    startDate: window.startDate,
+    endDate: window.endDate,
+  });
 
   emitProgress(onProgress, {
     phase: 'repairing',
@@ -660,7 +774,9 @@ function scanAndRepairComplianceGaps(options = {}) {
     gapsDetected: gaps.length,
     repairsEnqueued: repairCount + qualityResult.repairsEnqueued,
     locfQualityIssues: qualityResult.issues.length,
+    rollupInvariantIssues: rollupInvariantIssues.length,
     gaps,
+    rollupIssues: rollupInvariantIssues,
   };
 
   persistComplianceRunMeta(db, result);
@@ -784,6 +900,7 @@ function repairDetectedGaps(dbOverride = null) {
 module.exports = {
   isMarketLinkedAsset,
   detectGapsForTable,
+  detectRollupInvariantIssues,
   findAndRecordDailyValuesGaps,
   findAndRecordAllGaps,
   detectLocfQualityIssues,

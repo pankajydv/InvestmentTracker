@@ -1278,15 +1278,6 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
     JOIN investments i ON i.id = t.investment_id
     WHERE ${txnScope.clause} AND i.asset_type = ?
   `);
-  const intervalDayChangeForType = db.prepare(`
-    SELECT COALESCE(SUM(day_change), 0) AS day_change
-    FROM asset_type_daily
-    WHERE ${dailyScope.clause}
-      AND asset_type = ?
-      AND date > ?
-      AND date <= ?
-  `);
-
   const byType = {};
   const portfolioIntervalCashflows = [];
 
@@ -1344,9 +1335,7 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
     portfolioIntervalCashflows.push(...intervalCashflows);
 
     const intervalXirrRate = calculateXirr(intervalCashflows);
-    const intervalNetProfit = Number(intervalDayChangeForType.get(
-      ...dailyScope.params, assetTypeKey, chosenFrom, chosenTo,
-    )?.day_change || 0);
+    const intervalNetProfit = intervalCashflows.reduce((sum, flow) => sum + flow.amount, 0);
 
     byType[assetTypeKey] = {
       dayChange: intervalNetProfit,
@@ -2271,7 +2260,7 @@ module.exports = function (db) {
             FROM daily_values
             WHERE investment_id = ?
               AND portfolio_id = ?
-              AND date > ?
+              AND date >= ?
               AND date <= ?
           `)
         : db.prepare(`
@@ -2281,26 +2270,40 @@ module.exports = function (db) {
             FROM daily_values
             WHERE investment_id = ?
               AND portfolio_id IS NOT NULL
-              AND date > ?
+              AND date >= ?
               AND date <= ?
           `);
 
-      const sumIntervalDayChangeForInvestment = portfolio_id
+      const intervalTransactionsForInvestment = portfolio_id
         ? db.prepare(`
-            SELECT COALESCE(SUM(day_change), 0) AS interval_day_change
-            FROM daily_values
+            SELECT DATE(transaction_date) AS txn_date, transaction_type,
+                   COALESCE(amount, 0) AS amount, COALESCE(fees, 0) AS fees, notes
+            FROM transactions
             WHERE investment_id = ?
               AND portfolio_id = ?
-              AND date >= ?
-              AND date <= ?
+              AND DATE(transaction_date) >= ?
+              AND DATE(transaction_date) <= ?
           `)
         : db.prepare(`
-            SELECT COALESCE(SUM(day_change), 0) AS interval_day_change
-            FROM daily_values
+            SELECT DATE(transaction_date) AS txn_date, transaction_type,
+                   COALESCE(amount, 0) AS amount, COALESCE(fees, 0) AS fees, notes
+            FROM transactions
             WHERE investment_id = ?
               AND portfolio_id IS NOT NULL
-              AND date >= ?
-              AND date <= ?
+              AND DATE(transaction_date) >= ?
+              AND DATE(transaction_date) <= ?
+          `);
+
+      const firstActivityDateForInvestment = portfolio_id
+        ? db.prepare(`
+            SELECT MIN(DATE(transaction_date)) AS first_date
+            FROM transactions
+            WHERE investment_id = ? AND portfolio_id = ?
+          `)
+        : db.prepare(`
+            SELECT MIN(DATE(transaction_date)) AS first_date
+            FROM transactions
+            WHERE investment_id = ? AND portfolio_id IS NOT NULL
           `);
 
       const openingValueForInvestment = portfolio_id
@@ -2337,13 +2340,33 @@ module.exports = function (db) {
           continue;
         }
 
-        const intervalDayChange = portfolio_id
-          ? Number(sumIntervalDayChangeForInvestment.get(inv.id, portfolio_id, chosenFrom, chosenTo)?.interval_day_change || 0)
-          : Number(sumIntervalDayChangeForInvestment.get(inv.id, chosenFrom, chosenTo)?.interval_day_change || 0);
-
-        const openingValue = portfolio_id
+        const storedOpeningValue = portfolio_id
           ? Number(openingValueForInvestment.get(inv.id, portfolio_id, chosenFrom)?.current_value || 0)
           : Number(openingValueForInvestment.get(inv.id, chosenFrom)?.current_value || 0);
+        const firstActivityDate = portfolio_id
+          ? firstActivityDateForInvestment.get(inv.id, portfolio_id)?.first_date || null
+          : firstActivityDateForInvestment.get(inv.id)?.first_date || null;
+        const isInceptionWindow = !!firstActivityDate && intervalFromDate <= firstActivityDate;
+        const openingValue = isInceptionWindow ? 0 : storedOpeningValue;
+        const closingValue = portfolio_id
+          ? Number(openingValueForInvestment.get(inv.id, portfolio_id, chosenTo)?.current_value || 0)
+          : Number(openingValueForInvestment.get(inv.id, chosenTo)?.current_value || 0);
+        const intervalTransactions = portfolio_id
+          ? intervalTransactionsForInvestment.all(inv.id, portfolio_id, chosenFrom, chosenTo)
+          : intervalTransactionsForInvestment.all(inv.id, chosenFrom, chosenTo);
+        let intervalDayChange = closingValue - openingValue;
+        for (const txn of intervalTransactions) {
+          if (!isInceptionWindow && txn.txn_date === chosenFrom) continue;
+          const amount = Number(txn.amount) || 0;
+          const fees = Number(txn.fees) || 0;
+          if (isAccrualOnlyXirrCashflow(txn.transaction_type, txn.notes)) continue;
+          if (CASH_OUTFLOW_TYPES.has(txn.transaction_type)) {
+            intervalDayChange -= amount + fees;
+          } else if (CASH_INFLOW_TYPES.has(txn.transaction_type)
+            && !isInternalXirrCashflow(inv.asset_type, txn.transaction_type)) {
+            intervalDayChange += amount - fees;
+          }
+        }
 
         inv.day_change = intervalDayChange;
         inv.day_change_pct = openingValue > 0 ? (intervalDayChange / openingValue) * 100 : 0;
@@ -2834,7 +2857,7 @@ module.exports = function (db) {
       const cacheKey = (customFromDate || customToDate)
         ? null
         : JSON.stringify({
-          kind: 'interval-metrics-v2',
+          kind: 'interval-metrics-v3',
             scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
             interval: intervalParam,
           });

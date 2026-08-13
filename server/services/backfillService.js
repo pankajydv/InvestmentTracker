@@ -1354,6 +1354,14 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
         WHERE investment_id = ? AND portfolio_id = ? AND date = ?
         LIMIT 1
       `),
+      deleteScopedDate: db.prepare(`
+        DELETE FROM daily_values
+        WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+      `),
+      deleteScopedRange: db.prepare(`
+        DELETE FROM daily_values
+        WHERE investment_id = ? AND portfolio_id = ? AND date >= ? AND date <= ?
+      `),
     };
 
   const dates = eachDate(fromDate, toDate);
@@ -1373,9 +1381,6 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   `).all(inv.id, portfolioId, toDate);
 
   const latestTxnDate = txRows.length ? txRows[txRows.length - 1].tx_date : null;
-
-  // Keep rebuild non-destructive so day continuity is preserved across weekends/holidays.
-  // Rows are refreshed via UPSERT as each date is recomputed.
 
   const unitInflowTypes = new Set([
     'BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN',
@@ -1510,6 +1515,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
 
     // Stop writing trailing zero-unit rows after exit for all unit-based assets.
     if (latestTxnDate && date > latestTxnDate && units <= 0 && !isProvidentAsset) {
+      written += dailyStatements.deleteScopedRange.run(inv.id, portfolioId, date, toDate).changes;
       break;
     }
 
@@ -1519,6 +1525,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       locfMarketStreak = 0;
       locfStreakStartDate = null;
       prevValue = 0;
+      written += dailyStatements.deleteScopedDate.run(inv.id, portfolioId, date).changes;
 
       if (latestTxnDate && date > latestTxnDate) {
         break;
