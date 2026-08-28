@@ -39,6 +39,41 @@ body {
     display: block;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+
+  .holdings-table-mobile {
+    width: 100%;
+    font-size: 0.78rem;
+  }
+
+  .holdings-table-mobile th,
+  .holdings-table-mobile td {
+    padding-left: 0.25rem !important;
+    padding-right: 0.25rem !important;
+    vertical-align: top;
+  }
+
+  .holdings-table-mobile th:not(.holdings-col-name) {
+    white-space: nowrap;
+  }
+
+  .holdings-table-mobile .holdings-col-name a {
+    font-size: 0.84rem;
+    line-height: 1.25;
+  }
+
+  .holdings-table-mobile .holdings-col-price,
+  .holdings-table-mobile .holdings-col-dayChange,
+  .holdings-table-mobile .holdings-col-totalReturn {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .holdings-mobile-extra {
+    margin-top: 0.15rem;
+    color: #49566a;
+    font-size: 0.65rem;
+    line-height: 1.1;
   }
 
   .holdings-table col.holdings-col-optional,
@@ -103,6 +138,198 @@ tr:hover .row-actions {
 .holdings-table td {
   padding-left: 0.4rem !important;
   padding-right: 0.4rem !important;
+}
+
+@media (min-width: 769px) {
+  .holdings-desktop-card {
+    overflow: visible;
+  }
+
+  .holdings-desktop-table-wrap {
+    overflow: visible;
+  }
+
+  .holdings-table {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .holdings-table thead th {
+    position: sticky;
+    top: 57px;
+    z-index: 5;
+    background-color: #f6f8fb;
+    box-shadow: inset 0 -1px 0 #d8dee8, 0 2px 5px rgba(15, 23, 42, 0.06);
+  }
+
+  .holdings-table th:not(.holdings-col-name),
+  .holdings-table td:not(.holdings-col-name) {
+    white-space: nowrap;
+  }
+
+  .holdings-table .holdings-col-totalCost {
+    border-left: 1px solid #dce3ec;
+    background-color: #fbfcfe;
+  }
+
+  .holdings-table .holdings-col-currentValue {
+    background-color: #f5f8ff;
+  }
+
+  .holdings-table tbody .holdings-col-currentValue > div:first-child {
+    color: #253b64;
+    font-weight: 600;
+  }
+
+  .holdings-table .holdings-col-totalReturn {
+    border-left: 1px solid #dce3ec;
+    background-color: #f7fbf8;
+  }
+
+  .holdings-table tbody .holdings-col-totalReturn > div:first-child {
+    font-weight: 700;
+  }
+
+  .holdings-table tbody tr:hover > .holdings-col-totalCost,
+  .holdings-table tbody tr:hover > .holdings-col-currentValue,
+  .holdings-table tbody tr:hover > .holdings-col-totalReturn {
+    filter: brightness(0.985);
+  }
+
+  .holdings-table tbody tr.table-light > td {
+    background-color: #eef3f8;
+    box-shadow: inset 0 1px 0 #d5dde7;
+  }
+}
+
+.holdings-mobile-list {
+  background: #eef1f5;
+}
+
+.holdings-mobile-item {
+  padding: 0.75rem 0.8rem 0.7rem;
+  background: #fff;
+  border-bottom: 1px solid #dfe4ea;
+}
+
+.holdings-mobile-item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.65rem;
+}
+
+.holdings-mobile-name-wrap {
+  min-width: 0;
+}
+
+.holdings-mobile-name {
+  display: block;
+  color: #0d6efd;
+  font-size: 0.96rem;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.holdings-mobile-total .holdings-mobile-name {
+  color: #202733;
+}
+
+.holdings-mobile-identifier {
+  display: block;
+  margin-top: 0.15rem;
+  color: #6b7280;
+  font-size: 0.67rem;
+}
+
+.holdings-mobile-pnl {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.holdings-mobile-pnl-value {
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.holdings-mobile-pnl-rate {
+  margin-top: 0.1rem;
+  font-size: 0.67rem;
+}
+
+.holdings-mobile-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.holdings-mobile-metric {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding-left: 0.45rem;
+  border-left: 1px solid #e4e8ed;
+  font-variant-numeric: tabular-nums;
+}
+
+.holdings-mobile-metric:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+
+.holdings-mobile-metric-label {
+  margin-bottom: 0.2rem;
+  color: #697386;
+  font-size: 0.61rem;
+  font-weight: 600;
+  letter-spacing: 0.025em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.holdings-mobile-metric-value {
+  overflow: hidden;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.holdings-mobile-metric-sub {
+  overflow: hidden;
+  margin-top: 0.18rem;
+  color: #737b87;
+  font-size: 0.62rem;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.holdings-mobile-asof {
+  margin-top: 0.16rem;
+  color: #8a5a12;
+  font-size: 0.58rem;
+  font-weight: 600;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.holdings-mobile-total {
+  background: #f4f7fb;
+  border-bottom: 0;
+}
+
+.holdings-mobile-footer {
+  padding-top: 0.45rem;
+  padding-bottom: 0.45rem;
+  color: #6b7280;
+  font-size: 0.7rem;
+  text-align: right;
 }
 
 .dashboard-header {

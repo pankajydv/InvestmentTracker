@@ -72,12 +72,11 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
   ];
   const mobileSortColumns = [
     { key: 'name', label: 'Name', subLabel: 'Folios / Identifier' },
-    { key: 'asOfDate', label: 'As Of', subLabel: 'Date' },
-    { key: 'price', label: 'Last Price', subLabel: 'Avg Cost / Unit', end: true },
+    { key: 'price', label: 'Last Price', subLabel: 'Avg / Value', end: true },
     {
       key: 'dayChange',
       label: '1D',
-      subLabel: '% Change',
+      subLabel: '% / Invested',
       end: true,
     },
     { key: 'totalReturn', label: 'Total P&L', subLabel: 'Abs | XIRR', end: true },
@@ -134,7 +133,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
   const tableColumns = isMobile ? mobileSortColumns : desktopColumns;
   const tableColumnWidths = ['30%', '11.5%', '11.5%', '11.5%', '11.5%', '9%', '15%'];
   const tableColumnWidthsWithAsOfDate = ['26%', '10%', '10.5%', '10.5%', '10.5%', '10.5%', '9%', '13%'];
-  const mobileTableColumnWidths = ['31%', '14%', '17%', '16%', '22%'];
+  const mobileTableColumnWidths = ['34%', '24%', '20%', '22%'];
   const columnWidths = isMobile
     ? mobileTableColumnWidths
     : (showAsOfDateColumn ? tableColumnWidthsWithAsOfDate : tableColumnWidths);
@@ -170,8 +169,169 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
     });
   };
 
+  if (isMobile) {
+    return (
+      <Card className="shadow-sm holdings-mobile-card">
+        <Card.Header className="bg-white d-flex justify-content-between align-items-center">
+          <h2 className="h6 fw-semibold mb-0" title={ASSET_TYPE_FULL_NAMES[type]}>
+            {(ASSET_TYPE_FULL_NAMES[type] || ASSET_TYPE_LABELS[type])} ({info.investments.length})
+          </h2>
+          <Link to={`/investments?type=${type}`} className="small text-decoration-none d-flex align-items-center gap-1">
+            View All <ArrowRight size={12} />
+          </Link>
+        </Card.Header>
+
+        <div className="holdings-mobile-list">
+          {sortInvestments(info.investments).map((inv) => {
+            const investedAmount = Number(inv.invested_amount) || 0;
+            const netInvested = investedAmount - (Number(inv.realized_proceeds) || 0);
+            const fallbackAbsPct = investedAmount > 0
+              ? ((Number(inv.profit_loss) || 0) / investedAmount) * 100
+              : 0;
+            const rowAbsPct = Number.isFinite(Number(inv.profit_loss_pct))
+              ? Number(inv.profit_loss_pct)
+              : fallbackAbsPct;
+            const acquiredUnits = Number(inv.acquired_units) || 0;
+            const avgCostText = acquiredUnits > 0.0001
+              ? formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)
+              : '-';
+
+            return (
+              <div className="holdings-mobile-item" key={inv.id}>
+                <div className="holdings-mobile-item-head">
+                  <div className="holdings-mobile-name-wrap">
+                    <Link
+                      to={`/investments/${inv.id}`}
+                      state={{ from: 'asset-type', fromLabel: ASSET_TYPE_LABELS[type] }}
+                      className="holdings-mobile-name text-decoration-none"
+                    >
+                      {inv.name}
+                    </Link>
+                    {inv.asset_type === 'MUTUAL_FUND' && inv.open_folios_count !== undefined ? (
+                      <span className="holdings-mobile-identifier">{inv.open_folios_count} folios</span>
+                    ) : inv.amfi_code ? (
+                      <span className="holdings-mobile-identifier">{inv.amfi_code}</span>
+                    ) : null}
+                  </div>
+                  <div className="holdings-mobile-pnl">
+                    <span className={`holdings-mobile-pnl-value ${profitColor(inv.profit_loss)}`}>
+                      {formatSensitiveAmount(inv.profit_loss, 0)}
+                    </span>
+                    <span className={`holdings-mobile-pnl-rate ${profitColor(rowAbsPct)}`}>
+                      {formatPct(rowAbsPct)} | {inv.xirr_pct == null ? 'N/A' : formatPct(inv.xirr_pct)}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="holdings-mobile-metrics">
+                  <div className="holdings-mobile-metric">
+                    <span className="holdings-mobile-metric-label">Price</span>
+                    <span className="holdings-mobile-metric-value text-nowrap">
+                      {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type)
+                        ? (Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-')
+                        : formatWithSymbol(inv.price_per_unit, inv.currency, 2)}
+                    </span>
+                    <span className="holdings-mobile-metric-sub text-nowrap">Avg {avgCostText}</span>
+                  </div>
+                  <div className="holdings-mobile-metric">
+                    <span className="holdings-mobile-metric-label">1D</span>
+                    {isIntervalSwitching ? (
+                      <>
+                        <span className="holdings-mobile-metric-value text-muted">...</span>
+                        <span className="holdings-mobile-metric-sub text-muted">...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className={`holdings-mobile-metric-value ${profitColor(inv.day_change)}`}>
+                          {formatSensitiveAmount(inv.day_change, 0)}
+                        </span>
+                        <span className={`holdings-mobile-metric-sub ${profitColor(inv.day_change_pct)}`}>
+                          {formatPct(inv.day_change_pct)}
+                        </span>
+                        {inv.day_change_uses_fallback && inv.day_change_as_of_date && (
+                          <span className="holdings-mobile-asof">
+                            As of {formatAsOfDate(inv.day_change_as_of_date)}
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  <div className="holdings-mobile-metric">
+                    <span className="holdings-mobile-metric-label">Current</span>
+                    <span className="holdings-mobile-metric-value">{formatSensitiveAmount(inv.current_value, 0)}</span>
+                    <span className="holdings-mobile-metric-sub">
+                      {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 2)} units` : '-'}
+                    </span>
+                  </div>
+                  <div className="holdings-mobile-metric">
+                    <span className="holdings-mobile-metric-label">Invested</span>
+                    <span className="holdings-mobile-metric-value">{formatSensitiveAmount(netInvested, 0)}</span>
+                    <span className="holdings-mobile-metric-sub">Total {formatSensitiveAmount(investedAmount, 0)}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+
+          <div className="holdings-mobile-item holdings-mobile-total">
+            <div className="holdings-mobile-item-head">
+              <span className="holdings-mobile-name">Total</span>
+              <div className="holdings-mobile-pnl">
+                <span className={`holdings-mobile-pnl-value ${profitColor(info.totalProfitLoss)}`}>
+                  {formatSensitiveAmount(info.totalProfitLoss, 0)}
+                </span>
+                <span className={`holdings-mobile-pnl-rate ${profitColor(totalAbsPct)}`}>
+                  {formatPct(totalAbsPct)} | {info.xirrPct == null ? 'N/A' : formatPct(info.xirrPct)}
+                </span>
+              </div>
+            </div>
+            <div className="holdings-mobile-metrics">
+              <div className="holdings-mobile-metric">
+                <span className="holdings-mobile-metric-label">Price</span>
+                <span className="holdings-mobile-metric-value text-nowrap">
+                  {weightedLivePrice == null ? '-' : formatWithSymbol(weightedLivePrice, weightedPriceCurrency, 2)}
+                </span>
+                <span className="holdings-mobile-metric-sub">Weighted</span>
+              </div>
+              <div className="holdings-mobile-metric">
+                <span className="holdings-mobile-metric-label">1D</span>
+                <span className={`holdings-mobile-metric-value ${profitColor(info.dayChange)}`}>
+                  {isIntervalSwitching ? '...' : formatSensitiveAmount(info.dayChange, 0)}
+                </span>
+                <span className={`holdings-mobile-metric-sub ${profitColor(totalDayChangePct)}`}>
+                  {isIntervalSwitching ? '...' : formatPct(totalDayChangePct)}
+                </span>
+                {!isIntervalSwitching && info.dayChangeFallbackCount > 0 && (
+                  <span className="holdings-mobile-asof">
+                    As of {info.dayChangeAsOfMixed
+                      ? 'Mixed'
+                      : (info.dayChangeAsOfDate ? formatAsOfDate(info.dayChangeAsOfDate) : '-')}
+                  </span>
+                )}
+              </div>
+              <div className="holdings-mobile-metric">
+                <span className="holdings-mobile-metric-label">Current</span>
+                <span className="holdings-mobile-metric-value">{formatSensitiveAmount(info.totalValue, 0)}</span>
+                <span className="holdings-mobile-metric-sub">{formatNumber(totalUnits, 2)} units</span>
+              </div>
+              <div className="holdings-mobile-metric">
+                <span className="holdings-mobile-metric-label">Invested</span>
+                <span className="holdings-mobile-metric-value">{formatSensitiveAmount(totalCurrentInvested, 0)}</span>
+                <span className="holdings-mobile-metric-sub">Total {formatSensitiveAmount(info.totalInvested, 0)}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <Card.Footer className="holdings-mobile-footer bg-white">
+          Cash Proceeds: {info.totalRealizedGain >= 0 ? '+' : ''}{formatINR(info.totalRealizedGain || 0)}
+        </Card.Footer>
+      </Card>
+    );
+  }
+
   return (
-    <Card className="shadow-sm">
+    <Card className="shadow-sm holdings-desktop-card">
       <Card.Header className="bg-white d-flex justify-content-between align-items-center">
         <h2 className="h6 fw-semibold mb-0" title={ASSET_TYPE_FULL_NAMES[type]}>
           {(ASSET_TYPE_FULL_NAMES[type] || ASSET_TYPE_LABELS[type])} ({info.investments.length})
@@ -182,8 +342,13 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
           </Link>
         </div>
       </Card.Header>
-      <div className="responsive-table">
-        <Table hover size="sm" className="mb-0 small holdings-table" style={{ tableLayout: 'fixed' }}>
+      <div className="responsive-table holdings-desktop-table-wrap">
+        <Table
+          hover
+          size="sm"
+          className={`mb-0 small holdings-table${isMobile ? ' holdings-table-mobile' : ''}`}
+          style={{ tableLayout: 'fixed' }}
+        >
           <colgroup>
             {columnWidths.map((width, idx) => (
               <col key={`${type}-col-${idx}`} style={{ width }} />
@@ -266,7 +431,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                           : `${inv.avg_cost_per_unit_native == null ? `${getCurrencySymbol(inv.currency)}N/A` : formatWithSymbol(inv.avg_cost_per_unit_native, inv.currency, 2)} | ₹${formatNumber(inv.invested_amount / inv.acquired_units, 2)}`)
                         : '';
                       return (
-                        <td key={`${inv.id}-price`} className="px-3 text-end holdings-col-price">
+                        <td key={`${inv.id}-price`} className="px-3 text-end holdings-col-price text-nowrap">
                           {INTEREST_RATE_ASSET_TYPES.has(inv.asset_type) ? (
                             <div className="fw-medium">
                               {Number(inv.price_per_unit) > 0 ? `${formatNumber(inv.price_per_unit, 2)}%` : '-'}
@@ -275,6 +440,11 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                             <div className="fw-medium">{formatWithSymbol(inv.price_per_unit, inv.currency, 2)}</div>
                           )}
                           <div className="text-muted" style={{ fontSize: '0.7rem' }}>{avgCostText}</div>
+                          {isMobile && (
+                            <div className="holdings-mobile-extra text-nowrap">
+                              Val {formatSensitiveAmount(inv.current_value, 0)}
+                            </div>
+                          )}
                         </td>
                       );
                     }
@@ -293,6 +463,11 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                               <div className={profitColor(inv.day_change_pct)} style={{ fontSize: '0.7rem' }}>
                                 {formatPct(inv.day_change_pct)}
                               </div>
+                              {isMobile && (
+                                <div className="holdings-mobile-extra text-nowrap">
+                                  Inv {formatSensitiveAmount((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}
+                                </div>
+                              )}
                             </>
                           )}
                         </td>
@@ -301,7 +476,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
 
                     if (col.key === 'totalCost') {
                       return (
-                        <td key={`${inv.id}-totalCost`} className="px-3 text-end holdings-col-totalCost">
+                        <td key={`${inv.id}-totalCost`} className="px-3 text-end holdings-col-totalCost text-nowrap">
                           <div className="fw-medium">{formatSensitiveAmount((Number(inv.invested_amount) || 0) - (Number(inv.realized_proceeds) || 0), 0)}</div>
                           <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                             {formatSensitiveAmount(inv.invested_amount, 0)}
@@ -312,7 +487,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
 
                     if (col.key === 'currentValue') {
                       return (
-                        <td key={`${inv.id}-currentValue`} className="px-3 text-end holdings-col-currentValue">
+                        <td key={`${inv.id}-currentValue`} className="px-3 text-end holdings-col-currentValue text-nowrap">
                           <div className="fw-medium">{formatSensitiveAmount(inv.current_value, 0)}</div>
                           <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                             {inv.total_units > 0.0001 ? `${formatNumber(inv.total_units, 4)} Units` : ''}
@@ -372,7 +547,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
 
                 if (col.key === 'price') {
                   return (
-                    <td key={`${type}-total-price`} className="px-3 text-end holdings-col-price">
+                    <td key={`${type}-total-price`} className="px-3 text-end holdings-col-price text-nowrap">
                       {INTEREST_RATE_ASSET_TYPES.has(type) ? (
                         <>
                           <div className="fw-medium">-</div>
@@ -387,7 +562,11 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                               ? '-'
                               : formatWithSymbol(weightedLivePrice, weightedPriceCurrency, 2)}
                           </div>
-                          {!isMobile && (
+                          {isMobile ? (
+                            <div className="holdings-mobile-extra text-nowrap">
+                              Val {formatSensitiveAmount(info.totalValue, 0)}
+                            </div>
+                          ) : (
                             <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                               {weightedAvgCostPerUnit == null
                                 ? ''
@@ -414,6 +593,11 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                           <div className={profitColor(totalDayChangePct)} style={{ fontSize: '0.7rem' }}>
                             {formatPct(totalDayChangePct)}
                           </div>
+                          {isMobile && (
+                            <div className="holdings-mobile-extra text-nowrap">
+                              Inv {formatSensitiveAmount(totalCurrentInvested, 0)}
+                            </div>
+                          )}
                         </>
                       )}
                     </td>
@@ -422,7 +606,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
 
                 if (col.key === 'totalCost') {
                   return (
-                    <td key={`${type}-total-totalCost`} className="px-3 text-end holdings-col-totalCost">
+                    <td key={`${type}-total-totalCost`} className="px-3 text-end holdings-col-totalCost text-nowrap">
                       <div className="fw-medium">{formatSensitiveAmount(totalCurrentInvested, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                         {formatSensitiveAmount(info.totalInvested, 0)}
@@ -433,7 +617,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
 
                 if (col.key === 'currentValue') {
                   return (
-                    <td key={`${type}-total-currentValue`} className="px-3 text-end holdings-col-currentValue">
+                    <td key={`${type}-total-currentValue`} className="px-3 text-end holdings-col-currentValue text-nowrap">
                       <div className="fw-medium">{formatSensitiveAmount(info.totalValue, 0)}</div>
                       <div className="text-muted" style={{ fontSize: '0.7rem' }}>
                         {totalUnits > 0.0001 ? `${formatNumber(totalUnits, 4)} Units` : ''}
