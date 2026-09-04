@@ -412,6 +412,7 @@ export default function InvestmentDetail() {
   // Delete confirmation modal state
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [deleteText, setDeleteText] = useState('');
+  const [deletingTxn, setDeletingTxn] = useState(false);
   const [interestUpdating, setInterestUpdating] = useState(false);
   const [showInterestPreviewModal, setShowInterestPreviewModal] = useState(false);
   const [interestPreviewRows, setInterestPreviewRows] = useState([]);
@@ -486,11 +487,14 @@ export default function InvestmentDetail() {
 
   const handleDeleteTxn = async (id) => {
     try {
+      setDeletingTxn(true);
       await deleteTransaction(id);
       setDeleteConfirm(null);
       loadData();
     } catch (e) {
       alert('Failed to delete: ' + e.message);
+    } finally {
+      setDeletingTxn(false);
     }
   };
 
@@ -2104,8 +2108,10 @@ export default function InvestmentDetail() {
           </div>
         </Modal.Body>
         <Modal.Footer>
-          <Button variant="secondary" size="sm" onClick={() => setDeleteConfirm(null)}>Cancel</Button>
-          <Button variant="danger" size="sm" onClick={() => handleDeleteTxn(deleteConfirm.id)} disabled={deleteText !== 'DELETE'}>Delete</Button>
+          <Button variant="secondary" size="sm" onClick={() => setDeleteConfirm(null)} disabled={deletingTxn}>Cancel</Button>
+          <Button variant="danger" size="sm" onClick={() => handleDeleteTxn(deleteConfirm.id)} disabled={deletingTxn || deleteText.trim().toUpperCase() !== 'DELETE'}>
+            {deletingTxn ? 'Deleting...' : 'Delete'}
+          </Button>
         </Modal.Footer>
       </Modal>
     </div>
