@@ -234,7 +234,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                     <span className="holdings-mobile-metric-sub text-nowrap">Avg {avgCostText}</span>
                   </div>
                   <div className="holdings-mobile-metric">
-                    <span className="holdings-mobile-metric-label">1D</span>
+                    <span className="holdings-mobile-metric-label">{selectedIntervalLabel}</span>
                     {isIntervalSwitching ? (
                       <>
                         <span className="holdings-mobile-metric-value text-muted">...</span>
@@ -294,7 +294,7 @@ export default function AssetTypeHoldingsTable({ type, info, portfolioTotalValue
                 <span className="holdings-mobile-metric-sub">Weighted</span>
               </div>
               <div className="holdings-mobile-metric">
-                <span className="holdings-mobile-metric-label">1D</span>
+                <span className="holdings-mobile-metric-label">{selectedIntervalLabel}</span>
                 <span className={`holdings-mobile-metric-value ${profitColor(info.dayChange)}`}>
                   {isIntervalSwitching ? '...' : formatSensitiveAmount(info.dayChange, 0)}
                 </span>
