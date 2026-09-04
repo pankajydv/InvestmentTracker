@@ -317,6 +317,54 @@ describe('Investments — Indian Stocks', () => {
     assert.ok(Array.isArray(body.transactions));
   });
 
+  it('GET /investments/:id aggregates latest DB values across portfolios', async () => {
+    const seededPortfolio1 = !db.prepare('SELECT 1 FROM portfolios WHERE id = 1').get();
+    const seededPortfolio2 = !db.prepare('SELECT 1 FROM portfolios WHERE id = 2').get();
+    const seededInvestment = !db.prepare('SELECT 1 FROM investments WHERE id = 1').get();
+    if (seededPortfolio1) db.prepare("INSERT INTO portfolios (id, name) VALUES (1, 'Detail Test One')").run();
+    if (seededPortfolio2) db.prepare("INSERT INTO portfolios (id, name) VALUES (2, 'Detail Test Two')").run();
+    if (seededInvestment) {
+      db.prepare("INSERT INTO investments (id, name, asset_type, ticker_symbol) VALUES (1, 'TCS', 'INDIAN_STOCK', 'TCS.NS')").run();
+    }
+
+    const insertDaily = db.prepare(`
+      INSERT INTO daily_values (
+        investment_id, portfolio_id, date, price_per_unit, total_units,
+        current_value, invested_amount, realized_proceeds, profit_loss,
+        price_source, day_change
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertDaily.run(1, 1, '2099-01-01', 100, 10, 1000, 800, 200, 400, 'LIVE', 10);
+    insertDaily.run(1, 2, '2099-01-01', 100, 5, 500, 500, 150, 150, 'LIVE', 5);
+
+    try {
+      const { status, body } = await api('GET', '/investments/1');
+      assert.equal(status, 200);
+      assert.equal(body.latestValue.current_value, 1500);
+      assert.equal(body.latestValue.invested_amount, 1300);
+      assert.equal(body.latestValue.realized_proceeds, 350);
+      assert.equal(body.latestValue.profit_loss, 550);
+      assert.equal(body.latestValue.total_units, 15);
+      assert.equal(body.latestValue.day_change, 15);
+      assert.equal(body.totalUnits, 15);
+      assert.equal(body.totalInvested, 1300);
+      assert.equal(body.realizedProceeds, 350);
+      assert.equal(body.saleProceeds, 350);
+
+      const listResponse = await api('GET', '/investments');
+      assert.equal(listResponse.status, 200);
+      const listedInvestment = listResponse.body.find((investment) => investment.id === 1);
+      assert.ok(listedInvestment);
+      assert.ok(Math.abs(listedInvestment.absolute_return_pct - ((550 / 1300) * 100)) < 1e-9);
+    } finally {
+      db.prepare("DELETE FROM daily_values WHERE investment_id = 1 AND date = '2099-01-01'").run();
+      if (seededInvestment) db.prepare('DELETE FROM investments WHERE id = 1').run();
+      if (seededPortfolio2) db.prepare('DELETE FROM portfolios WHERE id = 2').run();
+      if (seededPortfolio1) db.prepare('DELETE FROM portfolios WHERE id = 1').run();
+    }
+  });
+
   it('PUT /investments/:id updates investment', async () => {
     const { status, body } = await api('PUT', '/investments/1', { notes: 'Updated note' });
     assert.equal(status, 200);

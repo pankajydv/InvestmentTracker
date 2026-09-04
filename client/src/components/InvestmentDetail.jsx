@@ -658,11 +658,20 @@ export default function InvestmentDetail() {
   const isMSFTStock = /MSFT/i.test(String(data.ticker_symbol || '')) || /microsoft/i.test(String(data.name || ''));
   const canImportEspp = isForeignUSD && isMSFTStock;
 
-  const totalInvested = Number(data.totalInvested) || 0;
+  const snapshotInvested = Number(data.latestValue?.invested_amount);
+  const totalInvested = Number.isFinite(snapshotInvested)
+    ? snapshotInvested
+    : Number(data.totalInvested) || 0;
   const currentValue = Number(data.latestValue?.current_value) || 0;
-  const saleProceeds = Number(data.saleProceeds) || 0;
-  const cumulativeValue = currentValue + saleProceeds;
-  const totalProfitLoss = cumulativeValue - totalInvested;
+  const snapshotRealizedProceeds = Number(data.latestValue?.realized_proceeds);
+  const realizedProceeds = Number.isFinite(snapshotRealizedProceeds)
+    ? snapshotRealizedProceeds
+    : Number(data.realizedProceeds ?? data.saleProceeds) || 0;
+  const cumulativeValue = currentValue + realizedProceeds;
+  const snapshotProfitLoss = Number(data.latestValue?.profit_loss);
+  const totalProfitLoss = Number.isFinite(snapshotProfitLoss)
+    ? snapshotProfitLoss
+    : cumulativeValue - totalInvested;
   const absoluteReturnPct = totalInvested > 0
     ? (totalProfitLoss / totalInvested) * 100
     : null;
@@ -699,7 +708,6 @@ export default function InvestmentDetail() {
 
   const xirrRate = calculateXirr(xirrCashflows);
   const xirrPct = xirrRate == null ? null : xirrRate * 100;
-  const realizedGain = saleProceeds;
   const intervalMetrics = data.intervalXIRR || {};
   const intervalChange = Number(intervalMetrics.interval_change || 0);
   const intervalChangePct = Number(intervalMetrics.interval_change_pct || 0);
@@ -948,7 +956,7 @@ export default function InvestmentDetail() {
                 </div>
                 <div className="dashboard-detail-row">
                   <span className="dashboard-detail-label">Cash Proceeds</span>
-                  <span className="dashboard-detail-value">{formatINR(realizedGain)}</span>
+                  <span className="dashboard-detail-value">{formatINR(realizedProceeds)}</span>
                 </div>
               </div>
             </Card.Body>
@@ -1077,7 +1085,7 @@ export default function InvestmentDetail() {
                 </div>
                 <div className="dashboard-detail-row">
                   <span className="dashboard-detail-label">Cash Proceeds</span>
-                  <span className="dashboard-detail-value">{formatINR(realizedGain)}</span>
+                  <span className="dashboard-detail-value">{formatINR(realizedProceeds)}</span>
                 </div>
               </div>
             </Card.Body>

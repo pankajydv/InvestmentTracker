@@ -112,6 +112,52 @@ function toNumberOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function getLatestInvestmentValue(db, investmentId, portfolioId = null) {
+  if (portfolioId != null) {
+    return db.prepare(
+      'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
+    ).get(investmentId, portfolioId) || db.prepare(
+      'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+    ).get(investmentId) || null;
+  }
+
+  const latestValues = db.prepare(`
+    WITH latest_by_portfolio AS (
+      SELECT portfolio_id, MAX(date) AS max_date
+      FROM daily_values
+      WHERE investment_id = ? AND portfolio_id IS NOT NULL
+      GROUP BY portfolio_id
+    )
+    SELECT dv.*
+    FROM daily_values dv
+    INNER JOIN latest_by_portfolio latest
+      ON latest.portfolio_id = dv.portfolio_id AND latest.max_date = dv.date
+    WHERE dv.investment_id = ?
+    ORDER BY dv.date DESC, dv.portfolio_id ASC
+  `).all(investmentId, investmentId);
+
+  if (latestValues.length === 0) {
+    return db.prepare(
+      'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+    ).get(investmentId) || null;
+  }
+  if (latestValues.length === 1) return latestValues[0];
+
+  const newestValue = latestValues[0];
+  const sumField = (field) => latestValues.reduce((sum, row) => sum + Number(row[field] || 0), 0);
+  return {
+    ...newestValue,
+    id: null,
+    portfolio_id: null,
+    total_units: sumField('total_units'),
+    current_value: sumField('current_value'),
+    invested_amount: sumField('invested_amount'),
+    realized_proceeds: sumField('realized_proceeds'),
+    profit_loss: sumField('profit_loss'),
+    day_change: sumField('day_change'),
+  };
+}
+
 function buildMissingRanges(missingDates) {
   if (!Array.isArray(missingDates) || !missingDates.length) return [];
   const ranges = [];
@@ -1018,20 +1064,10 @@ module.exports = function (db) {
 
     const portfolioIdNum = portfolio_id ? parseInt(portfolio_id, 10) : null;
 
-    const latestValueByPortfolioStmt = db.prepare('SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1');
     const txnsByPortfolioStmt = db.prepare('SELECT transaction_type, transaction_date, amount, fees, notes FROM transactions WHERE investment_id = ? AND portfolio_id = ?');
 
     const enriched = investments.map((inv) => {
-      // For portfolio-scoped queries or combined: aggregate from all portfolio-scoped rows
-      const latestValues = portfolioIdNum
-        ? latestValueByPortfolioStmt.all(inv.id, portfolioIdNum)
-        : db.prepare('SELECT * FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1').all(inv.id);
-      let latestValue = latestValues[0] || null;
-      
-      // If portfolio-specific row not found and portfolio_id was specified, try combined
-      if (!latestValue && portfolioIdNum) {
-        latestValue = db.prepare('SELECT * FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1').get(inv.id);
-      }
+      const latestValue = getLatestInvestmentValue(db, inv.id, portfolioIdNum);
 
       const txns = portfolioIdNum
         ? txnsByPortfolioStmt.all(inv.id, portfolioIdNum)
@@ -1098,21 +1134,11 @@ module.exports = function (db) {
     const portfolioFilter = portfolioId ? ' AND portfolio_id = ?' : '';
     const portfolioParams = portfolioId ? [parseInt(portfolioId, 10)] : [];
     const parsedPortfolioId = portfolioId ? parseInt(portfolioId, 10) : null;
-    let latestValue;
-    if (portfolioId) {
-      latestValue = db.prepare(
-        'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
-      ).get(inv.id, parseInt(portfolioId, 10));
-    } else {
-      latestValue = db.prepare(
-          'SELECT * FROM daily_values WHERE investment_id = ? ORDER BY date DESC LIMIT 1'
-      ).get(inv.id);
-    }
+    const latestValue = getLatestInvestmentValue(db, inv.id, parsedPortfolioId);
     const totals = db.prepare(`
       SELECT
         COALESCE(SUM(CASE WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0) WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0) ELSE 0 END), 0) as total_units,
-        COALESCE(SUM(CASE WHEN transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}) THEN amount + COALESCE(fees, 0) ELSE 0 END), 0) as total_invested,
-        COALESCE(SUM(CASE WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT') THEN amount - COALESCE(fees, 0) ELSE 0 END), 0) as sale_proceeds
+        COALESCE(SUM(CASE WHEN transaction_type IN (${INVESTED_AMOUNT_INFLOW_TYPES_SQL}) THEN amount + COALESCE(fees, 0) ELSE 0 END), 0) as total_invested
       FROM transactions WHERE investment_id = ?${portfolioFilter}
     `).get(inv.id, ...portfolioParams);
 
@@ -1192,12 +1218,20 @@ module.exports = function (db) {
     });
     const dayChanges = resolveDayChangePair(dayChangeRows, inv.asset_type);
 
+    const totalUnits = latestValue?.total_units == null
+      ? Number(totals.total_units) || 0
+      : Number(latestValue.total_units) || 0;
+    const totalInvested = latestValue?.invested_amount == null
+      ? Number(totals.total_invested) || 0
+      : Number(latestValue.invested_amount) || 0;
+    const realizedProceeds = Number(latestValue?.realized_proceeds) || 0;
     res.json({
       ...inv,
       latestValue,
-      totalUnits: totals.total_units,
-      totalInvested: totals.total_invested,
-      saleProceeds: totals.sale_proceeds,
+      totalUnits,
+      totalInvested,
+      realizedProceeds,
+      saleProceeds: realizedProceeds,
       intervalXIRR,
       dayChanges,
       transactions,
