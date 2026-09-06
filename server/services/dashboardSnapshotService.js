@@ -2,7 +2,7 @@
  * Dashboard Snapshot Service (read-through cache)
  *
  * The dashboard `/summary` endpoint is expensive: it loads all transactions,
- * runs per-investment XIRR, and scans daily_values. Because the underlying data
+ * runs per-investment XIRR, and scans investment_metrics_daily. Because the underlying data
  * only changes on scheduler price updates or explicit mutations, we cache the
  * fully-built summary payload keyed by a monotonic `data_version`.
  *
@@ -81,7 +81,6 @@ function buildSnapshotKey(params = {}) {
   const {
     portfolioId,
     hideSold,
-    includeFullySoldInReturns,
     xirrMode,
     interval,
     customFromDate,
@@ -95,7 +94,6 @@ function buildSnapshotKey(params = {}) {
     kind: 'dashboard-summary-v2',
     scope: portfolioId != null ? String(portfolioId) : 'all',
     hideSold: !!hideSold,
-    includeFullySoldInReturns: !!includeFullySoldInReturns,
     xirrMode: xirrMode === 'portfolio_only' ? 'portfolio_only' : 'full',
     interval: interval || '1D',
   });

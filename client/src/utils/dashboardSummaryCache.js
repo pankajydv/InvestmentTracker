@@ -19,7 +19,6 @@ export function resolveDashboardCacheState(cachedVersion, serverVersion) {
 export function getDashboardCacheKey({
   targetPortfolioId,
   hideSold,
-  includeFullySoldInReturns,
   selectedInterval,
   customFromDate,
   customToDate,
@@ -28,7 +27,6 @@ export function getDashboardCacheKey({
   return JSON.stringify({
     targetPortfolioId: targetPortfolioId ?? null,
     hideSold: !!hideSold,
-    includeFullySoldInReturns: !!includeFullySoldInReturns,
     selectedInterval: selectedInterval || '1D',
     customFromDate: customFromDate || null,
     customToDate: customToDate || null,

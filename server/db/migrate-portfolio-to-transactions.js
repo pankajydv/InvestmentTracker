@@ -122,8 +122,8 @@ for (const group of allDupeGroups) {
     db.prepare('UPDATE transactions SET investment_id = ? WHERE investment_id = ?')
       .run(primary.id, orphan.id);
 
-    // Delete orphan's daily_values
-    db.prepare('DELETE FROM daily_values WHERE investment_id = ?').run(orphan.id);
+    // Delete orphan's investment_metrics_daily
+    db.prepare('DELETE FROM investment_metrics_daily WHERE investment_id = ?').run(orphan.id);
 
     // Delete orphan investment
     db.prepare('DELETE FROM investments WHERE id = ?').run(orphan.id);

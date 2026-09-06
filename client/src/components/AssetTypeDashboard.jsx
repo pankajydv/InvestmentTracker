@@ -250,7 +250,6 @@ export default function AssetTypeDashboard() {
   const selectedIdsKey = (selectedIds || []).join(',');
 
   const hideSold = settings.hideSoldInvestments;
-  const includeFullySoldInReturns = hideSold ? settings.includeFullySoldInReturns : true;
 
   useEffect(() => {
     let cancelled = false;
@@ -270,7 +269,6 @@ export default function AssetTypeDashboard() {
       const cacheKey = getDashboardCacheKey({
         targetPortfolioId: isAllScope ? null : (isPartialMulti ? null : selectedId),
         hideSold,
-        includeFullySoldInReturns,
         selectedInterval,
         customFromDate,
         customToDate,
@@ -329,7 +327,6 @@ export default function AssetTypeDashboard() {
 
         const requestOptions = {
           hideSold,
-          includeFullySoldInReturns,
           xirrMode: 'full',
           interval: selectedInterval,
           customFromDate: customFromDate || undefined,
@@ -344,7 +341,6 @@ export default function AssetTypeDashboard() {
           const scopeOptions = {
             portfolioIds: isAllScope ? undefined : selectedIds,
             hideSold,
-            includeFullySoldInReturns,
           };
           const overview = await getAssetTypeOverview(assetType, scopeOptions);
           if (cancelled) return;
@@ -437,7 +433,7 @@ export default function AssetTypeDashboard() {
     // refire this effect on every render. selectedIdsKey is the stable content signal.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     return () => { cancelled = true; };
-  }, [selectedId, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading, selectedInterval, customFromDate, customToDate]);
+  }, [selectedId, selectedIdsKey, hideSold, settingsLoading, selectedInterval, customFromDate, customToDate]);
 
   if (loading) return <DashboardSkeleton assetType />;
   if (error) return <ErrorMessage message={error} />;

@@ -585,7 +585,7 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
     } else {
       // Only require daily rows when the scope has a non-zero position before or after the date.
       // This avoids flagging pre-holding cash-only events (for example ESPP_CONTRIBUTION with zero units)
-      // as missing daily_values rows.
+      // as missing investment_metrics_daily rows.
       expected = runningUnits > 0.000001 || unitsAfter > 0.000001;
     }
 
@@ -623,7 +623,7 @@ function buildScopeHealth(db, scope, runDate, marketHolidaySet, firstTradableByI
 
   const dailyRows = db.prepare(`
     SELECT date, price_source
-    FROM daily_values
+    FROM investment_metrics_daily
     WHERE investment_id = ?
       AND portfolio_id = ?
       AND date >= ?

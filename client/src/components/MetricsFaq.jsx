@@ -60,7 +60,7 @@ export default function MetricsFaq() {
         <Accordion.Item eventKey="5">
           <Accordion.Header>How do LIVE vs LOCF prices work for stocks?</Accordion.Header>
           <Accordion.Body>
-            If a stock has an exact date entry in market_price_cache, daily_values stores that day as <strong>LIVE</strong>.
+            If a stock has an exact date entry in market_price_cache, investment_metrics_daily stores that day as <strong>LIVE</strong>.
             <br />
             <strong>LOCF</strong> is used only when an exact date price is unavailable and the system carries forward the nearest prior price.
             <br />

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Navbar as BsNavbar, Nav, Container, Button, Dropdown, Modal, Form, Alert } from 'react-bootstrap';
-import { BarChart3, PlusCircle, TrendingUp, List, ArrowLeftRight, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, SlidersHorizontal, CircleHelp, BellRing, DatabaseZap, Trash2, Eye, EyeOff } from 'lucide-react';
+import { Navbar as BsNavbar, Nav, Container, Button, Dropdown } from 'react-bootstrap';
+import { BarChart3, PlusCircle, TrendingUp, List, ArrowLeftRight, RefreshCw, Download, FileText, LogOut, Menu, ScrollText, CalendarDays, UploadCloud, CircleHelp, BellRing, DatabaseZap, Trash2, Eye, EyeOff } from 'lucide-react';
 import { HolidaysListModal, HolidaysSyncModal } from './HolidaysMenuItems';
 import ManualDirtyScopeModal from './ManualDirtyScopeModal';
 import PurgeMarketPriceCacheModal from './PurgeMarketPriceCacheModal';
@@ -24,16 +24,13 @@ export default function Navbar({ user, onLogout }) {
   const location = useLocation();
   const { selectedId } = usePortfolio();
   const { masked, toggleMasked } = usePrivacyMaskState();
-  const { settings, loading: settingsLoading, saving: settingsSaving, error: settingsError, saveSettings } = useAppSettings();
+  const { settings, loading: settingsLoading, saving: settingsSaving, saveSettings } = useAppSettings();
   const [updating, setUpdating] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [showHolidays, setShowHolidays] = useState(false);
   const [showSync, setShowSync] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
   const [showDirtyScopes, setShowDirtyScopes] = useState(false);
   const [showPurgeCache, setShowPurgeCache] = useState(false);
-  const [draftSettings, setDraftSettings] = useState(null);
-  const [settingsMessage, setSettingsMessage] = useState('');
   const [pendingCASuggestions, setPendingCASuggestions] = useState(0);
   const [pendingRsuVests, setPendingRsuVests] = useState(0);
   const currentYear = new Date().getFullYear();
@@ -63,31 +60,11 @@ export default function Navbar({ user, onLogout }) {
     };
   }, [selectedId, location.pathname]);
 
-  const openSettings = () => {
-    setSettingsMessage('');
-    setDraftSettings({ ...settings });
-    setShowSettings(true);
-  };
-
-  const closeSettings = () => {
-    if (settingsSaving) return;
-    setShowSettings(false);
-  };
-
-  const handleSaveSettings = async () => {
-    if (!draftSettings) return;
+  const toggleHideSold = async () => {
     try {
-      const next = {
-        hideSoldInvestments: !!draftSettings.hideSoldInvestments,
-        includeFullySoldInReturns: draftSettings.hideSoldInvestments
-          ? !!draftSettings.includeFullySoldInReturns
-          : true,
-      };
-      await saveSettings(next);
-      setDraftSettings(next);
-      setSettingsMessage('Settings updated successfully.');
+      await saveSettings({ hideSoldInvestments: !settings.hideSoldInvestments });
     } catch (_e) {
-      setSettingsMessage('Failed to update settings. Please retry.');
+      // AppSettingsContext surfaces the error; nothing else to do here.
     }
   };
 
@@ -231,8 +208,9 @@ export default function Navbar({ user, onLogout }) {
                 <ScrollText size={14} /> App Logs
               </Dropdown.Item>
 
-              <Dropdown.Item onClick={openSettings} className="d-flex align-items-center gap-2" disabled={settingsLoading}>
-                <SlidersHorizontal size={14} /> Settings
+              <Dropdown.Item onClick={toggleHideSold} className="d-flex align-items-center gap-2" disabled={settingsLoading || settingsSaving}>
+                {settings.hideSoldInvestments ? <Eye size={14} /> : <EyeOff size={14} />}
+                {settings.hideSoldInvestments ? 'Show sold investments' : 'Hide sold investments'}
               </Dropdown.Item>
 
               <Dropdown.Item as={Link} to="/faq" className="d-flex align-items-center gap-2">
@@ -298,93 +276,6 @@ export default function Navbar({ user, onLogout }) {
       <div className="d-sm-none mobile-portfolio-bar bg-white border-bottom px-3 py-2">
         <PortfolioSelector fullWidth />
       </div>
-      <Modal show={showSettings} onHide={closeSettings} centered>
-        <Modal.Header closeButton={!settingsSaving}>
-          <Modal.Title className="h5 mb-0">Settings</Modal.Title>
-        </Modal.Header>
-        <Modal.Body>
-          {settingsError && (
-            <Alert variant="warning" className="py-2">
-              {settingsError}
-            </Alert>
-          )}
-          {settingsMessage && (
-            <Alert variant={settingsMessage.toLowerCase().includes('failed') ? 'danger' : 'success'} className="py-2">
-              {settingsMessage}
-            </Alert>
-          )}
-          {!draftSettings ? (
-            <div className="text-muted small">Loading settings...</div>
-          ) : (
-            <div className="d-flex flex-column gap-3">
-              <Form.Group>
-                <Form.Label className="small fw-semibold mb-2">Sold investments display</Form.Label>
-                <div className="d-flex align-items-center gap-4">
-                  <Form.Check
-                    type="radio"
-                    id="settings-hide-sold-yes"
-                    label="Hide investments"
-                    checked={draftSettings.hideSoldInvestments}
-                    onChange={() => setDraftSettings((prev) => ({
-                      ...prev,
-                      hideSoldInvestments: true,
-                    }))}
-                  />
-                  <Form.Check
-                    type="radio"
-                    id="settings-hide-sold-no"
-                    label="Display investments"
-                    checked={!draftSettings.hideSoldInvestments}
-                    onChange={() => setDraftSettings((prev) => ({
-                      ...prev,
-                      hideSoldInvestments: false,
-                      includeFullySoldInReturns: true,
-                    }))}
-                  />
-                </div>
-              </Form.Group>
-
-              <Form.Group>
-                <Form.Label className="small fw-semibold mb-2">Include fully sold investments in returns</Form.Label>
-                <div className="d-flex align-items-center gap-4">
-                  <Form.Check
-                    type="radio"
-                    id="settings-include-sold-yes"
-                    label="Yes"
-                    checked={!!draftSettings.includeFullySoldInReturns}
-                    onChange={() => setDraftSettings((prev) => ({
-                      ...prev,
-                      includeFullySoldInReturns: true,
-                    }))}
-                  />
-                  <Form.Check
-                    type="radio"
-                    id="settings-include-sold-no"
-                    label="No"
-                    checked={!draftSettings.includeFullySoldInReturns}
-                    disabled={!draftSettings.hideSoldInvestments}
-                    onChange={() => setDraftSettings((prev) => ({
-                      ...prev,
-                      includeFullySoldInReturns: false,
-                    }))}
-                  />
-                </div>
-                <Form.Text className="text-muted">
-                  {!draftSettings.hideSoldInvestments
-                    ? 'When sold investments are displayed, returns always include them.'
-                    : 'Controls whether hidden fully sold investments are still included in total return and total cost.'}
-                </Form.Text>
-              </Form.Group>
-            </div>
-          )}
-        </Modal.Body>
-        <Modal.Footer>
-          <Button variant="outline-secondary" onClick={closeSettings} disabled={settingsSaving}>Cancel</Button>
-          <Button variant="primary" onClick={handleSaveSettings} disabled={settingsSaving || !draftSettings}>
-            {settingsSaving ? 'Saving...' : 'Update Selection'}
-          </Button>
-        </Modal.Footer>
-      </Modal>
       <HolidaysListModal show={showHolidays} onHide={() => setShowHolidays(false)} year={currentYear} />
       <HolidaysSyncModal show={showSync} onHide={() => setShowSync(false)} year={currentYear} />
       <ManualDirtyScopeModal show={showDirtyScopes} onHide={() => setShowDirtyScopes(false)} />

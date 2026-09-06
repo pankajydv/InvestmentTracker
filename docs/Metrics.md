@@ -28,7 +28,7 @@ Formula:
 
 Used for individual investment rows.
 
-Rows reflect investment-level attribution from daily_values, including switch/transfer attribution
+Rows reflect investment-level attribution from investment_metrics_daily, including switch/transfer attribution
 effects where applicable.
 
 ## Notes

@@ -66,7 +66,7 @@ npm test
 ## Architecture (High Level)
 
 - Source of truth: transactions table
-- Derived tables (rebuildable): daily_values, portfolio_daily, asset_type_daily
+- Derived tables (rebuildable): investment_metrics_daily, asset_metrics_daily, portfolio_metrics_daily
 - Incremental recompute trigger: dirty_backfill_scope
 
 Flow:

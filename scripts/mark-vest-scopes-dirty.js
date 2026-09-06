@@ -1,7 +1,7 @@
 /*
  * Mark dirty-backfill scopes for investments whose VEST `amount` was migrated
  * to net (see migrate-vest-amount-to-net.js), so the next scheduler/backfill run
- * recomputes daily_values + aggregates with the corrected invested basis.
+ * recomputes investment_metrics_daily + aggregates with the corrected invested basis.
  *
  * Marks each (investment, portfolio) scope dirty from the investment's first
  * transaction date. Idempotent (merges with any existing pending scope).

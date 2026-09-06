@@ -41,12 +41,11 @@ export const logout = () => fetchJSON('/auth/logout', { method: 'POST' });
 
 // Dashboard
 export const getDashboardVersion = () => fetchJSON('/dashboard/version', { cache: 'no-store' });
-const appendDashboardScopeParams = (params, { portfolioIds, hideSold, includeFullySoldInReturns } = {}) => {
+const appendDashboardScopeParams = (params, { portfolioIds, hideSold } = {}) => {
   if (Array.isArray(portfolioIds) && portfolioIds.length > 0) {
     params.set('portfolio_ids', portfolioIds.map((id) => String(id)).join(','));
   }
   if (hideSold) params.set('hide_sold', 'true');
-  if (includeFullySoldInReturns) params.set('include_sold_in_returns', 'true');
   return params;
 };
 export const getDashboardOverview = (options = {}) => {
@@ -67,11 +66,10 @@ export const getAssetTypeXirr = (assetType, options = {}) => {
   params.set('asset_type', assetType);
   return fetchJSON(`/dashboard/asset-xirr?${params}`);
 };
-export const getDashboardSummary = (portfolioId, { hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate } = {}) => {
+export const getDashboardSummary = (portfolioId, { hideSold, xirrMode, interval, customFromDate, customToDate } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);
   if (hideSold) params.set('hide_sold', 'true');
-  if (includeFullySoldInReturns) params.set('include_sold_in_returns', 'true');
   if (xirrMode) params.set('xirr_mode', String(xirrMode));
   if (interval) params.set('interval', String(interval));
   if (customFromDate) params.set('custom_from_date', String(customFromDate));
@@ -91,12 +89,11 @@ export const getAssetIntervalMetrics = ({ portfolioIds, interval, customFromDate
   return fetchJSON(`/dashboard/asset-interval-metrics?${params}`);
 };
 // Batch endpoint: fetch summary, health, and allocation in single request (optimized)
-export const getDashboardBatch = (portfolioId, { requests = 'summary,health,allocation', hideSold, includeFullySoldInReturns, xirrMode, interval, customFromDate, customToDate, runDate } = {}) => {
+export const getDashboardBatch = (portfolioId, { requests = 'summary,health,allocation', hideSold, xirrMode, interval, customFromDate, customToDate, runDate } = {}) => {
   const params = new URLSearchParams();
   if (portfolioId) params.set('portfolio_id', portfolioId);
   params.set('requests', requests);
   if (hideSold) params.set('hide_sold', 'true');
-  if (includeFullySoldInReturns) params.set('include_sold_in_returns', 'true');
   if (xirrMode) params.set('xirr_mode', String(xirrMode));
   if (interval) params.set('interval', String(interval));
   if (customFromDate) params.set('custom_from_date', String(customFromDate));

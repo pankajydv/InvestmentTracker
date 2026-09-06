@@ -87,6 +87,7 @@ function combineDashboardSummaries(results, selectedIds) {
   const portfolio = {
     total_value: 0,
     total_invested: 0,
+    net_invested: 0,
     total_profit_loss: 0,
     total_realized_proceeds: 0,
     day_change: 0,
@@ -99,6 +100,7 @@ function combineDashboardSummaries(results, selectedIds) {
     const p = result?.portfolio || {};
     portfolio.total_value += Number(p.total_value) || 0;
     portfolio.total_invested += Number(p.total_invested) || 0;
+    portfolio.net_invested += Number(p.net_invested) || 0;
     portfolio.total_profit_loss += Number(p.total_profit_loss) || 0;
     portfolio.total_realized_proceeds += Number(p.total_realized_proceeds) || 0;
     portfolio.day_change += Number(p.day_change) || 0;
@@ -497,11 +499,10 @@ export default function Dashboard() {
   }, []);
 
   const hideSold = settings.hideSoldInvestments;
-  const includeFullySoldInReturns = hideSold ? settings.includeFullySoldInReturns : true;
 
   useEffect(() => {
     loadData();
-  }, [selectedId, selectedIdsKey, hideSold, includeFullySoldInReturns, settingsLoading, selectedInterval, customFromDate, customToDate]);
+  }, [selectedId, selectedIdsKey, hideSold, settingsLoading, selectedInterval, customFromDate, customToDate]);
 
   // Defer health/compliance until after dashboard cards have rendered to avoid
   // blocking the overview response on the single-threaded Node.js event loop.
@@ -605,7 +606,6 @@ export default function Dashboard() {
     const cacheKey = getDashboardCacheKey({
       targetPortfolioId,
       hideSold,
-      includeFullySoldInReturns,
       selectedInterval,
       customFromDate,
       customToDate,
@@ -674,7 +674,6 @@ export default function Dashboard() {
         const scopeOptions = {
           portfolioIds: isAllScope ? undefined : selectedIds,
           hideSold,
-          includeFullySoldInReturns,
         };
         const overview = await getDashboardOverview(scopeOptions);
         if (runId !== loadRunRef.current) return;
@@ -713,7 +712,6 @@ export default function Dashboard() {
         setShowDetailTables(false);
         const requestOptions = {
           hideSold,
-          includeFullySoldInReturns,
           xirrMode: 'full',
           interval: selectedInterval,
           customFromDate: customFromDate || undefined,
@@ -762,7 +760,6 @@ export default function Dashboard() {
       } else {
         const result = await getDashboardSummary(targetPortfolioId, {
           hideSold,
-          includeFullySoldInReturns,
           xirrMode: 'full',
           interval: selectedInterval,
           customFromDate: customFromDate || undefined,
@@ -814,7 +811,8 @@ export default function Dashboard() {
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
   const totalRealizedGain = Number(portfolio.total_realized_proceeds) || 0;
-  const currentInvested = (Number(portfolio.total_invested) || 0) - totalRealizedGain;
+  // Prefer the stored net_invested; fall back to the legacy derivation for older responses.
+  const currentInvested = Number(portfolio.net_invested) || ((Number(portfolio.total_invested) || 0) - totalRealizedGain);
   const formatINRExact = (amount, options = {}) => {
     const sensitive = options?.sensitive !== false;
     if (sensitive && isPrivacyMaskEnabled()) return getMaskedValue({ currencySymbol: '₹' });

@@ -7,7 +7,7 @@
  * 2. Finds investments sharing the same isin_code (duplicate folios)
  * 3. Picks the canonical investment (most transactions → lowest ID tiebreak)
  * 4. Reassigns all transactions from duplicates to the canonical investment
- * 5. Merges daily_values (keeps canonical, deletes duplicates)
+ * 5. Merges investment_metrics_daily (keeps canonical, deletes duplicates)
  * 6. Deletes the now-empty duplicate investment records
  * 7. Auto-populates category for mutual funds that lack it
  *
@@ -95,9 +95,9 @@ for (const group of dupeGroups) {
       db.prepare('UPDATE transactions SET investment_id = ? WHERE investment_id = ?')
         .run(canonical.id, dup.id);
 
-      // Delete duplicate daily_values (canonical's are kept; duplicates may have different data
+      // Delete duplicate investment_metrics_daily (canonical's are kept; duplicates may have different data
       // but canonical is the one with most history)
-      db.prepare('DELETE FROM daily_values WHERE investment_id = ?').run(dup.id);
+      db.prepare('DELETE FROM investment_metrics_daily WHERE investment_id = ?').run(dup.id);
 
       // Delete the duplicate investment record
       db.prepare('DELETE FROM investments WHERE id = ?').run(dup.id);

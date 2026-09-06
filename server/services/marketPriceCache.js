@@ -1433,7 +1433,7 @@ async function hydrateStockSeriesForPhase2({
   }
 
   // LOCF is no longer materialized into the market cache. Provider gaps are carried
-  // forward at read time (nearest-on-or-before) when daily_values are computed.
+  // forward at read time (nearest-on-or-before) when investment_metrics_daily are computed.
 
   if (splitRebuildTriggered && typeof onInfo === 'function') {
     onInfo(`[MarketCache][SplitCheck] Completed split-triggered hydrate for ${symbol}`, {
@@ -1835,7 +1835,7 @@ async function hydrateHistoricalPriceSeries({
   }
 
   // LOCF is no longer materialized into the price cache. Provider gaps are carried
-  // forward at read time (nearest-on-or-before) when daily_values are computed.
+  // forward at read time (nearest-on-or-before) when investment_metrics_daily are computed.
   return getSeries(instrumentType, symbol, start, end).filter((row) => row.close != null);
 }
 
@@ -2006,9 +2006,15 @@ function upsertPriceSeries(instrumentType, symbol, points, source = null, invest
         'SELECT investment_id, close, source FROM market_price_cache WHERE instrument_type = ? AND symbol = ? AND date = ? LIMIT 1'
       )
       : null;
+    // Guard the UNIQUE(investment_id, date) index: when an investment's symbol
+    // changes, drop the stale-symbol row for the same investment and date first.
+    const deleteStaleSymbol = invId != null
+      ? conn.prepare('DELETE FROM market_price_cache WHERE investment_id = ? AND date = ? AND NOT (instrument_type = ? AND symbol = ?)')
+      : null;
     for (const p of rows) {
       const d = normalizeDate(p.date);
       if (!d) continue;
+      if (deleteStaleSymbol) deleteStaleSymbol.run(invId, d, instrumentType, symbol);
       const existingMarket = selectMarket ? selectMarket.get(instrumentType, symbol, d) : null;
       stmt.run(
         invId,
@@ -2125,10 +2131,19 @@ function upsertInvestmentPriceSeries(investmentId, instrumentType, providerSymbo
         'SELECT investment_id, close, source FROM market_price_cache WHERE instrument_type = ? AND symbol = ? AND date = ? LIMIT 1'
       )
       : null;
+    // The table enforces UNIQUE(investment_id, date) as well as
+    // UNIQUE(instrument_type, symbol, date). When an investment's symbol or
+    // instrument mapping changes, a stale row under the old symbol would collide
+    // on (investment_id, date). Remove it first so the insert cannot abort.
+    const deleteStaleSymbol = conn.prepare(
+      'DELETE FROM market_price_cache WHERE investment_id = ? AND date = ? AND NOT (instrument_type = ? AND symbol = ?)'
+    );
+    const normalizedInstrumentType = String(instrumentType || '').toUpperCase();
     for (const p of rows) {
       const d = normalizeDate(p.date);
       if (!d) continue;
-      const existingMarket = selectMarket ? selectMarket.get(String(instrumentType || '').toUpperCase(), investmentSymbol, d) : null;
+      deleteStaleSymbol.run(Number(investmentId), d, normalizedInstrumentType, investmentSymbol);
+      const existingMarket = selectMarket ? selectMarket.get(normalizedInstrumentType, investmentSymbol, d) : null;
       stmt.run(
         Number(investmentId),
         String(instrumentType || '').toUpperCase(),

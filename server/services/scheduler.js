@@ -66,7 +66,7 @@ const FX_UPGRADE_SWEEP_MAX_SESSIONS = parsePositiveIntEnv('FX_UPGRADE_SWEEP_MAX_
 const ENABLE_FOREIGN_RECONCILE = parseBooleanEnv('ENABLE_FOREIGN_RECONCILE', true);
 const FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS = parsePositiveIntEnv('FOREIGN_RECONCILE_MAX_LOOKBACK_DAYS', 10);
 const FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST = parseNonNegativeIntEnv('FOREIGN_RECONCILE_SETTLEMENT_CUTOFF_MINUTES_IST', (4 * 60) + 25);
-// Days of recent daily_values to scan for LOCF rows when reconciling lagging NAV/price feeds.
+// Days of recent investment_metrics_daily to scan for LOCF rows when reconciling lagging NAV/price feeds.
 const LOCF_RECONCILE_LOOKBACK_DAYS = parsePositiveIntEnv('LOCF_RECONCILE_LOOKBACK_DAYS', 5);
 // Asset types covered by the generic LOCF-lag self-healing path in the scheduler.
 // FOREIGN_STOCK is now included; its session check uses weekday-only (no holiday DB).
@@ -324,7 +324,7 @@ function resolveLocfSignalStartByScope(db, startDate, endDate) {
 
   const rows = db.prepare(`
     SELECT dv.investment_id, dv.portfolio_id, MIN(dv.date) AS locf_start
-    FROM daily_values dv
+    FROM investment_metrics_daily dv
     JOIN investments i ON i.id = dv.investment_id
     WHERE i.asset_type = 'FOREIGN_STOCK'
       AND dv.portfolio_id IS NOT NULL
@@ -466,7 +466,7 @@ function ensureForeignReconcileScopes(db, runDate, label, catchUp = null) {
 }
 
 /**
- * For investments in LOCF_LAG_RECONCILE_ASSET_TYPES whose daily_values carry a
+ * For investments in LOCF_LAG_RECONCILE_ASSET_TYPES whose investment_metrics_daily carry a
  * LOCF price source on recent market-session days, enqueue a dirty backfill scope
  * starting from the first LOCF date so backfill will re-process those rows once
  * the real NAV/price arrives from the provider (typically 1-2 days late).
@@ -480,7 +480,7 @@ function ensureMarketLinkedLocfReconcileScopes(db, runDate, label) {
   const placeholders = LOCF_LAG_RECONCILE_ASSET_TYPES.map(() => '?').join(',');
   const rows = db.prepare(`
     SELECT dv.investment_id, dv.portfolio_id, MIN(dv.date) AS locf_start
-    FROM daily_values dv
+    FROM investment_metrics_daily dv
     JOIN investments i ON i.id = dv.investment_id
     WHERE i.asset_type IN (${placeholders})
       AND dv.portfolio_id IS NOT NULL
@@ -756,7 +756,7 @@ function resolvePriceWatermark(db) {
     return String(cfg.value);
   }
 
-  const maxDaily = db.prepare('SELECT MAX(date) AS max_date FROM daily_values').get();
+  const maxDaily = db.prepare('SELECT MAX(date) AS max_date FROM investment_metrics_daily').get();
   if (maxDaily?.max_date && /^\d{4}-\d{2}-\d{2}$/.test(String(maxDaily.max_date))) {
     return String(maxDaily.max_date);
   }
@@ -870,7 +870,7 @@ function ensureRollingFreshnessDirtyScopes(db, runDate, label, options = {}) {
       dv.portfolio_id,
       dv.date,
       dv.price_source
-    FROM daily_values dv
+    FROM investment_metrics_daily dv
     JOIN investments i ON i.id = dv.investment_id
     WHERE i.asset_type IN (${typePlaceholders})
       AND dv.portfolio_id IS NOT NULL

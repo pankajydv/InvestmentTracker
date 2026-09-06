@@ -22,7 +22,6 @@ const {
 } = require('../server/services/dirtyBackfillService');
 const {
   detectGapsForTable,
-  detectRollupInvariantIssues,
 } = require('../server/services/compliance/complianceScanService');
 const { updateAllPrices } = require('../server/services/updater');
 const { updateDailyValues } = require('../server/services/backfillService');
@@ -328,7 +327,7 @@ describe('Investments — Indian Stocks', () => {
     }
 
     const insertDaily = db.prepare(`
-      INSERT INTO daily_values (
+      INSERT INTO investment_metrics_daily (
         investment_id, portfolio_id, date, price_per_unit, total_units,
         current_value, invested_amount, realized_proceeds, profit_loss,
         price_source, day_change
@@ -358,7 +357,7 @@ describe('Investments — Indian Stocks', () => {
       assert.ok(listedInvestment);
       assert.ok(Math.abs(listedInvestment.absolute_return_pct - ((550 / 1300) * 100)) < 1e-9);
     } finally {
-      db.prepare("DELETE FROM daily_values WHERE investment_id = 1 AND date = '2099-01-01'").run();
+      db.prepare("DELETE FROM investment_metrics_daily WHERE investment_id = 1 AND date = '2099-01-01'").run();
       if (seededInvestment) db.prepare('DELETE FROM investments WHERE id = 1').run();
       if (seededPortfolio2) db.prepare('DELETE FROM portfolios WHERE id = 2').run();
       if (seededPortfolio1) db.prepare('DELETE FROM portfolios WHERE id = 1').run();
@@ -388,7 +387,7 @@ describe('Investments — Balance Account XIRR', () => {
       VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?)
     `);
     const dailyInsert = db.prepare(`
-      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+      INSERT INTO investment_metrics_daily (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
       VALUES (?, ?, ?, 0, 1, ?, ?, 0, ?, 'COMPUTED', 0)
     `);
 
@@ -401,10 +400,10 @@ describe('Investments — Balance Account XIRR', () => {
     }
 
     const latestByPortfolio = db.prepare(
-      'SELECT date, current_value FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
+      'SELECT date, current_value FROM investment_metrics_daily WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
     );
     const latestGlobal = db.prepare(
-      'SELECT date, current_value FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+      'SELECT date, current_value FROM investment_metrics_daily WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
     );
 
     const pfLatest = latestByPortfolio.get(pf.body.id, 1) || latestGlobal.get(pf.body.id);
@@ -971,7 +970,7 @@ describe('Bonds — XIRR and Day Change', () => {
     txInsert.run(bondId, 1, 'INTEREST', '2025-07-15', 80, 10, 'AUTO_ACCRUAL_INTERNAL generated');
 
     db.prepare(`
-      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+      INSERT INTO investment_metrics_daily (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPUTED', 0)
     `).run(bondId, 1, '2025-12-31', 1000, 10, 10200, 10000, 120, 320);
 
@@ -1031,7 +1030,7 @@ describe('Bonds — XIRR and Day Change', () => {
 
     const prevCurrentValue = 10000 + Number(prevAccrual.accruedCoupon || 0);
     db.prepare(`
-      INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+      INSERT INTO investment_metrics_daily (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPUTED', 0)
     `).run(bondId, 1, prevDate, 1000, 10, prevCurrentValue, 10000, 100, prevCurrentValue - 10000 + 100);
 
@@ -1040,13 +1039,13 @@ describe('Bonds — XIRR and Day Change', () => {
 
     const todayRow = db.prepare(`
       SELECT current_value, day_change
-      FROM daily_values
+      FROM investment_metrics_daily
       WHERE investment_id = ? AND portfolio_id = ? AND date = ?
       ORDER BY id DESC
       LIMIT 1
     `).get(bondId, 1, today);
 
-    assert.ok(todayRow, 'Expected updater to write today daily_values row for bond');
+    assert.ok(todayRow, 'Expected updater to write today investment_metrics_daily row for bond');
     assert.ok(Number(todayRow.current_value) > 10000, 'Current value should include accrued coupon above principal');
     assert.ok(Number(todayRow.day_change) > 0, 'One-day change should reflect accrued coupon drift');
   });
@@ -1140,28 +1139,28 @@ describe('Dashboard', () => {
         VALUES (?, ?, 'SELL', '2026-08-07', 0, 1, 1, 0)
       `).run(investmentId, portfolioId);
       const insertDaily = db.prepare(`
-        INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+        INSERT INTO investment_metrics_daily (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
         VALUES (?, ?, ?, ?, 1, ?, 100, 0, ?, ?, ?)
       `);
       insertDaily.run(investmentId, portfolioId, '2026-08-06', 100, 100, 0, 'LIVE', -5);
       insertDaily.run(investmentId, portfolioId, '2026-08-07', 110, 110, 10, 'LIVE', 10);
       insertDaily.run(investmentId, portfolioId, '2026-08-08', 108, 108, 8, 'LIVE', -2);
-      const insertPortfolioDaily = db.prepare(`
-        INSERT INTO portfolio_daily (portfolio_id, date, total_value, total_invested, total_profit_loss, total_profit_loss_pct, day_change, day_change_pct)
-        VALUES (?, ?, ?, 100, ?, ?, ?, ?)
+      const insertPortfolioV2 = db.prepare(`
+        INSERT INTO portfolio_metrics_daily (portfolio_id, date, current_value, net_invested, realized_proceeds, total_profit_loss, total_day_change, calculation_version)
+        VALUES (?, ?, ?, 100, 0, ?, ?, 1)
       `);
-      insertPortfolioDaily.run(portfolioId, '2026-08-06', 100, 0, 0, -5, (-5 / 105) * 100);
-      insertPortfolioDaily.run(portfolioId, '2026-08-07', 110, 10, 10, 10, 10);
-      insertPortfolioDaily.run(portfolioId, '2026-08-08', 108, 8, 8, -2, (-2 / 110) * 100);
-      const insertAssetDaily = db.prepare(`
-        INSERT INTO asset_type_daily (
-          portfolio_id, asset_type, date, total_value, total_invested,
-          total_profit_loss, total_realized_proceeds, day_change, day_change_pct
-        ) VALUES (?, 'FOREIGN_STOCK', ?, ?, 100, ?, 0, ?, ?)
+      insertPortfolioV2.run(portfolioId, '2026-08-06', 100, 0, -5);
+      insertPortfolioV2.run(portfolioId, '2026-08-07', 110, 10, 10);
+      insertPortfolioV2.run(portfolioId, '2026-08-08', 108, 8, -2);
+      const insertAssetV2 = db.prepare(`
+        INSERT INTO asset_metrics_daily (
+          portfolio_id, asset_type, date, current_value, attribution_basis,
+          profit_loss_before_portfolio_expenses, attribution_proceeds, day_change, calculation_version
+        ) VALUES (?, 'FOREIGN_STOCK', ?, ?, 100, ?, 0, ?, 1)
       `);
-      insertAssetDaily.run(portfolioId, '2026-08-06', 100, 0, -5, (-5 / 105) * 100);
-      insertAssetDaily.run(portfolioId, '2026-08-07', 110, 10, 10, 10);
-      insertAssetDaily.run(portfolioId, '2026-08-08', 108, 8, -2, (-2 / 110) * 100);
+      insertAssetV2.run(portfolioId, '2026-08-06', 100, 0, -5);
+      insertAssetV2.run(portfolioId, '2026-08-07', 110, 10, 10);
+      insertAssetV2.run(portfolioId, '2026-08-08', 108, 8, -2);
 
       const overview = await api('GET', `/dashboard/overview?portfolio_ids=${portfolioId}`);
       assert.equal(overview.status, 200);
@@ -1188,9 +1187,9 @@ describe('Dashboard', () => {
       assert.equal(twoDay.body.byType.FOREIGN_STOCK.dayChange, 9);
       assert.equal(twoDay.body.investments[0].day_change, 9);
     } finally {
-      db.prepare('DELETE FROM asset_type_daily WHERE portfolio_id = ?').run(portfolioId);
-      db.prepare('DELETE FROM portfolio_daily WHERE portfolio_id = ?').run(portfolioId);
-      db.prepare('DELETE FROM daily_values WHERE investment_id = ?').run(investmentId);
+      db.prepare('DELETE FROM asset_metrics_daily WHERE portfolio_id = ?').run(portfolioId);
+      db.prepare('DELETE FROM portfolio_metrics_daily WHERE portfolio_id = ?').run(portfolioId);
+      db.prepare('DELETE FROM investment_metrics_daily WHERE investment_id = ?').run(investmentId);
       db.prepare('DELETE FROM transactions WHERE investment_id = ?').run(investmentId);
       db.prepare('DELETE FROM investments WHERE id = ?').run(investmentId);
       db.prepare('DELETE FROM portfolios WHERE id = ?').run(portfolioId);
@@ -1204,7 +1203,7 @@ describe('Dashboard', () => {
   });
 
   it('GET /dashboard/overview matches visible 1D summary values', async () => {
-    for (const query of ['', 'portfolio_id=1', 'portfolio_id=1&hide_sold=true&include_sold_in_returns=true']) {
+    for (const query of ['', 'portfolio_id=1', 'portfolio_id=1&hide_sold=true']) {
       const separator = query ? '&' : '';
       const summary = await api('GET', `/dashboard/summary?${query}${separator}interval=1D&xirr_mode=portfolio_only`);
       const overviewQuery = query.replace('portfolio_id=', 'portfolio_ids=');
@@ -1220,6 +1219,19 @@ describe('Dashboard', () => {
         for (const field of ['totalValue', 'totalInvested', 'totalProfitLoss', 'totalRealizedGain', 'dayChange', 'intervalChangePct']) {
           assertNear(overview.body.byType[type][field], summary.body.byType[type][field], `${type}.${field} (${query || 'all'})`);
         }
+      }
+    }
+  });
+
+  it('GET /dashboard/summary ignores the deprecated include_sold_in_returns param', async () => {
+    // Phase 6: sold returns are unconditional. The legacy param must be inert so a stale
+    // cached client that still sends it produces byte-identical totals.
+    const base = await api('GET', '/dashboard/summary?portfolio_id=1&hide_sold=true&interval=1D&xirr_mode=portfolio_only');
+    for (const legacy of ['include_sold_in_returns=true', 'include_sold_in_returns=false']) {
+      const withLegacy = await api('GET', `/dashboard/summary?portfolio_id=1&hide_sold=true&${legacy}&interval=1D&xirr_mode=portfolio_only`);
+      assert.equal(withLegacy.status, 200);
+      for (const field of ['total_value', 'total_invested', 'net_invested', 'total_profit_loss', 'total_realized_proceeds']) {
+        assertNear(withLegacy.body.portfolio[field], base.body.portfolio[field], `portfolio.${field} (${legacy})`);
       }
     }
   });
@@ -1258,6 +1270,35 @@ describe('Dashboard', () => {
       assert.ok('current_value' in row);
       assert.ok('price_source' in row);
     }
+  });
+
+  // Smoke tests for the V2-repointed history/interval endpoints (catch runtime/SQL errors).
+  it('GET /dashboard/performance returns 200 for scoped and combined', async () => {
+    for (const q of ['?portfolio_id=1', '', '?portfolio_id=1&interval=1Y']) {
+      const { status, body } = await api('GET', `/dashboard/performance${q}`);
+      assert.equal(status, 200, `performance ${q || 'all'}`);
+      assert.ok(body && typeof body === 'object' && !body.error, `performance ${q || 'all'} payload`);
+    }
+  });
+
+  it('GET /dashboard/performance-by-type returns 200', async () => {
+    for (const q of ['?asset_type=INDIAN_STOCK&portfolio_id=1', '?asset_type=INDIAN_STOCK']) {
+      const { status, body } = await api('GET', `/dashboard/performance-by-type${q}`);
+      assert.equal(status, 200, `performance-by-type ${q}`);
+      assert.ok(body && typeof body === 'object' && !body.error, `performance-by-type ${q} payload`);
+    }
+  });
+
+  it('GET /dashboard/asset-interval-metrics returns 200', async () => {
+    const { status, body } = await api('GET', '/dashboard/asset-interval-metrics?portfolio_ids=1&interval=1M');
+    assert.equal(status, 200);
+    assert.ok(body && typeof body === 'object' && !body.error);
+  });
+
+  it('GET /dashboard/batch returns 200', async () => {
+    const { status, body } = await api('GET', '/dashboard/batch?portfolio_id=1&requests=summary,health,allocation');
+    assert.equal(status, 200);
+    assert.ok(body.summary);
   });
 
   it('GET /dashboard/rollover supports asset_type and portfolio_ids filters', async () => {
@@ -1864,7 +1905,7 @@ describe('Dirty scope source guard for exited holdings', () => {
       insertTransaction.run(investmentId, portfolioId, 'BUY', '2026-08-07', 10, 1000);
 
       const insertDaily = localDb.prepare(`
-        INSERT INTO daily_values (
+        INSERT INTO investment_metrics_daily (
           investment_id, portfolio_id, date, price_per_unit, total_units,
           current_value, invested_amount, realized_proceeds, profit_loss,
           price_source, day_change
@@ -1889,12 +1930,12 @@ describe('Dirty scope source guard for exited holdings', () => {
       assert.equal(result.rowsWritten, 1);
       assert.equal(localDb.prepare(`
         SELECT COUNT(*) AS count
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id = ? AND date BETWEEN '2026-08-05' AND '2026-08-06'
       `).get(investmentId, portfolioId).count, 0);
       assert.equal(localDb.prepare(`
         SELECT total_units
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id = ? AND date = '2026-08-04'
       `).get(investmentId, portfolioId).total_units, 0);
     } finally {
@@ -2110,7 +2151,7 @@ describe('Provident compliance coverage', () => {
       insertTransaction.run(stock.lastInsertRowid, portfolio.lastInsertRowid, 'BUY', 10, 100, 1000);
 
       const insertDailyValue = localDb.prepare(`
-        INSERT INTO daily_values (
+        INSERT INTO investment_metrics_daily (
           investment_id, portfolio_id, date, price_per_unit, total_units,
           current_value, invested_amount, profit_loss, price_source, day_change
         ) VALUES (?, ?, '2026-07-29', ?, ?, ?, ?, ?, ?, 0)
@@ -2118,13 +2159,13 @@ describe('Provident compliance coverage', () => {
       insertDailyValue.run(provident.lastInsertRowid, portfolio.lastInsertRowid, 8.25, 1, 10000, 10000, 0, 'COMPUTED');
       insertDailyValue.run(stock.lastInsertRowid, portfolio.lastInsertRowid, 100, 10, 1000, 1000, 0, 'LIVE');
 
-      const gaps = detectGapsForTable(localDb, 'daily_values', 'investment_id', 'investment', {
+      const gaps = detectGapsForTable(localDb, 'investment_metrics_daily', 'investment_id', 'investment', {
         startDate: '2026-07-29',
         endDate: '2026-07-31',
       });
 
       assert.deepEqual(gaps, [{
-        table_name: 'daily_values',
+        table_name: 'investment_metrics_daily',
         entity_id: Number(provident.lastInsertRowid),
         gap_start_date: '2026-07-30',
         gap_end_date: '2026-07-31',
@@ -2162,7 +2203,7 @@ describe('Provident compliance coverage', () => {
       insertTransaction.run(investmentId, portfolioId, 'BUY', '2026-08-07', 5, 500);
 
       const insertDailyValue = localDb.prepare(`
-        INSERT INTO daily_values (
+        INSERT INTO investment_metrics_daily (
           investment_id, portfolio_id, date, price_per_unit, total_units,
           current_value, invested_amount, profit_loss, price_source, day_change
         ) VALUES (?, ?, ?, 100, ?, ?, ?, 0, 'LIVE', 0)
@@ -2171,7 +2212,7 @@ describe('Provident compliance coverage', () => {
       insertDailyValue.run(investmentId, portfolioId, '2026-08-04', 0, 0, 0);
       insertDailyValue.run(investmentId, portfolioId, '2026-08-07', 5, 500, 500);
 
-      const gaps = detectGapsForTable(localDb, 'daily_values', 'investment_id', 'investment', {
+      const gaps = detectGapsForTable(localDb, 'investment_metrics_daily', 'investment_id', 'investment', {
         startDate: '2026-08-03',
         endDate: '2026-08-07',
       });
@@ -2183,55 +2224,4 @@ describe('Provident compliance coverage', () => {
     }
   });
 
-  it('detects rollup totals that disagree with latest underlying daily rows', () => {
-    const Database = require('better-sqlite3');
-    const localDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'invtrack-rollup-invariant-test-'));
-    const localDb = new Database(path.join(localDataDir, 'investments.db'));
-
-    try {
-      const { initializeDb } = require('../server/db/schema');
-      initializeDb(localDb);
-
-      const portfolioId = localDb.prepare('INSERT INTO portfolios (name) VALUES (?)')
-        .run('Rollup Invariant Portfolio').lastInsertRowid;
-      const investmentId = localDb.prepare(`
-        INSERT INTO investments (name, asset_type, is_active, exclude_from_tracking)
-        VALUES ('Rollup Invariant Stock', 'INDIAN_STOCK', 1, 0)
-      `).run().lastInsertRowid;
-      localDb.prepare(`
-        INSERT INTO daily_values (
-          investment_id, portfolio_id, date, price_per_unit, total_units,
-          current_value, invested_amount, profit_loss, price_source, day_change
-        ) VALUES (?, ?, '2026-08-12', 110, 10, 1100, 1000, 100, 'LIVE', 100)
-      `).run(investmentId, portfolioId);
-      localDb.prepare(`
-        INSERT INTO portfolio_daily (
-          portfolio_id, date, total_value, total_invested, total_profit_loss,
-          total_profit_loss_pct, day_change, day_change_pct
-        ) VALUES (?, '2026-08-12', 999, 1000, 100, 10, 100, 10)
-      `).run(portfolioId);
-      localDb.prepare(`
-        INSERT INTO asset_type_daily (
-          portfolio_id, asset_type, date, total_value, total_invested,
-          total_profit_loss, total_realized_proceeds, total_unrealized_gain,
-          total_profit_loss_pct, day_change, day_change_pct
-        ) VALUES (?, 'INDIAN_STOCK', '2026-08-12', 1100, 1000, 100, 0, 100, 10, 100, 10)
-      `).run(portfolioId);
-
-      const issues = detectRollupInvariantIssues(localDb, {
-        startDate: '2026-08-12',
-        endDate: '2026-08-12',
-      });
-
-      assert.equal(issues.length, 1);
-      assert.equal(issues[0].table_name, 'portfolio_daily');
-      assert.equal(issues[0].entity_id, Number(portfolioId));
-      assert.equal(issues[0].date, '2026-08-12');
-      assert.equal(issues[0].actual.total_value, 999);
-      assert.equal(issues[0].expected.total_value, 1100);
-    } finally {
-      localDb.close();
-      fs.rmSync(localDataDir, { recursive: true, force: true });
-    }
-  });
 });

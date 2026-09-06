@@ -218,7 +218,7 @@ function buildScheduleFaA3Rows(db, { portfolioId, calendarYear }) {
 
   const dailyValueSeries = db.prepare(`
     SELECT DATE(dv.date) AS date, SUM(COALESCE(dv.current_value, 0)) AS total_current_value
-    FROM daily_values dv
+    FROM investment_metrics_daily dv
     WHERE dv.portfolio_id = ?
       AND dv.investment_id IN (${idPlaceholders})
       AND DATE(dv.date) >= ? AND DATE(dv.date) <= ?
@@ -525,7 +525,7 @@ function buildScheduleFaA3Rows(db, { portfolioId, calendarYear }) {
       closing_balance_inr: roundCurrency(a2ClosingBalanceInr),
       gross_paid_credited_inr: roundCurrency(a2GrossPaidCreditedInr),
       closing_balance_date: a2ClosingDate,
-      source: 'daily_values',
+      source: 'investment_metrics_daily',
     },
     summary: {
       rows: rows.length,
@@ -837,13 +837,13 @@ function buildTaxReport(db, fy, portfolioId, ltcgEquityExemption = 125000) {
     const totalCostUSD = lots.reduce((s, l) => s + (Number(l.fmv_per_unit) || 0) * l.units_remaining, 0);
 
     const yearEndDV = db.prepare(`
-      SELECT price_per_unit, current_value, date FROM daily_values
+      SELECT price_per_unit, current_value, date FROM investment_metrics_daily
       WHERE investment_id = ? AND date <= ?
       ORDER BY date DESC LIMIT 1
     `).get(inv.id, fyEndStr);
 
     const peakDV = db.prepare(`
-      SELECT MAX(current_value) as peak_value FROM daily_values
+      SELECT MAX(current_value) as peak_value FROM investment_metrics_daily
       WHERE investment_id = ? AND date >= ? AND date <= ?
     `).get(inv.id, fyStartStr, fyEndStr);
 

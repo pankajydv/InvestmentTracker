@@ -16,20 +16,15 @@ function parseBool(value, fallback) {
 
 function normalizeSettings(input) {
   const hideSoldInvestments = !!input.hideSoldInvestments;
-  const includeFullySoldInReturns = hideSoldInvestments
-    ? !!input.includeFullySoldInReturns
-    : true;
 
   return {
     hideSoldInvestments,
-    includeFullySoldInReturns,
   };
 }
 
 export function AppSettingsProvider({ children }) {
   const [settings, setSettings] = useState({
     hideSoldInvestments: true,
-    includeFullySoldInReturns: false,
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -48,7 +43,6 @@ export function AppSettingsProvider({ children }) {
         const legacyHideSold = parseBool(localStorage.getItem(LEGACY_HIDE_SOLD_KEY), true);
         const next = normalizeSettings({
           hideSoldInvestments: parseBool(cfg.hideSoldInvestments, legacyHideSold),
-          includeFullySoldInReturns: parseBool(cfg.includeFullySoldInReturns, false),
         });
         setSettings(next);
         localStorage.setItem(LEGACY_HIDE_SOLD_KEY, String(next.hideSoldInvestments));
@@ -74,7 +68,6 @@ export function AppSettingsProvider({ children }) {
     try {
       await updateConfig({
         hideSoldInvestments: String(next.hideSoldInvestments),
-        includeFullySoldInReturns: String(next.includeFullySoldInReturns),
       });
       setSettings(next);
       localStorage.setItem(LEGACY_HIDE_SOLD_KEY, String(next.hideSoldInvestments));

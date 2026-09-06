@@ -1,4 +1,4 @@
-// Compliance scan for missing daily_values, portfolio_daily, asset_type_daily
+// Compliance scan for missing investment_metrics_daily rows (the single authoritative per-investment table)
 const { applyEnvDefaults } = require('../../config/envDefaults');
 applyEnvDefaults();
 
@@ -14,7 +14,6 @@ const COMPLIANCE_LAST_GAPS_KEY = 'compliance_last_gaps_detected';
 const COMPLIANCE_LAST_REPAIRS_KEY = 'compliance_last_repairs_enqueued';
 const INCREMENTAL_LOOKBACK_DAYS = Math.max(1, Number(process.env.INCREMENTAL_COMPLIANCE_LOOKBACK_DAYS || 14));
 const EXITED_UNITS_EPSILON = 1e-6;
-const ROLLUP_INVARIANT_TOLERANCE = 0.01;
 const BALANCE_BASED_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MARKET_DATA_CUTOFF_MINUTES_IST = Object.freeze({
   // US equities settle after midnight IST; avoid same-day compliance gaps until end of IST day.
@@ -224,10 +223,10 @@ function isMarketLinkedAsset(assetType) {
 }
 
 /**
- * Generic gap detection for any table
- * @param {string} tableName - Target table (daily_values, portfolio_daily, asset_type_daily)
- * @param {string} keyColumn - Column name for entity ID (investment_id, portfolio_id, asset_type)
- * @param {string} keyType - Type of key for filtering (investment, portfolio, asset_type)
+ * Gap detection for the investment_metrics_daily table (the single authoritative per-investment table).
+ * @param {string} tableName - Target table (investment_metrics_daily)
+ * @param {string} keyColumn - Column name for entity ID (investment_id)
+ * @param {string} keyType - Type of key for filtering (investment)
  * @returns {array} Array of gap objects to record
  */
 function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
@@ -239,8 +238,8 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
 
   const gaps = [];
 
-  if (tableName === 'daily_values') {
-    // For daily_values: get investments and check their date ranges
+  if (tableName === 'investment_metrics_daily') {
+    // For investment_metrics_daily: get investments and check their date ranges
     const holdingUnitsAtDate = db.prepare(`
       SELECT COALESCE(SUM(
         CASE
@@ -334,227 +333,20 @@ function detectGapsForTable(db, tableName, keyColumn, keyType, options = {}) {
         });
       }
     }
-  } else if (tableName === 'portfolio_daily') {
-    // For portfolio_daily: get portfolios and check their date ranges
-    const portfolios = db.prepare(`
-      SELECT DISTINCT p.id,
-             MIN(dv.date) as start_date, MAX(dv.date) as end_date
-      FROM portfolios p
-      LEFT JOIN daily_values dv ON p.id = (
-        SELECT portfolio_id FROM investments WHERE id = dv.investment_id
-      )
-      WHERE dv.date IS NOT NULL
-      GROUP BY p.id
-    `).all();
-
-    for (const pf of portfolios) {
-      const { id, start_date, end_date } = pf;
-      if (!start_date || !end_date) continue;
-
-      const effectiveStartDate = startBoundary && startBoundary > start_date ? startBoundary : start_date;
-      const effectiveEndDate = endBoundary && endBoundary < end_date ? endBoundary : end_date;
-      if (!effectiveStartDate || !effectiveEndDate || effectiveStartDate > effectiveEndDate) continue;
-
-      let gapStart = null;
-
-      let d = new Date(`${effectiveStartDate}T00:00:00.000Z`);
-      const end = new Date(`${effectiveEndDate}T00:00:00.000Z`);
-
-      while (d <= end) {
-        const dateStr = d.toISOString().slice(0, 10);
-
-        const exists = db.prepare(`SELECT 1 FROM ${tableName} WHERE ${keyColumn} = ? AND date = ?`).get(id, dateStr);
-        
-        if (!exists) {
-          if (!gapStart) {
-            gapStart = dateStr;
-          }
-        } else {
-          if (gapStart) {
-            gaps.push({
-              table_name: tableName,
-              entity_id: id,
-              gap_start_date: gapStart,
-              gap_end_date: new Date(d.getTime() - 86400000).toISOString().slice(0, 10),
-            });
-            gapStart = null;
-          }
-        }
-
-        d.setDate(d.getDate() + 1);
-      }
-
-      // Close any open gap
-      if (gapStart) {
-        gaps.push({
-          table_name: tableName,
-          entity_id: id,
-          gap_start_date: gapStart,
-          gap_end_date: effectiveEndDate,
-        });
-      }
-    }
-  } else if (tableName === 'asset_type_daily') {
-    // For asset_type_daily: get asset types and check their date ranges
-    const assetTypes = db.prepare(`
-      SELECT DISTINCT i.asset_type,
-             MIN(dv.date) as start_date, MAX(dv.date) as end_date
-      FROM investments i
-      LEFT JOIN daily_values dv ON i.id = dv.investment_id
-      WHERE dv.date IS NOT NULL
-      GROUP BY i.asset_type
-    `).all();
-
-    for (const at of assetTypes) {
-      const { asset_type, start_date, end_date } = at;
-      if (!start_date || !end_date) continue;
-
-      const effectiveStartDate = startBoundary && startBoundary > start_date ? startBoundary : start_date;
-      const effectiveEndDate = endBoundary && endBoundary < end_date ? endBoundary : end_date;
-      if (!effectiveStartDate || !effectiveEndDate || effectiveStartDate > effectiveEndDate) continue;
-
-      let gapStart = null;
-
-      let d = new Date(`${effectiveStartDate}T00:00:00.000Z`);
-      const end = new Date(`${effectiveEndDate}T00:00:00.000Z`);
-
-      while (d <= end) {
-        const dateStr = d.toISOString().slice(0, 10);
-
-        const exists = db.prepare(`SELECT 1 FROM ${tableName} WHERE ${keyColumn} = ? AND date = ?`).get(asset_type, dateStr);
-        
-        if (!exists) {
-          if (!gapStart) {
-            gapStart = dateStr;
-          }
-        } else {
-          if (gapStart) {
-            gaps.push({
-              table_name: tableName,
-              entity_id: asset_type,
-              gap_start_date: gapStart,
-              gap_end_date: new Date(d.getTime() - 86400000).toISOString().slice(0, 10),
-            });
-            gapStart = null;
-          }
-        }
-
-        d.setDate(d.getDate() + 1);
-      }
-
-      // Close any open gap
-      if (gapStart) {
-        gaps.push({
-          table_name: tableName,
-          entity_id: asset_type,
-          gap_start_date: gapStart,
-          gap_end_date: effectiveEndDate,
-        });
-      }
-    }
   }
 
   return gaps;
 }
 
-function detectRollupInvariantIssues(db, options = {}) {
-  const startDate = parseIsoDate(options.startDate);
-  const endDate = parseIsoDate(options.endDate) || todayIso();
-  const tolerance = Math.max(0, Number(options.tolerance ?? ROLLUP_INVARIANT_TOLERANCE));
-  const issues = [];
-
-  const portfolioRows = db.prepare(`
-    SELECT portfolio_id, date, total_value, total_invested, total_profit_loss
-    FROM portfolio_daily
-    WHERE (? IS NULL OR date >= ?) AND date <= ?
-  `).all(startDate, startDate, endDate);
-  const expectedPortfolio = db.prepare(`
-    SELECT
-      COALESCE(SUM(dv.current_value), 0) AS total_value,
-      COALESCE(SUM(dv.invested_amount), 0) AS total_invested,
-      COALESCE(SUM(dv.profit_loss), 0) AS total_profit_loss
-    FROM daily_values dv
-    INNER JOIN (
-      SELECT investment_id, portfolio_id, MAX(date) AS max_date
-      FROM daily_values
-      WHERE portfolio_id = ? AND date <= ?
-      GROUP BY investment_id, portfolio_id
-    ) latest ON dv.investment_id = latest.investment_id
-      AND dv.portfolio_id = latest.portfolio_id
-      AND dv.date = latest.max_date
-  `);
-
-  const assetRows = db.prepare(`
-    SELECT portfolio_id, asset_type, date, total_value, total_invested,
-           total_profit_loss, total_realized_proceeds, total_unrealized_gain
-    FROM asset_type_daily
-    WHERE (? IS NULL OR date >= ?) AND date <= ?
-  `).all(startDate, startDate, endDate);
-  const expectedAsset = db.prepare(`
-    SELECT
-      COALESCE(SUM(dv.current_value), 0) AS total_value,
-      COALESCE(SUM(dv.invested_amount), 0) AS total_invested,
-      COALESCE(SUM(dv.profit_loss), 0) AS total_profit_loss,
-      COALESCE(SUM(dv.realized_proceeds), 0) AS total_realized_proceeds,
-      COALESCE(SUM(dv.current_value - (dv.invested_amount - dv.realized_proceeds)), 0) AS total_unrealized_gain
-    FROM daily_values dv
-    JOIN investments i ON i.id = dv.investment_id
-    INNER JOIN (
-      SELECT investment_id, portfolio_id, MAX(date) AS max_date
-      FROM daily_values
-      WHERE portfolio_id = ? AND date <= ?
-      GROUP BY investment_id, portfolio_id
-    ) latest ON dv.investment_id = latest.investment_id
-      AND dv.portfolio_id = latest.portfolio_id
-      AND dv.date = latest.max_date
-    WHERE i.asset_type = ? AND i.exclude_from_tracking != 1
-  `);
-
-  const compare = (tableName, row, expected, fields) => {
-    const mismatchedFields = fields.filter((field) => (
-      Math.abs(Number(row[field] || 0) - Number(expected[field] || 0)) > tolerance
-    ));
-    if (mismatchedFields.length === 0) return;
-
-    issues.push({
-      table_name: tableName,
-      entity_id: Number(row.portfolio_id),
-      asset_type: row.asset_type || null,
-      date: row.date,
-      mismatched_fields: mismatchedFields,
-      actual: Object.fromEntries(fields.map((field) => [field, Number(row[field] || 0)])),
-      expected: Object.fromEntries(fields.map((field) => [field, Number(expected[field] || 0)])),
-    });
-  };
-
-  const portfolioFields = ['total_value', 'total_invested', 'total_profit_loss'];
-  for (const row of portfolioRows) {
-    compare('portfolio_daily', row, expectedPortfolio.get(row.portfolio_id, row.date), portfolioFields);
-  }
-
-  const assetFields = [
-    'total_value', 'total_invested', 'total_profit_loss',
-    'total_realized_proceeds', 'total_unrealized_gain',
-  ];
-  for (const row of assetRows) {
-    compare(
-      'asset_type_daily',
-      row,
-      expectedAsset.get(row.portfolio_id, row.date, row.asset_type),
-      assetFields,
-    );
-  }
-
-  if (issues.length > 0) {
-    console.warn(`[ComplianceScan][RollupInvariant] ${issues.length} rollup mismatch(es) detected.`);
-  }
-
-  return issues;
+function detectRollupInvariantIssues() {
+  // Superseded by the canonical projection engine's in-memory invariants (checkInvariants).
+  // The legacy portfolio_daily/asset_type_daily rollups are no longer authoritative.
+  return [];
 }
 
 /**
- * Find and record missing gaps across all three daily tables
- * Scans daily_values, portfolio_daily, and asset_type_daily in one pass
+ * Find and record missing gaps in investment_metrics_daily (the single authoritative per-investment table).
+ * The asset/portfolio rollups are derived by the canonical projection engine, not gap-scanned.
  */
 function findAndRecordAllGaps(db, options = {}) {
   const allGaps = [];
@@ -564,17 +356,10 @@ function findAndRecordAllGaps(db, options = {}) {
   };
 
   try {
-    // Scan daily_values
-    const dailyValuesGaps = detectGapsForTable(db, 'daily_values', 'investment_id', 'investment', window);
+    // Scan investment_metrics_daily (the single authoritative per-investment table). The asset/portfolio
+    // rollups are derived by the canonical projection engine and validated by its invariants.
+    const dailyValuesGaps = detectGapsForTable(db, 'investment_metrics_daily', 'investment_id', 'investment', window);
     allGaps.push(...dailyValuesGaps);
-
-    // Scan portfolio_daily
-    const portfolioDailyGaps = detectGapsForTable(db, 'portfolio_daily', 'portfolio_id', 'portfolio', window);
-    allGaps.push(...portfolioDailyGaps);
-
-    // Scan asset_type_daily
-    const assetTypeDailyGaps = detectGapsForTable(db, 'asset_type_daily', 'asset_type', 'asset_type', window);
-    allGaps.push(...assetTypeDailyGaps);
   } catch (e) {
     console.error('[ComplianceScan] Error detecting gaps:', e.message);
     return [];
@@ -605,7 +390,7 @@ function findAndRecordDailyValuesGaps(db, options = {}) {
 }
 
 /**
- * Detect market-linked scopes whose recent daily_values are all LOCF (no LIVE row
+ * Detect market-linked scopes whose recent investment_metrics_daily are all LOCF (no LIVE row
  * within the freshness window).  Emits a WARN log per scope and marks it dirty.
  *
  * @param {object} db
@@ -639,7 +424,7 @@ function detectLocfQualityIssues(db, options = {}) {
       -- PRE/POST are preliminary and count as non-live for streak detection.
       MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) = 'LIVE' THEN dv.date END) AS last_non_locf_date,
       SUM(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LIVE' THEN 1 ELSE 0 END) AS locf_count_in_window
-    FROM daily_values dv
+    FROM investment_metrics_daily dv
     JOIN investments i ON i.id = dv.investment_id
     WHERE i.asset_type IN (${placeholders})
       AND i.is_active != 0
@@ -834,7 +619,7 @@ function repairDetectedGaps(dbOverride = null) {
   try {
     for (const gap of openGaps) {
       try {
-        if (gap.table_name === 'daily_values') {
+        if (gap.table_name === 'investment_metrics_daily') {
           // Mark investment as dirty for backfill
           const result = markScopeDirty(db, {
             investmentId: gap.entity_id,

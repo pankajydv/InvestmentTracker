@@ -672,6 +672,8 @@ export default function InvestmentDetail() {
     ? snapshotRealizedProceeds
     : Number(data.realizedProceeds ?? data.saleProceeds) || 0;
   const cumulativeValue = currentValue + realizedProceeds;
+  const netInvested = totalInvested - realizedProceeds; // capital still deployed in this position
+  const realizedPct = cumulativeValue > 0 ? (realizedProceeds / cumulativeValue) * 100 : null; // share of cumulative value already cashed out
   const snapshotProfitLoss = Number(data.latestValue?.profit_loss);
   const totalProfitLoss = Number.isFinite(snapshotProfitLoss)
     ? snapshotProfitLoss
@@ -955,8 +957,8 @@ export default function InvestmentDetail() {
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINR(currentValue)}</div>
               <div className="dashboard-detail-rows">
                 <div className="dashboard-detail-row">
-                  <span className="dashboard-detail-label">Total Invested</span>
-                  <span className="dashboard-detail-value">{formatINR(totalInvested)}</span>
+                  <span className="dashboard-detail-label">Net Invested</span>
+                  <span className="dashboard-detail-value">{formatINR(netInvested)}</span>
                 </div>
                 <div className="dashboard-detail-row">
                   <span className="dashboard-detail-label">Cash Proceeds</span>
@@ -1084,12 +1086,12 @@ export default function InvestmentDetail() {
               <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINR(cumulativeValue)}</div>
               <div className="dashboard-detail-rows">
                 <div className="dashboard-detail-row">
-                  <span className="dashboard-detail-label">Current Value</span>
-                  <span className="dashboard-detail-value">{formatINR(currentValue)}</span>
+                  <span className="dashboard-detail-label">Total Invested</span>
+                  <span className="dashboard-detail-value">{formatINR(totalInvested)}</span>
                 </div>
                 <div className="dashboard-detail-row">
-                  <span className="dashboard-detail-label">Cash Proceeds</span>
-                  <span className="dashboard-detail-value">{formatINR(realizedProceeds)}</span>
+                  <span className="dashboard-detail-label">Realized %</span>
+                  <span className="dashboard-detail-value">{realizedPct == null ? '—' : `${realizedPct.toFixed(1)}%`}</span>
                 </div>
               </div>
             </Card.Body>

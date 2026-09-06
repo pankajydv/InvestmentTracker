@@ -32,6 +32,7 @@ const {
 } = require('./marketPriceCache');
 const { updateAggregateDailyRange } = require('./updater');
 const { setBackfillProgress } = require('./dirtyBackfillService');
+const { safeRebuildCanonicalProjections } = require('./canonicalProjectionEngine');
 const { generateVestSuggestions } = require('./rsuVestActualizationService');
 const { toIsoDate, todayIso, exchangeDateFromUnixSeconds } = require('./dateUtils');
 const { logBackfillInfo, logBackfillWarn, logBackfillError } = require('./appLogger');
@@ -42,6 +43,7 @@ const {
   REALIZED_CASHFLOW_TYPES,
   REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL,
 } = require('../constants/transactionTypes');
+const { EXTERNAL_CASH_IN_TYPES, EXTERNAL_CASH_OUT_TYPES } = require('./transactionEffectPolicy');
 const {
   quantizeForStorage,
   quantizeNullableForStorage,
@@ -596,7 +598,7 @@ function getLocalFxRateOnOrBefore(date) {
   return Number(row.close);
 }
 
-// Must remain within daily_values.price_source CHECK constraint.
+// Must remain within investment_metrics_daily.price_source CHECK constraint.
 const IPO_CACHE_FILL_MAX_SESSIONS = 20;
 const IPO_CACHE_FILL_SOURCE = 'IPO';
 const STOCK_PROVIDER_PUBLISH_CUTOFF_MINUTES = 9 * 60 + 30;
@@ -831,7 +833,7 @@ async function fetchStockSeries(symbol, startDate, endDate, options = {}) {
 function getStoredPriceOnOrBefore(db, investmentId, portfolioId, date) {
   if (portfolioId == null) return null;
   const row = db.prepare(
-    'SELECT date, price_per_unit FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date <= ? ORDER BY date DESC LIMIT 1'
+    'SELECT date, price_per_unit FROM investment_metrics_daily WHERE investment_id = ? AND portfolio_id = ? AND date <= ? ORDER BY date DESC LIMIT 1'
   ).get(investmentId, portfolioId, date);
   return row ? { price: Number(row.price_per_unit || 0), source: row.date === date ? 'LIVE' : 'LOCF' } : null;
 }
@@ -1252,7 +1254,7 @@ function upsertDailyRow(db, row, statements = null, auditContext = null) {
   };
 
   const upsertScoped = statements?.upsertScoped || db.prepare(`
-    INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change, updated_at)
+    INSERT INTO investment_metrics_daily (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
       price_per_unit = excluded.price_per_unit,
@@ -1268,7 +1270,7 @@ function upsertDailyRow(db, row, statements = null, auditContext = null) {
 
   const selectExistingScoped = statements?.selectExistingScoped || db.prepare(`
     SELECT price_per_unit, current_value, price_source
-    FROM daily_values
+    FROM investment_metrics_daily
     WHERE investment_id = ? AND portfolio_id = ? AND date = ?
     LIMIT 1
   `);
@@ -1335,7 +1337,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
 
     const dailyStatements = {
       upsertScoped: db.prepare(`
-        INSERT INTO daily_values (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change, updated_at)
+        INSERT INTO investment_metrics_daily (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(investment_id, portfolio_id, date) DO UPDATE SET
           price_per_unit = excluded.price_per_unit,
@@ -1350,16 +1352,16 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       `),
       selectExistingScoped: db.prepare(`
         SELECT price_per_unit, current_value, price_source
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id = ? AND date = ?
         LIMIT 1
       `),
       deleteScopedDate: db.prepare(`
-        DELETE FROM daily_values
+        DELETE FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id = ? AND date = ?
       `),
       deleteScopedRange: db.prepare(`
-        DELETE FROM daily_values
+        DELETE FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id = ? AND date >= ? AND date <= ?
       `),
     };
@@ -1395,13 +1397,8 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
       ? REALIZED_CASHFLOW_TYPES_REINVEST_ACCRUAL
       : REALIZED_CASHFLOW_TYPES
   );
-  const netFlowPositiveTypes = new Set([
-    'BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN',
-    'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION',
-  ]);
-  const netFlowNegativeTypes = new Set([
-    'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC',
-  ]);
+  const netFlowPositiveTypes = new Set(EXTERNAL_CASH_IN_TYPES);
+  const netFlowNegativeTypes = new Set(EXTERNAL_CASH_OUT_TYPES);
 
   // Bond coupon income by date (for total-return day_change adjustment)
   const bondIncomeByDate = new Map();
@@ -1483,7 +1480,7 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
   }
 
   const prevBeforeRange = db.prepare(
-    'SELECT current_value FROM daily_values WHERE investment_id = ? AND portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
+    'SELECT current_value FROM investment_metrics_daily WHERE investment_id = ? AND portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1'
   ).get(inv.id, portfolioId, fromDate);
   let prevValue = Number(prevBeforeRange?.current_value || 0);
 
@@ -1514,7 +1511,9 @@ async function recomputeScopeRows(db, inv, portfolioId, fromDate, toDate, cache,
     carriedNetFlowSinceLastWrite += netFlow;
 
     // Stop writing trailing zero-unit rows after exit for all unit-based assets.
-    if (latestTxnDate && date > latestTxnDate && units <= 0 && !isProvidentAsset) {
+    // Use the exit epsilon (not strict <= 0) so tiny floating-point unit residuals
+    // from fractional buy/sell quantities still trigger the trailing-row cleanup.
+    if (latestTxnDate && date > latestTxnDate && units <= EXITED_UNITS_EPSILON && !isProvidentAsset) {
       written += dailyStatements.deleteScopedRange.run(inv.id, portfolioId, date, toDate).changes;
       break;
     }
@@ -4506,7 +4505,7 @@ async function updateDailyValues(db, options = {}) {
   let earliestTouchedDate = runDate;
   let earliestAggregateDate = null;
   // Ground-truth probe: capture the DB clock BEFORE any recompute writes so that after
-  // Step-3 we can detect the EARLIEST daily_values date actually touched during this run
+  // Step-3 we can detect the EARLIEST investment_metrics_daily date actually touched during this run
   // (via updated_at) and widen the rollup refresh accordingly. See Step-4 below.
   const aggregateFloorProbeTs = db.prepare("SELECT datetime('now') AS ts").get().ts;
   const forwardReplaySummary = {
@@ -4686,14 +4685,14 @@ async function updateDailyValues(db, options = {}) {
   });
 
   // Robustness: the aggregate refresh window is normally derived from each dirty scope's
-  // dirty_from_date. If a recompute rewrote daily_values rows further back than expected
+  // dirty_from_date. If a recompute rewrote investment_metrics_daily rows further back than expected
   // (or a wide historical rebuild ran), the rollup tables (portfolio_daily / asset_type_daily)
-  // would silently drift out of sync with daily_values. Widen the floor to the EARLIEST
-  // daily_values date actually touched during this run so the rollup rebuild always covers
+  // would silently drift out of sync with investment_metrics_daily. Widen the floor to the EARLIEST
+  // investment_metrics_daily date actually touched during this run so the rollup rebuild always covers
   // every changed row rather than only the planned dirty_from_date.
   try {
     const touchedFloor = db.prepare(
-      'SELECT MIN(date) AS d FROM daily_values WHERE portfolio_id IS NOT NULL AND updated_at >= ?'
+      'SELECT MIN(date) AS d FROM investment_metrics_daily WHERE portfolio_id IS NOT NULL AND updated_at >= ?'
     ).get(aggregateFloorProbeTs)?.d || null;
     if (touchedFloor && (earliestAggregateDate == null || touchedFloor < earliestAggregateDate)) {
       logBackfillStep(4, 1, 'Resolve aggregate refresh floor', 'completed', {
@@ -4840,6 +4839,9 @@ async function updateDailyValues(db, options = {}) {
   });
 
   clearAggregateResumeState(db);
+
+  // Keep the canonical V2 projections in step with the rebuilt legacy aggregates.
+  safeRebuildCanonicalProjections(db, { info: (m, meta) => logBackfillInfo(m, meta), warn: (m, meta) => logBackfillWarn(m, meta) });
 
   setBackfillProgress(db, {
     phase: 'finalizing',
@@ -5075,7 +5077,7 @@ async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
 
     // Insert or update daily values for each concrete portfolio scope.
     const upsertStmt = db.prepare(`
-      INSERT INTO daily_values (
+      INSERT INTO investment_metrics_daily (
         investment_id,
         portfolio_id,
         date,
@@ -5097,7 +5099,7 @@ async function backfillNPSHistoricalNAV(db, investmentId, startDate, endDate) {
     `);
     const selectExistingStmt = db.prepare(`
       SELECT price_per_unit, price_source
-      FROM daily_values
+      FROM investment_metrics_daily
       WHERE investment_id = ? AND portfolio_id = ? AND date = ?
       LIMIT 1
     `);

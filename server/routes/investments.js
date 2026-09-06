@@ -10,6 +10,9 @@ const {
 const { markScopeDirty, markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 const { getInvestmentSeries, getMarketSessionDates, getSeries } = require('../services/marketPriceCache');
 const { resolveDayChangePair } = require('../services/dayChangeService');
+const { isInternalXirrCashflow, isAccrualOnlyXirrCashflow } = require('../services/xirrClassification');
+const { computeXirrRate: calculateXirr } = require('../services/xirrMath');
+const { EXTERNAL_CASH_IN_TYPES, EXTERNAL_CASH_OUT_TYPES, toSqlInList } = require('../services/transactionEffectPolicy');
 
 /**
  * Normalize transaction_date to YYYY-MM-DD format (no time component)
@@ -38,7 +41,6 @@ const CASH_OUTFLOW_TYPES = new Set(XIRR_CASH_OUTFLOW_TYPES);
 
 const CASH_INFLOW_TYPES = new Set(XIRR_CASH_INFLOW_TYPES);
 
-const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MARKET_DRIVEN_ASSET_TYPES = new Set(['INDIAN_STOCK', 'FOREIGN_STOCK', 'MUTUAL_FUND', 'NPS', 'SGB']);
 
 function resolveDisplayDayChangeFromRows(rowsDesc, assetType) {
@@ -57,7 +59,7 @@ function getDayChangeRowsForInvestment(db, investmentId, portfolioId) {
   if (isPortfolioScoped) {
     return db.prepare(`
       SELECT date, day_change, current_value, price_source
-      FROM daily_values
+      FROM investment_metrics_daily
       WHERE investment_id = ? AND portfolio_id = ?
       ORDER BY date DESC, id DESC
       LIMIT 120
@@ -71,7 +73,7 @@ function getDayChangeRowsForInvestment(db, investmentId, portfolioId) {
       COALESCE(SUM(current_value), 0) AS current_value,
       MAX(price_source) AS price_source,
       MAX(CASE WHEN UPPER(COALESCE(price_source, '')) != 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
-    FROM daily_values
+    FROM investment_metrics_daily
     WHERE investment_id = ? AND portfolio_id IS NOT NULL
     GROUP BY date
     ORDER BY date DESC
@@ -113,23 +115,24 @@ function toNumberOrNull(value) {
 }
 
 function getLatestInvestmentValue(db, investmentId, portfolioId = null) {
+  // investment_metrics_daily is the single per-investment table; its accounting columns hold canonical values.
   if (portfolioId != null) {
     return db.prepare(
-      'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
+      'SELECT * FROM investment_metrics_daily WHERE investment_id = ? AND portfolio_id = ? ORDER BY date DESC LIMIT 1'
     ).get(investmentId, portfolioId) || db.prepare(
-      'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+      'SELECT * FROM investment_metrics_daily WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
     ).get(investmentId) || null;
   }
 
   const latestValues = db.prepare(`
     WITH latest_by_portfolio AS (
       SELECT portfolio_id, MAX(date) AS max_date
-      FROM daily_values
+      FROM investment_metrics_daily
       WHERE investment_id = ? AND portfolio_id IS NOT NULL
       GROUP BY portfolio_id
     )
     SELECT dv.*
-    FROM daily_values dv
+    FROM investment_metrics_daily dv
     INNER JOIN latest_by_portfolio latest
       ON latest.portfolio_id = dv.portfolio_id AND latest.max_date = dv.date
     WHERE dv.investment_id = ?
@@ -138,7 +141,7 @@ function getLatestInvestmentValue(db, investmentId, portfolioId = null) {
 
   if (latestValues.length === 0) {
     return db.prepare(
-      'SELECT * FROM daily_values WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
+      'SELECT * FROM investment_metrics_daily WHERE investment_id = ? AND portfolio_id IS NULL ORDER BY date DESC LIMIT 1'
     ).get(investmentId) || null;
   }
   if (latestValues.length === 1) return latestValues[0];
@@ -268,7 +271,7 @@ function calculateInvestmentIntervalXirr(db, {
         SELECT
           MIN(date) AS chosen_from,
           MAX(date) AS chosen_to
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ?
           AND portfolio_id = ?
           AND date >= ?
@@ -278,7 +281,7 @@ function calculateInvestmentIntervalXirr(db, {
         SELECT
           MIN(date) AS chosen_from,
           MAX(date) AS chosen_to
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ?
           AND portfolio_id IS NOT NULL
           AND date >= ?
@@ -308,19 +311,19 @@ function calculateInvestmentIntervalXirr(db, {
   const opening = isPortfolioScoped
     ? Number(db.prepare(`
       SELECT COALESCE(current_value, 0) AS value
-      FROM daily_values
+      FROM investment_metrics_daily
       WHERE investment_id = ? AND portfolio_id = ? AND date <= ?
       ORDER BY date DESC, id DESC
       LIMIT 1
     `).get(investmentId, portfolioId, chosenFromDate)?.value || 0)
     : Number(db.prepare(`
       SELECT COALESCE(SUM(current_value), 0) AS value
-      FROM daily_values
+      FROM investment_metrics_daily
       WHERE investment_id = ?
         AND portfolio_id IS NOT NULL
         AND date = (
           SELECT MAX(date)
-          FROM daily_values
+          FROM investment_metrics_daily
           WHERE investment_id = ? AND portfolio_id IS NOT NULL AND date <= ?
         )
     `).get(investmentId, investmentId, chosenFromDate)?.value || 0);
@@ -328,19 +331,19 @@ function calculateInvestmentIntervalXirr(db, {
   const closing = isPortfolioScoped
     ? Number(db.prepare(`
       SELECT COALESCE(current_value, 0) AS value
-      FROM daily_values
+      FROM investment_metrics_daily
       WHERE investment_id = ? AND portfolio_id = ? AND date <= ?
       ORDER BY date DESC, id DESC
       LIMIT 1
     `).get(investmentId, portfolioId, chosenToDate)?.value || 0)
     : Number(db.prepare(`
       SELECT COALESCE(SUM(current_value), 0) AS value
-      FROM daily_values
+      FROM investment_metrics_daily
       WHERE investment_id = ?
         AND portfolio_id IS NOT NULL
         AND date = (
           SELECT MAX(date)
-          FROM daily_values
+          FROM investment_metrics_daily
           WHERE investment_id = ? AND portfolio_id IS NOT NULL AND date <= ?
         )
     `).get(investmentId, investmentId, chosenToDate)?.value || 0);
@@ -411,13 +414,13 @@ function calculateInvestmentIntervalXirr(db, {
     const summedIntervalChange = isPortfolioScoped
       ? Number(db.prepare(`
         SELECT COALESCE(SUM(day_change), 0) AS value
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id = ?
           AND date > ? AND date <= ?
       `).get(investmentId, portfolioId, chosenFromDate, chosenToDate)?.value || 0)
       : Number(db.prepare(`
         SELECT COALESCE(SUM(day_change), 0) AS value
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id IS NOT NULL
           AND date > ? AND date <= ?
       `).get(investmentId, chosenFromDate, chosenToDate)?.value || 0);
@@ -428,8 +431,8 @@ function calculateInvestmentIntervalXirr(db, {
     const netFlow = isPortfolioScoped
       ? Number(db.prepare(`
         SELECT COALESCE(SUM(CASE
-          WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-          WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+          WHEN transaction_type IN (${toSqlInList(EXTERNAL_CASH_IN_TYPES)}) THEN COALESCE(amount, 0)
+          WHEN transaction_type IN (${toSqlInList(EXTERNAL_CASH_OUT_TYPES)}) THEN -COALESCE(amount, 0)
           WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
           ELSE 0
         END), 0) AS net_flow
@@ -439,8 +442,8 @@ function calculateInvestmentIntervalXirr(db, {
       `).get(investmentId, portfolioId, chosenFromDate, chosenToDate)?.net_flow || 0)
       : Number(db.prepare(`
         SELECT COALESCE(SUM(CASE
-          WHEN transaction_type IN ('BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION') THEN COALESCE(amount, 0)
-          WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC') THEN -COALESCE(amount, 0)
+          WHEN transaction_type IN (${toSqlInList(EXTERNAL_CASH_IN_TYPES)}) THEN COALESCE(amount, 0)
+          WHEN transaction_type IN (${toSqlInList(EXTERNAL_CASH_OUT_TYPES)}) THEN -COALESCE(amount, 0)
           WHEN transaction_type = 'TDS' THEN -ABS(COALESCE(amount, 0))
           ELSE 0
         END), 0) AS net_flow
@@ -493,81 +496,6 @@ function calculateInvestmentIntervalXirr(db, {
     from_date: chosenFromDate,
     to_date: chosenToDate,
   };
-}
-
-function isInternalXirrCashflow(assetType, transactionType) {
-  const normalizedAssetType = String(assetType || '').toUpperCase();
-  const normalizedType = String(transactionType || '').toUpperCase();
-
-  if (!INTERNAL_BALANCE_XIRR_ASSET_TYPES.has(normalizedAssetType)) {
-    return false;
-  }
-
-  if (normalizedType === 'INTEREST' || normalizedType === 'TDS') {
-    return true;
-  }
-
-  // Reconcile rows on balance-based accounts are statement/passbook corrections.
-  return normalizedType === 'RECONCILE';
-}
-
-function isAccrualOnlyXirrCashflow(transactionType, notes) {
-  const normalizedType = String(transactionType || '').toUpperCase();
-  if (normalizedType !== 'INTEREST') return false;
-  const noteText = String(notes || '').toUpperCase();
-  return noteText.includes('AUTO_ACCRUAL_INTERNAL') || noteText.includes('ACCRUAL_ONLY_INTERNAL');
-}
-
-function xnpv(rate, flows, baseDate) {
-  const msPerDay = 24 * 60 * 60 * 1000;
-  return flows.reduce((sum, flow) => {
-    const years = (flow.date - baseDate) / msPerDay / 365;
-    return sum + flow.amount / ((1 + rate) ** years);
-  }, 0);
-}
-
-function calculateXirr(flows) {
-  if (!Array.isArray(flows) || flows.length < 2) return null;
-
-  let hasPositive = false;
-  let hasNegative = false;
-  for (const flow of flows) {
-    if (flow.amount > 0) hasPositive = true;
-    if (flow.amount < 0) hasNegative = true;
-  }
-  if (!hasPositive || !hasNegative) return null;
-
-  const sortedFlows = [...flows].sort((a, b) => a.date - b.date);
-  const baseDate = sortedFlows[0].date;
-
-  let low = -0.9999;
-  let high = 10;
-  let fLow = xnpv(low, sortedFlows, baseDate);
-  let fHigh = xnpv(high, sortedFlows, baseDate);
-
-  for (let i = 0; i < 25 && fLow * fHigh > 0; i += 1) {
-    high *= 2;
-    fHigh = xnpv(high, sortedFlows, baseDate);
-  }
-
-  if (fLow * fHigh > 0) return null;
-
-  for (let i = 0; i < 100; i += 1) {
-    const mid = (low + high) / 2;
-    const fMid = xnpv(mid, sortedFlows, baseDate);
-
-    if (Math.abs(fMid) < 1e-7) return mid;
-
-    if (fLow * fMid < 0) {
-      high = mid;
-      fHigh = fMid;
-    } else {
-      low = mid;
-      fLow = fMid;
-    }
-  }
-
-  return (low + high) / 2;
 }
 
 module.exports = function (db) {
@@ -743,10 +671,10 @@ module.exports = function (db) {
       }
 
       const today = todayIso();
-      // For exited investments, default to the latest daily_values date so the
+      // For exited investments, default to the latest investment_metrics_daily date so the
       // trailing-year window doesn't land entirely after the last data point.
       const latestDvDate = db.prepare(
-        'SELECT MAX(date) AS d FROM daily_values WHERE investment_id = ?'
+        'SELECT MAX(date) AS d FROM investment_metrics_daily WHERE investment_id = ?'
       ).get(investmentId)?.d || today;
       const toDate = parseDateOnly(req.query.to) || (latestDvDate < today ? latestDvDate : today);
       const earliestTxnDate = db.prepare(
@@ -785,10 +713,16 @@ module.exports = function (db) {
         params.push(portfolioId);
       }
 
+      // investment_metrics_daily is the single per-investment table; its accounting columns are canonical.
+      const srcTable = 'investment_metrics_daily';
+      const unitsCol = 'total_units';
+      const basisCol = 'invested_amount';
+      const proceedsCol = 'realized_proceeds';
+
       const whereClause = filters.join(' AND ');
       const totalRows = Number(db.prepare(`
         SELECT COUNT(*) AS count
-        FROM daily_values
+        FROM ${srcTable}
         WHERE ${whereClause}
       `).get(...params)?.count || 0);
       const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
@@ -801,15 +735,15 @@ module.exports = function (db) {
           portfolio_id,
           date,
           price_per_unit,
-          total_units,
+          ${unitsCol} AS total_units,
           current_value,
-          invested_amount,
-          realized_proceeds,
+          ${basisCol} AS invested_amount,
+          ${proceedsCol} AS realized_proceeds,
           profit_loss,
           day_change,
           price_source,
           updated_at
-        FROM daily_values
+        FROM ${srcTable}
         WHERE ${whereClause}
         ORDER BY date DESC, portfolio_id IS NULL DESC, portfolio_id ASC
         LIMIT ? OFFSET ?
@@ -834,14 +768,14 @@ module.exports = function (db) {
       const displayedTo = rowsLimited.length ? rowsLimited[rowsLimited.length - 1].date : null;
       const latestRowDate = db.prepare(`
         SELECT date
-        FROM daily_values
+        FROM ${srcTable}
         WHERE ${whereClause}
         ORDER BY date DESC, portfolio_id IS NULL DESC, portfolio_id ASC
         LIMIT 1
       `).get(...params)?.date || null;
       const oldestRowDate = db.prepare(`
         SELECT date
-        FROM daily_values
+        FROM ${srcTable}
         WHERE ${whereClause}
         ORDER BY date ASC, portfolio_id IS NULL ASC, portfolio_id DESC
         LIMIT 1
@@ -1190,12 +1124,12 @@ module.exports = function (db) {
     const latestDateInScope = parsedPortfolioId
       ? db.prepare(`
         SELECT MAX(date) AS max_date
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id = ?
       `).get(inv.id, parsedPortfolioId)?.max_date
       : db.prepare(`
         SELECT MAX(date) AS max_date
-        FROM daily_values
+        FROM investment_metrics_daily
         WHERE investment_id = ? AND portfolio_id IS NOT NULL
       `).get(inv.id)?.max_date;
 

@@ -85,6 +85,28 @@ function getDb() {
 }
 
 function initializeDb(db) {
+  // Rename the interim *_v2 rollups to their canonical names before the CREATE block runs
+  // (idempotent; only fires on DBs still holding the old names). RENAME preserves data.
+  try {
+    const tableExists = (n) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(n);
+    if (tableExists('asset_metrics_daily_v2') && !tableExists('asset_metrics_daily')) {
+      db.exec('DROP INDEX IF EXISTS idx_asset_metrics_v2_portfolio_date');
+      db.exec('DROP INDEX IF EXISTS idx_asset_metrics_v2_type_date');
+      db.exec('ALTER TABLE asset_metrics_daily_v2 RENAME TO asset_metrics_daily');
+    }
+    if (tableExists('portfolio_metrics_daily_v2') && !tableExists('portfolio_metrics_daily')) {
+      db.exec('DROP INDEX IF EXISTS idx_portfolio_metrics_v2_latest');
+      db.exec('DROP INDEX IF EXISTS idx_portfolio_metrics_v2_date');
+      db.exec('ALTER TABLE portfolio_metrics_daily_v2 RENAME TO portfolio_metrics_daily');
+    }
+    // Rename the per-investment table to its canonical name. RENAME preserves data; the
+    // idx_daily_values_* / trg_daily_values_* internal identifiers auto-follow the table and
+    // match the fresh-DB CREATE statements, so migrated and fresh DBs stay identical.
+    if (tableExists('daily_values') && !tableExists('investment_metrics_daily')) {
+      db.exec('ALTER TABLE daily_values RENAME TO investment_metrics_daily');
+    }
+  } catch (_e) { /* best effort; the CREATE block below is the fresh-DB fallback */ }
+
   db.exec(`
     -- Family portfolios (each family member has one)
     CREATE TABLE IF NOT EXISTS portfolios (
@@ -115,7 +137,7 @@ function initializeDb(db) {
       previous_isin_codes TEXT,      -- Comma-separated historical ISINs (e.g. after stock splits)
       opening_balance REAL DEFAULT 0, -- For PPF/SSY/PF: balance carried forward from before first imported statement
       is_active INTEGER DEFAULT 1,   -- 1 = active (price updates), 0 = inactive (delisted etc.)
-      exclude_from_tracking INTEGER DEFAULT 0, -- 1 = exclude from daily_values calculations and dashboard (e.g. derived investments)
+      exclude_from_tracking INTEGER DEFAULT 0, -- 1 = exclude from investment_metrics_daily calculations and dashboard (e.g. derived investments)
       is_dirty_daily_values INTEGER DEFAULT 0,
       dirty_from_date TEXT,
       last_active_date TEXT,
@@ -179,7 +201,7 @@ function initializeDb(db) {
     );
 
     -- Daily snapshot of each investment's value (per portfolio + combined)
-    CREATE TABLE IF NOT EXISTS daily_values (
+    CREATE TABLE IF NOT EXISTS investment_metrics_daily (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       investment_id INTEGER NOT NULL,
       portfolio_id INTEGER,          -- NULL = combined/all portfolios
@@ -187,9 +209,9 @@ function initializeDb(db) {
       price_per_unit REAL,         -- NAV or stock price
       total_units REAL,            -- Total units held on that day
       current_value REAL NOT NULL, -- total_units * price_per_unit
-      invested_amount REAL NOT NULL, -- Total amount invested till date
-      realized_proceeds REAL DEFAULT 0, -- Cumulative cash out (realized proceeds)
-      profit_loss REAL NOT NULL,   -- current_value - invested_amount
+      invested_amount REAL NOT NULL, -- canonical attribution basis (written by the projection engine)
+      realized_proceeds REAL DEFAULT 0, -- canonical attribution proceeds (written by the projection engine)
+      profit_loss REAL NOT NULL,   -- canonical uniform-target P&L (written by the projection engine)
       price_source TEXT DEFAULT 'LIVE' CHECK(price_source IN ('LIVE', 'LOCF', 'COMPUTED', 'PRE', 'POST')),
       day_change REAL DEFAULT 0,   -- Change from previous day
       updated_at TEXT DEFAULT (datetime('now')),
@@ -197,37 +219,44 @@ function initializeDb(db) {
       UNIQUE(investment_id, portfolio_id, date)
     );
 
-    -- Portfolio-level daily snapshot (one row per portfolio per day, plus NULL portfolio_id = combined)
-    CREATE TABLE IF NOT EXISTS portfolio_daily (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      portfolio_id INTEGER,        -- NULL means combined/all portfolios
-      date TEXT NOT NULL,
-      total_value REAL NOT NULL,
-      total_invested REAL NOT NULL,
-      total_profit_loss REAL NOT NULL,
-      total_profit_loss_pct REAL,
-      day_change REAL DEFAULT 0,
-      day_change_pct REAL DEFAULT 0,
-      created_at TEXT DEFAULT (datetime('now')),
-      UNIQUE(portfolio_id, date)
-    );
+    -- ── Canonical rollup storage (written by the canonical projection engine) ──
+    -- The authoritative asset/portfolio daily rollups. Per-investment canonical metrics live on
+    -- investment_metrics_daily itself; the legacy portfolio_daily/asset_type_daily rollups have been dropped.
+    -- calculation_version stamps the accounting-policy generation (transactionEffectPolicy
+    -- CALCULATION_VERSION); source_data_version stamps the dashboard data version at write time.
 
-    -- Asset-type level daily snapshot (per portfolio + combined/null portfolio)
-    CREATE TABLE IF NOT EXISTS asset_type_daily (
+    -- Asset-type-scope canonical daily metrics. P&L is before portfolio-only expenses.
+    CREATE TABLE IF NOT EXISTS asset_metrics_daily (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       portfolio_id INTEGER,
       asset_type TEXT NOT NULL,
       date TEXT NOT NULL,
-      total_value REAL NOT NULL,
-      total_invested REAL NOT NULL,
+      current_value REAL NOT NULL,
+      attribution_basis REAL NOT NULL,
+      attribution_proceeds REAL NOT NULL DEFAULT 0,
+      profit_loss_before_portfolio_expenses REAL NOT NULL,
+      day_change REAL NOT NULL DEFAULT 0,
+      calculation_version INTEGER NOT NULL,
+      source_data_version INTEGER,
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(portfolio_id, asset_type, date, calculation_version)
+    );
+
+    -- Portfolio-scope canonical daily metrics. Compact rebuildable cache; portfolio expenses are
+    -- already applied into total_profit_loss. net_invested = external basis less cash proceeds.
+    CREATE TABLE IF NOT EXISTS portfolio_metrics_daily (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      portfolio_id INTEGER,
+      date TEXT NOT NULL,
+      current_value REAL NOT NULL,
+      net_invested REAL NOT NULL,
+      realized_proceeds REAL NOT NULL DEFAULT 0,
       total_profit_loss REAL NOT NULL,
-      total_realized_proceeds REAL DEFAULT 0,
-      total_unrealized_gain REAL DEFAULT 0,
-      total_profit_loss_pct REAL,
-      day_change REAL DEFAULT 0,
-      day_change_pct REAL DEFAULT 0,
-      created_at TEXT DEFAULT (datetime('now')),
-      UNIQUE(portfolio_id, asset_type, date)
+      total_day_change REAL NOT NULL DEFAULT 0,
+      calculation_version INTEGER NOT NULL,
+      source_data_version INTEGER,
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(portfolio_id, date, calculation_version)
     );
 
     -- PPF/SSY/PF interest rates history
@@ -326,19 +355,19 @@ function initializeDb(db) {
     );
 
     -- Indexes for faster queries
-    CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date);
-    CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date);
-    CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id);
-    CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id);
-    CREATE INDEX IF NOT EXISTS idx_daily_values_investment_portfolio_date_source ON daily_values(investment_id, portfolio_id, date, price_source);
-    CREATE INDEX IF NOT EXISTS idx_daily_values_source_date_investment_portfolio ON daily_values(price_source, date, investment_id, portfolio_id);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_date ON investment_metrics_daily(date);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON investment_metrics_daily(portfolio_id, investment_id, date);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON investment_metrics_daily(portfolio_id, date, investment_id);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON investment_metrics_daily(date, investment_id, portfolio_id);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_investment_portfolio_date_source ON investment_metrics_daily(investment_id, portfolio_id, date, price_source);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_source_date_investment_portfolio ON investment_metrics_daily(price_source, date, investment_id, portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_investment ON transactions(investment_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(transaction_date);
     CREATE INDEX IF NOT EXISTS idx_transactions_investment_portfolio_date ON transactions(investment_id, portfolio_id, transaction_date);
-    CREATE INDEX IF NOT EXISTS idx_portfolio_daily_date ON portfolio_daily(date);
-    CREATE INDEX IF NOT EXISTS idx_portfolio_daily_portfolio ON portfolio_daily(portfolio_id, date);
-    CREATE INDEX IF NOT EXISTS idx_asset_type_daily_portfolio_date ON asset_type_daily(portfolio_id, date);
-    CREATE INDEX IF NOT EXISTS idx_asset_type_daily_type_date ON asset_type_daily(asset_type, date);
+    CREATE INDEX IF NOT EXISTS idx_asset_metrics_portfolio_date ON asset_metrics_daily(portfolio_id, date, calculation_version);
+    CREATE INDEX IF NOT EXISTS idx_asset_metrics_type_date ON asset_metrics_daily(asset_type, date, calculation_version);
+    CREATE INDEX IF NOT EXISTS idx_portfolio_metrics_latest ON portfolio_metrics_daily(portfolio_id, date DESC, calculation_version);
+    CREATE INDEX IF NOT EXISTS idx_portfolio_metrics_date ON portfolio_metrics_daily(date, calculation_version);
     CREATE INDEX IF NOT EXISTS idx_transactions_portfolio ON transactions(portfolio_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_portfolio_investment ON transactions(portfolio_id, investment_id);
     CREATE INDEX IF NOT EXISTS idx_stock_intraday_portfolio_date ON stock_intraday_trades(portfolio_id, trade_date);
@@ -450,11 +479,27 @@ function initializeDb(db) {
     -- Dashboard performance optimization indexes
     CREATE INDEX IF NOT EXISTS idx_transactions_investment_portfolio ON transactions(investment_id, portfolio_id, transaction_date);
     CREATE INDEX IF NOT EXISTS idx_transactions_price_lookup ON transactions(investment_id, price_per_unit DESC, transaction_date DESC);
-    CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON daily_values(investment_id, portfolio_id, date DESC);
-    CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date DESC);
-    CREATE INDEX IF NOT EXISTS idx_portfolio_daily_latest ON portfolio_daily(portfolio_id, date DESC);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON investment_metrics_daily(investment_id, portfolio_id, date DESC);
+    CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON investment_metrics_daily(investment_id, date DESC);
     CREATE INDEX IF NOT EXISTS idx_market_holidays_date ON market_holidays(date);
   `);
+
+  // Retire the legacy rollup tables: all reads/writes now use the canonical V2 rollups
+  // (portfolio_metrics_daily_v2 / asset_metrics_daily_v2). Dropping a table also drops its
+  // indexes and NOT-NULL triggers. Idempotent; nothing recreates these tables.
+  db.exec('DROP TABLE IF EXISTS portfolio_daily');
+  db.exec('DROP TABLE IF EXISTS asset_type_daily');
+
+  // Additive column for the canonical portfolio projection so the portfolio card is
+  // self-sufficient (net_invested alone cannot recover gross basis or proceeds).
+  const pmv2Cols = db.prepare("PRAGMA table_info(portfolio_metrics_daily)").all().map((c) => c.name);
+  if (!pmv2Cols.includes('realized_proceeds')) {
+    db.exec('ALTER TABLE portfolio_metrics_daily ADD COLUMN realized_proceeds REAL NOT NULL DEFAULT 0');
+  }
+
+  // Per-investment canonical metrics were merged back onto investment_metrics_daily (single per-investment
+  // table). Drop the now-redundant investment_metrics_daily_v2 table if it lingers from before.
+  db.exec('DROP TABLE IF EXISTS investment_metrics_daily_v2');
 
   const migrationsEnabled = !isProductionMode() || process.env.ALLOW_DB_MIGRATIONS === 'true';
 
@@ -707,7 +752,7 @@ function initializeDb(db) {
     recordMigration(db, '20260412-add-investments-is-active', 'skipped', 'already present');
   }
 
-  // Add exclude_from_tracking column for skipping derived/synthetic investments in daily_values and dashboard
+  // Add exclude_from_tracking column for skipping derived/synthetic investments in investment_metrics_daily and dashboard
   if (requireMigrationsEnabled('20260412-add-investments-exclude-from-tracking', !invCols.includes('exclude_from_tracking'), 'investments.exclude_from_tracking missing')) {
     db.exec("ALTER TABLE investments ADD COLUMN exclude_from_tracking INTEGER DEFAULT 0");
     assertDbIntegrity(db, '20260412-add-investments-exclude-from-tracking');
@@ -1049,42 +1094,23 @@ function initializeDb(db) {
     recordMigration(db, ssyMigrationId, 'skipped', 'SSY already present');
   }
 
-  // ── Migration: add portfolio_id to daily_values ──────────────────────
+  // ── Migration: add portfolio_id to investment_metrics_daily ──────────────────────
   // SAFE: Only add column if missing; don't drop data (these are caches, not source data)
-  const dvCols = db.prepare("PRAGMA table_info(daily_values)").all().map(c => c.name);
-  if (requireMigrationsEnabled('20260412-add-daily-values-portfolio-id', !dvCols.includes('portfolio_id'), 'daily_values.portfolio_id missing')) {
-    console.log('Migrating daily_values: adding portfolio_id column (preserving old data)...');
+  const dvCols = db.prepare("PRAGMA table_info(investment_metrics_daily)").all().map(c => c.name);
+  if (requireMigrationsEnabled('20260412-add-daily-values-portfolio-id', !dvCols.includes('portfolio_id'), 'investment_metrics_daily.portfolio_id missing')) {
+    console.log('Migrating investment_metrics_daily: adding portfolio_id column (preserving old data)...');
     try {
-      db.exec('ALTER TABLE daily_values ADD COLUMN portfolio_id INTEGER DEFAULT NULL');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON daily_values(portfolio_id, date)');
+      db.exec('ALTER TABLE investment_metrics_daily ADD COLUMN portfolio_id INTEGER DEFAULT NULL');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON investment_metrics_daily(portfolio_id, date)');
       assertDbIntegrity(db, '20260412-add-daily-values-portfolio-id');
       recordMigration(db, '20260412-add-daily-values-portfolio-id', 'applied');
-      console.log('Migration complete: portfolio_id column added to daily_values.');
+      console.log('Migration complete: portfolio_id column added to investment_metrics_daily.');
     } catch (err) {
       // If ALTER fails, it's likely already present; continue
-      console.log('daily_values portfolio_id migration: column may already exist or table is new');
+      console.log('investment_metrics_daily portfolio_id migration: column may already exist or table is new');
     }
   } else if (!hasMigrationRecord(db, '20260412-add-daily-values-portfolio-id') && dvCols.includes('portfolio_id')) {
     recordMigration(db, '20260412-add-daily-values-portfolio-id', 'skipped', 'already present');
-  }
-
-  const pdCols = db.prepare("PRAGMA table_info(portfolio_daily)").all().map(c => c.name);
-  if (requireMigrationsEnabled('20260412-add-portfolio-daily-day-change', !pdCols.includes('day_change'), 'portfolio_daily.day_change missing')) {
-    console.log('Migrating portfolio_daily: adding day_change columns...');
-    try {
-      db.exec('ALTER TABLE portfolio_daily ADD COLUMN day_change REAL DEFAULT 0');
-      db.exec('ALTER TABLE portfolio_daily ADD COLUMN day_change_pct REAL DEFAULT 0');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_portfolio_daily_date ON portfolio_daily(date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_portfolio_daily_portfolio ON portfolio_daily(portfolio_id, date)');
-      assertDbIntegrity(db, '20260412-add-portfolio-daily-day-change');
-      recordMigration(db, '20260412-add-portfolio-daily-day-change', 'applied');
-      console.log('Migration complete: portfolio_daily columns added.');
-    } catch (err) {
-      // If ALTER fails, it's likely already present; continue
-      console.log('portfolio_daily migration: columns may already exist or table is new');
-    }
-  } else if (!hasMigrationRecord(db, '20260412-add-portfolio-daily-day-change') && pdCols.includes('day_change')) {
-    recordMigration(db, '20260412-add-portfolio-daily-day-change', 'skipped', 'already present');
   }
 
   // ── Migration: add EPS_CONTRIBUTION transaction_type + merge EPS investments ──────
@@ -1987,23 +2013,23 @@ function initializeDb(db) {
     recordMigration(db, '20260510-add-dirty-backfill-scope-table', 'skipped', 'already present');
   }
 
-  // ── Migration: ensure daily_values price_source + realized_proceeds columns ─────
-  const dvColsNow = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
+  // ── Migration: ensure investment_metrics_daily price_source + realized_proceeds columns ─────
+  const dvColsNow = new Set(db.prepare('PRAGMA table_info(investment_metrics_daily)').all().map((c) => c.name));
   const dailyValuesEnhancementId = '20260524-daily-values-price-source-realized-proceeds';
   if (requireMigrationsEnabled(
     dailyValuesEnhancementId,
     !dvColsNow.has('price_source') || !dvColsNow.has('realized_proceeds'),
-    'daily_values price_source/realized_proceeds missing'
+    'investment_metrics_daily price_source/realized_proceeds missing'
   )) {
     db.exec('BEGIN');
     try {
       if (!dvColsNow.has('price_source')) {
-        db.exec("ALTER TABLE daily_values ADD COLUMN price_source TEXT DEFAULT 'LIVE'");
+        db.exec("ALTER TABLE investment_metrics_daily ADD COLUMN price_source TEXT DEFAULT 'LIVE'");
       }
       if (dvColsNow.has('realized_gain') && !dvColsNow.has('realized_proceeds')) {
-        db.exec('ALTER TABLE daily_values RENAME COLUMN realized_gain TO realized_proceeds');
+        db.exec('ALTER TABLE investment_metrics_daily RENAME COLUMN realized_gain TO realized_proceeds');
       } else if (!dvColsNow.has('realized_proceeds')) {
-        db.exec('ALTER TABLE daily_values ADD COLUMN realized_proceeds REAL DEFAULT 0');
+        db.exec('ALTER TABLE investment_metrics_daily ADD COLUMN realized_proceeds REAL DEFAULT 0');
       }
       db.exec('COMMIT');
       assertDbIntegrity(db, dailyValuesEnhancementId);
@@ -2016,8 +2042,8 @@ function initializeDb(db) {
     recordMigration(db, dailyValuesEnhancementId, 'skipped', 'already present');
   }
 
-  // ── Migration: rationalize daily_values columns (drop derived columns, add updated_at) ──
-  const dvColsRationalize = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
+  // ── Migration: rationalize investment_metrics_daily columns (drop derived columns, add updated_at) ──
+  const dvColsRationalize = new Set(db.prepare('PRAGMA table_info(investment_metrics_daily)').all().map((c) => c.name));
   const dailyValuesRationalizationId = '20260528-daily-values-column-rationalization';
   const dailyValuesNeedsRationalization =
     dvColsRationalize.has('profit_loss_pct')
@@ -2028,9 +2054,9 @@ function initializeDb(db) {
   if (requireMigrationsEnabled(
     dailyValuesRationalizationId,
     dailyValuesNeedsRationalization,
-    'daily_values has legacy derived/timestamp columns'
+    'investment_metrics_daily has legacy derived/timestamp columns'
   )) {
-    const beforeDailyCount = getTableCount(db, 'daily_values');
+    const beforeDailyCount = getTableCount(db, 'investment_metrics_daily');
     const updatedAtExpr = dvColsRationalize.has('updated_at')
       ? (dvColsRationalize.has('created_at')
         ? 'COALESCE(updated_at, created_at, datetime(\'now\'))'
@@ -2093,47 +2119,47 @@ function initializeDb(db) {
           ${priceSourceExpr},
           ${dayChangeExpr},
           ${updatedAtExpr}
-        FROM daily_values
+        FROM investment_metrics_daily
       `);
 
-      db.exec('DROP TABLE daily_values');
-      db.exec('ALTER TABLE daily_values_new RENAME TO daily_values');
+      db.exec('DROP TABLE investment_metrics_daily');
+      db.exec('ALTER TABLE daily_values_new RENAME TO investment_metrics_daily');
 
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON daily_values(portfolio_id, date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON daily_values(investment_id, portfolio_id, date DESC)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON investment_metrics_daily(date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON investment_metrics_daily(portfolio_id, investment_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON investment_metrics_daily(portfolio_id, date, investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON investment_metrics_daily(date, investment_id, portfolio_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON investment_metrics_daily(portfolio_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON investment_metrics_daily(investment_id, portfolio_id, date DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON investment_metrics_daily(investment_id, date DESC)');
 
       // Recreate NOT NULL enforcement triggers dropped during table rebuild.
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_insert
-        BEFORE INSERT ON daily_values
+        BEFORE INSERT ON investment_metrics_daily
         WHEN NEW.portfolio_id IS NULL
         BEGIN
-          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+          SELECT RAISE(ABORT, 'investment_metrics_daily.portfolio_id must be non-null');
         END;
       `);
 
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_update
-        BEFORE UPDATE OF portfolio_id ON daily_values
+        BEFORE UPDATE OF portfolio_id ON investment_metrics_daily
         WHEN NEW.portfolio_id IS NULL
         BEGIN
-          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+          SELECT RAISE(ABORT, 'investment_metrics_daily.portfolio_id must be non-null');
         END;
       `);
 
       db.exec('COMMIT');
       db.exec('PRAGMA foreign_keys = ON');
 
-      const afterDailyCount = getTableCount(db, 'daily_values');
+      const afterDailyCount = getTableCount(db, 'investment_metrics_daily');
       ensureRowCountPreserved({
         before: beforeDailyCount,
         after: afterDailyCount,
-        table: 'daily_values',
+        table: 'investment_metrics_daily',
         migrationName: dailyValuesRationalizationId,
       });
 
@@ -2153,20 +2179,20 @@ function initializeDb(db) {
     recordMigration(db, dailyValuesRationalizationId, 'skipped', 'already rationalized');
   }
 
-  // ── Migration: remove ILLIQUID_CARRY from daily_values.price_source CHECK constraint ──
+  // ── Migration: remove ILLIQUID_CARRY from investment_metrics_daily.price_source CHECK constraint ──
   const dailyValuesConstraintMigrationId = '20260531-daily-values-price-source-remove-illiquid-carry';
   const dailyValuesTableSql = String(
-    db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_values'").get()?.sql || ''
+    db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='investment_metrics_daily'").get()?.sql || ''
   ).toUpperCase();
   const hasIlliquidCarryInConstraint = dailyValuesTableSql.includes("'ILLIQUID_CARRY'");
 
   if (requireMigrationsEnabled(
     dailyValuesConstraintMigrationId,
     hasIlliquidCarryInConstraint,
-    'daily_values.price_source CHECK still includes ILLIQUID_CARRY'
+    'investment_metrics_daily.price_source CHECK still includes ILLIQUID_CARRY'
   )) {
-    const dvColsConstraint = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
-    const beforeDailyCount = getTableCount(db, 'daily_values');
+    const dvColsConstraint = new Set(db.prepare('PRAGMA table_info(investment_metrics_daily)').all().map((c) => c.name));
+    const beforeDailyCount = getTableCount(db, 'investment_metrics_daily');
     const updatedAtExpr = dvColsConstraint.has('updated_at')
       ? (dvColsConstraint.has('created_at')
         ? 'COALESCE(updated_at, created_at, datetime(\'now\'))'
@@ -2231,46 +2257,46 @@ function initializeDb(db) {
           ${priceSourceExpr},
           ${dayChangeExpr},
           ${updatedAtExpr}
-        FROM daily_values
+        FROM investment_metrics_daily
       `);
 
-      db.exec('DROP TABLE daily_values');
-      db.exec('ALTER TABLE daily_values_new RENAME TO daily_values');
+      db.exec('DROP TABLE investment_metrics_daily');
+      db.exec('ALTER TABLE daily_values_new RENAME TO investment_metrics_daily');
 
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON daily_values(portfolio_id, date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON daily_values(investment_id, portfolio_id, date DESC)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON investment_metrics_daily(date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON investment_metrics_daily(portfolio_id, investment_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON investment_metrics_daily(portfolio_id, date, investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON investment_metrics_daily(date, investment_id, portfolio_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON investment_metrics_daily(portfolio_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON investment_metrics_daily(investment_id, portfolio_id, date DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON investment_metrics_daily(investment_id, date DESC)');
 
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_insert
-        BEFORE INSERT ON daily_values
+        BEFORE INSERT ON investment_metrics_daily
         WHEN NEW.portfolio_id IS NULL
         BEGIN
-          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+          SELECT RAISE(ABORT, 'investment_metrics_daily.portfolio_id must be non-null');
         END;
       `);
 
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_update
-        BEFORE UPDATE OF portfolio_id ON daily_values
+        BEFORE UPDATE OF portfolio_id ON investment_metrics_daily
         WHEN NEW.portfolio_id IS NULL
         BEGIN
-          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+          SELECT RAISE(ABORT, 'investment_metrics_daily.portfolio_id must be non-null');
         END;
       `);
 
       db.exec('COMMIT');
       db.exec('PRAGMA foreign_keys = ON');
 
-      const afterDailyCount = getTableCount(db, 'daily_values');
+      const afterDailyCount = getTableCount(db, 'investment_metrics_daily');
       ensureRowCountPreserved({
         before: beforeDailyCount,
         after: afterDailyCount,
-        table: 'daily_values',
+        table: 'investment_metrics_daily',
         migrationName: dailyValuesConstraintMigrationId,
       });
 
@@ -2290,22 +2316,22 @@ function initializeDb(db) {
     recordMigration(db, dailyValuesConstraintMigrationId, 'skipped', 'constraint already excludes ILLIQUID_CARRY');
   }
 
-  // ── Migration: add PRE and POST to daily_values.price_source CHECK constraint ──
+  // ── Migration: add PRE and POST to investment_metrics_daily.price_source CHECK constraint ──
   // Required to store FOREIGN_STOCK pre-market ('PRE') and after-hours ('POST') prices
   // as distinct, upgradeable sources rather than collapsing them to 'LIVE'.
   const dailyValuesPrepPostMigrationId = '20260616-daily-values-price-source-add-pre-post';
   const currentDvTableSql = String(
-    db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_values'").get()?.sql || ''
+    db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='investment_metrics_daily'").get()?.sql || ''
   );
   const needsPrePostConstraint = !currentDvTableSql.includes("'PRE'");
 
   if (requireMigrationsEnabled(
     dailyValuesPrepPostMigrationId,
     needsPrePostConstraint,
-    "daily_values.price_source CHECK does not include 'PRE'/'POST'"
+    "investment_metrics_daily.price_source CHECK does not include 'PRE'/'POST'"
   )) {
-    const dvColsPrePost = new Set(db.prepare('PRAGMA table_info(daily_values)').all().map((c) => c.name));
-    const beforeCountPrePost = getTableCount(db, 'daily_values');
+    const dvColsPrePost = new Set(db.prepare('PRAGMA table_info(investment_metrics_daily)').all().map((c) => c.name));
+    const beforeCountPrePost = getTableCount(db, 'investment_metrics_daily');
     const updatedAtExprPP = dvColsPrePost.has('updated_at')
       ? (dvColsPrePost.has('created_at')
         ? "COALESCE(updated_at, created_at, datetime('now'))"
@@ -2364,33 +2390,33 @@ function initializeDb(db) {
           id, investment_id, portfolio_id, date, price_per_unit, total_units,
           current_value, invested_amount, ${realizedProceedsExprPP}, profit_loss,
           ${priceSourceExprPP}, ${dayChangeExprPP}, ${updatedAtExprPP}
-        FROM daily_values
+        FROM investment_metrics_daily
       `);
-      db.exec('DROP TABLE daily_values');
-      db.exec('ALTER TABLE daily_values_new RENAME TO daily_values');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON daily_values(date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON daily_values(portfolio_id, investment_id, date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON daily_values(portfolio_id, date, investment_id)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON daily_values(date, investment_id, portfolio_id)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON daily_values(portfolio_id, date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON daily_values(investment_id, portfolio_id, date DESC)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON daily_values(investment_id, date DESC)');
+      db.exec('DROP TABLE investment_metrics_daily');
+      db.exec('ALTER TABLE daily_values_new RENAME TO investment_metrics_daily');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date ON investment_metrics_daily(date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_inv_date ON investment_metrics_daily(portfolio_id, investment_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio_date_investment ON investment_metrics_daily(portfolio_id, date, investment_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_date_investment_portfolio ON investment_metrics_daily(date, investment_id, portfolio_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_portfolio ON investment_metrics_daily(portfolio_id, date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_latest_lookup ON investment_metrics_daily(investment_id, portfolio_id, date DESC)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_daily_values_investment_date ON investment_metrics_daily(investment_id, date DESC)');
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_insert
-        BEFORE INSERT ON daily_values WHEN NEW.portfolio_id IS NULL
-        BEGIN SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null'); END;
+        BEFORE INSERT ON investment_metrics_daily WHEN NEW.portfolio_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'investment_metrics_daily.portfolio_id must be non-null'); END;
       `);
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_update
-        BEFORE UPDATE OF portfolio_id ON daily_values WHEN NEW.portfolio_id IS NULL
-        BEGIN SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null'); END;
+        BEFORE UPDATE OF portfolio_id ON investment_metrics_daily WHEN NEW.portfolio_id IS NULL
+        BEGIN SELECT RAISE(ABORT, 'investment_metrics_daily.portfolio_id must be non-null'); END;
       `);
       db.exec('COMMIT');
       db.exec('PRAGMA foreign_keys = ON');
-      const afterCountPrePost = getTableCount(db, 'daily_values');
+      const afterCountPrePost = getTableCount(db, 'investment_metrics_daily');
       ensureRowCountPreserved({
         before: beforeCountPrePost, after: afterCountPrePost,
-        table: 'daily_values', migrationName: dailyValuesPrepPostMigrationId,
+        table: 'investment_metrics_daily', migrationName: dailyValuesPrepPostMigrationId,
       });
       assertDbIntegrity(db, dailyValuesPrepPostMigrationId);
       recordMigration(
@@ -2415,58 +2441,6 @@ function initializeDb(db) {
     recordMigration(db, lastActiveMigrationId, 'applied');
   } else if (!hasMigrationRecord(db, lastActiveMigrationId) && invColsLatest.has('last_active_date')) {
     recordMigration(db, lastActiveMigrationId, 'skipped', 'already present');
-  }
-
-  // ── Migration: add asset_type_daily table ─────────────────────────────────
-  const hasAssetTypeDaily = !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='asset_type_daily'").get();
-  const assetTypeDailyMigrationId = '20260510-add-asset-type-daily-table';
-  if (requireMigrationsEnabled(assetTypeDailyMigrationId, !hasAssetTypeDaily, 'asset_type_daily missing')) {
-    db.exec('BEGIN');
-    try {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS asset_type_daily (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          portfolio_id INTEGER,
-          asset_type TEXT NOT NULL,
-          date TEXT NOT NULL,
-          total_value REAL NOT NULL,
-          total_invested REAL NOT NULL,
-          total_profit_loss REAL NOT NULL,
-          total_realized_proceeds REAL DEFAULT 0,
-          total_unrealized_gain REAL DEFAULT 0,
-          total_profit_loss_pct REAL,
-          day_change REAL DEFAULT 0,
-          day_change_pct REAL DEFAULT 0,
-          created_at TEXT DEFAULT (datetime('now')),
-          UNIQUE(portfolio_id, asset_type, date)
-        )
-      `);
-      db.exec('CREATE INDEX IF NOT EXISTS idx_asset_type_daily_portfolio_date ON asset_type_daily(portfolio_id, date)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_asset_type_daily_type_date ON asset_type_daily(asset_type, date)');
-      db.exec('COMMIT');
-      assertDbIntegrity(db, assetTypeDailyMigrationId);
-      recordMigration(db, assetTypeDailyMigrationId, 'applied');
-    } catch (e) {
-      db.exec('ROLLBACK');
-      throw e;
-    }
-  } else if (!hasMigrationRecord(db, assetTypeDailyMigrationId) && hasAssetTypeDaily) {
-    recordMigration(db, assetTypeDailyMigrationId, 'skipped', 'already present');
-  }
-
-  // ── Migration: rename asset_type_daily total_realized_gain -> total_realized_proceeds ──
-  const assetTypeDailyCols = new Set(db.prepare('PRAGMA table_info(asset_type_daily)').all().map((c) => c.name));
-  const assetTypeDailyRenameMigrationId = '20260524-asset-type-daily-total-realized-proceeds';
-  if (requireMigrationsEnabled(
-    assetTypeDailyRenameMigrationId,
-    assetTypeDailyCols.has('total_realized_gain') && !assetTypeDailyCols.has('total_realized_proceeds'),
-    'asset_type_daily total_realized_proceeds missing'
-  )) {
-    db.exec('ALTER TABLE asset_type_daily RENAME COLUMN total_realized_gain TO total_realized_proceeds');
-    assertDbIntegrity(db, assetTypeDailyRenameMigrationId);
-    recordMigration(db, assetTypeDailyRenameMigrationId, 'applied');
-  } else if (!hasMigrationRecord(db, assetTypeDailyRenameMigrationId) && assetTypeDailyCols.has('total_realized_proceeds')) {
-    recordMigration(db, assetTypeDailyRenameMigrationId, 'skipped', 'already present');
   }
 
   // ── Migration: add historical_price_repair_scope table ───────────────────
@@ -2703,67 +2677,29 @@ function ensureRemoveCombinedAggregatesMigration(db) {
   if (!hasMigration) {
     db.exec('BEGIN');
     try {
-      const deletedDaily = db.prepare('DELETE FROM daily_values WHERE portfolio_id IS NULL').run().changes;
-      const deletedPortfolio = db.prepare('DELETE FROM portfolio_daily WHERE portfolio_id IS NULL').run().changes;
-      const deletedAssetType = db.prepare('DELETE FROM asset_type_daily WHERE portfolio_id IS NULL').run().changes;
+      const deletedDaily = db.prepare('DELETE FROM investment_metrics_daily WHERE portfolio_id IS NULL').run().changes;
 
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_insert
-        BEFORE INSERT ON daily_values
+        BEFORE INSERT ON investment_metrics_daily
         WHEN NEW.portfolio_id IS NULL
         BEGIN
-          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
+          SELECT RAISE(ABORT, 'investment_metrics_daily.portfolio_id must be non-null');
         END;
       `);
 
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS trg_daily_values_portfolio_not_null_update
-        BEFORE UPDATE OF portfolio_id ON daily_values
+        BEFORE UPDATE OF portfolio_id ON investment_metrics_daily
         WHEN NEW.portfolio_id IS NULL
         BEGIN
-          SELECT RAISE(ABORT, 'daily_values.portfolio_id must be non-null');
-        END;
-      `);
-
-      db.exec(`
-        CREATE TRIGGER IF NOT EXISTS trg_portfolio_daily_portfolio_not_null_insert
-        BEFORE INSERT ON portfolio_daily
-        WHEN NEW.portfolio_id IS NULL
-        BEGIN
-          SELECT RAISE(ABORT, 'portfolio_daily.portfolio_id must be non-null');
-        END;
-      `);
-
-      db.exec(`
-        CREATE TRIGGER IF NOT EXISTS trg_portfolio_daily_portfolio_not_null_update
-        BEFORE UPDATE OF portfolio_id ON portfolio_daily
-        WHEN NEW.portfolio_id IS NULL
-        BEGIN
-          SELECT RAISE(ABORT, 'portfolio_daily.portfolio_id must be non-null');
-        END;
-      `);
-
-      db.exec(`
-        CREATE TRIGGER IF NOT EXISTS trg_asset_type_daily_portfolio_not_null_insert
-        BEFORE INSERT ON asset_type_daily
-        WHEN NEW.portfolio_id IS NULL
-        BEGIN
-          SELECT RAISE(ABORT, 'asset_type_daily.portfolio_id must be non-null');
-        END;
-      `);
-
-      db.exec(`
-        CREATE TRIGGER IF NOT EXISTS trg_asset_type_daily_portfolio_not_null_update
-        BEFORE UPDATE OF portfolio_id ON asset_type_daily
-        WHEN NEW.portfolio_id IS NULL
-        BEGIN
-          SELECT RAISE(ABORT, 'asset_type_daily.portfolio_id must be non-null');
+          SELECT RAISE(ABORT, 'investment_metrics_daily.portfolio_id must be non-null');
         END;
       `);
 
       db.exec('COMMIT');
       assertDbIntegrity(db, migrationId);
-      const notes = `removed NULL rows daily_values=${deletedDaily}, portfolio_daily=${deletedPortfolio}, asset_type_daily=${deletedAssetType}`;
+      const notes = `removed NULL rows investment_metrics_daily=${deletedDaily}`;
       db.prepare(`
         INSERT OR REPLACE INTO schema_migrations (id, status, notes, applied_at)
         VALUES (?, ?, ?, datetime('now'))

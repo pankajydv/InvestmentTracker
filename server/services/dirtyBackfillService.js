@@ -256,7 +256,7 @@ function parseJsonSafe(value) {
 
 /**
  * Select active tracked scopes that are genuinely BEHIND on recent daily values:
- * scopes with no daily_values rows at all, or whose latest materialized row predates
+ * scopes with no investment_metrics_daily rows at all, or whose latest materialized row predates
  * yesterday. Scopes that are current through yesterday (today may still be an expected
  * LOCF) are intentionally excluded so we don't re-backfill already-fresh data.
  */
@@ -276,7 +276,7 @@ function enqueueBehindTrackedScopes(db, runDate, dirtyFromDate, reason, sourceEv
       ), 0) AS net_units,
       (
         SELECT MAX(dv.date)
-        FROM daily_values dv
+        FROM investment_metrics_daily dv
         WHERE dv.investment_id = i.id AND dv.portfolio_id = t.portfolio_id
       ) AS latest_dv_date
     FROM investments i
@@ -696,7 +696,7 @@ function markNPSInvestmentsDirtyFromTransactions(db) {
   `).all();
 
   for (const { investment_id: investmentId, earliest_date: dirtyFromDate } of transactions) {
-    markNPSDirty(db, investmentId, dirtyFromDate, 'Reprocessing NPS daily_values');
+    markNPSDirty(db, investmentId, dirtyFromDate, 'Reprocessing NPS investment_metrics_daily');
   }
 }
 

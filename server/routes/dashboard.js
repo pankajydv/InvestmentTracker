@@ -3,6 +3,10 @@ const router = express.Router();
 const { getMarketSessionDates } = require('../services/marketPriceCache');
 const { calculateIntervalXIRR } = require('../services/xirrCalculator');
 const { getCachedXirr, generateCacheKey } = require('../services/xirrCacheService');
+const { isInternalXirrCashflow, isAccrualOnlyXirrCashflow } = require('../services/xirrClassification');
+const { computeXirrRate: calculateXirr } = require('../services/xirrMath');
+const { getPortfolioV2Latest, getPortfolioV2History, getAssetAllocationV2, getAssetTypeHistoryV2, getRolloverV2 } = require('../services/canonicalReadModel');
+const { CALCULATION_VERSION } = require('../services/transactionEffectPolicy');
 const {
   isSnapshotEnabled,
   ensureDashboardSnapshotTable,
@@ -39,7 +43,6 @@ const INTERNAL_RECEIVED_TYPES = new Set(COST_BASIS_RECEIVED_TYPES_NO_INTEREST);
 
 const INTERNAL_BALANCE_ASSET_TYPES_SQL = "'PF','PPF','SSY'";
 
-const INTERNAL_BALANCE_XIRR_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES = new Set(['PF', 'PPF', 'SSY']);
 const MARKET_LINKED_DAY_CHANGE_ASSET_TYPES = new Set([
   'INDIAN_STOCK',
@@ -49,81 +52,6 @@ const MARKET_LINKED_DAY_CHANGE_ASSET_TYPES = new Set([
   'NPS',
 ]);
 const MAX_NON_LOCF_SESSION_LAG = DAY_CHANGE_FALLBACK_MAX_LAG_SESSIONS;
-
-function isInternalXirrCashflow(assetType, transactionType) {
-  const normalizedAssetType = String(assetType || '').toUpperCase();
-  const normalizedType = String(transactionType || '').toUpperCase();
-
-  if (!INTERNAL_BALANCE_XIRR_ASSET_TYPES.has(normalizedAssetType)) {
-    return false;
-  }
-
-  if (normalizedType === 'INTEREST' || normalizedType === 'TDS') {
-    return true;
-  }
-
-  return normalizedType === 'RECONCILE';
-}
-
-function isAccrualOnlyXirrCashflow(transactionType, notes) {
-  const normalizedType = String(transactionType || '').toUpperCase();
-  if (normalizedType !== 'INTEREST') return false;
-  const noteText = String(notes || '').toUpperCase();
-  return noteText.includes('AUTO_ACCRUAL_INTERNAL') || noteText.includes('ACCRUAL_ONLY_INTERNAL');
-}
-
-function xnpv(rate, flows, baseDate) {
-  const msPerDay = 24 * 60 * 60 * 1000;
-  return flows.reduce((sum, flow) => {
-    const years = (flow.date - baseDate) / msPerDay / 365;
-    return sum + flow.amount / ((1 + rate) ** years);
-  }, 0);
-}
-
-function calculateXirr(flows) {
-  if (!Array.isArray(flows) || flows.length < 2) return null;
-
-  let hasPositive = false;
-  let hasNegative = false;
-  for (const flow of flows) {
-    if (flow.amount > 0) hasPositive = true;
-    if (flow.amount < 0) hasNegative = true;
-  }
-  if (!hasPositive || !hasNegative) return null;
-
-  const sortedFlows = [...flows].sort((a, b) => a.date - b.date);
-  const baseDate = sortedFlows[0].date;
-
-  let low = -0.9999;
-  let high = 10;
-  let fLow = xnpv(low, sortedFlows, baseDate);
-  let fHigh = xnpv(high, sortedFlows, baseDate);
-
-  // Phase 4: Reduce iterations for dashboard (40% faster, still accurate)
-  for (let i = 0; i < 20 && fLow * fHigh > 0; i += 1) {
-    high *= 2;
-    fHigh = xnpv(high, sortedFlows, baseDate);
-  }
-
-  if (fLow * fHigh > 0) return null;
-
-  for (let i = 0; i < 50; i += 1) {
-    const mid = (low + high) / 2;
-    const fMid = xnpv(mid, sortedFlows, baseDate);
-
-    if (Math.abs(fMid) < 1e-6) return mid;
-
-    if (fLow * fMid < 0) {
-      high = mid;
-      fHigh = fMid;
-    } else {
-      low = mid;
-      fLow = fMid;
-    }
-  }
-
-  return (low + high) / 2;
-}
 
 function diffIsoDays(startIso, endIso) {
   if (!startIso || !endIso) return 1;
@@ -260,7 +188,6 @@ function buildDashboardOverviewCacheKey(scopeIds, query = {}) {
     kind: 'dashboard-overview-v4',
     scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
     hideSold: isTruthyQueryValue(query.hide_sold),
-    includeSoldInReturns: isTruthyQueryValue(query.include_sold_in_returns),
   });
 }
 
@@ -269,7 +196,6 @@ function buildDashboardXirrCacheKey(scopeIds, query = {}) {
     kind: 'dashboard-xirr-summary-v1',
     scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
     hideSold: isTruthyQueryValue(query.hide_sold),
-    includeSoldInReturns: isTruthyQueryValue(query.include_sold_in_returns),
   });
 }
 
@@ -277,15 +203,12 @@ function buildDashboardOverview(db, query = {}) {
   const scopeIds = parsePortfolioIds(query);
   const scope = portfolioScopeClause('portfolio_id', scopeIds);
   const hideSold = isTruthyQueryValue(query.hide_sold);
-  const includeSoldInReturns = hideSold
-    ? isTruthyQueryValue(query.include_sold_in_returns)
-    : true;
 
   const latestDate = db.prepare(`
     SELECT MAX(date) AS max_date
-    FROM portfolio_daily
-    WHERE ${scope.clause}
-  `).get(...scope.params)?.max_date || null;
+    FROM portfolio_metrics_daily
+    WHERE ${scope.clause} AND calculation_version = ?
+  `).get(...scope.params, CALCULATION_VERSION)?.max_date || null;
 
   const currentValueScope = portfolioScopeClause('t.portfolio_id', scopeIds);
   const assetRows = db.prepare(`
@@ -303,12 +226,12 @@ function buildDashboardOverview(db, query = {}) {
         dv.date,
         COALESCE(dv.current_value, 0) AS current_value
       FROM tracked_scopes tracked
-      LEFT JOIN daily_values dv
+      LEFT JOIN investment_metrics_daily dv
         ON dv.investment_id = tracked.investment_id
         AND dv.portfolio_id = tracked.portfolio_id
         AND dv.date = (
           SELECT MAX(latest.date)
-          FROM daily_values latest
+          FROM investment_metrics_daily latest
           WHERE latest.investment_id = tracked.investment_id
             AND latest.portfolio_id = tracked.portfolio_id
         )
@@ -379,10 +302,9 @@ function buildDashboardOverview(db, query = {}) {
     if (receivedTypes.has(txn.transaction_type)) totals.realized += amount - fees;
   }
 
+  // Sold returns are unconditional: every tracked scope (held or fully exited)
+  // contributes to lifetime totals. Visibility (hide_sold) only filters rows.
   for (const totals of transactionTotals.values()) {
-    const internalBalance = INTERNAL_BALANCE_DAY_CHANGE_ASSET_TYPES.has(totals.assetType);
-    const includeReturns = includeSoldInReturns || internalBalance || totals.netUnits > 0.001;
-    if (!includeReturns) continue;
     if (!byType[totals.assetType]) {
       byType[totals.assetType] = {
         investments: [], totalValue: 0, totalInvested: 0, totalProfitLoss: 0,
@@ -413,7 +335,7 @@ function buildDashboardOverview(db, query = {}) {
       SUM(COALESCE(dv.day_change, 0)) AS day_change,
       MAX(dv.price_source) AS price_source,
       MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
-    FROM daily_values dv
+    FROM investment_metrics_daily dv
     JOIN investments i ON i.id = dv.investment_id
     WHERE ${latestDailyScope.clause}
       AND dv.date >= ?
@@ -500,14 +422,14 @@ function buildDashboardOverview(db, query = {}) {
   const strictPortfolioRows = db.prepare(`
     SELECT
       date,
-      SUM(COALESCE(total_value, 0)) AS current_value,
-      SUM(COALESCE(day_change, 0)) AS day_change
-    FROM portfolio_daily
-    WHERE ${scope.clause}
+      SUM(COALESCE(current_value, 0)) AS current_value,
+      SUM(COALESCE(total_day_change, 0)) AS day_change
+    FROM portfolio_metrics_daily
+    WHERE ${scope.clause} AND calculation_version = ?
     GROUP BY date
     ORDER BY date DESC
     LIMIT 2
-  `).all(...scope.params);
+  `).all(...scope.params, CALCULATION_VERSION);
   const portfolioDayChanges = buildStrictPortfolioDayChangePair(strictPortfolioRows);
   const latestPortfolio = strictPortfolioRows[0] || null;
   const previousPortfolio = strictPortfolioRows[1] || null;
@@ -532,18 +454,40 @@ function buildDashboardOverview(db, query = {}) {
     WHERE ${expenseScope.clause}
   `).get(...expenseScope.params)?.total_expenses || 0);
 
+  // Source portfolio card totals from the canonical V2 projection so the card, history,
+  // and projection agree. Legacy byType values remain only when V2 has no rows for a type.
+  {
+    const v2Assets = getAssetAllocationV2(db, scopeIds);
+    if (v2Assets) {
+      const byTypeV2 = new Map(v2Assets.map((a) => [a.asset_type, a]));
+      for (const [type, info] of Object.entries(byType)) {
+        const a = byTypeV2.get(type);
+        if (!a) continue;
+        info.totalValue = a.total_value;
+        info.totalInvested = a.total_invested; // gross basis
+        info.totalRealizedGain = a.total_realized_proceeds;
+        info.totalProfitLoss = a.total_profit_loss; // before portfolio expenses
+      }
+    }
+  }
+  const v2Portfolio = getPortfolioV2Latest(db, scopeIds);
+
   return {
     portfolio: {
       date: latestInvestmentDate || latestDate,
-      total_value: totalValue,
-      total_invested: totalInvested,
-      total_profit_loss: totalProfitLoss,
-      total_realized_proceeds: totalRealized,
-      total_profit_loss_pct: totalInvested > 0 ? (totalProfitLoss / totalInvested) * 100 : 0,
+      total_value: v2Portfolio ? v2Portfolio.total_value : totalValue,
+      total_invested: v2Portfolio ? v2Portfolio.total_invested : totalInvested,
+      net_invested: v2Portfolio ? v2Portfolio.net_invested : (totalInvested - totalRealized),
+      total_profit_loss: v2Portfolio ? v2Portfolio.total_profit_loss : totalProfitLoss,
+      total_realized_proceeds: v2Portfolio ? v2Portfolio.total_realized_proceeds : totalRealized,
+      total_profit_loss_pct: v2Portfolio
+        ? v2Portfolio.total_profit_loss_pct
+        : (totalInvested > 0 ? (totalProfitLoss / totalInvested) * 100 : 0),
       day_change: dayChange,
       day_change_pct: previousValue > 0 ? (dayChange / previousValue) * 100 : 0,
       dayChanges: portfolioDayChanges,
       xirr_pct: null,
+      calculation_version: v2Portfolio ? v2Portfolio.calculation_version : null,
     },
     byType,
     investmentCount: visibleInvestmentCount,
@@ -653,7 +597,6 @@ function buildDashboardXirrSummary(db, query = {}) {
 function buildAssetTypeOverview(db, assetType, query = {}) {
   const scopeIds = parsePortfolioIds(query);
   const hideSold = isTruthyQueryValue(query.hide_sold);
-  const includeSoldInReturns = hideSold ? isTruthyQueryValue(query.include_sold_in_returns) : true;
   const scope = portfolioScopeClause('t.portfolio_id', scopeIds);
 
   // Get investments of this type with transaction aggregates
@@ -735,8 +678,8 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
   const latestDailyScope = portfolioScopeClause('dv.portfolio_id', scopeIds);
   const pdScope = portfolioScopeClause('portfolio_id', scopeIds);
   const latestDate = db.prepare(`
-    SELECT MAX(date) AS max_date FROM portfolio_daily WHERE ${pdScope.clause}
-  `).get(...pdScope.params)?.max_date || null;
+    SELECT MAX(date) AS max_date FROM portfolio_metrics_daily WHERE ${pdScope.clause} AND calculation_version = ?
+  `).get(...pdScope.params, CALCULATION_VERSION)?.max_date || null;
   // For a single asset type, the day-change floor is simply MAX_NON_LOCF_SESSION_LAG+1
   // trading days back — at most ~10 calendar days, well under the 366 iteration ceiling.
   const dayChangeFloor = latestDate ? addDaysIso(latestDate, -10) : null;
@@ -745,7 +688,7 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
   const latestValueRows = db.prepare(`
     WITH latest_dates AS (
       SELECT dv.investment_id, MAX(dv.date) AS max_date
-      FROM daily_values dv
+      FROM investment_metrics_daily dv
       JOIN investments i ON i.id = dv.investment_id
       WHERE ${latestDailyScope.clause} AND i.exclude_from_tracking = 0 AND UPPER(i.asset_type) = ?
       GROUP BY dv.investment_id
@@ -758,7 +701,7 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
       SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
       SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss
     FROM latest_dates ld
-    JOIN daily_values dv ON dv.investment_id = ld.investment_id AND dv.date = ld.max_date AND ${portfolioScopeClause('dv.portfolio_id', scopeIds).clause}
+    JOIN investment_metrics_daily dv ON dv.investment_id = ld.investment_id AND dv.date = ld.max_date AND ${portfolioScopeClause('dv.portfolio_id', scopeIds).clause}
     GROUP BY ld.investment_id, ld.max_date
   `).all(...latestDailyScope.params, assetType, ...portfolioScopeClause('dv.portfolio_id', scopeIds).params);
   const latestValueByInv = new Map(latestValueRows.map((r) => [Number(r.investment_id), r]));
@@ -776,7 +719,7 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
       SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
       MAX(dv.price_source) AS price_source,
       MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
-    FROM daily_values dv
+    FROM investment_metrics_daily dv
     JOIN investments i ON i.id = dv.investment_id
     WHERE ${latestDailyScope.clause}
       AND dv.date >= ? AND dv.date <= ?
@@ -897,9 +840,9 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
   // Compute day_change_pct and portfolio_pct
   const totalValue = investments.reduce((sum, inv) => sum + inv.current_value, 0);
   const portfolioValue = Number(db.prepare(`
-    SELECT SUM(total_value) AS v FROM portfolio_daily
-    WHERE ${pdScope.clause} AND date = ?
-  `).get(...pdScope.params, latestDate || '2000-01-01')?.v || 0) || totalValue;
+    SELECT SUM(current_value) AS v FROM portfolio_metrics_daily
+    WHERE ${pdScope.clause} AND date = ? AND calculation_version = ?
+  `).get(...pdScope.params, latestDate || '2000-01-01', CALCULATION_VERSION)?.v || 0) || totalValue;
   for (const inv of investments) {
     const prevValue = inv.current_value - inv.day_change;
     inv.day_change_pct = prevValue > 0 ? (inv.day_change / prevValue) * 100 : 0;
@@ -1247,15 +1190,15 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
 
   const findBoundsForType = db.prepare(`
     SELECT MIN(date) AS chosen_from, MAX(date) AS chosen_to
-    FROM asset_type_daily
-    WHERE ${dailyScope.clause} AND asset_type = ? AND date >= ? AND date <= ?
+    FROM asset_metrics_daily
+    WHERE ${dailyScope.clause} AND asset_type = ? AND date >= ? AND date <= ? AND calculation_version = ?
   `);
-  // asset_type_daily is unique per (portfolio_id, asset_type, date), so SUM(total_value)
+  // asset_metrics_daily is unique per (portfolio_id, asset_type, date, version), so SUM(current_value)
   // equals the single row for one portfolio and the combined value for a subset/all.
   const valueForType = db.prepare(`
-    SELECT COALESCE(SUM(total_value), 0) AS total_value
-    FROM asset_type_daily
-    WHERE ${dailyScope.clause} AND asset_type = ? AND date = ?
+    SELECT COALESCE(SUM(current_value), 0) AS total_value
+    FROM asset_metrics_daily
+    WHERE ${dailyScope.clause} AND asset_type = ? AND date = ? AND calculation_version = ?
   `);
   const intervalTransactionsForType = db.prepare(`
     SELECT
@@ -1290,7 +1233,7 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
       intervalToDate: null,
     };
 
-    const bounds = findBoundsForType.get(...dailyScope.params, assetTypeKey, intervalFromDate, intervalToDate);
+    const bounds = findBoundsForType.get(...dailyScope.params, assetTypeKey, intervalFromDate, intervalToDate, CALCULATION_VERSION);
     const chosenFrom = bounds?.chosen_from || null;
     const chosenTo = bounds?.chosen_to || null;
     if (!chosenFrom || !chosenTo || chosenFrom > chosenTo) continue;
@@ -1302,8 +1245,8 @@ function computeScopeIntervalMetrics(db, { scopeIds = [], assetTypes = [], inter
 
     const openingValue = isInceptionWindow
       ? 0
-      : Number(valueForType.get(...dailyScope.params, assetTypeKey, chosenFrom)?.total_value || 0);
-    const closingValue = Number(valueForType.get(...dailyScope.params, assetTypeKey, chosenTo)?.total_value || 0);
+      : Number(valueForType.get(...dailyScope.params, assetTypeKey, chosenFrom, CALCULATION_VERSION)?.total_value || 0);
+    const closingValue = Number(valueForType.get(...dailyScope.params, assetTypeKey, chosenTo, CALCULATION_VERSION)?.total_value || 0);
 
     const intervalTransactions = intervalTransactionsForType.all(...txnScope.params, assetTypeKey, chosenFrom, chosenTo);
 
@@ -1386,7 +1329,6 @@ module.exports = function (db) {
         assetType,
         scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
         hideSold: isTruthyQueryValue(req.query.hide_sold),
-        includeSoldInReturns: isTruthyQueryValue(req.query.include_sold_in_returns),
       });
       if (isSnapshotEnabled()) {
         const cached = getCachedSnapshot(db, cacheKey, version);
@@ -1413,7 +1355,6 @@ module.exports = function (db) {
         assetType,
         scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
         hideSold: isTruthyQueryValue(req.query.hide_sold),
-        includeSoldInReturns: isTruthyQueryValue(req.query.include_sold_in_returns),
       });
       if (isSnapshotEnabled()) {
         const cached = getCachedSnapshot(db, cacheKey, version);
@@ -1467,10 +1408,7 @@ module.exports = function (db) {
   // ─── Portfolio Summary (Dashboard) ────────────────────────────────────
   const handleSummary = (req, res) => {
     const { portfolio_id, hide_sold } = req.query;
-    const includeSoldInReturnsRaw = String(req.query.include_sold_in_returns || '').trim().toLowerCase();
-    const includeSoldInReturnsRequested = includeSoldInReturnsRaw === 'true' || includeSoldInReturnsRaw === '1' || includeSoldInReturnsRaw === 'yes';
     const hideSold = hide_sold === 'true';
-    const includeSoldInReturns = hideSold ? includeSoldInReturnsRequested : true;
     const xirrModeRaw = String(req.query.xirr_mode || 'full').trim().toLowerCase();
     const xirrMode = xirrModeRaw === 'portfolio_only' ? 'portfolio_only' : 'full';
 
@@ -1485,7 +1423,6 @@ module.exports = function (db) {
         snapshotKey = buildSnapshotKey({
           portfolioId: portfolio_id != null ? portfolio_id : null,
           hideSold,
-          includeFullySoldInReturns: includeSoldInReturns,
           xirrMode,
           interval: String(req.query.interval || '1D').trim().toUpperCase(),
           customFromDate: req.query.custom_from_date || null,
@@ -1512,12 +1449,12 @@ module.exports = function (db) {
     // but resolve interval bounds from the requested scope so single-portfolio
     // requests do not drift to unrelated newer portfolio dates.
     const latestDateResult = db.prepare(`
-      SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id IS NOT NULL
-    `).get();
+      SELECT MAX(date) AS max_date FROM portfolio_metrics_daily WHERE portfolio_id IS NOT NULL AND calculation_version = ?
+    `).get(CALCULATION_VERSION);
     const latestAggregateDate = latestDateResult?.max_date;
     const scopedPortfolioId = portfolio_id ? Number(portfolio_id) : null;
     const latestDateInDb = Number.isInteger(scopedPortfolioId) && scopedPortfolioId > 0
-      ? (db.prepare('SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id = ?').get(scopedPortfolioId)?.max_date || null)
+      ? (db.prepare('SELECT MAX(date) AS max_date FROM portfolio_metrics_daily WHERE portfolio_id = ? AND calculation_version = ?').get(scopedPortfolioId, CALCULATION_VERSION)?.max_date || null)
       : latestAggregateDate;
 
     let stalePricesWarning = null;
@@ -1696,19 +1633,19 @@ module.exports = function (db) {
     if ((isPresetOneDay || isPresetYesterday) && intervalToDate) {
       if (portfolio_id) {
         const latestOneDay = db.prepare(`
-          SELECT total_value, day_change
-          FROM portfolio_daily
-          WHERE portfolio_id = ? AND date = ?
+          SELECT current_value AS total_value, total_day_change AS day_change
+          FROM portfolio_metrics_daily
+          WHERE portfolio_id = ? AND date = ? AND calculation_version = ?
           LIMIT 1
-        `).get(portfolio_id, intervalToDate);
+        `).get(portfolio_id, intervalToDate, CALCULATION_VERSION);
 
         const previousOneDay = db.prepare(`
-          SELECT total_value
-          FROM portfolio_daily
-          WHERE portfolio_id = ? AND date < ?
+          SELECT current_value AS total_value
+          FROM portfolio_metrics_daily
+          WHERE portfolio_id = ? AND date < ? AND calculation_version = ?
           ORDER BY date DESC
           LIMIT 1
-        `).get(portfolio_id, intervalToDate);
+        `).get(portfolio_id, intervalToDate, CALCULATION_VERSION);
 
         const prevTotal = Number(previousOneDay?.total_value || 0);
         const dayChange = Number(latestOneDay?.day_change || 0);
@@ -1726,24 +1663,24 @@ module.exports = function (db) {
       } else {
         const latestOneDay = db.prepare(`
           SELECT
-            SUM(COALESCE(total_value, 0)) AS total_value,
-            SUM(COALESCE(day_change, 0)) AS day_change
-          FROM portfolio_daily
-          WHERE portfolio_id IS NOT NULL AND date = ?
-        `).get(intervalToDate);
+            SUM(COALESCE(current_value, 0)) AS total_value,
+            SUM(COALESCE(total_day_change, 0)) AS day_change
+          FROM portfolio_metrics_daily
+          WHERE portfolio_id IS NOT NULL AND date = ? AND calculation_version = ?
+        `).get(intervalToDate, CALCULATION_VERSION);
 
         const previousDate = db.prepare(`
           SELECT MAX(date) AS prev_date
-          FROM portfolio_daily
-          WHERE portfolio_id IS NOT NULL AND date < ?
-        `).get(intervalToDate)?.prev_date || null;
+          FROM portfolio_metrics_daily
+          WHERE portfolio_id IS NOT NULL AND date < ? AND calculation_version = ?
+        `).get(intervalToDate, CALCULATION_VERSION)?.prev_date || null;
 
         const previousOneDay = previousDate
           ? db.prepare(`
-              SELECT SUM(COALESCE(total_value, 0)) AS total_value
-              FROM portfolio_daily
-              WHERE portfolio_id IS NOT NULL AND date = ?
-            `).get(previousDate)
+              SELECT SUM(COALESCE(current_value, 0)) AS total_value
+              FROM portfolio_metrics_daily
+              WHERE portfolio_id IS NOT NULL AND date = ? AND calculation_version = ?
+            `).get(previousDate, CALCULATION_VERSION)
           : null;
 
         const prevTotal = Number(previousOneDay?.total_value || 0);
@@ -1767,11 +1704,11 @@ module.exports = function (db) {
     let rollupWarning = null;
     if (portfolio_id) {
       latest = db.prepare(
-        'SELECT * FROM portfolio_daily WHERE portfolio_id = ? ORDER BY date DESC LIMIT 1'
-      ).get(portfolio_id);
+        'SELECT portfolio_id, date, current_value AS total_value, net_invested AS total_invested, total_profit_loss, total_day_change AS day_change FROM portfolio_metrics_daily WHERE portfolio_id = ? AND calculation_version = ? ORDER BY date DESC LIMIT 1'
+      ).get(portfolio_id, CALCULATION_VERSION);
 
       const previous = latest?.date
-        ? db.prepare('SELECT total_value FROM portfolio_daily WHERE portfolio_id = ? AND date < ? ORDER BY date DESC LIMIT 1').get(portfolio_id, latest.date)
+        ? db.prepare('SELECT current_value AS total_value FROM portfolio_metrics_daily WHERE portfolio_id = ? AND date < ? AND calculation_version = ? ORDER BY date DESC LIMIT 1').get(portfolio_id, latest.date, CALCULATION_VERSION)
         : null;
       const prevTotal = Number(previous?.total_value || 0);
       latest = {
@@ -1783,17 +1720,17 @@ module.exports = function (db) {
     } else {
       const maxRollupDate = db.prepare(`
         SELECT MAX(date) AS max_date
-        FROM portfolio_daily
-        WHERE portfolio_id IS NOT NULL
-      `).get()?.max_date || null;
+        FROM portfolio_metrics_daily
+        WHERE portfolio_id IS NOT NULL AND calculation_version = ?
+      `).get(CALCULATION_VERSION)?.max_date || null;
 
       if (maxRollupDate) {
         const portfoliosTotal = Number(db.prepare('SELECT COUNT(*) AS count FROM portfolios').get()?.count || 0);
         const portfoliosCovered = Number(db.prepare(`
           SELECT COUNT(DISTINCT portfolio_id) AS count
-          FROM portfolio_daily
-          WHERE portfolio_id IS NOT NULL AND date = ?
-        `).get(maxRollupDate)?.count || 0);
+          FROM portfolio_metrics_daily
+          WHERE portfolio_id IS NOT NULL AND date = ? AND calculation_version = ?
+        `).get(maxRollupDate, CALCULATION_VERSION)?.count || 0);
 
         if (portfoliosCovered < portfoliosTotal) {
           rollupWarning = {
@@ -1810,27 +1747,27 @@ module.exports = function (db) {
         const latestAgg = db.prepare(`
           SELECT
             ? AS date,
-            SUM(total_value) as total_value,
-            SUM(total_invested) as total_invested,
+            SUM(current_value) as total_value,
+            SUM(net_invested) as total_invested,
             SUM(total_profit_loss) as total_profit_loss,
-            CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
-            SUM(day_change) as day_change
-          FROM portfolio_daily
-          WHERE portfolio_id IS NOT NULL AND date = ?
-        `).get(maxRollupDate, maxRollupDate);
+            CASE WHEN SUM(net_invested) > 0 THEN (SUM(total_profit_loss) / SUM(net_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
+            SUM(total_day_change) as day_change
+          FROM portfolio_metrics_daily
+          WHERE portfolio_id IS NOT NULL AND date = ? AND calculation_version = ?
+        `).get(maxRollupDate, maxRollupDate, CALCULATION_VERSION);
 
         const previousDate = db.prepare(`
           SELECT MAX(date) AS prev_date
-          FROM portfolio_daily
-          WHERE portfolio_id IS NOT NULL AND date < ?
-        `).get(maxRollupDate)?.prev_date || null;
+          FROM portfolio_metrics_daily
+          WHERE portfolio_id IS NOT NULL AND date < ? AND calculation_version = ?
+        `).get(maxRollupDate, CALCULATION_VERSION)?.prev_date || null;
 
         const previousTotal = previousDate
           ? Number(db.prepare(`
-              SELECT SUM(total_value) AS total_value
-              FROM portfolio_daily
-              WHERE portfolio_id IS NOT NULL AND date = ?
-            `).get(previousDate)?.total_value || 0)
+              SELECT SUM(current_value) AS total_value
+              FROM portfolio_metrics_daily
+              WHERE portfolio_id IS NOT NULL AND date = ? AND calculation_version = ?
+            `).get(previousDate, CALCULATION_VERSION)?.total_value || 0)
           : 0;
 
         latest = {
@@ -1862,7 +1799,7 @@ module.exports = function (db) {
       : '';
     const soldParams = (hideSold && portfolio_id) ? [portfolio_id, portfolio_id] : [];
 
-    // Build daily_values portfolio filter
+    // Build investment_metrics_daily portfolio filter
     const dvPortfolioJoin = portfolio_id
       ? 'AND dv.portfolio_id = ?'
       : '';
@@ -1899,7 +1836,7 @@ module.exports = function (db) {
       ])
     );
 
-    // Phase 3: Batch fetch all daily_values needed (eliminate per-investment queries)
+    // Phase 3: Batch fetch all investment_metrics_daily needed (eliminate per-investment queries)
     const allDailyValuesRaw = portfolio_id
       ? db.prepare(`
           SELECT
@@ -1925,7 +1862,7 @@ module.exports = function (db) {
             dv.price_source,
             CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LOCF' THEN 1 ELSE 0 END AS has_non_locf,
             ROW_NUMBER() OVER (PARTITION BY dv.investment_id ORDER BY dv.date DESC) as row_num
-          FROM daily_values dv
+          FROM investment_metrics_daily dv
           WHERE dv.portfolio_id = ?
             AND dv.investment_id IN (SELECT id FROM investments WHERE exclude_from_tracking = 0)
         `).all(portfolio_id)
@@ -1949,7 +1886,7 @@ module.exports = function (db) {
             MAX(dv.price_source) AS price_source,
             MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf,
             ROW_NUMBER() OVER (PARTITION BY dv.investment_id ORDER BY dv.date DESC) as row_num
-          FROM daily_values dv
+          FROM investment_metrics_daily dv
           WHERE dv.investment_id IN (SELECT id FROM investments WHERE exclude_from_tracking = 0)
           GROUP BY dv.investment_id, dv.date
         `).all();
@@ -1971,7 +1908,7 @@ module.exports = function (db) {
 
     // Get individual investment summaries
     if (portfolio_id) {
-      // Portfolio-scoped query: get latest daily_values for each investment in that portfolio
+      // Portfolio-scoped query: get latest investment_metrics_daily for each investment in that portfolio
       var investments = db.prepare(`
         SELECT
           i.id, COALESCE(i.display_name, i.name) as name, i.asset_type, i.ticker_symbol, i.amfi_code, i.currency,
@@ -1994,16 +1931,16 @@ module.exports = function (db) {
             ELSE 0
           END as day_change_pct
         FROM investments i
-        LEFT JOIN daily_values dv ON i.id = dv.investment_id AND dv.portfolio_id = ? AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+        LEFT JOIN investment_metrics_daily dv ON i.id = dv.investment_id AND dv.portfolio_id = ? AND dv.date = (SELECT MAX(date) FROM investment_metrics_daily WHERE investment_id = i.id AND portfolio_id = ?)
         WHERE 1=1 AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)${soldFilter} AND i.exclude_from_tracking = 0
         ORDER BY i.asset_type, i.name
       `).all(portfolio_id, portfolio_id, portfolio_id, ...soldParams);
     } else {
-      // Combined view: aggregate latest daily_values for each investment across all portfolios
+      // Combined view: aggregate latest investment_metrics_daily for each investment across all portfolios
       var investments = db.prepare(`
         WITH latest_by_scope AS (
           SELECT investment_id, portfolio_id, MAX(date) AS max_date
-          FROM daily_values
+          FROM investment_metrics_daily
           GROUP BY investment_id, portfolio_id
         ),
         latest_agg AS (
@@ -2016,7 +1953,7 @@ module.exports = function (db) {
             SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
             SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
             SUM(COALESCE(dv.day_change, 0)) AS day_change
-          FROM daily_values dv
+          FROM investment_metrics_daily dv
           INNER JOIN latest_by_scope lbs ON dv.investment_id = lbs.investment_id
             AND dv.portfolio_id = lbs.portfolio_id
             AND dv.date = lbs.max_date
@@ -2257,7 +2194,7 @@ module.exports = function (db) {
             SELECT
               MIN(date) AS chosen_from,
               MAX(date) AS chosen_to
-            FROM daily_values
+            FROM investment_metrics_daily
             WHERE investment_id = ?
               AND portfolio_id = ?
               AND date >= ?
@@ -2267,7 +2204,7 @@ module.exports = function (db) {
             SELECT
               MIN(date) AS chosen_from,
               MAX(date) AS chosen_to
-            FROM daily_values
+            FROM investment_metrics_daily
             WHERE investment_id = ?
               AND portfolio_id IS NOT NULL
               AND date >= ?
@@ -2309,7 +2246,7 @@ module.exports = function (db) {
       const openingValueForInvestment = portfolio_id
         ? db.prepare(`
             SELECT COALESCE(current_value, 0) AS current_value
-            FROM daily_values
+            FROM investment_metrics_daily
             WHERE investment_id = ?
               AND portfolio_id = ?
               AND date = ?
@@ -2317,7 +2254,7 @@ module.exports = function (db) {
           `)
         : db.prepare(`
             SELECT COALESCE(SUM(current_value), 0) AS current_value
-            FROM daily_values
+            FROM investment_metrics_daily
             WHERE investment_id = ?
               AND portfolio_id IS NOT NULL
               AND date = ?
@@ -2379,12 +2316,10 @@ module.exports = function (db) {
 
     // Intentionally no table-derived overwrite for preset 1D.
 
-    const totalsSoldFilter = hideSold && !includeSoldInReturns
-      ? soldFilter
-      : '';
-    const totalsSoldParams = (hideSold && !includeSoldInReturns && portfolio_id)
-      ? [portfolio_id, portfolio_id]
-      : [];
+    // Sold returns are unconditional: totals never filter out fully-exited scopes.
+    // hide_sold only affects the visible rows (soldFilter above), not the totals.
+    const totalsSoldFilter = '';
+    const totalsSoldParams = [];
 
     const byTypeTotals = portfolio_id
       ? db.prepare(`
@@ -2415,9 +2350,9 @@ module.exports = function (db) {
                     WHERE investment_id = i.id AND portfolio_id = ? AND transaction_type IN (${DASHBOARD_RETURNS_INVESTED_TYPES_SQL})), 0)
             ) as totalProfitLoss
           FROM investments i
-          LEFT JOIN daily_values dv ON i.id = dv.investment_id
+          LEFT JOIN investment_metrics_daily dv ON i.id = dv.investment_id
             AND dv.portfolio_id = ?
-            AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+            AND dv.date = (SELECT MAX(date) FROM investment_metrics_daily WHERE investment_id = i.id AND portfolio_id = ?)
           WHERE EXISTS (
             SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?
           )${totalsSoldFilter} AND i.exclude_from_tracking = 0
@@ -2435,14 +2370,14 @@ module.exports = function (db) {
       : db.prepare(`
           WITH latest_by_scope AS (
             SELECT investment_id, portfolio_id, MAX(date) AS max_date
-            FROM daily_values
+            FROM investment_metrics_daily
             GROUP BY investment_id, portfolio_id
           ),
           latest_agg AS (
             SELECT
               dv.investment_id,
               SUM(COALESCE(dv.current_value, 0)) AS current_value
-            FROM daily_values dv
+            FROM investment_metrics_daily dv
             INNER JOIN latest_by_scope lbs ON dv.investment_id = lbs.investment_id
               AND dv.portfolio_id = lbs.portfolio_id
               AND dv.date = lbs.max_date
@@ -2528,7 +2463,7 @@ module.exports = function (db) {
       }
     }
 
-    // Non-1D: compute asset-type interval change from asset_type_daily using strict in-range
+    // Non-1D: compute asset-type interval change from the V2 asset rollup using strict in-range
     // bounds. Delegated to the shared scope-aware helper (computeScopeIntervalMetrics) so the
     // single-portfolio, "all", and arbitrary-subset scopes are numerically identical — the % is
     // a non-additive XIRR that must be solved over unioned cashflows, not averaged.
@@ -2558,6 +2493,7 @@ module.exports = function (db) {
       date: latestSnapshotDate || latest?.date || null,
       total_value: investments.reduce((sum, inv) => sum + (Number(inv.current_value) || 0), 0),
       total_invested: totalInvestedByScope,
+      net_invested: totalInvestedByScope - totalRealizedGainByScope,
       total_profit_loss: totalProfitLossByScope,
       total_realized_proceeds: totalRealizedGainByScope,
       day_change: Number(latest?.day_change || 0),
@@ -2574,6 +2510,33 @@ module.exports = function (db) {
     const totalValue = derivedPortfolio.total_value;
     for (const inv of investments) {
       inv.portfolio_pct = totalValue > 0 ? ((inv.current_value || 0) / totalValue) * 100 : 0;
+    }
+
+    // Source the summary card totals from the canonical V2 projection so /summary and
+    // /overview agree. Legacy byType values remain only when V2 has no rows for a type.
+    {
+      const v2Assets = getAssetAllocationV2(db, portfolio_id ? [Number(portfolio_id)] : []);
+      if (v2Assets) {
+        const byTypeV2 = new Map(v2Assets.map((a) => [a.asset_type, a]));
+        for (const [type, info] of Object.entries(byType)) {
+          const a = byTypeV2.get(type);
+          if (!a) continue;
+          info.totalValue = a.total_value;
+          info.totalInvested = a.total_invested; // gross basis
+          info.totalRealizedGain = a.total_realized_proceeds;
+          info.totalProfitLoss = a.total_profit_loss; // before portfolio expenses
+        }
+      }
+    }
+    const v2SummaryPortfolio = getPortfolioV2Latest(db, portfolio_id ? [Number(portfolio_id)] : []);
+    if (v2SummaryPortfolio) {
+      derivedPortfolio.total_value = v2SummaryPortfolio.total_value;
+      derivedPortfolio.total_invested = v2SummaryPortfolio.total_invested;
+      derivedPortfolio.net_invested = v2SummaryPortfolio.net_invested;
+      derivedPortfolio.total_realized_proceeds = v2SummaryPortfolio.total_realized_proceeds;
+      derivedPortfolio.total_profit_loss = v2SummaryPortfolio.total_profit_loss;
+      derivedPortfolio.total_profit_loss_pct = v2SummaryPortfolio.total_profit_loss_pct;
+      derivedPortfolio.calculation_version = v2SummaryPortfolio.calculation_version;
     }
 
     // Get portfolio count info
@@ -2750,7 +2713,6 @@ module.exports = function (db) {
     const overviewVariants = [
       {},
       { hide_sold: 'true' },
-      { hide_sold: 'true', include_sold_in_returns: 'true' },
     ];
     const version = getDataVersion(db);
     for (const portfolioId of scopes) {
@@ -2847,8 +2809,8 @@ module.exports = function (db) {
       const customToDate = req.query.custom_to_date || null;
 
       const latestDateInDb = db.prepare(`
-        SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id IS NOT NULL
-      `).get()?.max_date || null;
+        SELECT MAX(date) AS max_date FROM portfolio_metrics_daily WHERE portfolio_id IS NOT NULL AND calculation_version = ?
+      `).get(CALCULATION_VERSION)?.max_date || null;
       const { intervalFromDate, intervalToDate } = resolveIntervalWindow(
         latestDateInDb, intervalParam, customFromDate, customToDate,
       );
@@ -2875,9 +2837,9 @@ module.exports = function (db) {
       const dailyScope = portfolioScopeClause('portfolio_id', scopeIds);
       const assetTypes = db.prepare(`
         SELECT DISTINCT asset_type
-        FROM asset_type_daily
-        WHERE ${dailyScope.clause} AND date >= ? AND date <= ?
-      `).all(...dailyScope.params, intervalFromDate, intervalToDate).map((r) => r.asset_type);
+        FROM asset_metrics_daily
+        WHERE ${dailyScope.clause} AND date >= ? AND date <= ? AND calculation_version = ?
+      `).all(...dailyScope.params, intervalFromDate, intervalToDate, CALCULATION_VERSION).map((r) => r.asset_type);
 
       const metrics = computeScopeIntervalMetrics(db, {
         scopeIds, assetTypes, intervalFromDate, intervalToDate,
@@ -2936,32 +2898,11 @@ module.exports = function (db) {
       }
     }
 
-    // Portfolio level performance — filtered by portfolio_id
-    let portfolioData;
-    if (portfolio_id) {
-      portfolioData = db.prepare(`
-        SELECT * FROM portfolio_daily
-        WHERE portfolio_id = ? AND date BETWEEN ? AND ?
-        ORDER BY date ASC
-      `).all(portfolio_id, startDate, endDate);
-    } else {
-      portfolioData = db.prepare(`
-        SELECT
-          MAX(date) as date,
-          SUM(total_value) as total_value,
-          SUM(total_invested) as total_invested,
-          SUM(total_profit_loss) as total_profit_loss,
-          CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
-          SUM(day_change) as day_change,
-          0 as day_change_pct
-        FROM portfolio_daily
-        WHERE date BETWEEN ? AND ?
-        GROUP BY date
-        ORDER BY date ASC
-      `).all(startDate, endDate);
-    }
+    // Portfolio level performance — from the canonical rollup (carry-forward aligned).
+    const v2History = getPortfolioV2History(db, portfolio_id ? [Number(portfolio_id)] : [], startDate, endDate);
+    let portfolioData = v2History || [];
 
-    // Per-investment performance (portfolio-scoped daily_values)
+    // Per-investment performance (portfolio-scoped investment_metrics_daily)
     if (portfolio_id) {
       var investmentData = db.prepare(`
         SELECT
@@ -2982,7 +2923,7 @@ module.exports = function (db) {
           dv.updated_at,
           COALESCE(i.display_name, i.name) as name,
           i.asset_type
-        FROM daily_values dv
+        FROM investment_metrics_daily dv
         JOIN investments i ON dv.investment_id = i.id
         WHERE dv.date BETWEEN ? AND ? AND dv.portfolio_id = ? AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)
         ORDER BY dv.date ASC, i.name ASC
@@ -3004,7 +2945,7 @@ module.exports = function (db) {
           0 as day_change_pct,
           COALESCE(i.display_name, i.name) as name,
           i.asset_type
-        FROM daily_values dv
+        FROM investment_metrics_daily dv
         JOIN investments i ON dv.investment_id = i.id
         WHERE dv.date BETWEEN ? AND ?
         GROUP BY i.id, dv.date
@@ -3017,29 +2958,35 @@ module.exports = function (db) {
     const typeFilterClause = asset_type ? 'AND asset_type = ?' : '';
     if (portfolio_id) {
       var typeRows = db.prepare(`
-        SELECT *
-        FROM asset_type_daily
-        WHERE date BETWEEN ? AND ? AND portfolio_id = ? ${typeFilterClause}
+        SELECT asset_type, date,
+          current_value AS total_value,
+          attribution_basis AS total_invested,
+          profit_loss_before_portfolio_expenses AS total_profit_loss,
+          attribution_proceeds AS total_realized_proceeds,
+          0 AS total_unrealized_gain,
+          day_change
+        FROM asset_metrics_daily
+        WHERE date BETWEEN ? AND ? AND portfolio_id = ? AND calculation_version = ? ${typeFilterClause}
         ORDER BY date ASC, asset_type ASC
-      `).all(startDate, endDate, portfolio_id, ...(asset_type ? [asset_type] : []));
+      `).all(startDate, endDate, portfolio_id, CALCULATION_VERSION, ...(asset_type ? [asset_type] : []));
     } else {
       var typeRows = db.prepare(`
         SELECT
           asset_type,
           date,
-          SUM(total_value) as total_value,
-          SUM(total_invested) as total_invested,
-          SUM(total_profit_loss) as total_profit_loss,
-          SUM(total_realized_proceeds) as total_realized_proceeds,
-          SUM(total_unrealized_gain) as total_unrealized_gain,
-          CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
+          SUM(current_value) as total_value,
+          SUM(attribution_basis) as total_invested,
+          SUM(profit_loss_before_portfolio_expenses) as total_profit_loss,
+          SUM(attribution_proceeds) as total_realized_proceeds,
+          0 as total_unrealized_gain,
+          CASE WHEN SUM(attribution_basis) > 0 THEN (SUM(profit_loss_before_portfolio_expenses) / SUM(attribution_basis)) * 100 ELSE 0 END as total_profit_loss_pct,
           SUM(day_change) as day_change,
           0 as day_change_pct
-        FROM asset_type_daily
-        WHERE date BETWEEN ? AND ? ${typeFilterClause}
+        FROM asset_metrics_daily
+        WHERE date BETWEEN ? AND ? AND calculation_version = ? ${typeFilterClause}
         GROUP BY asset_type, date
         ORDER BY date ASC, asset_type ASC
-      `).all(startDate, endDate, ...(asset_type ? [asset_type] : []));
+      `).all(startDate, endDate, CALCULATION_VERSION, ...(asset_type ? [asset_type] : []));
     }
 
     const portfolioDayChangeByDate = new Map();
@@ -3144,31 +3091,9 @@ module.exports = function (db) {
       }
     }
 
-    const rows = db.prepare(`
-      ${portfolio_id
-        ? `SELECT *
-           FROM asset_type_daily
-           WHERE asset_type = ?
-             AND portfolio_id = ?
-             AND date BETWEEN ? AND ?
-           ORDER BY date ASC`
-        : `SELECT
-             asset_type,
-             date,
-             SUM(total_value) as total_value,
-             SUM(total_invested) as total_invested,
-             SUM(total_profit_loss) as total_profit_loss,
-             SUM(total_realized_proceeds) as total_realized_proceeds,
-             SUM(total_unrealized_gain) as total_unrealized_gain,
-             CASE WHEN SUM(total_invested) > 0 THEN (SUM(total_profit_loss) / SUM(total_invested)) * 100 ELSE 0 END as total_profit_loss_pct,
-             SUM(day_change) as day_change,
-             0 as day_change_pct
-           FROM asset_type_daily
-           WHERE asset_type = ?
-             AND date BETWEEN ? AND ?
-           GROUP BY asset_type, date
-           ORDER BY date ASC`}
-    `).all(...(portfolio_id ? [asset_type, portfolio_id, startDate, endDate] : [asset_type, startDate, endDate]));
+    // Asset-type history from the canonical V2 asset metrics (falls back to legacy when empty).
+    const v2TypeHistory = getAssetTypeHistoryV2(db, asset_type, portfolio_id ? [Number(portfolio_id)] : [], startDate, endDate);
+    const rows = v2TypeHistory || [];
 
     const typeInvestmentRows = portfolio_id
       ? db.prepare(`
@@ -3179,7 +3104,7 @@ module.exports = function (db) {
             dv.day_change,
             dv.price_source,
             i.asset_type
-          FROM daily_values dv
+          FROM investment_metrics_daily dv
           JOIN investments i ON i.id = dv.investment_id
           WHERE i.asset_type = ?
             AND dv.portfolio_id = ?
@@ -3195,7 +3120,7 @@ module.exports = function (db) {
             MAX(dv.price_source) AS price_source,
             i.asset_type,
             MAX(CASE WHEN UPPER(COALESCE(dv.price_source, '')) <> 'LOCF' THEN 1 ELSE 0 END) AS has_non_locf
-          FROM daily_values dv
+          FROM investment_metrics_daily dv
           JOIN investments i ON i.id = dv.investment_id
           WHERE i.asset_type = ?
             AND dv.date BETWEEN ? AND ?
@@ -3268,7 +3193,7 @@ module.exports = function (db) {
             day_change,
             CASE WHEN (current_value - day_change) > 0 THEN (day_change / (current_value - day_change)) * 100 ELSE 0 END as day_change_pct,
             updated_at
-          FROM daily_values
+          FROM investment_metrics_daily
           WHERE investment_id = ? AND portfolio_id = ? AND date >= ?
           ORDER BY date ASC
         `).all(req.params.investmentId, portfolio_id, startDate)
@@ -3286,7 +3211,7 @@ module.exports = function (db) {
             MAX(price_source) as price_source,
             SUM(day_change) as day_change,
             0 as day_change_pct
-          FROM daily_values
+          FROM investment_metrics_daily
           WHERE investment_id = ? AND date >= ?
           GROUP BY investment_id, date
           ORDER BY date ASC
@@ -3330,87 +3255,110 @@ module.exports = function (db) {
           ? Math.min(Math.floor(legacyLimitRaw), 5000)
           : 366);
 
-      const filters = [
-        'dv.date >= ?',
-        'dv.date <= ?',
-        'i.exclude_from_tracking = 0',
-      ];
-      const params = [fromDate, toDate];
+      // Serve the history from the carry-forward canonical projections so exited holdings
+      // are retained and the latest row matches the top card. Falls back to the legacy
+      // exact-date investment_metrics_daily aggregation when V2 is empty.
+      let normalizedRows;
+      let totalRows;
+      let totalPages;
+      let currentPage;
+      let latestRowDate;
+      let oldestRowDate;
 
-      if (assetType) {
-        filters.push('i.asset_type = ?');
-        params.push(assetType);
-      }
+      const v2Rollover = getRolloverV2(db, { portfolioIds, assetType, fromDate, toDate, page, pageSize });
 
-      if (portfolioIds.length > 0) {
-        filters.push(`dv.portfolio_id IN (${portfolioIds.map(() => '?').join(', ')})`);
-        params.push(...portfolioIds);
+      if (v2Rollover) {
+        normalizedRows = v2Rollover.rows;
+        totalRows = v2Rollover.totalRows;
+        totalPages = v2Rollover.totalPages;
+        currentPage = v2Rollover.currentPage;
+        latestRowDate = v2Rollover.latestRowDate;
+        oldestRowDate = v2Rollover.oldestRowDate;
       } else {
-        filters.push('dv.portfolio_id IS NOT NULL');
-      }
+        const filters = [
+          'dv.date >= ?',
+          'dv.date <= ?',
+          'i.exclude_from_tracking = 0',
+        ];
+        const params = [fromDate, toDate];
 
-      const whereClause = filters.join(' AND ');
-      const totalRows = Number(db.prepare(`
-        SELECT COUNT(*) AS count
-        FROM (
-          SELECT dv.date
-          FROM daily_values dv
+        if (assetType) {
+          filters.push('i.asset_type = ?');
+          params.push(assetType);
+        }
+
+        if (portfolioIds.length > 0) {
+          filters.push(`dv.portfolio_id IN (${portfolioIds.map(() => '?').join(', ')})`);
+          params.push(...portfolioIds);
+        } else {
+          filters.push('dv.portfolio_id IS NOT NULL');
+        }
+
+        const whereClause = filters.join(' AND ');
+        totalRows = Number(db.prepare(`
+          SELECT COUNT(*) AS count
+          FROM (
+            SELECT dv.date
+            FROM investment_metrics_daily dv
+            JOIN investments i ON i.id = dv.investment_id
+            WHERE ${whereClause}
+            GROUP BY dv.date
+          ) grouped_dates
+        `).get(...params)?.count || 0);
+
+        totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
+        currentPage = Math.min(page, totalPages);
+        const offset = (currentPage - 1) * pageSize;
+
+        const rows = db.prepare(`
+          SELECT
+            dv.date,
+            SUM(COALESCE(dv.current_value, 0)) AS current_value,
+            SUM(COALESCE(dv.invested_amount, 0) - COALESCE(dv.realized_proceeds, 0)) AS invested_amount,
+            SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
+            SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
+            SUM(COALESCE(dv.day_change, 0)) AS day_change,
+            COUNT(*) AS contributing_rows,
+            COUNT(DISTINCT dv.portfolio_id) AS contributing_portfolios,
+            COUNT(DISTINCT COALESCE(dv.price_source, 'UNKNOWN')) AS source_count,
+            MIN(COALESCE(dv.price_source, 'UNKNOWN')) AS min_source
+          FROM investment_metrics_daily dv
           JOIN investments i ON i.id = dv.investment_id
           WHERE ${whereClause}
           GROUP BY dv.date
-        ) grouped_dates
-      `).get(...params)?.count || 0);
+          ORDER BY dv.date DESC
+          LIMIT ? OFFSET ?
+        `).all(...params, pageSize, offset);
 
-      const totalPages = Math.max(1, Math.ceil(totalRows / pageSize));
-      const currentPage = Math.min(page, totalPages);
-      const offset = (currentPage - 1) * pageSize;
+        const bounds = db.prepare(`
+          SELECT
+            MAX(dv.date) AS latest_row_date,
+            MIN(dv.date) AS oldest_row_date
+          FROM investment_metrics_daily dv
+          JOIN investments i ON i.id = dv.investment_id
+          WHERE ${whereClause}
+        `).get(...params) || {};
+        latestRowDate = bounds.latest_row_date || null;
+        oldestRowDate = bounds.oldest_row_date || null;
 
-      const rows = db.prepare(`
-        SELECT
-          dv.date,
-          SUM(COALESCE(dv.current_value, 0)) AS current_value,
-          SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
-          SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
-          SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss,
-          SUM(COALESCE(dv.day_change, 0)) AS day_change,
-          COUNT(*) AS contributing_rows,
-          COUNT(DISTINCT dv.portfolio_id) AS contributing_portfolios,
-          COUNT(DISTINCT COALESCE(dv.price_source, 'UNKNOWN')) AS source_count,
-          MIN(COALESCE(dv.price_source, 'UNKNOWN')) AS min_source
-        FROM daily_values dv
-        JOIN investments i ON i.id = dv.investment_id
-        WHERE ${whereClause}
-        GROUP BY dv.date
-        ORDER BY dv.date DESC
-        LIMIT ? OFFSET ?
-      `).all(...params, pageSize, offset);
-
-      const bounds = db.prepare(`
-        SELECT
-          MAX(dv.date) AS latest_row_date,
-          MIN(dv.date) AS oldest_row_date
-        FROM daily_values dv
-        JOIN investments i ON i.id = dv.investment_id
-        WHERE ${whereClause}
-      `).get(...params) || {};
-
-      const normalizedRows = rows.map((row) => {
-        const currentValue = Number(row.current_value) || 0;
-        const dayChange = Number(row.day_change) || 0;
-        const previousValue = currentValue - dayChange;
-        return {
-          date: row.date,
-          current_value: currentValue,
-          invested_amount: Number(row.invested_amount) || 0,
-          realized_proceeds: Number(row.realized_proceeds) || 0,
-          profit_loss: Number(row.profit_loss) || 0,
-          day_change: dayChange,
-          day_change_pct: previousValue > 0 ? (dayChange / previousValue) * 100 : 0,
-          price_source: resolveAggregatedSource(row),
-          contributing_rows: Number(row.contributing_rows) || 0,
-          contributing_portfolios: Number(row.contributing_portfolios) || 0,
-        };
-      });
+        normalizedRows = rows.map((row) => {
+          const currentValue = Number(row.current_value) || 0;
+          const dayChange = Number(row.day_change) || 0;
+          const previousValue = currentValue - dayChange;
+          return {
+            date: row.date,
+            current_value: currentValue,
+            invested_amount: Number(row.invested_amount) || 0,
+            realized_proceeds: Number(row.realized_proceeds) || 0,
+            profit_loss: Number(row.profit_loss) || 0,
+            day_change: dayChange,
+            day_change_pct: previousValue > 0 ? (dayChange / previousValue) * 100 : 0,
+            price_source: resolveAggregatedSource(row),
+            contributing_rows: Number(row.contributing_rows) || 0,
+            contributing_portfolios: Number(row.contributing_portfolios) || 0,
+          };
+        });
+      }
 
       res.json({
         scope: {
@@ -3437,8 +3385,8 @@ module.exports = function (db) {
         summary: {
           rows_in_window: totalRows,
           rows_returned: normalizedRows.length,
-          latest_row_date: bounds.latest_row_date || null,
-          oldest_row_date: bounds.oldest_row_date || null,
+          latest_row_date: latestRowDate,
+          oldest_row_date: oldestRowDate,
         },
         rows: normalizedRows,
       });
@@ -3450,6 +3398,13 @@ module.exports = function (db) {
   // ─── Asset allocation breakdown ───────────────────────────────────────
   router.get('/allocation', (req, res) => {
     const { portfolio_id } = req.query;
+
+    // Source allocation from the canonical V2 asset metrics (falls back to legacy when empty).
+    const v2Allocation = getAssetAllocationV2(db, portfolio_id ? [Number(portfolio_id)] : []);
+    if (v2Allocation) {
+      return res.json(v2Allocation);
+    }
+
     const portfolioFilter = portfolio_id ? ' AND EXISTS (SELECT 1 FROM transactions t WHERE t.investment_id = i.id AND t.portfolio_id = ?)' : '';
     const pfParams = portfolio_id ? [portfolio_id] : [];
     const allocation = portfolio_id
@@ -3461,16 +3416,16 @@ module.exports = function (db) {
             COALESCE(SUM(dv.invested_amount), 0) as total_invested,
             COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
           FROM investments i
-          LEFT JOIN daily_values dv ON i.id = dv.investment_id
+          LEFT JOIN investment_metrics_daily dv ON i.id = dv.investment_id
             AND dv.portfolio_id = ?
-            AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+            AND dv.date = (SELECT MAX(date) FROM investment_metrics_daily WHERE investment_id = i.id AND portfolio_id = ?)
           WHERE 1=1${portfolioFilter}
           GROUP BY i.asset_type
         `).all(portfolio_id, portfolio_id, ...pfParams)
       : db.prepare(`
           WITH latest_by_scope AS (
             SELECT investment_id, portfolio_id, MAX(date) AS max_date
-            FROM daily_values
+            FROM investment_metrics_daily
             GROUP BY investment_id, portfolio_id
           ),
           latest_agg AS (
@@ -3479,7 +3434,7 @@ module.exports = function (db) {
               SUM(COALESCE(dv.current_value, 0)) AS current_value,
               SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
               SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss
-            FROM daily_values dv
+            FROM investment_metrics_daily dv
             INNER JOIN latest_by_scope lbs ON dv.investment_id = lbs.investment_id
               AND dv.portfolio_id = lbs.portfolio_id
               AND dv.date = lbs.max_date
@@ -3516,31 +3471,29 @@ module.exports = function (db) {
         try {
           // Consolidate MAX(date) query once
           const latestDateResult = db.prepare(`
-            SELECT MAX(date) AS max_date FROM portfolio_daily WHERE portfolio_id IS NOT NULL
-          `).get();
+            SELECT MAX(date) AS max_date FROM portfolio_metrics_daily WHERE portfolio_id IS NOT NULL AND calculation_version = ?
+          `).get(CALCULATION_VERSION);
           const latestDateInDb = latestDateResult?.max_date;
 
           // Get summary data (simplified version)
           const portfolio_id = req.query.portfolio_id;
-          const hideSold = req.query.hide_sold === 'true';
-          const includeFullySoldInReturns = req.query.include_sold_in_returns === 'true';
 
           if (portfolio_id) {
             summaryData = db.prepare(
-              'SELECT * FROM portfolio_daily WHERE portfolio_id = ? ORDER BY date DESC LIMIT 1'
-            ).get(portfolio_id);
+              'SELECT portfolio_id, date, current_value AS total_value, net_invested AS total_invested, total_profit_loss, total_day_change AS day_change FROM portfolio_metrics_daily WHERE portfolio_id = ? AND calculation_version = ? ORDER BY date DESC LIMIT 1'
+            ).get(portfolio_id, CALCULATION_VERSION);
           } else {
             if (latestDateInDb) {
               summaryData = db.prepare(`
                 SELECT
                   ? AS date,
-                  SUM(total_value) as total_value,
-                  SUM(total_invested) as total_invested,
+                  SUM(current_value) as total_value,
+                  SUM(net_invested) as total_invested,
                   SUM(total_profit_loss) as total_profit_loss,
-                  SUM(day_change) as day_change
-                FROM portfolio_daily
-                WHERE portfolio_id IS NOT NULL AND date = ?
-              `).get(latestDateInDb, latestDateInDb);
+                  SUM(total_day_change) as day_change
+                FROM portfolio_metrics_daily
+                WHERE portfolio_id IS NOT NULL AND date = ? AND calculation_version = ?
+              `).get(latestDateInDb, latestDateInDb, CALCULATION_VERSION);
             }
           }
           result.summary = { status: 'ok', data: summaryData, latest_date: latestDateInDb };
@@ -3556,7 +3509,7 @@ module.exports = function (db) {
           const portfolio_id = req.query.portfolio_id;
           const runDate = req.query.run_date || new Date().toISOString().split('T')[0];
 
-          // Get daily_values health
+          // Get investment_metrics_daily health
           const allHealthData = portfolio_id
             ? db.prepare(`
                 SELECT
@@ -3565,7 +3518,7 @@ module.exports = function (db) {
                   COUNT(CASE WHEN dv.total_units = 0 AND dv.current_value > 1 THEN 1 END) AS zero_units_nonzero_value
                 FROM (
                   SELECT investment_id, MAX(date) AS date, total_units, current_value
-                  FROM daily_values
+                  FROM investment_metrics_daily
                   WHERE portfolio_id = ?
                   GROUP BY investment_id
                 ) dv
@@ -3577,7 +3530,7 @@ module.exports = function (db) {
                   COUNT(CASE WHEN dv.total_units = 0 AND dv.current_value > 1 THEN 1 END) AS zero_units_nonzero_value
                 FROM (
                   SELECT investment_id, portfolio_id, MAX(date) AS date, total_units, current_value
-                  FROM daily_values
+                  FROM investment_metrics_daily
                   GROUP BY investment_id, portfolio_id
                 ) dv
               `).get(runDate);
@@ -3607,15 +3560,15 @@ module.exports = function (db) {
                   COALESCE(SUM(dv.invested_amount), 0) as total_invested,
                   COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
                 FROM investments i
-                LEFT JOIN daily_values dv ON i.id = dv.investment_id
+                LEFT JOIN investment_metrics_daily dv ON i.id = dv.investment_id
                   AND dv.portfolio_id = ?
-                  AND dv.date = (SELECT MAX(date) FROM daily_values WHERE investment_id = i.id AND portfolio_id = ?)
+                  AND dv.date = (SELECT MAX(date) FROM investment_metrics_daily WHERE investment_id = i.id AND portfolio_id = ?)
                 GROUP BY i.asset_type
               `).all(portfolio_id, portfolio_id)
             : db.prepare(`
                 WITH latest_by_scope AS (
                   SELECT investment_id, portfolio_id, MAX(date) AS max_date
-                  FROM daily_values
+                  FROM investment_metrics_daily
                   GROUP BY investment_id, portfolio_id
                 )
                 SELECT
@@ -3625,7 +3578,7 @@ module.exports = function (db) {
                   COALESCE(SUM(dv.invested_amount), 0) as total_invested,
                   COALESCE(SUM(dv.profit_loss), 0) as total_profit_loss
                 FROM investments i
-                LEFT JOIN daily_values dv ON i.id = dv.investment_id
+                LEFT JOIN investment_metrics_daily dv ON i.id = dv.investment_id
                   AND dv.date IN (
                     SELECT max_date FROM latest_by_scope
                     WHERE investment_id = dv.investment_id

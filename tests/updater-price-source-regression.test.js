@@ -93,7 +93,7 @@ describe('Updater price source regressions', () => {
 
     const todayRow = db.prepare(
       `SELECT date, price_per_unit, price_source
-       FROM daily_values
+       FROM investment_metrics_daily
        WHERE investment_id = ? AND portfolio_id = ? AND date = ?
        ORDER BY id DESC LIMIT 1`
     ).get(investmentId, portfolioId, today);
@@ -104,7 +104,7 @@ describe('Updater price source regressions', () => {
 
     const staleLiveRow = db.prepare(
       `SELECT COUNT(*) AS n
-       FROM daily_values
+       FROM investment_metrics_daily
        WHERE investment_id = ? AND portfolio_id = ? AND date = ? AND price_source = 'LIVE'`
     ).get(investmentId, portfolioId, staleProviderDate);
 
@@ -150,7 +150,7 @@ describe('Updater price source regressions', () => {
 
     const closeRow = db.prepare(
       `SELECT price_per_unit, price_source
-       FROM daily_values
+       FROM investment_metrics_daily
        WHERE investment_id = ? AND portfolio_id = ? AND date = ?
        ORDER BY id DESC LIMIT 1`
     ).get(investmentId, portfolioId, sessionDate);
@@ -161,7 +161,7 @@ describe('Updater price source regressions', () => {
 
     const todayRow = db.prepare(
       `SELECT price_per_unit, price_source
-       FROM daily_values
+       FROM investment_metrics_daily
        WHERE investment_id = ? AND portfolio_id = ? AND date = ?
        ORDER BY id DESC LIMIT 1`
     ).get(investmentId, portfolioId, today);
@@ -210,7 +210,7 @@ describe('Updater price source regressions', () => {
 
     let firstRow = db.prepare(
       `SELECT price_per_unit, price_source
-       FROM daily_values
+       FROM investment_metrics_daily
        WHERE investment_id = ? AND portfolio_id = ? AND date = ?
        ORDER BY id DESC LIMIT 1`
     ).get(investmentId, portfolioId, today);
@@ -247,7 +247,7 @@ describe('Updater price source regressions', () => {
 
     let secondRow = db.prepare(
       `SELECT price_per_unit, price_source
-       FROM daily_values
+       FROM investment_metrics_daily
        WHERE investment_id = ? AND portfolio_id = ? AND date = ?
        ORDER BY id DESC LIMIT 1`
     ).get(investmentId, portfolioId, today);

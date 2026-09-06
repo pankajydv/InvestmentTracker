@@ -12,7 +12,7 @@
  * Gross value remains recoverable from gross_units * price_per_unit, so no data
  * is lost. Run with `--apply` to write; default is a dry run.
  *
- * After applying, daily_values / asset_type_daily / portfolio_daily for the
+ * After applying, investment_metrics_daily / asset_type_daily / portfolio_daily for the
  * affected investments must be recomputed (dirty-scope backfill).
  */
 const path = require('path');
@@ -91,6 +91,6 @@ if (skippedRows.length) {
   for (const s of skippedRows) console.log('  ', JSON.stringify(s));
 }
 if (!APPLY) console.log('\nDRY RUN — no changes written. Re-run with `--apply` to commit.');
-else console.log('\nAPPLIED. Recompute daily_values/aggregates for the affected investments next.');
+else console.log('\nAPPLIED. Recompute investment_metrics_daily/aggregates for the affected investments next.');
 
 db.close();

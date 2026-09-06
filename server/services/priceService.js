@@ -145,7 +145,7 @@ function detectForeignStockSession(meta, timestamps, closes) {
     changePercent:   Math.round(changePct * 100) / 100,
     previousClose:   prevClose,
     officialClose,
-    date:            providerDate,   // intended daily_values date
+    date:            providerDate,   // intended investment_metrics_daily date
     sessionDateIst,                  // actual US session date (for after-hours writeback)
     sessionPhase,                    // 'pre' | 'regular' | 'post'
   };

@@ -30,7 +30,7 @@ $prodBackup = "$RemoteBackupDir/investments.pre-local-sync-$ts.db"
 Write-Host "=== WAL-aware local -> production DB sync ==="
 
 # Block if deployment activity is in progress.
-$deployJobs = ssh -o BatchMode=yes -o ConnectTimeout=15 -i $SshKeyPath $RemoteUserHost "pgrep -af 'docker.*build|docker.*pull|docker.*push|docker.*deploy' || true"
+$deployJobs = ssh -o BatchMode=yes -o ConnectTimeout=15 -i $SshKeyPath $RemoteUserHost "pgrep -af '[d]ocker.*(build|pull|push|deploy)' || true"
 if ($deployJobs -and $deployJobs.Trim().Length -gt 0) {
     throw "Active deployment process detected on production. Aborting.`n$deployJobs"
 }
