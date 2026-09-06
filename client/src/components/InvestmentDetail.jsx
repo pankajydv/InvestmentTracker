@@ -673,7 +673,9 @@ export default function InvestmentDetail() {
     : Number(data.realizedProceeds ?? data.saleProceeds) || 0;
   const cumulativeValue = currentValue + realizedProceeds;
   const netInvested = totalInvested - realizedProceeds; // capital still deployed in this position
-  const realizedPct = cumulativeValue > 0 ? (realizedProceeds / cumulativeValue) * 100 : null; // share of cumulative value already cashed out
+  const gainOnNetInvestedPct = netInvested > 0
+    ? ((currentValue - netInvested) / netInvested) * 100
+    : null;
   const snapshotProfitLoss = Number(data.latestValue?.profit_loss);
   const totalProfitLoss = Number.isFinite(snapshotProfitLoss)
     ? snapshotProfitLoss
@@ -1090,8 +1092,8 @@ export default function InvestmentDetail() {
                   <span className="dashboard-detail-value">{formatINR(totalInvested)}</span>
                 </div>
                 <div className="dashboard-detail-row">
-                  <span className="dashboard-detail-label">Realized %</span>
-                  <span className="dashboard-detail-value">{realizedPct == null ? '—' : `${realizedPct.toFixed(1)}%`}</span>
+                  <span className="dashboard-detail-label" title="Return on capital still invested">Open Gain</span>
+                  <span className={`dashboard-detail-value ${profitColor(gainOnNetInvestedPct)}`}>{gainOnNetInvestedPct == null ? '—' : formatPct(gainOnNetInvestedPct)}</span>
                 </div>
               </div>
             </Card.Body>
@@ -1108,7 +1110,7 @@ export default function InvestmentDetail() {
               </div>
               <div className="dashboard-return-rows">
                 <div className="dashboard-return-row">
-                  <span className="dashboard-return-label">Absolute</span>
+                  <span className="dashboard-return-label" title="Return across invested capital, current value, and realized proceeds">Absolute</span>
                   <span className={`dashboard-return-value ${profitColor(absoluteReturnPct)}`}>
                     {formatPct(absoluteReturnPct)}
                   </span>

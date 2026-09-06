@@ -222,13 +222,13 @@ export default function DashboardRolloverTable({ title, description, assetType =
                       data.rows.map((row) => (
                         <tr key={row.date}>
                           <td>{row.date}</td>
-                          <td className="text-end">{formatINR(row.current_value)}</td>
-                          <td className={`text-end ${profitColor(row.day_change)}`}>{formatINRExact(row.day_change, 0)}</td>
+                          <td className="text-end">{formatINRExact(row.current_value)}</td>
+                          <td className={`text-end ${profitColor(row.day_change)}`}>{formatINRExact(row.day_change)}</td>
                           <td className={`text-end ${profitColor(row.day_change_pct)}`}>{formatNumber(row.day_change_pct, 2)}%</td>
                           {showSource && <td className="ps-4">{row.price_source || '-'}</td>}
-                          {showMore && <td className="text-end">{formatINR(row.invested_amount)}</td>}
-                          {showMore && <td className="text-end">{formatINR(row.realized_proceeds)}</td>}
-                          {showMore && <td className={`text-end ${profitColor(row.profit_loss)}`}>{formatINR(row.profit_loss)}</td>}
+                          {showMore && <td className="text-end">{formatINRExact(row.invested_amount)}</td>}
+                          {showMore && <td className="text-end">{formatINRExact(row.realized_proceeds)}</td>}
+                          {showMore && <td className={`text-end ${profitColor(row.profit_loss)}`}>{formatINRExact(row.profit_loss)}</td>}
                           {showMore && <td className="text-end">{row.contributing_portfolios || 0}</td>}
                         </tr>
                       ))
