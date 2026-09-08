@@ -236,27 +236,52 @@ async function updateAllPrices(db, options = {}) {
 
   investments = investments.filter(i => BALANCE_BASED_TYPES.has(i.asset_type) || openInvestmentIds.has(i.id));
 
-  // Remove same-day rows previously written for fully exited unit-based holdings.
-  // This keeps latest valuation anchored to the true exit date (no trailing zero-unit snapshots).
+  const getOpenUnitsBeforeScopeDate = db.prepare(`
+    SELECT COALESCE(
+      SUM(CASE
+        WHEN transaction_type IN ('BUY', 'DEPOSIT', 'BONUS', 'SPLIT', 'IPO', 'TRANSFER_IN', 'SWITCH_IN', 'RIGHTS', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE') THEN COALESCE(units, 0)
+        WHEN transaction_type IN ('SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CONSOLIDATION', 'CHARGES', 'AMC') THEN -COALESCE(units, 0)
+        ELSE 0
+      END), 0
+    ) AS total
+    FROM transactions
+    WHERE investment_id = ?
+      AND portfolio_id = ?
+      AND date(transaction_date) < ?
+  `);
+  const wasScopeOpenBeforeDate = (investmentId, portfolioId, date) => (
+    Number(getOpenUnitsBeforeScopeDate.get(investmentId, portfolioId, date)?.total || 0) > 0.0001
+  );
+
+  // Remove same-day rows for holdings that exited before today, while retaining
+  // today's zero-unit liquidation row when the position closed today.
   if (exitedUnitBasedIds.length > 0) {
-    const exitedNameById = new Map(investments.map((i) => [i.id, i.name]));
+    const exitedNameById = new Map(
+      db.prepare(`SELECT id, name FROM investments WHERE id IN (${exitedUnitBasedIds.map(() => '?').join(',')})`)
+        .all(...exitedUnitBasedIds)
+        .map((i) => [Number(i.id), i.name])
+    );
+    const deleteExitedSnapshot = db.prepare(`
+      DELETE FROM investment_metrics_daily
+      WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+    `);
     const CHUNK = 400;
     for (let i = 0; i < exitedUnitBasedIds.length; i += CHUNK) {
       const chunk = exitedUnitBasedIds.slice(i, i + CHUNK);
       const placeholders = chunk.map(() => '?').join(',');
-      const toDeleteRows = ENABLE_ROW_WRITE_AUDIT
-        ? db.prepare(`
-          SELECT investment_id, portfolio_id
-          FROM investment_metrics_daily
-          WHERE date = ?
-            AND investment_id IN (${placeholders})
-        `).all(today, ...chunk)
-        : [];
-      db.prepare(`
-        DELETE FROM investment_metrics_daily
+      const cleanupCandidates = db.prepare(`
+        SELECT investment_id, portfolio_id
+        FROM investment_metrics_daily
         WHERE date = ?
           AND investment_id IN (${placeholders})
-      `).run(today, ...chunk);
+      `).all(today, ...chunk);
+      const toDeleteRows = cleanupCandidates.filter((row) => (
+        !wasScopeOpenBeforeDate(row.investment_id, row.portfolio_id, today)
+      ));
+
+      for (const row of toDeleteRows) {
+        deleteExitedSnapshot.run(row.investment_id, row.portfolio_id, today);
+      }
 
       if (ENABLE_ROW_WRITE_AUDIT && toDeleteRows.length > 0) {
         for (const row of toDeleteRows) {
@@ -697,7 +722,8 @@ async function updateAllPrices(db, options = {}) {
         realizedCashflow = getRealizedCashflowPortfolio(inv, pid, asOfDate);
       } else {
         const scopeOpenUnits = Number(getOpenUnitsPortfolio.get(inv.id, pid, asOfDate)?.total || 0);
-        if (scopeOpenUnits <= 0.0001) {
+        const isExitDate = scopeOpenUnits <= 0.0001 && wasScopeOpenBeforeDate(inv.id, pid, asOfDate);
+        if (scopeOpenUnits <= 0.0001 && !isExitDate) {
           const existing = getExistingDailyRowByScopeDate.get(inv.id, pid, asOfDate);
           deleteTodaySnapshotForScope.run(inv.id, pid, asOfDate);
           if (existing) {

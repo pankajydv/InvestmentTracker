@@ -70,6 +70,102 @@ describe('Updater price source regressions', () => {
     };
   }
 
+  it('preserves a same-day liquidation row while deleting post-exit snapshots', async () => {
+    const portfolioId = Number(db.prepare('INSERT INTO portfolios (name) VALUES (?)').run('Exit Portfolio').lastInsertRowid);
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = addDaysIso(today, -1);
+    const buyDate = addDaysIso(today, -10);
+    const insertInvestment = db.prepare(`
+      INSERT INTO investments (name, asset_type, ticker_symbol, is_active, exclude_from_tracking)
+      VALUES (?, 'INDIAN_STOCK', ?, 1, 0)
+    `);
+    const exitTodayId = Number(insertInvestment.run('Exit Today', 'EXIT-TODAY.NS').lastInsertRowid);
+    const exitedYesterdayId = Number(insertInvestment.run('Exited Yesterday', 'EXITED-YESTERDAY.NS').lastInsertRowid);
+    const insertTxn = db.prepare(`
+      INSERT INTO transactions
+        (investment_id, portfolio_id, transaction_type, transaction_date, units, amount, price_per_unit, fees)
+      VALUES (?, ?, ?, ?, 10, 1000, 100, 0)
+    `);
+    insertTxn.run(exitTodayId, portfolioId, 'BUY', buyDate);
+    insertTxn.run(exitTodayId, portfolioId, 'SELL', today);
+    insertTxn.run(exitedYesterdayId, portfolioId, 'BUY', buyDate);
+    insertTxn.run(exitedYesterdayId, portfolioId, 'SELL', yesterday);
+
+    const insertDaily = db.prepare(`
+      INSERT INTO investment_metrics_daily
+        (investment_id, portfolio_id, date, price_per_unit, total_units, current_value,
+         invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+      VALUES (?, ?, ?, 100, 0, 0, 1000, 1000, 0, 'LIVE', 0)
+    `);
+    insertDaily.run(exitTodayId, portfolioId, today);
+    insertDaily.run(exitedYesterdayId, portfolioId, today);
+
+    const result = await updateAllPrices(db, { assetTypes: ['INDIAN_STOCK'] });
+    assert.equal(Number(result.errorCount || 0), 0);
+
+    const exitTodayRow = db.prepare(`
+      SELECT total_units, current_value, realized_proceeds
+      FROM investment_metrics_daily
+      WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+    `).get(exitTodayId, portfolioId, today);
+    assert.ok(exitTodayRow, 'the liquidation-day row should remain');
+    assert.equal(Number(exitTodayRow.total_units), 0);
+    assert.equal(Number(exitTodayRow.current_value), 0);
+    assert.equal(Number(exitTodayRow.realized_proceeds), 1000);
+
+    const staleRow = db.prepare(`
+      SELECT 1
+      FROM investment_metrics_daily
+      WHERE investment_id = ? AND portfolio_id = ? AND date = ?
+    `).get(exitedYesterdayId, portfolioId, today);
+    assert.equal(staleRow, undefined, 'a post-exit snapshot should still be deleted');
+  });
+
+  it('writes the liquidation-day row for one portfolio when another remains open', async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const buyDate = addDaysIso(today, -10);
+    const investmentId = Number(db.prepare(`
+      INSERT INTO investments (name, asset_type, ticker_symbol, is_active, exclude_from_tracking)
+      VALUES ('Portfolio Exit', 'INDIAN_STOCK', 'PORTFOLIO-EXIT.NS', 1, 0)
+    `).run().lastInsertRowid);
+    const exitingPortfolioId = Number(db.prepare('INSERT INTO portfolios (name) VALUES (?)').run('Exiting').lastInsertRowid);
+    const openPortfolioId = Number(db.prepare('INSERT INTO portfolios (name) VALUES (?)').run('Open').lastInsertRowid);
+    const insertTxn = db.prepare(`
+      INSERT INTO transactions
+        (investment_id, portfolio_id, transaction_type, transaction_date, units, amount, price_per_unit, fees)
+      VALUES (?, ?, ?, ?, 10, 1000, 100, 0)
+    `);
+    insertTxn.run(investmentId, exitingPortfolioId, 'BUY', buyDate);
+    insertTxn.run(investmentId, exitingPortfolioId, 'SELL', today);
+    insertTxn.run(investmentId, openPortfolioId, 'BUY', buyDate);
+    stockPriceMock = async () => ({
+      price: 105,
+      officialClose: 105,
+      change: 0,
+      changePercent: 0,
+      date: today,
+    });
+
+    const result = await updateAllPrices(db, { assetTypes: ['INDIAN_STOCK'] });
+    assert.equal(Number(result.errorCount || 0), 0);
+
+    const rows = db.prepare(`
+      SELECT portfolio_id, total_units, current_value, realized_proceeds
+      FROM investment_metrics_daily
+      WHERE investment_id = ? AND date = ?
+      ORDER BY portfolio_id
+    `).all(investmentId, today);
+    assert.deepEqual(rows.map((row) => ({
+      portfolio_id: Number(row.portfolio_id),
+      total_units: Number(row.total_units),
+      current_value: Number(row.current_value),
+      realized_proceeds: Number(row.realized_proceeds),
+    })), [
+      { portfolio_id: exitingPortfolioId, total_units: 0, current_value: 0, realized_proceeds: 1000 },
+      { portfolio_id: openPortfolioId, total_units: 10, current_value: 1050, realized_proceeds: 0 },
+    ]);
+  });
+
   it('does not fabricate stale provider-date LIVE rows for Indian stocks', async () => {
     const { investmentId, portfolioId } = seedInvestment({
       name: 'Angel One',
