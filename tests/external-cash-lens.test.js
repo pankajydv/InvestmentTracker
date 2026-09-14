@@ -8,13 +8,13 @@ const {
   toSqlInList,
 } = require('../server/services/transactionEffectPolicy');
 
-// Locks the day-change external-cash lens so the consolidated consumers stay
+// Locks the day-change capital-flow lens so the consolidated consumers stay
 // behavior-neutral with the historical inline lists.
-describe('day-change external-cash lens', () => {
-  it('matches the historical cash-in and cash-out membership exactly', () => {
+describe('day-change capital-flow lens', () => {
+  it('matches the approved capital-in and capital-out membership exactly', () => {
     assert.deepEqual([...EXTERNAL_CASH_IN_TYPES], [
       'BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN',
-      'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION',
+      'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION', 'VEST',
     ]);
     assert.deepEqual([...EXTERNAL_CASH_OUT_TYPES], [
       'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC',
@@ -22,11 +22,16 @@ describe('day-change external-cash lens', () => {
     assert.deepEqual([...EXTERNAL_CASH_ABS_NEGATIVE_TYPES], ['TDS']);
   });
 
-  it('excludes income and non-cash acquisitions from the cash lens', () => {
-    for (const type of ['DIVIDEND', 'INTEREST', 'VEST', 'ESPP_PURCHASE', 'BONUS', 'SPLIT', 'RECONCILE']) {
+  it('excludes income and non-basis events from the capital-flow lens', () => {
+    for (const type of ['DIVIDEND', 'INTEREST', 'ESPP_PURCHASE', 'BONUS', 'SPLIT', 'RECONCILE']) {
       assert.equal(EXTERNAL_CASH_IN_TYPES.includes(type), false, `${type} not cash-in`);
       assert.equal(EXTERNAL_CASH_OUT_TYPES.includes(type), false, `${type} not cash-out`);
     }
+  });
+
+  it('treats a recorded-cost RSU vest as performance-neutral capital introduced', () => {
+    assert.equal(EXTERNAL_CASH_IN_TYPES.includes('VEST'), true);
+    assert.equal(EXTERNAL_CASH_OUT_TYPES.includes('VEST'), false);
   });
 
   it('produces a safe SQL IN list', () => {

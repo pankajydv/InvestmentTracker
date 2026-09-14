@@ -188,13 +188,14 @@ function resolveClassificationEffect(transactionType, context = {}) {
   };
 }
 
-// Day-change external-cash lens: transactions that move external cash on their date.
-// Day change strips these so it reflects valuation movement, not deposits/withdrawals.
-// This is a distinct lens from the basis/proceeds classification (it excludes income
-// and non-cash acquisitions like VEST, and includes fee outflows).
+// Day-change capital-flow lens: transactions that add or remove accounted capital on
+// their date. Day change strips these so it reflects valuation movement, not capital
+// introduced or withdrawn. This is distinct from the basis/proceeds classification:
+// it excludes income, includes fee outflows, and treats recorded-cost RSU vests as
+// performance-neutral acquisitions even though they are not cash paid by the investor.
 const EXTERNAL_CASH_IN_TYPES = Object.freeze([
   'BUY', 'DEPOSIT', 'IPO', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN',
-  'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION',
+  'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'ESPP_CONTRIBUTION', 'VEST',
 ]);
 const EXTERNAL_CASH_OUT_TYPES = Object.freeze([
   'SELL', 'REDEMPTION', 'WITHDRAWAL', 'TRANSFER_OUT', 'SWITCH_OUT', 'CHARGES', 'AMC',

@@ -102,6 +102,29 @@ test('provident investment: withdrawal counts as proceeds in the target P&L', ()
   db.close();
 });
 
+test('RSU vest day change excludes the recorded vest basis and matches the P&L movement', () => {
+  const db = makeDb();
+  db.prepare("INSERT INTO investments (id, asset_type, exclude_from_tracking) VALUES (4, 'FOREIGN_STOCK', 0)").run();
+  db.prepare('INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, amount, fees, units) VALUES (4, 1, ?, ?, ?, 0, ?)')
+    .run('VEST', '2026-01-02', 1000, 10);
+  const dv = db.prepare('INSERT INTO investment_metrics_daily (investment_id, portfolio_id, date, price_per_unit, current_value, day_change) VALUES (?,?,?,?,?,?)');
+  dv.run(4, 1, '2026-01-01', 100, 0, 0);
+  // Value rises by 1,050, but 1,000 is newly vested basis. The economic return is 50.
+  dv.run(4, 1, '2026-01-02', 105, 1050, 50);
+
+  rebuildCanonicalProjections(db);
+  const rows = db.prepare(`
+    SELECT date, total_profit_loss, total_day_change
+    FROM portfolio_metrics_daily
+    WHERE portfolio_id = 1
+    ORDER BY date
+  `).all();
+  assert.equal(round2(rows[1].total_day_change), 50);
+  assert.equal(round2(rows[1].total_profit_loss - rows[0].total_profit_loss), 110);
+  // The existing fixture contributes 60 after expenses, plus the vest investment's 50 gain.
+  db.close();
+});
+
 test('portfolio aggregation applies expenses and honors the net_invested identity', () => {
   const db = makeDb();
   rebuildCanonicalProjections(db);
