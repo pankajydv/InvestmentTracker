@@ -331,6 +331,7 @@ export default function AddInvestment() {
         investment_id: inv.id,
         portfolio_id: Number(portfolioId),
         grant_keys: rsuGrantPreview.grant_keys,
+        grants: rsuGrantPreview.grants,
         include_future: rsuIncludeFuture,
         overwrite_existing: rsuOverwriteExisting,
       });

@@ -1,7 +1,10 @@
 function addMonths(isoDate, months) {
   const [year, month, day] = String(isoDate).split('-').map(Number);
-  const base = new Date(Date.UTC(year, month - 1, day));
-  const target = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + months, base.getUTCDate()));
+  const targetMonth = new Date(Date.UTC(year, month - 1 + months, 1));
+  const targetYear = targetMonth.getUTCFullYear();
+  const targetMonthIndex = targetMonth.getUTCMonth();
+  const lastDay = new Date(Date.UTC(targetYear, targetMonthIndex + 1, 0)).getUTCDate();
+  const target = new Date(Date.UTC(targetYear, targetMonthIndex, Math.min(day, lastDay)));
   const yyyy = target.getUTCFullYear();
   const mm = String(target.getUTCMonth() + 1).padStart(2, '0');
   const dd = String(target.getUTCDate()).padStart(2, '0');
@@ -28,6 +31,97 @@ function buildAnnualPlan() {
     plan.push({ months, percent: 5 });
   }
   return plan;
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(parseInt(code, 10)));
+}
+
+function extractDocumentText(buffer) {
+  const source = Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer || '');
+  if (!/<html\b|<body\b|<table\b/i.test(source)) return source;
+
+  return decodeHtmlEntities(
+    source
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/tr\s*>/gi, '\n')
+      .replace(/<\/p\s*>/gi, '\n')
+      .replace(/<[^>]+>/g, ' ')
+  ).replace(/[ \t\r]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim();
+}
+
+function parseDocumentDate(value) {
+  const match = String(value || '').match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (!match) return null;
+  const [, month, day, year] = match;
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function parseAwardDate(text) {
+  const labeled = text.match(/award\s+date\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4})/i)?.[1];
+  const inline = text.match(/on\s+(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s*\([^)]*award\s+date/i)?.[1];
+  return parseDocumentDate(labeled || inline);
+}
+
+function parseRsuGrantDocument(buffer, fileName = 'document') {
+  const text = extractDocumentText(buffer);
+  const awardNumber = text.match(/award\s+number\s*[:\-]?\s*(\d{7,})/i)?.[1] || null;
+  const awardDate = parseAwardDate(text);
+  const planYear = text.match(/(20\d{2})\s+stock\s+plan/i)?.[1] || null;
+  const isAnnualAward = /non[-\s]us\s+annual\s+agreement/i.test(text);
+  const label = planYear && isAnnualAward
+    ? `FY${planYear.slice(2)} Annual SA`
+    : 'Microsoft Stock Award (SA)';
+  const sharesRaw = text.match(/(?:hereby\s+)?award(?:ed)?\s+(?:to\s+[^\d]{0,100})?([\d,]+)\s+stock\s+awards?/i)?.[1]
+    || text.match(/([\d,]+)\s+stock\s+awards?/i)?.[1]
+    || text.match(/total\s+(?:number\s+of\s+)?shares(?:\s+subject\s+to\s+the\s+award)?\s*[:\-]?\s*([\d,]+)/i)?.[1]
+    || text.match(/([\d,]+)\s+shares\s+subject\s+to\s+the\s+award/i)?.[1]
+    || null;
+  const totalShares = sharesRaw ? Number(sharesRaw.replace(/,/g, '')) : null;
+
+  const plan = [];
+  const vestPattern = /(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s+(\d+)\s+months?\s+([\d.]+)\s*%/gi;
+  let match;
+  while ((match = vestPattern.exec(text)) !== null) {
+    const vestDate = parseDocumentDate(match[1]);
+    const months = Number(match[2]);
+    const percent = Number(match[3]);
+    if (vestDate && Number.isFinite(months) && Number.isFinite(percent)) {
+      plan.push({ vestDate, months, percent });
+    }
+  }
+
+  if (!plan.length && awardDate) {
+    const relativeVestPattern = /([\d.]+)\s*%\s+(\d+)\s+months?\s+from\s+award\s+date/gi;
+    while ((match = relativeVestPattern.exec(text)) !== null) {
+      const percent = Number(match[1]);
+      const months = Number(match[2]);
+      if (Number.isFinite(months) && Number.isFinite(percent)) {
+        plan.push({ vestDate: shiftToNextWeekday(addMonths(awardDate, months)), months, percent });
+      }
+    }
+  }
+
+  if (!awardNumber || !awardDate || !Number.isFinite(totalShares) || !plan.length) {
+    throw new Error(`Could not extract award number, award date, shares, and vesting schedule from ${fileName}`);
+  }
+
+  return {
+    key: `AWARD_${awardNumber}`,
+    label,
+    awardNumber,
+    awardDate,
+    totalShares,
+    plan,
+  };
 }
 
 const GRANTS = [
@@ -122,6 +216,7 @@ function toYyyyMmDd(value) {
 function generateGrantRows(grant) {
   const rows = [];
   let allocatedUnits = 0;
+  let allocatedPercent = 0;
 
   for (let i = 0; i < grant.plan.length; i += 1) {
     const tranche = grant.plan[i];
@@ -131,19 +226,20 @@ function generateGrantRows(grant) {
     const rawUnits = hasExplicitUnits
       ? Number(tranche.units)
       : (grant.totalShares * tranche.percent) / 100;
-    const isLast = trancheIndex === totalTranches;
     const units = hasExplicitUnits
       ? Number(tranche.units)
-      : (isLast
-        ? grant.totalShares - allocatedUnits
-        : Math.floor(rawUnits));
+      : (() => {
+        allocatedPercent += Number(tranche.percent || 0);
+        const cumulativeTarget = Math.round((grant.totalShares * allocatedPercent) / 100);
+        return cumulativeTarget - allocatedUnits;
+      })();
     const vestPercent = tranche.percent != null
       ? tranche.percent
       : Number(((units * 100) / grant.totalShares).toFixed(6));
 
     allocatedUnits += units;
 
-    const vestDate = shiftToNextWeekday(addMonths(grant.awardDate, tranche.months));
+    const vestDate = tranche.vestDate || shiftToNextWeekday(addMonths(grant.awardDate, tranche.months));
     const seq = String(trancheIndex).padStart(2, '0');
 
     rows.push({
@@ -175,9 +271,10 @@ function generateRsuSchedule(options = {}) {
     ? new Set(options.grantKeys)
     : null;
 
+  const sourceGrants = Array.isArray(options.grants) && options.grants.length ? options.grants : GRANTS;
   const selected = grantKeys
-    ? GRANTS.filter((g) => grantKeys.has(g.key))
-    : GRANTS;
+    ? sourceGrants.filter((g) => grantKeys.has(g.key))
+    : sourceGrants;
 
   const allRows = selected.flatMap(generateGrantRows);
   const filteredRows = includeFuture
@@ -223,5 +320,6 @@ function generateRsuSchedule(options = {}) {
 
 module.exports = {
   GRANTS,
+  parseRsuGrantDocument,
   generateRsuSchedule,
 };

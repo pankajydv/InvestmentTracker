@@ -5,7 +5,7 @@ const { lookupTickerByISIN, fetchCorporateActions, toNSETicker, fetchHistoricalS
 const { parseContractNotes } = require('../services/contractNoteParser');
 const { parseFidelityTradeConfirmation } = require('../services/fidelityTradeConfirmationParser');
 const { parsePnLStatement } = require('../services/pnlParser');
-const { GRANTS, generateRsuSchedule } = require('../services/rsuGrantService');
+const { parseRsuGrantDocument, generateRsuSchedule } = require('../services/rsuGrantService');
 const { OFFERINGS, generateEsppSchedule } = require('../services/esppGrantService');
 const { parseOpenLots, parseClosedLots, reconcileVestTransactions } = require('../services/fidelityVestReconciler');
 const { normalizeRows, annotatePreviewRows } = require('../services/esppAcquisitionImportService');
@@ -942,6 +942,33 @@ module.exports = function (db) {
         return res.json({ created: 0, skipped: 0, removed_existing: 0, total_rows: 0 });
       }
 
+      const repairExisting = db.prepare(`
+        UPDATE transactions
+        SET units = NULL,
+            exchange_rate_used = CASE
+              WHEN DATE(transaction_date) > DATE('now') THEN NULL
+              ELSE exchange_rate_used
+            END,
+            notes = REPLACE(notes, ?, ?)
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'VEST'
+          AND tax_withheld_units IS NULL
+          AND (price_per_unit IS NULL OR fmv_per_unit IS NULL OR amount IS NULL OR amount <= 0)
+          AND notes LIKE ?
+      `);
+      for (const grant of schedule.grants) {
+        const oldPrefix = `RSU Vest | Award ${grant.awardNumber}`;
+        const newPrefix = `RSU Vest | ${grant.label}`;
+        repairExisting.run(
+          oldPrefix,
+          newPrefix,
+          investmentId,
+          portfolioId,
+          `%${oldPrefix}%`,
+        );
+      }
+
       const existing = db.prepare(`
         SELECT id, transaction_date, notes
         FROM transactions
@@ -1440,79 +1467,45 @@ module.exports = function (db) {
         return res.status(400).json({ error: 'No files uploaded' });
       }
 
-      const grantByAward = new Map(GRANTS.map((g) => [String(g.awardNumber), g]));
-      const grantKeys = new Set();
+      const grants = [];
       const fileSummaries = [];
 
-      const parseText = (buffer) => {
-        const utf8 = buffer.toString('utf8');
-        const latin1 = buffer.toString('latin1');
-        const utf16 = buffer.toString('utf16le');
-        return [utf8, latin1, utf16].join('\n');
-      };
-
-      const extractMatch = (text, regex) => {
-        const match = text.match(regex);
-        return match ? String(match[1]).trim() : null;
-      };
-
-      const detectAwardNumber = (text) => {
-        const cleaned = String(text || '');
-
-        const labeled = extractMatch(cleaned, /award\s+number\s*[:\-]?\s*([0-9]{7,})/i);
-        if (labeled && grantByAward.has(labeled)) return labeled;
-
-        // Fast path: exact known award number appears anywhere in the extracted text.
-        for (const award of grantByAward.keys()) {
-          if (cleaned.includes(award)) return award;
-        }
-
-        // Fallback: normalize potentially split digits (e.g. "0 0 0 0 ...") and try matching.
-        const candidates = cleaned.match(/[0-9][0-9\s\-]{8,}[0-9]/g) || [];
-        for (const raw of candidates) {
-          const digits = raw.replace(/\D/g, '');
-          if (grantByAward.has(digits)) return digits;
-        }
-
-        return null;
-      };
-
       for (const file of req.files) {
-        const text = parseText(file.buffer);
-        const awardNumber = detectAwardNumber(text);
-        const awardDate = extractMatch(text, /award\s+date\s*[:\-]?\s*([0-9]{2}[\/\-][0-9]{2}[\/\-][0-9]{4})/i);
-        const sharesMatchA = text.match(/total\s+(?:number\s+of\s+)?shares(?:\s+subject\s+to\s+the\s+award)?\s*[:\-]?\s*([0-9,]+)/i);
-        const sharesMatchB = text.match(/([0-9,]+)\s+shares\s+subject\s+to\s+the\s+award/i);
-        const sharesRaw = sharesMatchA?.[1] || sharesMatchB?.[1] || null;
-        const shares = sharesRaw ? Number(String(sharesRaw).replace(/,/g, '')) : null;
-
-        const grant = awardNumber ? grantByAward.get(awardNumber) : null;
-        if (grant) grantKeys.add(grant.key);
+        let grant = null;
+        let parseError = null;
+        try {
+          grant = parseRsuGrantDocument(file.buffer, file.originalname);
+          grants.push(grant);
+        } catch (e) {
+          parseError = e.message;
+        }
 
         fileSummaries.push({
           file_name: file.originalname,
-          award_number: awardNumber,
-          award_date: awardDate,
-          extracted_shares: shares,
-          matched_grant_key: grant ? grant.key : null,
-          matched_grant_label: grant ? grant.label : null,
+          award_number: grant?.awardNumber || null,
+          award_date: grant?.awardDate || null,
+          extracted_shares: grant?.totalShares || null,
+          matched_grant_key: grant?.key || null,
+          matched_grant_label: grant?.label || null,
+          error: parseError,
         });
       }
 
-      const matchedGrants = GRANTS
-        .filter((g) => grantKeys.has(g.key))
+      const matchedGrants = grants
         .map((g) => ({
           key: g.key,
           label: g.label,
           award_number: g.awardNumber,
           award_date: g.awardDate,
           total_shares: g.totalShares,
+          plan: g.plan,
         }));
 
       res.json({
         files_processed: req.files.length,
         matched_count: matchedGrants.length,
-        grant_keys: Array.from(grantKeys),
+        grant_keys: grants.map((g) => g.key),
+        grants,
         matched_grants: matchedGrants,
         file_summaries: fileSummaries,
       });
@@ -1693,6 +1686,7 @@ module.exports = function (db) {
         include_future,
         as_of_date,
         grant_keys,
+        grants,
         overwrite_existing,
       } = req.body || {};
 
@@ -1709,6 +1703,7 @@ module.exports = function (db) {
         includeFuture: include_future === true,
         asOfDate: as_of_date || null,
         grantKeys: Array.isArray(grant_keys) ? grant_keys : null,
+        grants: Array.isArray(grants) ? grants : null,
       });
 
       const rows = schedule.rows;

@@ -658,6 +658,7 @@ export default function InvestmentDetail() {
   const interestPreviewDecimals = isPPF ? 0 : 2;
   const isBond = data.asset_type === 'BOND';
   const isSGB = data.asset_type === 'SGB';
+  const showStt = data.asset_type !== 'FOREIGN_STOCK';
   const isForeignUSD = data.asset_type === 'FOREIGN_STOCK' && data.currency === 'USD';
   const isMSFTStock = /MSFT/i.test(String(data.ticker_symbol || '')) || /microsoft/i.test(String(data.name || ''));
   const canImportEspp = isForeignUSD && isMSFTStock;
@@ -1414,7 +1415,7 @@ export default function InvestmentDetail() {
                       {!isPPF && <th className="px-3 text-end">Price</th>}
                       <th className="px-3 text-end">Amt</th>
                       {!isPPF && <th className="px-3 text-end">Fees</th>}
-                      {!isPPF && <th className="px-3 text-end">STT</th>}
+                      {showStt && <th className="px-3 text-end">STT</th>}
                       {isPPF && <th className="px-3 text-end">Balance</th>}
                       {!isPPF && <th className="px-3 text-end">Hold</th>}
                       {hasFolioColumn && <th className="px-3">Folio</th>}
@@ -1438,7 +1439,9 @@ export default function InvestmentDetail() {
                       let unitBal = 0;
                       let amtBal = data.opening_balance || 0;
                       for (const txn of sorted) {
-                        if (UNIT_ADD_TYPES.includes(txn.transaction_type)) unitBal += txn.units || 0;
+                        const isFutureVest = txn.transaction_type === 'VEST'
+                          && String(txn.transaction_date || '') > todayIso;
+                        if (!isFutureVest && UNIT_ADD_TYPES.includes(txn.transaction_type)) unitBal += txn.units || 0;
                         else if (UNIT_SUB_TYPES.includes(txn.transaction_type)) unitBal -= txn.units || 0;
                         if (Math.abs(unitBal) < 1e-6) unitBal = 0;
                         holdingMap[txn.id] = unitBal;
@@ -1491,7 +1494,7 @@ export default function InvestmentDetail() {
                         {!isPPF && (
                           <td className="px-3 text-end">
                             {txn.units ? formatNumber(txn.units, 4) : '-'}
-                            {isForeignUSD && txn.gross_units != null && txn.tax_withheld_units != null && Math.abs(Number(txn.gross_units || 0) - Number(txn.units || 0)) > 0.000001 ? (
+                            {isForeignUSD && txn.gross_units != null ? (
                               <div className="text-muted" style={{ fontSize: '0.75rem', whiteSpace: 'nowrap' }}>
                                 Gross {formatNumber(txn.gross_units, 4)}
                               </div>
@@ -1519,7 +1522,7 @@ export default function InvestmentDetail() {
                           ) : null}
                         </td>
                         {!isPPF && <td className="px-3 text-end">{txn.fees > 0 ? `₹${formatNumber(txn.fees, 2)}` : '-'}</td>}
-                        {!isPPF && <td className="px-3 text-end text-muted">{txn.stt != null ? `₹${formatNumber(txn.stt, 2)}` : '-'}</td>}
+                        {showStt && <td className="px-3 text-end text-muted">{txn.stt != null ? `₹${formatNumber(txn.stt, 2)}` : '-'}</td>}
                         {isPPF && <td className="px-3 text-end fw-medium">₹{formatNumber(balanceMap[txn.id], 2)}</td>}
                         {!isPPF && <td className="px-3 text-end">{holdingMap[txn.id] != null ? formatNumber(holdingMap[txn.id], 4) : '-'}</td>}
                         {!isPPF && hasFolio && <td className="px-3 text-muted" style={{ fontSize: '0.8rem' }}>{txn.folio_number || '-'}</td>}
