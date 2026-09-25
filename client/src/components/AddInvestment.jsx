@@ -5,9 +5,10 @@ import { createInvestment, addTransaction, getInvestments, searchMutualFunds, se
 import { ASSET_TYPE_LABELS, ASSET_TYPE_FILTER_ORDER } from '../utils/formatters';
 import { ArrowLeft, Search, CheckCircle, FileText, Upload, Receipt, AlertCircle, Loader2, ChevronDown, ChevronUp, Plus } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
+import { getCreationTransactionTypes } from '../utils/transactionTypes';
 
 const ASSET_TYPES = ASSET_TYPE_FILTER_ORDER;
-const STOCK_TXN_TYPES = ['BUY', 'SELL'];
+const STOCK_TXN_TYPES = getCreationTransactionTypes('INDIAN_STOCK');
 
 export default function AddInvestment() {
   const navigate = useNavigate();
@@ -186,7 +187,7 @@ export default function AddInvestment() {
 
   useEffect(() => {
     if (assetType === 'PPF' || assetType === 'SSY') {
-      const allowedTypes = new Set(['DEPOSIT', 'WITHDRAWAL', 'INTEREST', 'RECONCILE']);
+      const allowedTypes = new Set(getCreationTransactionTypes(assetType));
       setTxn((prev) => ({
         ...prev,
         transaction_type: allowedTypes.has(prev.transaction_type) ? prev.transaction_type : 'DEPOSIT',
@@ -1742,7 +1743,7 @@ export default function AddInvestment() {
               <h2 className="h6 fw-semibold mb-3">3. Purchase / Sale / Redemption</h2>
               <div className="mb-3">
                 <div className="d-flex flex-wrap gap-2">
-                  {['BUY', 'SELL', 'REDEMPTION'].map((t) => (
+                  {getCreationTransactionTypes(assetType).map((t) => (
                     <Form.Check
                       key={t}
                       inline

@@ -528,6 +528,53 @@ describe('Bonds — Accrual Engine', () => {
     assert.equal(payoutDay.meta?.hasCouponPaymentOnAsOf, true);
   });
 
+  it('drops accrued coupon to zero once the bond is fully redeemed', () => {
+    const investment = {
+      id: 9994,
+      asset_type: 'BOND',
+      face_value: 1000,
+      coupon_rate: 9.15,
+      coupon_frequency: 'ANNUAL',
+      name: 'Redeemed Annual Bond',
+    };
+
+    const transactions = [
+      { tx_date: '2023-08-28', transaction_type: 'BUY', units: 46, amount: 45540 },
+      { tx_date: '2023-09-25', transaction_type: 'INTEREST', units: 46, amount: 4209 },
+      { tx_date: '2024-09-24', transaction_type: 'INTEREST', units: 46, amount: 4209 },
+      { tx_date: '2025-09-24', transaction_type: 'INTEREST', units: 46, amount: 4209 },
+      { tx_date: '2026-09-25', transaction_type: 'REDEMPTION', units: 46, amount: 50209 },
+    ];
+
+    // Day before redemption: full year of coupon still accrued while units are held.
+    const beforeRedemption = computeBondAccruedCoupon({
+      investment,
+      transactions,
+      asOfDate: '2026-09-24',
+      dayCount: 365,
+    });
+    assert.ok(Number(beforeRedemption.accruedCoupon) > 4000, `Expected carried accrual before redemption, got ${beforeRedemption.accruedCoupon}`);
+
+    // On/after full redemption: no units held, so no coupon receivable lingers.
+    const onRedemption = computeBondAccruedCoupon({
+      investment,
+      transactions,
+      asOfDate: '2026-09-25',
+      dayCount: 365,
+    });
+    assert.equal(Number(onRedemption.accruedCoupon), 0);
+    assert.equal(onRedemption.meta?.fullyExited, true);
+
+    const afterRedemption = computeBondAccruedCoupon({
+      investment,
+      transactions,
+      asOfDate: '2026-09-26',
+      dayCount: 365,
+    });
+    assert.equal(Number(afterRedemption.accruedCoupon), 0);
+    assert.equal(afterRedemption.meta?.fullyExited, true);
+  });
+
   it('computes monthly coupon accrual and flags missing expected coupon transaction', () => {
     const investment = {
       id: 9992,

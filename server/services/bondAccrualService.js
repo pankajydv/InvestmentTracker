@@ -1,5 +1,8 @@
 const VALID_FREQUENCIES = new Set(['MONTHLY', 'QUARTERLY', 'SEMI_ANNUAL', 'ANNUAL']);
 
+// Below this net-units threshold a position is treated as fully exited (no coupon receivable).
+const UNIT_EXIT_EPSILON = 1e-6;
+
 const FREQUENCY_MONTHS = {
   MONTHLY: 1,
   QUARTERLY: 3,
@@ -319,6 +322,21 @@ function computeBondAccruedCoupon({
       accrued += units * dailyRate;
     }
     cursor = addDaysIso(cursor, 1);
+  }
+
+  // A fully-exited position (e.g. after a full sale or redemption) holds no coupon
+  // receivable: any accrued coupon is settled in the sale/redemption proceeds. Without
+  // this guard the residual accrual would linger as phantom current value at zero units.
+  if (units <= UNIT_EXIT_EPSILON) {
+    return {
+      accruedCoupon: 0,
+      meta: {
+        ...baseMeta,
+        skipped: false,
+        accrualStartDate,
+        fullyExited: true,
+      },
+    };
   }
 
   return {

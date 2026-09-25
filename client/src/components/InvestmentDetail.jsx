@@ -5,6 +5,7 @@ import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, upd
 import { formatINR, formatINRExact, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
 import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { allocateForeignStockSoldUnits, isForeignStockLotFullySold } from '../utils/foreignStockLots';
+import { getInvestmentTransactionTypes } from '../utils/transactionTypes';
 import { parseSGBName, convertDateFormat, calculateCouponDates, getPaidCouponDates, calculateInterestPaid, calculateAccruedInterest, getLastCouponDate, getNextCouponDate } from '../utils/sgbCalculator';
 import { ArrowLeft, Trash2, Plus, X, Settings, Pencil, Wallet, PiggyBank, BarChart3, TrendingUp, TrendingDown } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
@@ -51,27 +52,6 @@ function isInternalXirrCashflow(assetType, transactionType) {
   }
 
   return normalizedType === 'RECONCILE';
-}
-
-function getTxnTypesForInvestment(investment) {
-  if (!investment) return ['BUY', 'SELL', 'DIVIDEND'];
-
-  const isPPFType = investment.asset_type === 'PPF' || investment.asset_type === 'SSY';
-  const isPFType = investment.asset_type === 'PF';
-  const isEpsInvestment = isPFType && /eps/i.test(String(investment.name || ''));
-  const isBondType = investment.asset_type === 'BOND';
-  const isSGBType = investment.asset_type === 'SGB';
-  const isForeignUsdType = investment.asset_type === 'FOREIGN_STOCK' && investment.currency === 'USD';
-
-  if (isPPFType) return ['DEPOSIT', 'WITHDRAWAL', 'INTEREST', 'RECONCILE'];
-  if (isPFType) {
-    return isEpsInvestment
-      ? ['EPS_CONTRIBUTION', 'INTEREST', 'WITHDRAWAL', 'RECONCILE']
-      : ['DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'INTEREST', 'WITHDRAWAL', 'RECONCILE'];
-  }
-  if (isBondType || isSGBType) return ['BUY', 'SELL', 'INTEREST'];
-  if (isForeignUsdType) return ['VEST', 'ESPP_CONTRIBUTION', 'ESPP_PURCHASE', 'BUY', 'SELL', 'DIVIDEND'];
-  return ['BUY', 'SELL', 'DIVIDEND'];
 }
 
 function xnpv(rate, flows, baseDate) {
@@ -180,7 +160,7 @@ export default function InvestmentDetail() {
   });
   const [rateLoading, setRateLoading] = useState(false);
 
-  const txnTypes = getTxnTypesForInvestment(data);
+  const txnTypes = getInvestmentTransactionTypes(data);
 
   useEffect(() => {
     if (!showAddTxn) return;
@@ -673,7 +653,9 @@ export default function InvestmentDetail() {
     ? snapshotRealizedProceeds
     : Number(data.realizedProceeds ?? data.saleProceeds) || 0;
   const cumulativeValue = currentValue + realizedProceeds;
-  const netInvested = totalInvested - realizedProceeds; // capital still deployed in this position
+  // Capital still deployed in this position. Once realized proceeds have recovered the
+  // full cost, no capital remains invested, so this floors at 0 rather than going negative.
+  const netInvested = Math.max(0, totalInvested - realizedProceeds);
   const gainOnNetInvestedPct = netInvested > 0
     ? ((currentValue - netInvested) / netInvested) * 100
     : null;
