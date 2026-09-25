@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { Alert, Button, Card, Col, Row, Spinner } from 'react-bootstrap';
-import { ArrowLeft, PiggyBank, TrendingDown, TrendingUp, Wallet } from 'lucide-react';
+import { ArrowLeft, BarChart3, PiggyBank, TrendingDown, TrendingUp, Wallet } from 'lucide-react';
 import { getAssetTypeOverview, getAssetTypeXirr, getDashboardSummary, getDashboardVersion, getAssetIntervalMetrics } from '../services/api';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
@@ -453,8 +453,19 @@ export default function AssetTypeDashboard() {
   const netProfitLoss = Number(typeInfo.totalProfitLoss) || 0;
   const totalInvested = Number(typeInfo.totalInvested) || 0;
   const totalRealizedGain = Number(typeInfo.totalRealizedGain) || 0;
-  const currentInvested = totalInvested - totalRealizedGain;
+  // Capital still deployed across this asset type: sum of each position's remaining
+  // invested capital, floored at 0 so a fully-recovered holding never shows as negative
+  // (and never offsets capital still deployed in other holdings).
+  const currentInvested = (typeInfo.investments || []).reduce((sum, inv) => {
+    const invested = Number(inv.invested_amount) || 0;
+    const proceeds = Number(inv.realized_proceeds) || 0;
+    return sum + Math.max(0, invested - proceeds);
+  }, 0);
   const netReturnPct = totalInvested > 0 ? (netProfitLoss / totalInvested) * 100 : 0;
+  const totalValue = Number(typeInfo.totalValue) || 0;
+  const cumulativeValue = totalValue + totalRealizedGain;
+  // Return on capital still deployed; null (shown as "—") once nothing remains invested.
+  const openGainPct = currentInvested > 0 ? ((totalValue - currentInvested) / currentInvested) * 100 : null;
   const intervalChangePct = Number(typeInfo.intervalChangePct ?? 0);
   const intervalLabel = selectedInterval === 'CUSTOM'
     ? `${customFromDate} to ${customToDate}`
@@ -495,7 +506,7 @@ export default function AssetTypeDashboard() {
       </div>
 
       <Row className="g-3">
-        <Col md={6} lg={4} className="order-1">
+        <Col md={6} lg={3} className="order-1">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
@@ -515,7 +526,27 @@ export default function AssetTypeDashboard() {
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={4} className="order-3">
+        <Col md={6} lg={3} className="order-3">
+          <Card className="shadow-sm h-100">
+            <Card.Body className="py-3">
+              <div className="d-flex align-items-center gap-2 text-muted small mb-1">
+                <BarChart3 size={16} /> Cumulative Value
+              </div>
+              <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINRExact(cumulativeValue)}</div>
+              <div className="dashboard-detail-rows">
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Total Invested</span>
+                  <span className="dashboard-detail-value">{formatINRExact(totalInvested)}</span>
+                </div>
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label" title="Return on capital still invested">Open Gain</span>
+                  <span className={`dashboard-detail-value ${profitColor(openGainPct)}`}>{openGainPct == null ? '—' : formatPct(openGainPct)}</span>
+                </div>
+              </div>
+            </Card.Body>
+          </Card>
+        </Col>
+        <Col md={6} lg={3} className="order-4">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
@@ -609,7 +640,7 @@ export default function AssetTypeDashboard() {
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={4} className="order-2">
+        <Col md={6} lg={3} className="order-2">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">

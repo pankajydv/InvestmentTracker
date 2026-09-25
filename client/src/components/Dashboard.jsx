@@ -5,7 +5,7 @@ import { getDashboardOverview, getDashboardSummary, getDashboardVersion, getDash
 import { getOpenGaps, getComplianceStatus } from '../services/compliance';
 import { ComplianceWarning } from './ComplianceWarning';
 import { formatINR, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_COLORS, ASSET_TYPE_FULL_NAMES, ASSET_TYPE_SLUG, compareAssetTypes, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
-import { TrendingUp, TrendingDown, Wallet, PiggyBank, ArrowRight, AlertTriangle } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, PiggyBank, BarChart3, ArrowRight, AlertTriangle } from 'lucide-react';
 import { usePortfolio } from '../context/PortfolioContext';
 import { useAppSettings } from '../context/AppSettingsContext';
 import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
@@ -811,8 +811,14 @@ export default function Dashboard() {
   const netProfitLoss = portfolio.total_profit_loss - (totalExpenses || 0);
   const netReturnPct = portfolio.total_invested > 0 ? (netProfitLoss / portfolio.total_invested) * 100 : 0;
   const totalRealizedGain = Number(portfolio.total_realized_proceeds) || 0;
+  const totalInvested = Number(portfolio.total_invested) || 0;
   // Prefer the stored net_invested; fall back to the legacy derivation for older responses.
-  const currentInvested = Number(portfolio.net_invested) || ((Number(portfolio.total_invested) || 0) - totalRealizedGain);
+  // Floored at 0 so a fully-recovered portfolio never shows negative capital still deployed.
+  const currentInvested = Math.max(0, Number(portfolio.net_invested) || (totalInvested - totalRealizedGain));
+  const totalValue = Number(portfolio.total_value) || 0;
+  const cumulativeValue = totalValue + totalRealizedGain;
+  // Return on capital still deployed; null (shown as "—") once nothing remains invested.
+  const openGainPct = currentInvested > 0 ? ((totalValue - currentInvested) / currentInvested) * 100 : null;
   const formatINRExact = (amount, options = {}) => {
     const sensitive = options?.sensitive !== false;
     if (sensitive && isPrivacyMaskEnabled()) return getMaskedValue({ currencySymbol: '₹' });
@@ -1087,7 +1093,7 @@ export default function Dashboard() {
 
       {/* Portfolio Summary Cards */}
       <Row className="g-3 mb-4">
-        <Col md={6} lg={4} className="order-1">
+        <Col md={6} lg={3} className="order-1">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
@@ -1107,7 +1113,27 @@ export default function Dashboard() {
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={4} className="order-3">
+        <Col md={6} lg={3} className="order-3">
+          <Card className="shadow-sm h-100">
+            <Card.Body className="py-3">
+              <div className="d-flex align-items-center gap-2 text-muted small mb-1">
+                <BarChart3 size={16} /> Cumulative Value
+              </div>
+              <div className="fw-bold" style={{ fontSize: '1.9rem', lineHeight: 1.1 }}>{formatINRExact(cumulativeValue)}</div>
+              <div className="dashboard-detail-rows">
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label">Total Invested</span>
+                  <span className="dashboard-detail-value">{formatINRExact(totalInvested)}</span>
+                </div>
+                <div className="dashboard-detail-row">
+                  <span className="dashboard-detail-label" title="Return on capital still invested">Open Gain</span>
+                  <span className={`dashboard-detail-value ${profitColor(openGainPct)}`}>{openGainPct == null ? '—' : formatPct(openGainPct)}</span>
+                </div>
+              </div>
+            </Card.Body>
+          </Card>
+        </Col>
+        <Col md={6} lg={3} className="order-4">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
@@ -1222,7 +1248,7 @@ export default function Dashboard() {
             </Card.Body>
           </Card>
         </Col>
-        <Col md={6} lg={4} className="order-2">
+        <Col md={6} lg={3} className="order-2">
           <Card className="shadow-sm h-100">
             <Card.Body className="py-3">
               <div className="d-flex align-items-center gap-2 text-muted small mb-1">
