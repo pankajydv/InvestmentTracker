@@ -1265,21 +1265,12 @@ export default function Dashboard() {
                   const intervalPctSuffix = isDayChangeMode ? '' : ' p.a.';
                   const lifetimeClass = profitColor(info.totalProfitLoss);
                   const intervalClass = profitColor(info.dayChange);
-                  const allocationPct = portfolio.total_value > 0
-                    ? (info.totalValue / portfolio.total_value) * 100
-                    : 0;
 
                   return (
                 <div
                   className="rounded p-2 border asset-allocation-card"
                   style={{ borderLeftColor: ASSET_TYPE_COLORS[type], borderLeftWidth: '4px', borderLeftStyle: 'solid' }}
                 >
-                  <span
-                    className="asset-allocation-pct"
-                    title={`${ASSET_TYPE_FULL_NAMES[type] || ASSET_TYPE_LABELS[type]} is ${allocationPct.toFixed(1)}% of total current value`}
-                  >
-                    {allocationPct.toFixed(1)}%
-                  </span>
                   <Link
                     to={`/asset-types/${ASSET_TYPE_SLUG[type] || type.toLowerCase()}`}
                     className="text-decoration-underline fw-semibold"

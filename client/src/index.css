@@ -544,22 +544,6 @@ tr:hover .row-actions {
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.5);
 }
 
-.asset-allocation-pct {
-  position: absolute;
-  top: 0.3rem;
-  right: 0.4rem;
-  font-size: 0.66rem;
-  font-weight: 700;
-  line-height: 1;
-  padding: 0.1rem 0.32rem;
-  border-radius: 999px;
-  background: #eef2f7;
-  color: #47546a;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.01em;
-  pointer-events: auto;
-}
-
 /* Tax page consistency pass */
 .tax-modern-page .accordion-item {
   border: 1px solid #d8e2f1;
@@ -844,13 +828,6 @@ tr:hover .row-actions {
   .asset-allocation-card .fw-semibold.text-nowrap {
     font-size: 1rem !important;
     margin-top: 0.12rem;
-  }
-
-  .asset-allocation-pct {
-    top: 0.25rem;
-    right: 0.25rem;
-    font-size: 0.6rem;
-    padding: 0.08rem 0.26rem;
   }
 
   .asset-allocation-card > a {
