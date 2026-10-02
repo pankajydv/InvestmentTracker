@@ -683,6 +683,142 @@ describe('Transactions — BUY and SELL', () => {
     assert.equal(body.transaction_type, 'SELL');
   });
 
+  it('POST derives a domestic BUY amount from units and price', async () => {
+    const { status, body } = await api('POST', '/transactions', {
+      investment_id: 1, portfolio_id: 1, transaction_type: 'BUY', transaction_date: '2023-07-01',
+      units: 2, price_per_unit: 1234.5,
+    });
+    assert.equal(status, 201);
+    assert.equal(body.amount, 2469);
+  });
+
+  it('POST derives an INR amount for a USD cash transaction', async () => {
+    const invRes = await api('POST', '/investments', {
+      name: 'USD Cash Test', asset_type: 'FOREIGN_STOCK', ticker_symbol: 'USDCASH', currency: 'USD',
+    });
+    assert.equal(invRes.status, 201);
+    mockUsdInrRate = async () => 82.5;
+
+    try {
+      const { status, body } = await api('POST', '/transactions', {
+        investment_id: invRes.body.id,
+        portfolio_id: 1,
+        transaction_type: 'DIVIDEND',
+        transaction_date: '2023-07-02',
+        usd_amount: 100,
+      });
+      assert.equal(status, 201);
+      assert.equal(body.usd_amount, 100);
+      assert.equal(body.exchange_rate_used, 82.5);
+      assert.equal(body.amount, 8250);
+
+      const purchase = await api('POST', '/transactions', {
+        investment_id: invRes.body.id,
+        portfolio_id: 1,
+        transaction_type: 'ESPP_PURCHASE',
+        transaction_date: '2023-09-30',
+        units: 10,
+        price_per_unit: 90,
+      });
+      assert.equal(purchase.status, 201);
+      assert.equal(purchase.body.amount, 0);
+      assert.equal(purchase.body.usd_amount, 900);
+      assert.equal(purchase.body.fmv_per_unit, 100);
+    } finally {
+      mockUsdInrRate = async () => 80;
+    }
+  });
+
+  it('reconciles matching ESPP activity without replacing transaction IDs', async () => {
+    const invRes = await api('POST', '/investments', {
+      name: 'ESPP Reconcile Test', asset_type: 'FOREIGN_STOCK', ticker_symbol: 'ESPPR', currency: 'USD',
+    });
+    assert.equal(invRes.status, 201);
+    mockUsdInrRate = async () => 80;
+
+    const rows = [
+      {
+        activity_type: 'ESPP_CONTRIBUTION',
+        import_key: 'ESPP_CONTRIB|2026-08',
+        month_key: '2026-08',
+        contribution_date: '2026-08-28',
+        amount: 1000,
+        source_file: 'August.pdf',
+      },
+      {
+        activity_type: 'ESPP_PURCHASE',
+        offering_period: 'JUL/01/2026 - SEP/30/2026',
+        purchase_date: '2026-09-30',
+        purchase_quantity: 10,
+        purchase_price: 90,
+        purchase_value: 900,
+        fmv_purchase_date: 100,
+        transaction_number: 'ESPP123',
+        reference_number: 'REF123',
+        cusip: '594918104',
+        source_file: 'Purchase.pdf',
+      },
+    ];
+
+    try {
+      const first = await api('POST', '/stocks/espp-activity/import', {
+        investment_id: invRes.body.id,
+        portfolio_id: 1,
+        rows,
+      });
+      assert.equal(first.status, 200);
+      assert.equal(first.body.created, 2);
+      assert.equal(first.body.updated, 0);
+      assert.equal(first.body.unchanged, 0);
+
+      const original = db.prepare(`
+        SELECT id, transaction_type, amount, usd_amount, fmv_per_unit
+        FROM transactions
+        WHERE investment_id = ?
+        ORDER BY transaction_type
+      `).all(invRes.body.id);
+      assert.equal(original.length, 2);
+
+      const second = await api('POST', '/stocks/espp-activity/import', {
+        investment_id: invRes.body.id,
+        portfolio_id: 1,
+        rows,
+      });
+      assert.equal(second.status, 200);
+      assert.equal(second.body.created, 0);
+      assert.equal(second.body.updated, 0);
+      assert.equal(second.body.unchanged, 2);
+
+      const changedRows = rows.map((row) => (
+        row.activity_type === 'ESPP_CONTRIBUTION'
+          ? { ...row, amount: 1100 }
+          : { ...row, purchase_value: 910, fmv_purchase_date: 101 }
+      ));
+      const third = await api('POST', '/stocks/espp-activity/import', {
+        investment_id: invRes.body.id,
+        portfolio_id: 1,
+        rows: changedRows,
+      });
+      assert.equal(third.status, 200);
+      assert.equal(third.body.created, 0);
+      assert.equal(third.body.updated, 2);
+      assert.equal(third.body.unchanged, 0);
+
+      const reconciled = db.prepare(`
+        SELECT id, transaction_type, amount, usd_amount, fmv_per_unit
+        FROM transactions
+        WHERE investment_id = ?
+        ORDER BY transaction_type
+      `).all(invRes.body.id);
+      assert.deepEqual(reconciled.map((row) => row.id), original.map((row) => row.id));
+      assert.equal(reconciled.find((row) => row.transaction_type === 'ESPP_CONTRIBUTION').amount, 1100);
+      assert.equal(reconciled.find((row) => row.transaction_type === 'ESPP_PURCHASE').usd_amount, 910);
+      assert.equal(reconciled.find((row) => row.transaction_type === 'ESPP_PURCHASE').fmv_per_unit, 101);
+    } finally {
+      mockUsdInrRate = async () => 80;
+    }
+  });
+
   it('GET /transactions returns transactions with correct fields', async () => {
     const { status, body } = await api('GET', '/transactions?portfolio_id=1');
     const items = txnItems(body);

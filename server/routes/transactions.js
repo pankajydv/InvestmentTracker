@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+const DERIVED_AMOUNT_TRANSACTION_TYPES = new Set(['BUY', 'SELL', 'REDEMPTION', 'VEST']);
+const ESPP_DISCOUNT_RATE = 0.10;
 const { fetchHistoricalUSDToINR, fetchUSDToINR } = require('../services/priceService');
 const { markDirtyFromTransactions } = require('../services/dirtyBackfillService');
 const { invalidatePortfolioXirrCache } = require('../services/xirrCacheService');
@@ -150,19 +152,18 @@ module.exports = function (db) {
       } = req.body;
 
       const amountMissing = amount === undefined || amount === null || amount === '' || Number.isNaN(Number(amount));
-      if (!investment_id || !portfolio_id || !transaction_type || !transaction_date || amountMissing) {
-        return res.status(400).json({ error: 'investment_id, portfolio_id, transaction_type, transaction_date, and amount are required' });
+      if (!investment_id || !portfolio_id || !transaction_type || !transaction_date) {
+        return res.status(400).json({ error: 'investment_id, portfolio_id, transaction_type, and transaction_date are required' });
       }
 
-      const normalizedAmount = Number(amount);
       const normalizedFees = Number.isFinite(Number(fees)) ? Number(fees) : 0;
       const normalizedPricePerUnit = price_per_unit === undefined || price_per_unit === null || price_per_unit === ''
         ? null
         : Number(price_per_unit);
-      const normalizedUsdAmount = usd_amount === undefined || usd_amount === null || usd_amount === ''
+      let normalizedUsdAmount = usd_amount === undefined || usd_amount === null || usd_amount === ''
         ? null
         : Number(usd_amount);
-      const normalizedFmvPerUnit = fmv_per_unit === undefined || fmv_per_unit === null || fmv_per_unit === ''
+      let normalizedFmvPerUnit = fmv_per_unit === undefined || fmv_per_unit === null || fmv_per_unit === ''
         ? null
         : Number(fmv_per_unit);
       const normalizedGrossUnits = gross_units === undefined || gross_units === null || gross_units === ''
@@ -196,6 +197,57 @@ module.exports = function (db) {
         return res.status(400).json({ error: normalizedUnitsCheck.error });
       }
       const normalizedUnits = normalizedUnitsCheck.value;
+      if (
+        inv.currency === 'USD'
+        && normalizedUsdAmount === null
+        && Number.isFinite(normalizedUnits)
+        && Number.isFinite(normalizedPricePerUnit)
+      ) {
+        normalizedUsdAmount = normalizedUnits * normalizedPricePerUnit;
+      }
+      if (
+        transaction_type === 'ESPP_PURCHASE'
+        && normalizedFmvPerUnit === null
+        && Number.isFinite(normalizedPricePerUnit)
+        && normalizedPricePerUnit > 0
+      ) {
+        normalizedFmvPerUnit = normalizedPricePerUnit / (1 - ESPP_DISCOUNT_RATE);
+      }
+      let normalizedAmount = amountMissing ? null : Number(amount);
+
+      if (normalizedAmount === null && transaction_type === 'ESPP_PURCHASE') {
+        normalizedAmount = 0;
+      } else if (
+        normalizedAmount === null
+        && inv.currency === 'USD'
+        && Number.isFinite(normalizedUsdAmount)
+        && normalizedUsdAmount >= 0
+      ) {
+        if (!(Number(resolvedRate) > 0)) {
+          return res.status(400).json({ error: `USD/INR rate is unavailable for ${normalizedTransactionDate}` });
+        }
+        normalizedAmount = normalizedUsdAmount * Number(resolvedRate);
+      } else if (
+        normalizedAmount === null
+        && DERIVED_AMOUNT_TRANSACTION_TYPES.has(transaction_type)
+        && Number.isFinite(normalizedUnits)
+        && Number.isFinite(normalizedPricePerUnit)
+      ) {
+        const sourceAmount = normalizedUnits * normalizedPricePerUnit;
+        if (inv.currency === 'USD') {
+          if (!(Number(resolvedRate) > 0)) {
+            return res.status(400).json({ error: `USD/INR rate is unavailable for ${normalizedTransactionDate}` });
+          }
+          normalizedUsdAmount = normalizedUsdAmount ?? sourceAmount;
+          normalizedAmount = sourceAmount * Number(resolvedRate);
+        } else {
+          normalizedAmount = sourceAmount;
+        }
+      }
+
+      if (!Number.isFinite(normalizedAmount)) {
+        return res.status(400).json({ error: 'amount is required when it cannot be derived from the transaction details' });
+      }
 
       const result = db.prepare(`
         INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees, broker, notes, exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units)

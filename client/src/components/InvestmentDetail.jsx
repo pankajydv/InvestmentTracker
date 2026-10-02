@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router-dom';
 import { Card, Row, Col, Table, Button, Form, Spinner, Badge, Modal, Dropdown, Collapse } from 'react-bootstrap';
-import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppContributionsFromPayslips, importEsppContributions, getInvestmentDailyValues, getPortfolios } from '../services/api';
+import { getInvestment, deleteInvestment, addTransaction, deleteTransaction, updateTransaction, previewInvestmentInterestUpdate, applyInvestmentInterestUpdate, getUSDINRRate, previewEsppActivity, importEsppActivity, getInvestmentDailyValues, getPortfolios } from '../services/api';
 import { formatINR, formatINRExact, formatNumber, formatPct, formatDate, profitColor, ASSET_TYPE_LABELS, ASSET_TYPE_FULL_NAMES, isPrivacyMaskEnabled, getMaskedValue } from '../utils/formatters';
 import { resolvePortfolioColor, resolvePortfolioOwnerLabel } from '../utils/portfolioColors';
 import { allocateForeignStockSoldUnits, isForeignStockLotFullySold } from '../utils/foreignStockLots';
@@ -15,6 +15,9 @@ import CollapsibleSectionHeader from './CollapsibleSectionHeader';
 const UNIT_ADD_TYPES = ['BUY', 'IPO', 'BONUS', 'SPLIT', 'RIGHTS', 'TRANSFER_IN', 'SWITCH_IN', 'DEPOSIT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE'];
 const UNIT_SUB_TYPES = ['SELL', 'REDEMPTION', 'TRANSFER_OUT', 'SWITCH_OUT', 'WITHDRAWAL', 'CONSOLIDATION', 'CHARGES', 'AMC'];
 const EDITABLE_TYPES = ['BUY', 'SELL', 'IPO', 'AMC', 'DEPOSIT', 'WITHDRAWAL', 'TRANSFER_IN', 'TRANSFER_OUT', 'TRANSFER', 'SWITCH_IN', 'SWITCH_OUT', 'EMPLOYER_CONTRIBUTION', 'VOLUNTARY_CONTRIBUTION', 'VEST', 'ESPP_PURCHASE', 'ESPP_CONTRIBUTION', 'DIVIDEND', 'BONUS', 'SPLIT', 'RIGHTS'];
+const UNIT_PRICE_TRANSACTION_TYPES = new Set(['BUY', 'SELL', 'REDEMPTION', 'VEST', 'ESPP_PURCHASE']);
+const DERIVED_AMOUNT_TRANSACTION_TYPES = new Set(['BUY', 'SELL', 'REDEMPTION', 'VEST', 'ESPP_PURCHASE']);
+const FEE_TRANSACTION_TYPES = new Set(['BUY', 'SELL', 'REDEMPTION']);
 const TYPE_LABELS = {
   DEPOSIT: 'Deposit',
   EMPLOYER_CONTRIBUTION: 'Employer',
@@ -153,12 +156,8 @@ export default function InvestmentDetail() {
     exchange_rate_used: '',
     usd_amount: '',
     fmv_per_unit: '',
-    offering_period: '',
-    grant_date: '',
-    share_source: 'SP',
-    holding_period: 'Short',
   });
-  const [rateLoading, setRateLoading] = useState(false);
+  const [, setRateLoading] = useState(false);
 
   const txnTypes = getInvestmentTransactionTypes(data);
 
@@ -312,7 +311,7 @@ export default function InvestmentDetail() {
         amount = 0;
       } else if ((amount == null || Number.isNaN(amount)) && usdUnits && priceUSD && rate) {
         amount = usdUnits * priceUSD * rate;
-      } else if ((amount == null || Number.isNaN(amount)) && usdUnits && priceUSD) {
+      } else if ((amount == null || Number.isNaN(amount)) && usdUnits && priceUSD && !isForeignUSD) {
         amount = usdUnits * priceUSD;
       }
 
@@ -320,21 +319,13 @@ export default function InvestmentDetail() {
       const usdAmount = hasUsdAmountInput
         ? parseFloat(txnForm.usd_amount)
         : (usdUnits && priceUSD ? usdUnits * priceUSD : null);
+      if ((amount == null || Number.isNaN(amount)) && isForeignUSD && Number.isFinite(usdAmount) && rate) {
+        amount = usdAmount * rate;
+      }
 
-      const normalizedShareSource = String(txnForm.share_source || '').trim().toUpperCase();
-      const normalizedHoldingPeriod = String(txnForm.holding_period || '').trim();
-      const offering = String(txnForm.offering_period || '').trim();
-      const sourceSuffix = offering
-        ? offering.replace(/\s+/g, '')
-        : 'Manual';
-      const esppKey = `ESPP_MANUAL|${txnForm.transaction_date}|${sourceSuffix}`;
+      const esppKey = `ESPP_MANUAL|${txnForm.transaction_date}|${usdUnits || 0}|${priceUSD || 0}`;
       const autoEsppNotes = [
         'ESPP Purchase | ESPP',
-        offering ? `Offering ${offering}` : null,
-        txnForm.grant_date ? `Grant Date ${txnForm.grant_date}` : null,
-        normalizedShareSource ? `Share Source ${normalizedShareSource}` : null,
-        normalizedHoldingPeriod ? `Holding ${normalizedHoldingPeriod}` : null,
-        Number.isFinite(parseFloat(txnForm.fmv_per_unit)) ? `FMV Purchase $${parseFloat(txnForm.fmv_per_unit).toFixed(2)}` : null,
         'Source Manual Add Transaction',
         `Key ${esppKey}`,
         txnForm.notes ? `User Note ${txnForm.notes.trim()}` : null,
@@ -368,7 +359,6 @@ export default function InvestmentDetail() {
         transaction_type: txnTypes[0], transaction_date: new Date().toISOString().split('T')[0],
         units: '', price_per_unit: '', amount: '', fees: '0', broker: '', notes: '',
         exchange_rate_used: '', usd_amount: '', fmv_per_unit: '',
-        offering_period: '', grant_date: '', share_source: 'SP', holding_period: 'Short',
       });
       loadData();
     } catch (e) {
@@ -399,13 +389,12 @@ export default function InvestmentDetail() {
   const [interestPreviewWindow, setInterestPreviewWindow] = useState(null);
   const [interestHiddenExistingCount, setInterestHiddenExistingCount] = useState(0);
   const [selectedInterestRows, setSelectedInterestRows] = useState({});
-  const [showEsppModal, setShowEsppModal] = useState(false);
-  const [esppPayslipFiles, setEsppPayslipFiles] = useState([]);
-  const [esppContributionLoading, setEsppContributionLoading] = useState(false);
-  const [esppContributionImporting, setEsppContributionImporting] = useState(false);
-  const [esppContributionPreview, setEsppContributionPreview] = useState(null);
-  const [esppContributionOverwrite, setEsppContributionOverwrite] = useState(false);
-  const [esppContributionStatus, setEsppContributionStatus] = useState(null);
+  const [esppEntryMode, setEsppEntryMode] = useState('upload');
+  const [esppActivityFiles, setEsppActivityFiles] = useState([]);
+  const [esppActivityLoading, setEsppActivityLoading] = useState(false);
+  const [esppActivityImporting, setEsppActivityImporting] = useState(false);
+  const [esppActivityPreview, setEsppActivityPreview] = useState(null);
+  const [esppActivityStatus, setEsppActivityStatus] = useState(null);
 
   const getChanges = () => {
     if (!editTxn) return [];
@@ -537,57 +526,56 @@ export default function InvestmentDetail() {
     }
   };
 
-  const handlePreviewEsppContributions = async () => {
-    setEsppContributionStatus(null);
+  const handlePreviewEsppActivity = async () => {
+    setEsppActivityStatus(null);
     if (!selectedId) {
-      alert('Select a portfolio first to preview ESPP contributions.');
+      alert('Select a portfolio first to preview ESPP activity.');
       return;
     }
-    if (!esppPayslipFiles.length) {
-      alert('Select one or more payslip PDF files first.');
+    if (!esppActivityFiles.length) {
+      alert('Select one or more payslip or Fidelity ESPP confirmation PDFs first.');
       return;
     }
 
     try {
-      setEsppContributionLoading(true);
-      const result = await previewEsppContributionsFromPayslips(esppPayslipFiles, Number(id), Number(selectedId));
-      setEsppContributionPreview(result);
+      setEsppActivityLoading(true);
+      const result = await previewEsppActivity(esppActivityFiles, Number(id), Number(selectedId));
+      setEsppActivityPreview(result);
     } catch (e) {
-      alert('ESPP contribution preview failed: ' + e.message);
+      alert('ESPP activity preview failed: ' + e.message);
     } finally {
-      setEsppContributionLoading(false);
+      setEsppActivityLoading(false);
     }
   };
 
-  const handleImportEsppContributions = async () => {
-    setEsppContributionStatus(null);
+  const handleImportEsppActivity = async () => {
+    setEsppActivityStatus(null);
     if (!selectedId) {
-      setEsppContributionStatus({ type: 'danger', text: 'Select a portfolio first to import ESPP contributions.' });
+      setEsppActivityStatus({ type: 'danger', text: 'Select a portfolio first to import ESPP activity.' });
       return;
     }
-    if (!esppContributionPreview?.rows?.length) {
-      setEsppContributionStatus({ type: 'danger', text: 'Preview contributions first.' });
+    if (!esppActivityPreview?.rows?.length) {
+      setEsppActivityStatus({ type: 'danger', text: 'Preview ESPP activity first.' });
       return;
     }
 
     try {
-      setEsppContributionImporting(true);
-      const result = await importEsppContributions({
+      setEsppActivityImporting(true);
+      const result = await importEsppActivity({
         investment_id: Number(id),
         portfolio_id: Number(selectedId),
-        overwrite_existing: esppContributionOverwrite,
-        rows: esppContributionPreview.rows,
+        rows: esppActivityPreview.rows,
       });
       await loadData();
-      await handlePreviewEsppContributions();
-      setEsppContributionStatus({
+      await handlePreviewEsppActivity();
+      setEsppActivityStatus({
         type: 'success',
-        text: `Import complete. Created: ${result.created}, Skipped: ${result.skipped}, Replaced: ${result.removed_existing}.`,
+        text: `Import complete. Created: ${result.created}, Updated: ${result.updated}, Unchanged: ${result.unchanged}.`,
       });
     } catch (e) {
-      setEsppContributionStatus({ type: 'danger', text: 'Import failed: ' + e.message });
+      setEsppActivityStatus({ type: 'danger', text: 'Import failed: ' + e.message });
     } finally {
-      setEsppContributionImporting(false);
+      setEsppActivityImporting(false);
     }
   };
 
@@ -595,11 +583,20 @@ export default function InvestmentDetail() {
     const updated = { ...txnForm, [field]: value };
     const isEsppPurchase = updated.transaction_type === 'ESPP_PURCHASE';
 
-    if (field === 'transaction_type' && value === 'ESPP_PURCHASE') {
-      if (!String(updated.amount || '').trim()) updated.amount = '0';
-      if (!String(updated.broker || '').trim()) updated.broker = 'Fidelity';
-      if (!String(updated.share_source || '').trim()) updated.share_source = 'SP';
-      if (!String(updated.holding_period || '').trim()) updated.holding_period = 'Short';
+    if (field === 'transaction_type') {
+      if (value === 'ESPP_PURCHASE') {
+        updated.amount = '0';
+        if (!String(updated.broker || '').trim()) updated.broker = 'Fidelity';
+      } else if (DERIVED_AMOUNT_TRANSACTION_TYPES.has(value) || DERIVED_AMOUNT_TRANSACTION_TYPES.has(txnForm.transaction_type)) {
+        updated.amount = '';
+        updated.usd_amount = '';
+      }
+      if (!UNIT_PRICE_TRANSACTION_TYPES.has(value)) {
+        updated.units = '';
+        updated.price_per_unit = '';
+        updated.fmv_per_unit = '';
+      }
+      if (!FEE_TRANSACTION_TYPES.has(value)) updated.fees = '0';
     }
 
     // Date change: auto-fetch RBI rate for USD investments
@@ -640,8 +637,15 @@ export default function InvestmentDetail() {
   const isSGB = data.asset_type === 'SGB';
   const showStt = data.asset_type !== 'FOREIGN_STOCK';
   const isForeignUSD = data.asset_type === 'FOREIGN_STOCK' && data.currency === 'USD';
-  const isMSFTStock = /MSFT/i.test(String(data.ticker_symbol || '')) || /microsoft/i.test(String(data.name || ''));
-  const canImportEspp = isForeignUSD && isMSFTStock;
+  const isEsppTransaction = txnForm.transaction_type === 'ESPP_CONTRIBUTION' || txnForm.transaction_type === 'ESPP_PURCHASE';
+  const transactionTypeOptions = txnTypes.reduce((options, type) => {
+    const option = type === 'ESPP_CONTRIBUTION' || type === 'ESPP_PURCHASE' ? 'ESPP' : type;
+    return options.includes(option) ? options : [...options, option];
+  }, []);
+  const usesUnitsAndPrice = !isPPF && UNIT_PRICE_TRANSACTION_TYPES.has(txnForm.transaction_type);
+  const amountIsDerived = DERIVED_AMOUNT_TRANSACTION_TYPES.has(txnForm.transaction_type);
+  const showAmountInput = !amountIsDerived;
+  const showFeesInput = !isForeignUSD && FEE_TRANSACTION_TYPES.has(txnForm.transaction_type);
 
   const snapshotInvested = Number(data.latestValue?.invested_amount);
   const totalInvested = Number.isFinite(snapshotInvested)
@@ -894,6 +898,102 @@ export default function InvestmentDetail() {
     return TYPE_LABELS[type] || type.replace(/_/g, ' ');
   };
 
+  const renderEsppUpload = () => (
+    <Col xs={12}>
+      <div className="border rounded-3 p-3 bg-light">
+        <div className="small fw-semibold mb-1">Upload ESPP documents</div>
+        <div className="small text-muted mb-3">
+          Upload Microsoft payslips and Fidelity ESPP purchase confirmation PDFs together.
+          Payslips create monthly ESPP contributions, while Fidelity confirmations create ESPP purchases.
+          Document types are detected automatically before anything is imported.
+        </div>
+        <Row className="g-2 align-items-end mb-2">
+          <Col md={7}>
+            <Form.Label className="small mb-1">ESPP activity PDF files</Form.Label>
+            <Form.Control
+              type="file"
+              size="sm"
+              multiple
+              accept=".pdf,application/pdf"
+              onChange={(e) => {
+                setEsppActivityFiles(Array.from(e.target.files || []));
+                setEsppActivityPreview(null);
+                setEsppActivityStatus(null);
+              }}
+            />
+          </Col>
+          <Col md={5}>
+            <Button type="button" size="sm" variant="outline-primary" onClick={handlePreviewEsppActivity} disabled={esppActivityLoading || !esppActivityFiles.length}>
+              {esppActivityLoading ? 'Previewing...' : 'Preview Activity'}
+            </Button>
+          </Col>
+        </Row>
+
+        {esppActivityPreview?.rows?.length ? (
+          <>
+            <div className="small my-2">
+              <strong>Rows:</strong> {esppActivityPreview.rows_found || esppActivityPreview.rows.length} |{' '}
+              <strong>Contributions:</strong> {esppActivityPreview.contribution_rows || 0} |{' '}
+              <strong>Purchases:</strong> {esppActivityPreview.purchase_rows || 0} |{' '}
+              <strong>Already Imported:</strong> {esppActivityPreview.imported_rows || 0}
+            </div>
+            <div className="responsive-table" style={{ maxHeight: 280, overflowY: 'auto' }}>
+              <Table size="sm" hover className="mb-0 small">
+                <thead className="table-light">
+                  <tr>
+                    <th>Activity</th>
+                    <th>Date</th>
+                    <th>Details</th>
+                    <th>Source</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {esppActivityPreview.rows.map((row) => (
+                    <tr key={row.import_key}>
+                      <td>
+                        {row.activity_type === 'ESPP_PURCHASE'
+                          ? <Badge bg="primary">Purchase</Badge>
+                          : <Badge bg="info">Contribution</Badge>}
+                      </td>
+                      <td>{formatDate(row.purchase_date || row.contribution_date)}</td>
+                      <td>
+                        {row.activity_type === 'ESPP_PURCHASE'
+                          ? <>{formatNumber(row.purchase_quantity, 4)} shares @ ${formatNumber(row.purchase_price, 4)}</>
+                          : <>{row.month_key}: ₹{formatNumber(row.amount, 2)}</>}
+                      </td>
+                      <td>{row.source_file}</td>
+                      <td>
+                        {row.already_imported
+                          ? <Badge bg="secondary">Existing</Badge>
+                          : <Badge bg="success">New</Badge>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
+          </>
+        ) : null}
+        {esppActivityStatus?.text ? (
+          <div className={`small mt-2 ${esppActivityStatus.type === 'danger' ? 'text-danger' : 'text-success'}`}>
+            {esppActivityStatus.text}
+          </div>
+        ) : null}
+        <Button
+          type="button"
+          variant="primary"
+          size="sm"
+          className="mt-3"
+          onClick={handleImportEsppActivity}
+          disabled={esppActivityImporting || !esppActivityPreview?.rows?.length}
+        >
+          {esppActivityImporting ? 'Importing Activity...' : 'Import Activity'}
+        </Button>
+      </div>
+    </Col>
+  );
+
   return (
     <div>
       {/* Header */}
@@ -915,11 +1015,6 @@ export default function InvestmentDetail() {
           {isPPF && (
             <Button variant="outline-primary" size="sm" onClick={handleInterestUpdate} disabled={interestUpdating} className="d-flex align-items-center gap-1">
               {interestUpdating ? 'Updating...' : 'Update Interest'}
-            </Button>
-          )}
-          {canImportEspp && (
-            <Button variant="outline-primary" size="sm" onClick={() => setShowEsppModal(true)} className="d-flex align-items-center gap-1">
-              Import ESPP Contributions
             </Button>
           )}
           <Link to={`/investments/${id}/settings`} state={{ from: cameFrom, transactionsSearch, investmentsSearch }} className="btn btn-outline-secondary btn-sm d-flex align-items-center gap-1">
@@ -1141,107 +1236,100 @@ export default function InvestmentDetail() {
               <Row className="g-3">
                 <Col md={4}>
                   <Form.Label className="small">Type</Form.Label>
-                  <Form.Select size="sm" value={txnForm.transaction_type} onChange={(e) => updateTxnField('transaction_type', e.target.value)}>
-                    {txnTypes.map((t) => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
+                  <Form.Select
+                    size="sm"
+                    value={isEsppTransaction ? 'ESPP' : txnForm.transaction_type}
+                    onChange={(e) => {
+                      if (e.target.value === 'ESPP') {
+                        setEsppEntryMode('upload');
+                        updateTxnField('transaction_type', 'ESPP_PURCHASE');
+                      } else {
+                        updateTxnField('transaction_type', e.target.value);
+                      }
+                    }}
+                  >
+                    {transactionTypeOptions.map((type) => (
+                      <option key={type} value={type}>{type.replace(/_/g, ' ')}</option>
+                    ))}
                   </Form.Select>
                 </Col>
+                {isEsppTransaction && (
+                  <Col xs={12}>
+                    <Form.Label className="small d-block mb-2">How would you like to add ESPP activity?</Form.Label>
+                    <div className="d-flex gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={esppEntryMode === 'upload' ? 'primary' : 'outline-secondary'}
+                        onClick={() => setEsppEntryMode('upload')}
+                      >
+                        Upload documents
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={esppEntryMode === 'manual' ? 'primary' : 'outline-secondary'}
+                        onClick={() => setEsppEntryMode('manual')}
+                      >
+                        Enter manually
+                      </Button>
+                    </div>
+                  </Col>
+                )}
+                {isEsppTransaction && esppEntryMode === 'upload' ? renderEsppUpload() : null}
+                {(!isEsppTransaction || esppEntryMode === 'manual') && (
+                  <>
+                {isEsppTransaction && (
+                  <Col md={4}>
+                    <Form.Label className="small">ESPP Activity</Form.Label>
+                    <Form.Select
+                      size="sm"
+                      value={txnForm.transaction_type}
+                      onChange={(e) => updateTxnField('transaction_type', e.target.value)}
+                    >
+                      <option value="ESPP_CONTRIBUTION">Contribution</option>
+                      <option value="ESPP_PURCHASE">Purchase</option>
+                    </Form.Select>
+                  </Col>
+                )}
                 <Col md={4}>
                   <Form.Label className="small">Date</Form.Label>
                   <Form.Control size="sm" type="date" value={txnForm.transaction_date}
                     onChange={(e) => updateTxnField('transaction_date', e.target.value)} required />
                 </Col>
-                {!isPPF && (
+                {usesUnitsAndPrice && (
                   <>
-                    {txnForm.transaction_type !== 'ESPP_CONTRIBUTION' && (
-                      <>
-                        <Col md={4}>
-                          <Form.Label className="small">Units</Form.Label>
-                          <Form.Control size="sm" type="number" step="0.001" value={txnForm.units}
-                            onChange={(e) => updateTxnField('units', e.target.value)} placeholder="Number of units" />
-                        </Col>
-                        <Col md={4}>
-                          <Form.Label className="small">{isForeignUSD ? 'Price/Unit (USD)' : 'Price per Unit'}</Form.Label>
-                          <Form.Control size="sm" type="number" step="0.0001" value={txnForm.price_per_unit}
-                            onChange={(e) => updateTxnField('price_per_unit', e.target.value)} placeholder={isForeignUSD ? 'FMV in USD' : 'Price per unit'} />
-                        </Col>
-                        {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
-                          <Col md={4}>
-                            <Form.Label className="small">FMV/Unit on Purchase Date (USD)</Form.Label>
-                            <Form.Control size="sm" type="number" step="0.0001" value={txnForm.fmv_per_unit}
-                              onChange={(e) => updateTxnField('fmv_per_unit', e.target.value)} placeholder="Market price (USD)" />
-                          </Col>
-                        )}
-                        {isForeignUSD && (
-                          <Col md={4}>
-                            <Form.Label className="small d-flex align-items-center gap-1">
-                              FX Rate (₹/USD) {rateLoading && <Spinner animation="border" size="sm" />}
-                            </Form.Label>
-                            <Form.Control size="sm" type="number" step="0.0001" value={txnForm.exchange_rate_used}
-                              onChange={(e) => updateTxnField('exchange_rate_used', e.target.value)} placeholder="Auto-fetched from FX sources" />
-                          </Col>
-                        )}
-                      </>
-                    )}
+                    <Col md={4}>
+                      <Form.Label className="small">Units</Form.Label>
+                      <Form.Control size="sm" type="number" step="0.001" value={txnForm.units}
+                        onChange={(e) => updateTxnField('units', e.target.value)} placeholder="Number of units" required />
+                    </Col>
+                    <Col md={4}>
+                      <Form.Label className="small">{isForeignUSD ? 'Price/Unit (USD)' : 'Price per Unit'}</Form.Label>
+                      <Form.Control size="sm" type="number" step="0.0001" value={txnForm.price_per_unit}
+                        onChange={(e) => updateTxnField('price_per_unit', e.target.value)} placeholder={isForeignUSD ? 'Price in USD' : 'Price per unit'} required />
+                    </Col>
                   </>
                 )}
-                <Col md={4}>
-                  <Form.Label className="small">
-                    Amount (₹)
-                    {isForeignUSD && txnForm.usd_amount ? ` — USD ${txnForm.usd_amount}` : ''}
-                    {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' ? ' (usually 0 for ESPP acquisitions)' : ''}
-                  </Form.Label>
-                  <Form.Control size="sm" type="number" step="0.01" value={txnForm.amount}
-                    onChange={(e) => updateTxnField('amount', e.target.value)} placeholder="Total amount in ₹" required={txnForm.transaction_type !== 'ESPP_PURCHASE'} />
-                </Col>
-                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                {showAmountInput && (
                   <Col md={4}>
-                    <Form.Label className="small">Cost Basis (USD)</Form.Label>
-                    <Form.Control size="sm" type="number" step="0.01" value={txnForm.usd_amount}
-                      onChange={(e) => updateTxnField('usd_amount', e.target.value)} placeholder="e.g. 2615.93" />
+                    <Form.Label className="small">{isForeignUSD ? 'Amount (USD)' : 'Amount (₹)'}</Form.Label>
+                    <Form.Control
+                      size="sm"
+                      type="number"
+                      step="0.01"
+                      value={isForeignUSD ? txnForm.usd_amount : txnForm.amount}
+                      onChange={(e) => updateTxnField(isForeignUSD ? 'usd_amount' : 'amount', e.target.value)}
+                      placeholder={isForeignUSD ? 'Amount in USD' : 'Amount in ₹'}
+                      required
+                    />
                   </Col>
                 )}
-                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
+                {showFeesInput && (
                   <Col md={4}>
-                    <Form.Label className="small">Broker</Form.Label>
-                    <Form.Control size="sm" type="text" value={txnForm.broker}
-                      onChange={(e) => updateTxnField('broker', e.target.value)} placeholder="Fidelity" />
-                  </Col>
-                )}
-                <Col md={4}>
-                  <Form.Label className="small">Charges (₹)</Form.Label>
-                  <Form.Control size="sm" type="number" step="0.01" value={txnForm.fees}
-                    onChange={(e) => updateTxnField('fees', e.target.value)} />
-                </Col>
-                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
-                  <Col md={4}>
-                    <Form.Label className="small">Offering Period</Form.Label>
-                    <Form.Control size="sm" type="text" value={txnForm.offering_period}
-                      onChange={(e) => updateTxnField('offering_period', e.target.value)} placeholder="APR/01/2026 - JUN/30/2026" />
-                  </Col>
-                )}
-                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
-                  <Col md={4}>
-                    <Form.Label className="small">Grant Date</Form.Label>
-                    <Form.Control size="sm" type="date" value={txnForm.grant_date}
-                      onChange={(e) => updateTxnField('grant_date', e.target.value)} />
-                  </Col>
-                )}
-                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
-                  <Col md={4}>
-                    <Form.Label className="small">Share Source</Form.Label>
-                    <Form.Control size="sm" type="text" value={txnForm.share_source}
-                      onChange={(e) => updateTxnField('share_source', e.target.value)} placeholder="SP" />
-                  </Col>
-                )}
-                {isForeignUSD && txnForm.transaction_type === 'ESPP_PURCHASE' && (
-                  <Col md={4}>
-                    <Form.Label className="small">Holding Period</Form.Label>
-                    <Form.Select size="sm" value={txnForm.holding_period}
-                      onChange={(e) => updateTxnField('holding_period', e.target.value)}>
-                      <option value="Short">Short</option>
-                      <option value="Long">Long</option>
-                      <option value="">Not Specified</option>
-                    </Form.Select>
+                    <Form.Label className="small">Charges (₹)</Form.Label>
+                    <Form.Control size="sm" type="number" step="0.01" value={txnForm.fees}
+                      onChange={(e) => updateTxnField('fees', e.target.value)} />
                   </Col>
                 )}
                 <Col md={4}>
@@ -1250,8 +1338,12 @@ export default function InvestmentDetail() {
                     onChange={(e) => updateTxnField('notes', e.target.value)} placeholder="Optional" />
                 </Col>
                 <Col xs={12}>
-                  <Button type="submit" variant="primary" size="sm">Add Transaction</Button>
+                  <Button type="submit" variant="primary" size="sm">
+                    {isEsppTransaction ? `Add ESPP ${txnForm.transaction_type === 'ESPP_PURCHASE' ? 'Purchase' : 'Contribution'}` : 'Add Transaction'}
+                  </Button>
                 </Col>
+                  </>
+                )}
               </Row>
             </Form>
           </Card.Body>
@@ -1981,97 +2073,6 @@ export default function InvestmentDetail() {
           <Button variant="secondary" size="sm" onClick={() => setShowInterestPreviewModal(false)}>Cancel</Button>
           <Button variant="primary" size="sm" onClick={handleApplySelectedInterestRows} disabled={interestUpdating}>
             {interestUpdating ? 'Applying...' : 'Apply Selected Entries'}
-          </Button>
-        </Modal.Footer>
-      </Modal>
-
-      <Modal show={showEsppModal} onHide={() => setShowEsppModal(false)} centered size="lg">
-        <Modal.Header closeButton>
-          <Modal.Title className="h6">Import ESPP Contributions</Modal.Title>
-        </Modal.Header>
-        <Modal.Body>
-          <div className="small fw-semibold mb-2">Monthly ESPP Contributions (from payslips)</div>
-          <div className="small text-muted mb-2">
-            Upload yearly/monthly payslip PDFs to create monthly <strong>ESPP Contribution</strong> cash outflow entries for XIRR timing.
-            Contribution date is derived from payslip pay date when available; otherwise defaults to 28th (preponed to previous working day on weekends).
-          </div>
-          <Row className="g-2 align-items-end mb-2">
-            <Col md={7}>
-              <Form.Label className="small mb-1">Payslip PDF files</Form.Label>
-              <Form.Control
-                type="file"
-                size="sm"
-                multiple
-                accept=".pdf"
-                onChange={(e) => {
-                  const files = Array.from(e.target.files || []);
-                  setEsppPayslipFiles(files);
-                  setEsppContributionStatus(null);
-                }}
-              />
-            </Col>
-            <Col md={5}>
-              <div className="d-flex gap-2">
-                <Button size="sm" variant="outline-primary" onClick={handlePreviewEsppContributions} disabled={esppContributionLoading || !esppPayslipFiles.length}>
-                  {esppContributionLoading ? 'Previewing...' : 'Preview Contributions'}
-                </Button>
-                <Form.Check
-                  type="switch"
-                  id="espp-contrib-overwrite"
-                  label="Replace existing"
-                  checked={esppContributionOverwrite}
-                  onChange={(e) => setEsppContributionOverwrite(e.target.checked)}
-                />
-              </div>
-            </Col>
-          </Row>
-
-          {esppContributionPreview?.rows?.length ? (
-            <>
-              <div className="small mb-2">
-                <strong>Rows:</strong> {esppContributionPreview.rows_found || esppContributionPreview.rows.length} |{' '}
-                <strong>Already Imported:</strong> {esppContributionPreview.imported_rows || 0}
-              </div>
-              <div className="responsive-table" style={{ maxHeight: 220, overflowY: 'auto' }}>
-                <Table size="sm" hover className="mb-0 small">
-                  <thead className="table-light">
-                    <tr>
-                      <th>Month</th>
-                      <th>Date</th>
-                      <th className="text-end">Amount</th>
-                      <th>Source</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {esppContributionPreview.rows.map((row) => (
-                      <tr key={row.import_key}>
-                        <td>{row.month_key}</td>
-                        <td>{formatDate(row.contribution_date)}</td>
-                        <td className="text-end">₹{formatNumber(row.amount, 2)}</td>
-                        <td>{row.source_file}</td>
-                        <td>
-                          {row.already_imported
-                            ? <Badge bg="secondary">Existing</Badge>
-                            : <Badge bg="success">New</Badge>}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </Table>
-              </div>
-            </>
-          ) : null}
-          {esppContributionStatus?.text ? (
-            <div className={`small mt-2 ${esppContributionStatus.type === 'danger' ? 'text-danger' : 'text-success'}`}>
-              {esppContributionStatus.text}
-            </div>
-          ) : null}
-        </Modal.Body>
-        <Modal.Footer>
-          <Button variant="secondary" size="sm" onClick={() => setShowEsppModal(false)}>Close</Button>
-          <Button variant="outline-primary" size="sm" onClick={handleImportEsppContributions} disabled={esppContributionImporting || !esppContributionPreview?.rows?.length}>
-            {esppContributionImporting ? 'Importing Contributions...' : 'Import Contributions'}
           </Button>
         </Modal.Footer>
       </Modal>

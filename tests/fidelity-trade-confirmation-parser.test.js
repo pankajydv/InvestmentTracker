@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseFidelityTradeConfirmationText } = require('../server/services/fidelityTradeConfirmationParser');
+const {
+  parseFidelityTradeConfirmationText,
+  parseFidelityEsppPurchaseConfirmationText,
+} = require('../server/services/fidelityTradeConfirmationParser');
 
 function confirmation({ quantity, gross, fee, net, transactionNumber, referenceNumber }) {
   return `YOU SOLD ${quantity} AT 450.3100
@@ -56,4 +59,41 @@ test('parses Fidelity fractional-share sale with zero fee', () => {
   assert.equal(parsed.trades[0].feesUsd, 0);
   assert.equal(parsed.trades[0].netProceedsUsd, 356.2);
   assert.equal(parsed.trades[0].transactionNumber, 'Q8X6M3');
+});
+
+test('parses Fidelity ESPP purchase confirmation', () => {
+  const parsed = parseFidelityEsppPurchaseConfirmationText(`Confirmation of purchase made through your
+MICROSOFT ESPP PLAN on SEP/30/2026.
+YOU PURCHASED 10.0746 AT $461.6100 PURCHASE
+PRICE
+SECURITY DESCRIPTION SYMBOL: MSFT
+MICROSOFT CORP
+     $5,167.26
+     $4,650.54
+       $516.72
+     $4,650.54
+         10.0746
+I02946326 1 09-30-26 10-01-26 0CP0GR 594918104
+Market Value at Purchase
+Accumulated Contributions
+Gain
+Share Proceeds
+FIDELITY STOCK PLAN SERVICES, LLC
+REF # 26274-0CP0GR
+Offering period: JUL/01/2026 - SEP/30/2026`, 'MSFT-ESPP.pdf');
+
+  assert.equal(parsed.broker, 'Fidelity');
+  assert.equal(parsed.participantId, 'I02946326');
+  assert.equal(parsed.transactionNumber, '0CP0GR');
+  assert.equal(parsed.purchase.purchaseDate, '2026-09-30');
+  assert.equal(parsed.purchase.settlementDate, '2026-10-01');
+  assert.equal(parsed.purchase.offeringStartDate, '2026-07-01');
+  assert.equal(parsed.purchase.offeringEndDate, '2026-09-30');
+  assert.equal(parsed.purchase.ticker, 'MSFT');
+  assert.equal(parsed.purchase.quantity, 10.0746);
+  assert.equal(parsed.purchase.purchasePrice, 461.61);
+  assert.equal(parsed.purchase.purchaseValueUsd, 4650.54);
+  assert.equal(parsed.purchase.marketValueUsd, 5167.26);
+  assert.ok(Math.abs(parsed.purchase.fmvPerUnit - 512.899768) < 0.000001);
+  assert.equal(parsed.purchase.gainUsd, 516.72);
 });

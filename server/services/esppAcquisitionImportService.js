@@ -51,6 +51,10 @@ function normalizeRow(raw = {}, index = 0, sourceLabel = '') {
   const purchaseValue = parseNumber(raw.purchase_value || raw.value || raw.usd_amount);
   const parsedFmvPurchaseDate = parseNumber(raw.fmv_purchase_date || raw.fmv_at_purchase_date || raw.fmv_per_unit);
   const fmvOfferingStart = parseNumber(raw.fmv_offering_start_date || raw.fmv_at_offering_start_date || raw.fmv_start);
+  const transactionNumber = String(raw.transaction_number || '').trim();
+  const referenceNumber = String(raw.reference_number || '').trim();
+  const cusip = String(raw.cusip || '').trim();
+  const sourceFile = String(raw.source_file || sourceLabel || '').trim();
 
   if (!purchaseDate) throw new Error(`row ${index + 1}: invalid purchase date`);
   if (!(purchaseQty > 0)) throw new Error(`row ${index + 1}: purchase quantity must be > 0`);
@@ -74,7 +78,10 @@ function normalizeRow(raw = {}, index = 0, sourceLabel = '') {
     `Offering ${normalizedOffering}`,
     fmvOfferingStart != null ? `FMV Start $${fmvOfferingStart.toFixed(2)}` : null,
     fmvPurchaseDate != null ? `FMV Purchase $${fmvPurchaseDate.toFixed(2)}` : null,
-    sourceLabel ? `Source ${sourceLabel}` : null,
+    transactionNumber ? `Fidelity Transaction ${transactionNumber}` : null,
+    referenceNumber ? `Ref ${referenceNumber}` : null,
+    cusip ? `CUSIP ${cusip}` : null,
+    sourceFile ? `Source ${sourceFile}` : null,
     `Key ${key}`,
   ].filter(Boolean);
 
@@ -86,6 +93,10 @@ function normalizeRow(raw = {}, index = 0, sourceLabel = '') {
     purchase_value: usdAmount,
     fmv_purchase_date: fmvPurchaseDate,
     fmv_offering_start_date: fmvOfferingStart,
+    transaction_number: transactionNumber || null,
+    reference_number: referenceNumber || null,
+    cusip: cusip || null,
+    source_file: sourceFile || null,
     import_key: key,
     notes: noteParts.join(' | '),
   };
@@ -105,9 +116,13 @@ function makeFallbackSignature(row) {
 function buildExistingMaps(existingRows = []) {
   const byKey = new Map();
   const bySignature = new Map();
+  const byTransactionNumber = new Map();
 
   for (const txn of existingRows) {
     const notes = String(txn.notes || '');
+    const transactionMatch = notes.match(/Fidelity Transaction\s+([^|\s]+)/i);
+    if (transactionMatch) byTransactionNumber.set(String(transactionMatch[1]).toUpperCase(), txn.id);
+
     const keyMatch = notes.match(/Key\s+(ESPP_ACQ\|[^|]+\|[^|\s]+)/i);
     if (keyMatch) byKey.set(String(keyMatch[1]).toUpperCase(), txn.id);
 
@@ -115,15 +130,21 @@ function buildExistingMaps(existingRows = []) {
     bySignature.set(sig, txn.id);
   }
 
-  return { byKey, bySignature };
+  return { byKey, bySignature, byTransactionNumber };
 }
 
 function annotatePreviewRows(normalizedRows = [], existingRows = []) {
-  const { byKey, bySignature } = buildExistingMaps(existingRows);
+  const { byKey, bySignature, byTransactionNumber } = buildExistingMaps(existingRows);
   return normalizedRows.map((row) => {
     const key = String(row.import_key || '').toUpperCase();
     const signature = makeFallbackSignature(row);
-    const existingId = byKey.get(key) || bySignature.get(signature) || null;
+    const transactionNumber = String(row.transaction_number || '').toUpperCase();
+    const existingId = (
+      (transactionNumber ? byTransactionNumber.get(transactionNumber) : null)
+      || byKey.get(key)
+      || bySignature.get(signature)
+      || null
+    );
     return {
       ...row,
       already_imported: Boolean(existingId),

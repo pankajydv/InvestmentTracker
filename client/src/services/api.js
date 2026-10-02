@@ -563,6 +563,29 @@ export const importEsppContributions = (data = {}) =>
     body: JSON.stringify(data),
   });
 
+export const previewEsppActivity = async (files, investmentId, portfolioId) => {
+  const formData = new FormData();
+  files.forEach((file) => formData.append('files', file));
+  formData.append('investment_id', String(investmentId));
+  formData.append('portfolio_id', String(portfolioId));
+  const res = await fetch(`${API_BASE}/stocks/espp-activity/preview`, {
+    method: 'POST',
+    body: formData,
+    credentials: 'include',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || 'ESPP activity preview failed');
+  }
+  return res.json();
+};
+
+export const importEsppActivity = (data = {}) =>
+  fetchJSON('/stocks/espp-activity/import', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+
 // ESPP share acquisitions (quarterly purchase history), prepared from OCR/UI extraction rows.
 export const previewEsppAcquisitions = (data = {}) =>
   fetchJSON('/stocks/espp-acquisitions/preview', {

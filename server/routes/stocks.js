@@ -3,7 +3,10 @@ const multer = require('multer');
 const { PDFParse } = require('pdf-parse');
 const { lookupTickerByISIN, fetchCorporateActions, toNSETicker, fetchHistoricalStockPrice, fetchHistoricalOHLC, fetchHistoricalUSDToINR } = require('../services/priceService');
 const { parseContractNotes } = require('../services/contractNoteParser');
-const { parseFidelityTradeConfirmation } = require('../services/fidelityTradeConfirmationParser');
+const {
+  parseFidelityTradeConfirmation,
+  parseFidelityEsppPurchaseConfirmation,
+} = require('../services/fidelityTradeConfirmationParser');
 const { parsePnLStatement } = require('../services/pnlParser');
 const { parseRsuGrantDocument, generateRsuSchedule } = require('../services/rsuGrantService');
 const { OFFERINGS, generateEsppSchedule } = require('../services/esppGrantService');
@@ -1247,6 +1250,355 @@ module.exports = function (db) {
         error: e.message,
       });
       res.status(500).json({ error: 'Failed to import ESPP contributions: ' + e.message });
+    }
+  });
+
+  router.post('/espp-activity/preview', upload.array('files', 20), async (req, res) => {
+    try {
+      const investmentId = req.body?.investment_id ? parseInt(req.body.investment_id, 10) : null;
+      const portfolioId = req.body?.portfolio_id ? parseInt(req.body.portfolio_id, 10) : null;
+      if (!investmentId || !portfolioId) {
+        return res.status(400).json({ error: 'investment_id and portfolio_id are required' });
+      }
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: 'No ESPP activity files uploaded' });
+      }
+
+      const investment = db.prepare('SELECT id, ticker_symbol FROM investments WHERE id = ?').get(investmentId);
+      if (!investment) return res.status(404).json({ error: 'Investment not found' });
+
+      const contributionByKey = new Map();
+      const purchaseRows = [];
+      const unsupportedFiles = [];
+
+      for (const file of req.files) {
+        const confirmation = await parseFidelityEsppPurchaseConfirmation(file.buffer, file.originalname);
+        if (confirmation?.purchase) {
+          const purchaseTicker = String(confirmation.purchase.ticker || '').toUpperCase();
+          const investmentTicker = String(investment.ticker_symbol || '').toUpperCase();
+          if (investmentTicker && purchaseTicker !== investmentTicker) {
+            throw new Error(`${file.originalname} is for ${purchaseTicker}, not ${investmentTicker}`);
+          }
+
+          purchaseRows.push({
+            offering_period: confirmation.purchase.offeringPeriod,
+            purchase_date: confirmation.purchase.purchaseDate,
+            purchase_quantity: confirmation.purchase.quantity,
+            purchase_price: confirmation.purchase.purchasePrice,
+            purchase_value: confirmation.purchase.purchaseValueUsd,
+            fmv_purchase_date: confirmation.purchase.fmvPerUnit,
+            fmv_offering_start_date: null,
+            source_file: file.originalname,
+            settlement_date: confirmation.purchase.settlementDate,
+            transaction_number: confirmation.purchase.transactionNumber,
+            reference_number: confirmation.purchase.referenceNumber,
+            cusip: confirmation.purchase.cusip,
+          });
+          continue;
+        }
+
+        const contributionRows = await extractEsppContributionsFromPayslipFiles([file]);
+        if (!contributionRows.length) {
+          unsupportedFiles.push(file.originalname);
+          continue;
+        }
+        for (const row of contributionRows) {
+          contributionByKey.set(String(row.import_key).toUpperCase(), row);
+        }
+      }
+
+      if (unsupportedFiles.length) {
+        return res.status(400).json({
+          error: `Unsupported ESPP document${unsupportedFiles.length === 1 ? '' : 's'}: ${unsupportedFiles.join(', ')}`,
+        });
+      }
+
+      const existingContributions = db.prepare(`
+        SELECT id, transaction_date, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'ESPP_CONTRIBUTION'
+      `).all(investmentId, portfolioId);
+      const existingContributionKeys = new Set();
+      for (const txn of existingContributions) {
+        const keyMatch = String(txn.notes || '').match(/Key\s+(ESPP_CONTRIB\|\d{4}-\d{2})/i);
+        existingContributionKeys.add(
+          String(keyMatch?.[1] || `ESPP_CONTRIB|${String(txn.transaction_date || '').slice(0, 7)}`).toUpperCase(),
+        );
+      }
+
+      const existingPurchases = db.prepare(`
+        SELECT id, transaction_date, units, price_per_unit, usd_amount, notes
+        FROM transactions
+        WHERE investment_id = ?
+          AND portfolio_id = ?
+          AND transaction_type = 'ESPP_PURCHASE'
+      `).all(investmentId, portfolioId);
+
+      const contributions = Array.from(contributionByKey.values())
+        .sort((a, b) => a.month_key.localeCompare(b.month_key))
+        .map((row) => ({
+          ...row,
+          activity_type: 'ESPP_CONTRIBUTION',
+          already_imported: existingContributionKeys.has(String(row.import_key).toUpperCase()),
+        }));
+      const purchases = annotatePreviewRows(
+        normalizeRows(purchaseRows, ''),
+        existingPurchases,
+      ).map((row, index) => ({
+        ...row,
+        activity_type: 'ESPP_PURCHASE',
+        source_file: purchaseRows[index].source_file,
+        settlement_date: purchaseRows[index].settlement_date,
+        transaction_number: purchaseRows[index].transaction_number,
+        reference_number: purchaseRows[index].reference_number,
+        cusip: purchaseRows[index].cusip,
+      }));
+      const rows = [...contributions, ...purchases].sort((a, b) => {
+        const dateA = a.contribution_date || a.purchase_date || '';
+        const dateB = b.contribution_date || b.purchase_date || '';
+        return dateA.localeCompare(dateB);
+      });
+
+      res.json({
+        files_processed: req.files.length,
+        rows_found: rows.length,
+        imported_rows: rows.filter((row) => row.already_imported).length,
+        contribution_rows: contributions.length,
+        purchase_rows: purchases.length,
+        rows,
+      });
+    } catch (e) {
+      logAppError('[Stocks] ESPP activity preview failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        file_count: Array.isArray(req.files) ? req.files.length : 0,
+        error: e.message,
+      });
+      res.status(500).json({ error: 'Failed to preview ESPP activity: ' + e.message });
+    }
+  });
+
+  router.post('/espp-activity/import', express.json(), async (req, res) => {
+    try {
+      const investmentId = parseInt(req.body?.investment_id, 10);
+      const portfolioId = parseInt(req.body?.portfolio_id, 10);
+      const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+      if (!investmentId || !portfolioId) {
+        return res.status(400).json({ error: 'investment_id and portfolio_id are required' });
+      }
+      if (!rows.length) {
+        return res.status(400).json({ error: 'rows is required and must be a non-empty array' });
+      }
+
+      const investment = db.prepare('SELECT id FROM investments WHERE id = ?').get(investmentId);
+      if (!investment) return res.status(404).json({ error: 'Investment not found' });
+
+      const contributionRows = rows.filter((row) => row.activity_type === 'ESPP_CONTRIBUTION');
+      const purchaseInputRows = rows.filter((row) => row.activity_type === 'ESPP_PURCHASE');
+      if (contributionRows.length + purchaseInputRows.length !== rows.length) {
+        return res.status(400).json({ error: 'Every row must have a supported ESPP activity_type' });
+      }
+      const purchaseRows = normalizeRows(purchaseInputRows, '');
+
+      const existingContributions = db.prepare(`
+        SELECT id, transaction_date, amount, notes
+        FROM transactions
+        WHERE investment_id = ? AND portfolio_id = ? AND transaction_type = 'ESPP_CONTRIBUTION'
+      `).all(investmentId, portfolioId);
+      const contributionByKey = new Map();
+      for (const txn of existingContributions) {
+        const keyMatch = String(txn.notes || '').match(/Key\s+(ESPP_CONTRIB\|\d{4}-\d{2})/i);
+        const key = keyMatch?.[1] || `ESPP_CONTRIB|${String(txn.transaction_date || '').slice(0, 7)}`;
+        contributionByKey.set(String(key).toUpperCase(), txn);
+      }
+
+      const existingPurchases = db.prepare(`
+        SELECT id, transaction_date, units, price_per_unit, amount, fees, broker,
+          exchange_rate_used, usd_amount, fmv_per_unit, notes
+        FROM transactions
+        WHERE investment_id = ? AND portfolio_id = ? AND transaction_type = 'ESPP_PURCHASE'
+      `).all(investmentId, portfolioId);
+      const annotatedPurchases = annotatePreviewRows(purchaseRows, existingPurchases);
+      const purchaseById = new Map(existingPurchases.map((txn) => [txn.id, txn]));
+
+      const rateByDate = new Map();
+      for (const row of annotatedPurchases) {
+        if (!rateByDate.has(row.purchase_date)) {
+          rateByDate.set(row.purchase_date, Number(await fetchHistoricalUSDToINR(row.purchase_date)));
+        }
+      }
+
+      const insertContribution = db.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees, broker, notes,
+          exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units
+        ) VALUES (?, ?, 'ESPP_CONTRIBUTION', ?, NULL, NULL, ?, 0, 'Payroll', ?, NULL, NULL, NULL, NULL, NULL)
+      `);
+      const insertPurchase = db.prepare(`
+        INSERT INTO transactions (
+          investment_id, portfolio_id, transaction_type, transaction_date,
+          units, price_per_unit, amount, fees, broker, notes,
+          exchange_rate_used, usd_amount, fmv_per_unit, gross_units, tax_withheld_units
+        ) VALUES (?, ?, 'ESPP_PURCHASE', ?, ?, ?, 0, 0, 'Fidelity', ?, ?, ?, ?, NULL, NULL)
+      `);
+      const updateContribution = db.prepare(`
+        UPDATE transactions
+        SET transaction_date = ?, amount = ?, fees = 0, broker = 'Payroll', notes = ?
+        WHERE id = ?
+      `);
+      const updatePurchase = db.prepare(`
+        UPDATE transactions
+        SET transaction_date = ?, units = ?, price_per_unit = ?, amount = 0, fees = 0,
+          broker = 'Fidelity', notes = ?, exchange_rate_used = ?, usd_amount = ?, fmv_per_unit = ?
+        WHERE id = ?
+      `);
+
+      let createdContributions = 0;
+      let createdPurchases = 0;
+      let updatedContributions = 0;
+      let updatedPurchases = 0;
+      let unchanged = 0;
+      const dirtyCandidates = [];
+      const sameNumber = (left, right, tolerance = 1e-6) => {
+        const a = Number(left);
+        const b = Number(right);
+        return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= tolerance;
+      };
+
+      db.transaction(() => {
+        for (const row of contributionRows) {
+          const importKey = String(row.import_key || '').toUpperCase();
+          const contributionDate = String(row.contribution_date || '');
+          const amount = Number(row.amount || 0);
+          if (!importKey || !contributionDate || !(amount > 0)) {
+            throw new Error('Invalid ESPP contribution row');
+          }
+
+          const monthKey = String(row.month_key || contributionDate.slice(0, 7));
+          const notes = [
+            `ESPP Contribution | Month ${monthKey}`,
+            row.source_file ? `Source ${row.source_file}` : null,
+            `Key ${importKey}`,
+          ].filter(Boolean).join(' | ');
+          const existing = contributionByKey.get(importKey);
+          if (existing) {
+            const changed = (
+              String(existing.transaction_date || '') !== contributionDate
+              || !sameNumber(existing.amount, amount)
+              || String(existing.notes || '') !== notes
+            );
+            if (!changed) {
+              unchanged += 1;
+              continue;
+            }
+            updateContribution.run(contributionDate, amount, notes, existing.id);
+            updatedContributions += 1;
+            dirtyCandidates.push({
+              investment_id: investmentId,
+              portfolio_id: portfolioId,
+              transaction_date: String(existing.transaction_date || '') < contributionDate
+                ? String(existing.transaction_date || '')
+                : contributionDate,
+            });
+          } else {
+            insertContribution.run(investmentId, portfolioId, contributionDate, amount, notes);
+            createdContributions += 1;
+            dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: contributionDate });
+          }
+        }
+
+        for (const row of annotatedPurchases) {
+          const rate = rateByDate.get(row.purchase_date) || null;
+          const existing = purchaseById.get(row.existing_transaction_id);
+          if (existing) {
+            const changed = (
+              String(existing.transaction_date || '') !== row.purchase_date
+              || !sameNumber(existing.units, row.purchase_quantity)
+              || !sameNumber(existing.price_per_unit, row.purchase_price)
+              || !sameNumber(existing.amount, 0)
+              || !sameNumber(existing.fees, 0)
+              || String(existing.broker || '') !== 'Fidelity'
+              || String(existing.notes || '') !== row.notes
+              || !sameNumber(existing.exchange_rate_used, rate)
+              || !sameNumber(existing.usd_amount, row.purchase_value)
+              || !sameNumber(existing.fmv_per_unit, row.fmv_purchase_date)
+            );
+            if (!changed) {
+              unchanged += 1;
+              continue;
+            }
+            updatePurchase.run(
+              row.purchase_date,
+              row.purchase_quantity,
+              row.purchase_price,
+              row.notes,
+              rate,
+              row.purchase_value,
+              row.fmv_purchase_date,
+              existing.id,
+            );
+            updatedPurchases += 1;
+            dirtyCandidates.push({
+              investment_id: investmentId,
+              portfolio_id: portfolioId,
+              transaction_date: String(existing.transaction_date || '') < row.purchase_date
+                ? String(existing.transaction_date || '')
+                : row.purchase_date,
+            });
+          } else {
+            insertPurchase.run(
+              investmentId,
+              portfolioId,
+              row.purchase_date,
+              row.purchase_quantity,
+              row.purchase_price,
+              row.notes,
+              rate,
+              row.purchase_value,
+              row.fmv_purchase_date,
+            );
+            createdPurchases += 1;
+            dirtyCandidates.push({ investment_id: investmentId, portfolio_id: portfolioId, transaction_date: row.purchase_date });
+          }
+        }
+      })();
+
+      const created = createdContributions + createdPurchases;
+      const updated = updatedContributions + updatedPurchases;
+      if (dirtyCandidates.length > 0) {
+        markDirtyFromTransactions(db, dirtyCandidates, 'espp-activity-reconciled', `investment:${investmentId}`);
+      }
+      logAppInfo('[Stocks] ESPP activity import completed', {
+        investment_id: investmentId,
+        portfolio_id: portfolioId,
+        created,
+        created_contributions: createdContributions,
+        created_purchases: createdPurchases,
+        updated,
+        updated_contributions: updatedContributions,
+        updated_purchases: updatedPurchases,
+        unchanged,
+      });
+      res.json({
+        created,
+        created_contributions: createdContributions,
+        created_purchases: createdPurchases,
+        updated,
+        updated_contributions: updatedContributions,
+        updated_purchases: updatedPurchases,
+        unchanged,
+        total_rows: rows.length,
+      });
+    } catch (e) {
+      logAppError('[Stocks] ESPP activity import failed', {
+        investment_id: Number(req.body?.investment_id || 0) || null,
+        portfolio_id: Number(req.body?.portfolio_id || 0) || null,
+        error: e.message,
+      });
+      res.status(500).json({ error: 'Failed to import ESPP activity: ' + e.message });
     }
   });
 
