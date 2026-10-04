@@ -1385,6 +1385,79 @@ describe('Dashboard', () => {
     assert.ok('portfolio' in body);
   });
 
+  it('asset-overview aggregates lifetime basis/proceeds across active and exited scopes', async () => {
+    // An investment held in one portfolio (active) and fully exited in another (whose
+    // snapshots stop at an earlier date). The asset-overview row must reflect LIFETIME
+    // invested/proceeds/P&L — summing the latest snapshot of EACH scope — not just the
+    // active scope. This reproduces the "+absolute with -XIRR" inconsistency.
+    const activePf = Number(db.prepare('INSERT INTO portfolios (name) VALUES (?)').run('Lifetime Active').lastInsertRowid);
+    const exitedPf = Number(db.prepare('INSERT INTO portfolios (name) VALUES (?)').run('Lifetime Exited').lastInsertRowid);
+    const invId = Number(db.prepare(`
+      INSERT INTO investments (name, asset_type, amfi_code)
+      VALUES ('Lifetime Split Fund', 'MUTUAL_FUND', 'LIFE1')
+    `).run().lastInsertRowid);
+
+    try {
+      const txn = db.prepare(`
+        INSERT INTO transactions (investment_id, portfolio_id, transaction_type, transaction_date, units, price_per_unit, amount, fees)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      // Active scope: still holding units.
+      txn.run(invId, activePf, 'BUY', '2026-09-01', 2071.942, 111.01, 230000, 0);
+      // Exited scope: bought then fully redeemed at a loss.
+      txn.run(invId, exitedPf, 'BUY', '2026-06-01', 3428.005, 112.31, 385000, 0);
+      txn.run(invId, exitedPf, 'SELL', '2026-09-01', 3428.005, 102.62, 351788, 0);
+
+      const insertDaily = db.prepare(`
+        INSERT INTO investment_metrics_daily (investment_id, portfolio_id, date, price_per_unit, total_units, current_value, invested_amount, realized_proceeds, profit_loss, price_source, day_change)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIVE', 0)
+      `);
+      // Exited scope: last snapshot is older and has zero current value (basis 385000,
+      // proceeds 351788, P&L = 0 + 351788 - 385000 = -33212).
+      insertDaily.run(invId, exitedPf, '2026-09-01', 102.62, 0, 0, 385000, 351788, -33212);
+      // Active scope: newer snapshots, still valued (basis 230000, proceeds 0,
+      // P&L = 234558 - 230000 = 4558).
+      insertDaily.run(invId, activePf, '2026-09-09', 113.00, 2071.942, 234100, 230000, 0, 4100);
+      insertDaily.run(invId, activePf, '2026-09-10', 113.21, 2071.942, 234558, 230000, 0, 4558);
+
+      const insertPortfolioV2 = db.prepare(`
+        INSERT INTO portfolio_metrics_daily (portfolio_id, date, current_value, net_invested, realized_proceeds, total_profit_loss, total_day_change, calculation_version)
+        VALUES (?, ?, ?, ?, ?, ?, 0, 1)
+      `);
+      insertPortfolioV2.run(exitedPf, '2026-09-01', 0, 33212, 351788, -33212);
+      insertPortfolioV2.run(activePf, '2026-09-10', 234558, 230000, 0, 4558);
+
+      const res = await api('GET', `/dashboard/asset-overview?asset_type=MUTUAL_FUND&portfolio_ids=${activePf},${exitedPf}`);
+      assert.equal(res.status, 200);
+      const row = (res.body.investments || []).find((inv) => inv.id === invId);
+      assert.ok(row, 'investment row present in asset-overview');
+
+      // Lifetime, scope-summed values (not just the active scope).
+      assertNear(row.invested_amount, 615000, 'lifetime invested');
+      assertNear(row.realized_proceeds, 351788, 'lifetime proceeds');
+      assertNear(row.current_value, 234558, 'current value');
+      assertNear(row.profit_loss, -28654, 'lifetime P&L');
+      assertNear(row.total_units, 2071.942, 'held units');
+
+      // Explicit lifetime contract fields.
+      assertNear(row.lifetime_invested, 615000, 'lifetime_invested field');
+      assertNear(row.lifetime_proceeds, 351788, 'lifetime_proceeds field');
+      assertNear(row.lifetime_profit_loss, -28654, 'lifetime_profit_loss field');
+
+      // Absolute return is negative (lifetime P&L / lifetime invested), consistent in sign
+      // with a negative XIRR — never the misleading +1.98% from the open scope alone.
+      assert.ok(row.absolute_return_pct < 0, `absolute_return_pct should be negative, got ${row.absolute_return_pct}`);
+      assertNear(row.absolute_return_pct, (-28654 / 615000) * 100, 'absolute_return_pct');
+      assertNear(row.profit_loss_pct, (-28654 / 615000) * 100, 'profit_loss_pct equals absolute');
+    } finally {
+      db.prepare('DELETE FROM portfolio_metrics_daily WHERE portfolio_id IN (?, ?)').run(activePf, exitedPf);
+      db.prepare('DELETE FROM investment_metrics_daily WHERE investment_id = ?').run(invId);
+      db.prepare('DELETE FROM transactions WHERE investment_id = ?').run(invId);
+      db.prepare('DELETE FROM investments WHERE id = ?').run(invId);
+      db.prepare('DELETE FROM portfolios WHERE id IN (?, ?)').run(activePf, exitedPf);
+    }
+  });
+
   it('GET /dashboard/overview matches visible 1D summary values', async () => {
     for (const query of ['', 'portfolio_id=1', 'portfolio_id=1&hide_sold=true']) {
       const separator = query ? '&' : '';

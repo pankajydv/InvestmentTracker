@@ -684,26 +684,50 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
   // trading days back — at most ~10 calendar days, well under the 366 iteration ceiling.
   const dayChangeFloor = latestDate ? addDaysIso(latestDate, -10) : null;
 
-  // Latest value per investment (unbounded — authoritative for current_value)
+  // Latest value per investment (unbounded — authoritative for current_value).
+  // The latest snapshot is resolved PER (investment, portfolio) scope and then summed
+  // across scopes, so an investment held in one portfolio and fully exited in another
+  // still contributes its exited scope's lifetime basis/proceeds/P&L. Using a single
+  // global MAX(date) would drop exited scopes (they stop producing new snapshots once
+  // sold), which understates lifetime invested/proceeds and corrupts absolute return.
   const latestValueRows = db.prepare(`
     WITH latest_dates AS (
-      SELECT dv.investment_id, MAX(dv.date) AS max_date
+      SELECT dv.investment_id, dv.portfolio_id, MAX(dv.date) AS max_date
       FROM investment_metrics_daily dv
       JOIN investments i ON i.id = dv.investment_id
       WHERE ${latestDailyScope.clause} AND i.exclude_from_tracking = 0 AND UPPER(i.asset_type) = ?
-      GROUP BY dv.investment_id
+      GROUP BY dv.investment_id, dv.portfolio_id
+    ), scope_latest AS (
+      SELECT
+        ld.investment_id,
+        ld.max_date AS date,
+        COALESCE(dv.current_value, 0) AS current_value,
+        dv.price_per_unit,
+        COALESCE(dv.total_units, 0) AS total_units,
+        COALESCE(dv.invested_amount, 0) AS invested_amount,
+        COALESCE(dv.realized_proceeds, 0) AS realized_proceeds,
+        COALESCE(dv.profit_loss, 0) AS profit_loss,
+        ROW_NUMBER() OVER (
+          PARTITION BY ld.investment_id ORDER BY ld.max_date DESC, ld.portfolio_id DESC
+        ) AS scope_rank
+      FROM latest_dates ld
+      JOIN investment_metrics_daily dv
+        ON dv.investment_id = ld.investment_id
+        AND dv.portfolio_id = ld.portfolio_id
+        AND dv.date = ld.max_date
     )
-    SELECT ld.investment_id, ld.max_date AS date,
-      SUM(COALESCE(dv.current_value, 0)) AS current_value,
-      MAX(dv.price_per_unit) AS price_per_unit,
-      SUM(COALESCE(dv.total_units, 0)) AS total_units,
-      SUM(COALESCE(dv.invested_amount, 0)) AS invested_amount,
-      SUM(COALESCE(dv.realized_proceeds, 0)) AS realized_proceeds,
-      SUM(COALESCE(dv.profit_loss, 0)) AS profit_loss
-    FROM latest_dates ld
-    JOIN investment_metrics_daily dv ON dv.investment_id = ld.investment_id AND dv.date = ld.max_date AND ${portfolioScopeClause('dv.portfolio_id', scopeIds).clause}
-    GROUP BY ld.investment_id, ld.max_date
-  `).all(...latestDailyScope.params, assetType, ...portfolioScopeClause('dv.portfolio_id', scopeIds).params);
+    SELECT
+      investment_id,
+      MAX(date) AS date,
+      SUM(current_value) AS current_value,
+      MAX(CASE WHEN scope_rank = 1 THEN price_per_unit END) AS price_per_unit,
+      SUM(total_units) AS total_units,
+      SUM(invested_amount) AS invested_amount,
+      SUM(realized_proceeds) AS realized_proceeds,
+      SUM(profit_loss) AS profit_loss
+    FROM scope_latest
+    GROUP BY investment_id
+  `).all(...latestDailyScope.params, assetType);
   const latestValueByInv = new Map(latestValueRows.map((r) => [Number(r.investment_id), r]));
 
   // Recent rows for day-change resolution only
@@ -784,16 +808,39 @@ function buildAssetTypeOverview(db, assetType, query = {}) {
       openFoliosCount = [...folioMap.values()].filter((u) => u > 0.0001).length;
     }
 
+    // Lifetime return lens (single source of truth for "Absolute"): lifetime invested is
+    // gross basis across every scope, lifetime proceeds is all realized cash received, and
+    // lifetime P&L = current value + lifetime proceeds - lifetime invested. When a canonical
+    // snapshot exists it is authoritative (and already scope-summed above); otherwise we fall
+    // back to the transaction-derived totals. Both lenses are kept consistent so a legitimate
+    // zero in one field can never fall through to the other lens's value.
+    const currentValue = Number(latestValue?.current_value || 0);
+    const lifetimeInvested = Number(latestValue ? latestValue.invested_amount : totals.invested) || 0;
+    const lifetimeProceeds = Number(latestValue ? latestValue.realized_proceeds : totals.realized) || 0;
+    const lifetimeProfitLoss = latestValue
+      ? Number(latestValue.profit_loss || 0)
+      : (currentValue + lifetimeProceeds - lifetimeInvested);
+    const absoluteReturnPct = lifetimeInvested > 0
+      ? (lifetimeProfitLoss / lifetimeInvested) * 100
+      : null;
+
     investments.push({
       id, name: meta.name, asset_type: assetType,
       ticker_symbol: meta.ticker_symbol, amfi_code: meta.amfi_code,
       currency: meta.currency, isin_code: meta.isin_code, display_name: meta.display_name,
       date,
       price_per_unit: Number(latestValue?.price_per_unit || latestRow?.price_per_unit || 0),
-      current_value: Number(latestValue?.current_value || 0),
-      invested_amount: Number(latestValue?.invested_amount || totals.invested || 0),
-      realized_proceeds: Number(latestValue?.realized_proceeds || totals.realized || 0),
-      profit_loss: Number(latestValue?.profit_loss || 0),
+      current_value: currentValue,
+      invested_amount: lifetimeInvested,
+      realized_proceeds: lifetimeProceeds,
+      profit_loss: lifetimeProfitLoss,
+      profit_loss_pct: absoluteReturnPct,
+      // Explicit lifetime contract: consumers should prefer these named fields over
+      // re-deriving absolute return from ambiguous invested_amount/realized_proceeds.
+      lifetime_invested: lifetimeInvested,
+      lifetime_proceeds: lifetimeProceeds,
+      lifetime_profit_loss: lifetimeProfitLoss,
+      absolute_return_pct: absoluteReturnPct,
       total_units: Number(latestValue?.total_units || latestRow?.total_units || 0),
       acquired_units: acquiredUnits,
       day_change: dayChange,
@@ -1325,7 +1372,7 @@ module.exports = function (db) {
       const scopeIds = parsePortfolioIds(req.query);
       const version = getDataVersion(db);
       const cacheKey = JSON.stringify({
-        kind: 'asset-overview-v2',
+        kind: 'asset-overview-v3',
         assetType,
         scope: scopeIds.length ? scopeIds.slice().sort((a, b) => a - b).join(',') : 'all',
         hideSold: isTruthyQueryValue(req.query.hide_sold),
